@@ -1,0 +1,29 @@
+#include "resources.h"
+
+// Other resource statements...
+
+RES_O_HAND_LEFT		RES_T_OBJ	"../assets/LeftHand.obj"
+RES_O_HAND_RIGHT	RES_T_OBJ	"../assets/RightHand.obj"
+
+RES_O_FNT_UBUNTU	RES_T_FNTMETA	"../assets/Ubuntu-30.sfn"
+RES_O_FNT_UBUNTU	RES_T_PNG	"../assets/Ubuntu-30-texture.png"
+
+RES_O_FNT_MEDIEVAL	RES_T_FNTMETA	"../assets/MedievalSharp-30.sfn"
+RES_O_FNT_MEDIEVAL	RES_T_PNG	"../assets/MedievalSharp-30-texture.png"
+
+RES_O_FNT_PARCHMENT	RES_T_FNTMETA	"../assets/ParchmentMF-30.sfn"
+RES_O_FNT_PARCHMENT	RES_T_PNG	"../assets/ParchmentMF-30-texture.png"
+
+RES_O_BG_PARCHMENT	RES_T_PNG	"../assets/parchment-bg.png"
+
+RES_O_SPACEBAR		RES_T_PNG	"Misc/Keyboard/SpaceBar.png"
+
+RES_O_SND_HOVER		RES_T_WAV	"Sounds/low click.wav"
+RES_O_SND_PRESS		RES_T_WAV	"Sounds/Select key.wav"
+
+RES_O_KB_EN_GB		RES_T_KBLAYOUT	"../assets/en_gb.kb"
+
+RES_O_CTRL_Q3_LEFT	RES_T_OBJ	"../assets/Quest3_Left.obj"
+RES_O_CTRL_Q3_RIGHT	RES_T_OBJ	"../assets/Quest3_Right.obj"
+RES_O_CTRL_Q3_LEFT	RES_T_PNG	"../assets/Quest3_Left.png"
+RES_O_CTRL_Q3_RIGHT	RES_T_PNG	"../assets/Quest3_Right.png"

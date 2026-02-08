@@ -1,0 +1,19 @@
+If:
+  PathMatch: ^(DrvOpenXR|OCOVR|OpenOVR).*\.(cpp|h)$
+  PathExclude: .*\.gen\..*
+
+Diagnostics:
+  ClangTidy:
+    Add:
+    - bugprone-*
+    - clang-analyzer-*
+    - cppcoreguidelines-*
+    - hicpp-*
+    - misc-*
+    - modernize-*
+    - performance-*
+    - portability-*
+    - readability-*
+    CheckOptions:
+      cppcoreguidelines-avoid-do-while.IgnoreMacros: true
+  UnusedIncludes: Strict
