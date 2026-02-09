@@ -15,6 +15,7 @@
 #include "Misc/ScopeGuard.h"
 #include "convert.h"
 #include "generated/static_bases.gen.h"
+#include <algorithm>
 #include <direct.h>
 #include <string>
 #include <sstream>
@@ -218,6 +219,260 @@ static bool ReloadShortcutSettings()
 
 static bool s_shortcutSettingsInitialized = false;
 
+// =========================================================================
+// CONTROLLER COMBO SYSTEM — maps button combos to keyboard scancodes
+// =========================================================================
+
+struct ComboBinding {
+	struct BtnReq {
+		int ctrl;             // 0=left, 1=right
+		uint64_t mask;        // digital button mask (0 if stick direction)
+		int stickAxis;        // 0=X, 1=Y (only when mask==0)
+		float stickThreshold; // +0.7 or -0.7 (only when mask==0)
+	};
+
+	std::vector<BtnReq> buttons;
+	std::string mode;  // "press", "double_tap", "triple_tap", "quadruple_tap", "long_press"
+	int timingMs;
+	int scancode;
+
+	// Per-combo detection state
+	int tapCount;
+	ULONGLONG tapTimes[4];
+	bool wasAllPressed;
+	ULONGLONG holdStart;
+	bool firedThisPress;
+
+	ComboBinding() : timingMs(500), scancode(0), tapCount(0),
+		wasAllPressed(false), holdStart(0), firedThisPress(false) {
+		memset(tapTimes, 0, sizeof(tapTimes));
+	}
+};
+
+static std::vector<ComboBinding> s_combos;
+static bool s_combosLoaded = false;
+
+static void SendScancode(int scancode)
+{
+	INPUT inputs[2] = {};
+	inputs[0].type = INPUT_KEYBOARD;
+	inputs[0].ki.wScan = (WORD)scancode;
+	inputs[0].ki.dwFlags = KEYEVENTF_SCANCODE;
+	inputs[1].type = INPUT_KEYBOARD;
+	inputs[1].ki.wScan = (WORD)scancode;
+	inputs[1].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+	SendInput(2, inputs, sizeof(INPUT));
+}
+
+static bool ParseComboButton(const std::string& token, ComboBinding::BtnReq& out)
+{
+	out.mask = 0;
+	out.stickAxis = 0;
+	out.stickThreshold = 0;
+
+	// Face buttons
+	if (token == "a")            { out.ctrl = 1; out.mask = ButtonMaskFromId(k_EButton_A); return true; }
+	if (token == "b")            { out.ctrl = 1; out.mask = ButtonMaskFromId(k_EButton_ApplicationMenu); return true; }
+	if (token == "x")            { out.ctrl = 0; out.mask = ButtonMaskFromId(k_EButton_A); return true; }
+	if (token == "y")            { out.ctrl = 0; out.mask = ButtonMaskFromId(k_EButton_ApplicationMenu); return true; }
+
+	// Stick clicks
+	if (token == "left_stick")   { out.ctrl = 0; out.mask = ButtonMaskFromId(k_EButton_SteamVR_Touchpad); return true; }
+	if (token == "right_stick")  { out.ctrl = 1; out.mask = ButtonMaskFromId(k_EButton_SteamVR_Touchpad); return true; }
+
+	// Grips and triggers
+	if (token == "left_grip")    { out.ctrl = 0; out.mask = ButtonMaskFromId(k_EButton_Grip); return true; }
+	if (token == "right_grip")   { out.ctrl = 1; out.mask = ButtonMaskFromId(k_EButton_Grip); return true; }
+	if (token == "left_trigger") { out.ctrl = 0; out.mask = ButtonMaskFromId(k_EButton_Axis1); return true; }
+	if (token == "right_trigger"){ out.ctrl = 1; out.mask = ButtonMaskFromId(k_EButton_Axis1); return true; }
+
+	// Stick directions (analog threshold)
+	if (token == "left_stick_up")    { out.ctrl = 0; out.stickAxis = 1; out.stickThreshold = 0.7f; return true; }
+	if (token == "left_stick_down")  { out.ctrl = 0; out.stickAxis = 1; out.stickThreshold = -0.7f; return true; }
+	if (token == "left_stick_left")  { out.ctrl = 0; out.stickAxis = 0; out.stickThreshold = -0.7f; return true; }
+	if (token == "left_stick_right") { out.ctrl = 0; out.stickAxis = 0; out.stickThreshold = 0.7f; return true; }
+	if (token == "right_stick_up")   { out.ctrl = 1; out.stickAxis = 1; out.stickThreshold = 0.7f; return true; }
+	if (token == "right_stick_down") { out.ctrl = 1; out.stickAxis = 1; out.stickThreshold = -0.7f; return true; }
+	if (token == "right_stick_left") { out.ctrl = 1; out.stickAxis = 0; out.stickThreshold = -0.7f; return true; }
+	if (token == "right_stick_right"){ out.ctrl = 1; out.stickAxis = 0; out.stickThreshold = 0.7f; return true; }
+
+	return false;
+}
+
+static void LoadCombos()
+{
+	s_combos.clear();
+
+	wchar_t dllPath[MAX_PATH];
+	GetModuleFileNameW(nullptr, dllPath, MAX_PATH);
+	std::wstring path(dllPath);
+	size_t pos = path.find_last_of(L"\\/");
+	if (pos != std::wstring::npos)
+		path = path.substr(0, pos + 1);
+	path += L"opencomposite.ini";
+
+	FILE* f = nullptr;
+	for (int retry = 0; retry < 5 && !f; retry++) {
+		f = _wfopen(path.c_str(), L"r");
+		if (!f && retry < 4)
+			Sleep(50);
+	}
+	if (!f)
+		return;
+
+	bool inCombosSection = false;
+	char line[512];
+
+	while (fgets(line, sizeof(line), f)) {
+		if (line[0] == '[') {
+			inCombosSection = (strstr(line, "[combos]") != nullptr);
+			continue;
+		}
+		if (!inCombosSection)
+			continue;
+		if (s_combos.size() >= 16)
+			break;
+
+		// Parse: comboN=button_string,mode,timing_ms,0xSC
+		char* eq = strchr(line, '=');
+		if (!eq) continue;
+		char* val = eq + 1;
+
+		// Split value by commas
+		char btnStr[256] = {}, modeStr[64] = {}, timingStr[16] = {}, scStr[16] = {};
+		if (sscanf(val, "%255[^,],%63[^,],%15[^,],%15s", btnStr, modeStr, timingStr, scStr) < 4)
+			continue;
+
+		// Parse scancode (hex)
+		int sc = 0;
+		if (strncmp(scStr, "0x", 2) == 0 || strncmp(scStr, "0X", 2) == 0)
+			sc = (int)strtol(scStr + 2, nullptr, 16);
+		else
+			sc = (int)strtol(scStr, nullptr, 16);
+		if (sc == 0) continue;
+
+		// Parse timing
+		int timing = atoi(timingStr);
+
+		// Parse buttons
+		ComboBinding combo;
+		combo.mode = modeStr;
+		combo.timingMs = timing;
+		combo.scancode = sc;
+
+		std::istringstream bss(btnStr);
+		std::string token;
+		bool valid = true;
+		while (std::getline(bss, token, '+')) {
+			while (!token.empty() && token.front() == ' ') token.erase(token.begin());
+			while (!token.empty() && token.back() == ' ') token.pop_back();
+			if (token.empty()) continue;
+
+			ComboBinding::BtnReq req;
+			if (ParseComboButton(token, req))
+				combo.buttons.push_back(req);
+			else
+				valid = false;
+		}
+
+		if (valid && !combo.buttons.empty())
+			s_combos.push_back(std::move(combo));
+	}
+	fclose(f);
+
+	// Sort: combos with more buttons checked first (prevents grip+A from eating grip+A+B)
+	std::sort(s_combos.begin(), s_combos.end(),
+		[](const ComboBinding& a, const ComboBinding& b) { return a.buttons.size() > b.buttons.size(); });
+
+	OOVR_LOGF("Loaded %d controller combos", (int)s_combos.size());
+}
+
+static void ProcessCombos(BaseSystem* sys, const VRControllerState_t ctrlState[2], const bool ctrlValid[2])
+{
+	for (auto& combo : s_combos) {
+		// Check if ALL required buttons are pressed
+		bool allPressed = true;
+		for (const auto& req : combo.buttons) {
+			int ci = req.ctrl;
+			if (!ctrlValid[ci]) { allPressed = false; break; }
+
+			bool pressed = false;
+			if (req.mask != 0) {
+				// Digital button check
+				pressed = (ctrlState[ci].ulButtonPressed & req.mask) != 0;
+				// Analog fallback for grip/trigger
+				if (!pressed) {
+					if (req.mask == ButtonMaskFromId(k_EButton_Grip))
+						pressed = ctrlState[ci].rAxis[2].x >= 0.5f;
+					else if (req.mask == ButtonMaskFromId(k_EButton_Axis1))
+						pressed = ctrlState[ci].rAxis[1].x >= 0.5f;
+				}
+			} else {
+				// Stick direction check (analog axis)
+				float axisVal = (req.stickAxis == 0)
+					? ctrlState[ci].rAxis[0].x
+					: ctrlState[ci].rAxis[0].y;
+				pressed = (req.stickThreshold > 0)
+					? (axisVal >= req.stickThreshold)
+					: (axisVal <= req.stickThreshold);
+			}
+
+			if (!pressed) { allPressed = false; break; }
+		}
+
+		if (combo.mode == "press") {
+			// Modifier combo: fire once when all held, reset when released
+			if (allPressed && !combo.firedThisPress) {
+				SendScancode(combo.scancode);
+				combo.firedThisPress = true;
+				OOVR_LOGF("Combo fired (press): scancode 0x%02x", combo.scancode);
+			}
+			if (!allPressed)
+				combo.firedThisPress = false;
+		} else if (combo.mode == "long_press") {
+			if (allPressed) {
+				if (combo.holdStart == 0)
+					combo.holdStart = GetTickCount64();
+				else if (!combo.firedThisPress &&
+					(GetTickCount64() - combo.holdStart) >= (ULONGLONG)combo.timingMs) {
+					SendScancode(combo.scancode);
+					combo.firedThisPress = true;
+					OOVR_LOGF("Combo fired (long_press): scancode 0x%02x", combo.scancode);
+				}
+			} else {
+				combo.holdStart = 0;
+				combo.firedThisPress = false;
+			}
+		} else {
+			// Multi-tap modes: double_tap, triple_tap, quadruple_tap
+			int requiredTaps = 2;
+			if (combo.mode == "triple_tap") requiredTaps = 3;
+			else if (combo.mode == "quadruple_tap" || combo.mode == "quad_tap") requiredTaps = 4;
+			int timing = combo.timingMs > 0 ? combo.timingMs : 500;
+
+			bool justPressed = allPressed && !combo.wasAllPressed;
+
+			if (justPressed) {
+				ULONGLONG now = GetTickCount64();
+				if (combo.tapCount > 0 && (now - combo.tapTimes[combo.tapCount - 1]) > (ULONGLONG)timing)
+					combo.tapCount = 0;
+				if (combo.tapCount < 4)
+					combo.tapTimes[combo.tapCount] = now;
+				combo.tapCount++;
+				if (combo.tapCount >= requiredTaps) {
+					SendScancode(combo.scancode);
+					combo.tapCount = 0;
+					OOVR_LOGF("Combo fired (%s): scancode 0x%02x", combo.mode.c_str(), combo.scancode);
+				}
+			}
+			// Expire stale taps
+			if (combo.tapCount > 0 && (GetTickCount64() - combo.tapTimes[combo.tapCount - 1]) > (ULONGLONG)timing)
+				combo.tapCount = 0;
+		}
+		combo.wasAllPressed = allPressed;
+	}
+}
+
 // Class to represent an overlay
 class BaseOverlay::OverlayData {
 public:
@@ -318,6 +573,7 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 	// Initialize shortcut settings from config on first run
 	if (!s_shortcutSettingsInitialized) {
 		InitShortcutSettings();
+		LoadCombos();
 		s_shortcutSettingsInitialized = true;
 	}
 
@@ -343,6 +599,7 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 						OOVR_LOGF("Shortcut settings reloaded: enabled=%d button=%s mode=%s timing=%d",
 							s_shortcutEnabled, s_shortcutButton.c_str(), s_shortcutMode.c_str(), s_shortcutTiming);
 					}
+					LoadCombos();
 				}
 			}
 		}
@@ -476,6 +733,22 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 					shortcutHoldStart = 0;
 				}
 			}
+		}
+	}
+
+	// ── Controller combo processing — disabled while keyboard is open ──
+	if (!keyboard && !s_combos.empty()) {
+		BaseSystem* sys = GetUnsafeBaseSystem();
+		if (sys) {
+			VRControllerState_t comboCtrlState[2] = {};
+			bool comboCtrlValid[2] = { false, false };
+			TrackedDeviceIndex_t lIdx = sys->GetTrackedDeviceIndexForControllerRole(TrackedControllerRole_LeftHand);
+			TrackedDeviceIndex_t rIdx = sys->GetTrackedDeviceIndexForControllerRole(TrackedControllerRole_RightHand);
+			if (lIdx != k_unTrackedDeviceIndexInvalid)
+				comboCtrlValid[0] = sys->GetControllerState(lIdx, &comboCtrlState[0], sizeof(comboCtrlState[0]));
+			if (rIdx != k_unTrackedDeviceIndexInvalid)
+				comboCtrlValid[1] = sys->GetControllerState(rIdx, &comboCtrlState[1], sizeof(comboCtrlState[1]));
+			ProcessCombos(sys, comboCtrlState, comboCtrlValid);
 		}
 	}
 #endif

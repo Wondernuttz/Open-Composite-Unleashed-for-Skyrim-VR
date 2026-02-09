@@ -40,6 +40,12 @@
 #include "tmp_gfx/TemporaryD3D11.h"
 #endif
 
+#include "../OpenOVR/Misc/Config.h"
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+#include <d3d11.h>
+#endif
+
 #include <chrono>
 #include <ranges>
 #include <type_traits>
@@ -84,8 +90,119 @@ XrBackend::XrBackend(bool useVulkanTmpGfx, bool useD3D11TmpGfx)
 	}
 }
 
+// --- GPU Timing via D3D11 Timestamp Queries ---
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+void XrBackend::InitGpuTiming(ID3D11Device* device)
+{
+	if (gpuTimingInitialized)
+		return;
+
+	D3D11_QUERY_DESC disjointDesc = {};
+	disjointDesc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+
+	D3D11_QUERY_DESC timestampDesc = {};
+	timestampDesc.Query = D3D11_QUERY_TIMESTAMP;
+
+	HRESULT hr = device->CreateQuery(&disjointDesc, &gpuTimestampDisjoint);
+	if (FAILED(hr)) {
+		OOVR_LOG("GPU timing: failed to create disjoint query");
+		return;
+	}
+
+	hr = device->CreateQuery(&timestampDesc, &gpuTimestampBegin);
+	if (FAILED(hr)) {
+		OOVR_LOG("GPU timing: failed to create begin timestamp query");
+		gpuTimestampDisjoint->Release();
+		gpuTimestampDisjoint = nullptr;
+		return;
+	}
+
+	hr = device->CreateQuery(&timestampDesc, &gpuTimestampEnd);
+	if (FAILED(hr)) {
+		OOVR_LOG("GPU timing: failed to create end timestamp query");
+		gpuTimestampDisjoint->Release();
+		gpuTimestampDisjoint = nullptr;
+		gpuTimestampBegin->Release();
+		gpuTimestampBegin = nullptr;
+		return;
+	}
+
+	device->AddRef();
+	gpuTimingDevice = device;
+	device->GetImmediateContext(&gpuTimingContext);
+
+	gpuTimingInitialized = true;
+	OOVR_LOG("GPU timing: D3D11 timestamp queries initialized");
+}
+
+void XrBackend::ReadGpuTimingResults()
+{
+	if (!gpuTimingInFlight)
+		return;
+
+	D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData;
+	HRESULT hr = gpuTimingContext->GetData(gpuTimestampDisjoint, &disjointData, sizeof(disjointData), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+
+	if (hr != S_OK)
+		return; // Not ready yet, keep last measured value
+
+	if (disjointData.Disjoint) {
+		gpuTimingInFlight = false;
+		return; // GPU frequency changed, data unreliable
+	}
+
+	UINT64 beginTime, endTime;
+	hr = gpuTimingContext->GetData(gpuTimestampBegin, &beginTime, sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+	if (hr != S_OK)
+		return;
+
+	hr = gpuTimingContext->GetData(gpuTimestampEnd, &endTime, sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+	if (hr != S_OK)
+		return;
+
+	float deltaMs = (float)(endTime - beginTime) / (float)disjointData.Frequency * 1000.0f;
+
+	// Sanity check: ignore obviously wrong values
+	if (deltaMs > 0.0f && deltaMs < 200.0f) {
+		measuredGpuTimeMs = deltaMs;
+	}
+
+	gpuTimingInFlight = false;
+}
+
+void XrBackend::CleanupGpuTiming()
+{
+	if (gpuTimestampDisjoint) {
+		gpuTimestampDisjoint->Release();
+		gpuTimestampDisjoint = nullptr;
+	}
+	if (gpuTimestampBegin) {
+		gpuTimestampBegin->Release();
+		gpuTimestampBegin = nullptr;
+	}
+	if (gpuTimestampEnd) {
+		gpuTimestampEnd->Release();
+		gpuTimestampEnd = nullptr;
+	}
+	if (gpuTimingContext) {
+		gpuTimingContext->Release();
+		gpuTimingContext = nullptr;
+	}
+	if (gpuTimingDevice) {
+		gpuTimingDevice->Release();
+		gpuTimingDevice = nullptr;
+	}
+	gpuTimingInitialized = false;
+	gpuTimingInFlight = false;
+}
+#endif
+
 XrBackend::~XrBackend()
 {
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	CleanupGpuTiming();
+#endif
+
 	// First clear out the compositors, since they might try and access the OpenXR instance
 	// in their destructor.
 	PrepareForSessionShutdown();
@@ -210,6 +327,11 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
 			d3dInfo.device = dev;
 			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingD3D11KHR>>(d3dInfo);
 			DrvOpenXR::SetupSession();
+
+			// Initialize GPU timing queries before releasing the device
+			if (oovr_global_configuration.EnableGpuTiming()) {
+				InitGpuTiming(dev);
+			}
 
 			dev->Release();
 #else
@@ -382,9 +504,20 @@ void XrBackend::WaitForTrackingData()
 	XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
 	XrFrameState state{ XR_TYPE_FRAME_STATE };
 
+	// Initialize QPC frequency once
+	if (!qpcInitialized) {
+		QueryPerformanceFrequency(&qpcFrequency);
+		qpcInitialized = true;
+	}
+
 	{
 		auto lock = xr_session.lock_shared();
+
+		//QueryPerformanceCounter(&waitFrameStart);
 		OOVR_FAILED_XR_ABORT(xrWaitFrame(xr_session.get(), &waitInfo, &state));
+		//QueryPerformanceCounter(&waitFrameEnd);
+		//measuredWaitFrameMs = (float)(waitFrameEnd.QuadPart - waitFrameStart.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+
 		xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
 
 		// FIXME loop until this returns true?
@@ -393,6 +526,16 @@ void XrBackend::WaitForTrackingData()
 		XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
 		OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
 	}
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	// GPU timing: read previous frame's results, then start new measurement
+	if (gpuTimingInitialized) {
+		ReadGpuTimingResults();
+		gpuTimingContext->Begin(gpuTimestampDisjoint);
+		gpuTimingContext->End(gpuTimestampBegin);
+		gpuTimingInFlight = true;
+	}
+#endif
 
 	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
 	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -428,6 +571,9 @@ void XrBackend::WaitForTrackingData()
 	} else {
 		renderingFrame = true;
 	}
+
+	// Mark CPU frame start — game gets control back now
+	//QueryPerformanceCounter(&cpuFrameStart);
 }
 
 void XrBackend::StoreEyeTexture(
@@ -517,6 +663,17 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 		submittedEyeTextures = false;
 	}
 
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	// GPU timing: end measurement BEFORE overlay/keyboard processing.
+	// VRKeyboard constructor creates XR swapchains and D3D11 resources —
+	// doing that inside an active timestamp disjoint query can crash
+	// some OpenXR runtimes silently.
+	if (gpuTimingInitialized && gpuTimingInFlight) {
+		gpuTimingContext->End(gpuTimestampEnd);
+		gpuTimingContext->End(gpuTimestampDisjoint);
+	}
+#endif
+
 	// Ensure the BaseOverlay singleton exists so the keyboard shortcut
 	// detection in _BuildLayers runs every frame. Without this, the overlay
 	// is only created when the game explicitly requests IVROverlay, which
@@ -540,7 +697,25 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	info.layers = headers;
 	info.layerCount = layer_count;
 
+	// CPU frame time: game work is done, measure before xrEndFrame
+	//if (qpcInitialized && cpuFrameStart.QuadPart > 0) {
+	//	QueryPerformanceCounter(&cpuFrameEnd);
+	//	measuredCpuFrameMs = (float)(cpuFrameEnd.QuadPart - cpuFrameStart.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+	//}
+
+	// Compositor time: measure xrEndFrame duration
+	//QueryPerformanceCounter(&endFrameStart);
 	OOVR_FAILED_XR_SOFT_ABORT(xrEndFrame(xr_session.get(), &info));
+	//QueryPerformanceCounter(&endFrameEnd);
+	//if (qpcInitialized) {
+	//	measuredEndFrameMs = (float)(endFrameEnd.QuadPart - endFrameStart.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+	//
+	//	// Frame-to-frame interval
+	//	if (lastFrameSubmitQpc.QuadPart > 0) {
+	//		measuredFrameIntervalMs = (float)(endFrameEnd.QuadPart - lastFrameSubmitQpc.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+	//	}
+	//	lastFrameSubmitQpc = endFrameEnd;
+	//}
 
 	BaseSystem* sys = GetUnsafeBaseSystem();
 	if (sys) {
@@ -653,23 +828,31 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
 		pTiming->m_nNumDroppedFrames = 0; // number of additional times previous frame was scanned out
 		pTiming->m_nReprojectionFlags = 0;
 
-		// Just use sensible values until GPU timers implemented
-		pTiming->m_flPreSubmitGpuMs = 8.0f;
-		pTiming->m_flPostSubmitGpuMs = 1.0f;
-		pTiming->m_flTotalRenderGpuMs = 9.0f;
+		// GPU timing: use real D3D11 timestamp measurements if available, otherwise fall back to conservative estimates
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+		if (gpuTimingInitialized && measuredGpuTimeMs > 0.0f) {
+			pTiming->m_flPreSubmitGpuMs = measuredGpuTimeMs;
+			pTiming->m_flPostSubmitGpuMs = measuredEndFrameMs; // xrEndFrame includes compositor GPU work
+			pTiming->m_flTotalRenderGpuMs = measuredGpuTimeMs + measuredEndFrameMs;
+		} else
+#endif
+		{
+			pTiming->m_flPreSubmitGpuMs = 8.0f;
+			pTiming->m_flPostSubmitGpuMs = 1.0f;
+			pTiming->m_flTotalRenderGpuMs = 9.0f;
+		}
 
-		// Use very conservative guesses for these. They are used in F1 22 for dynamic resolution calculations but are not something that is provided
-		// through OpenXR. Using conservative values will give a bit more headroom for the game to target realistic frame times.
-		pTiming->m_flCompositorRenderGpuMs = 1.5f; // time spend performing distortion correction, rendering chaperone, overlays, etc.
-		pTiming->m_flCompositorRenderCpuMs = 3.0f; // time spent on cpu submitting the above work for this frame
+		// Compositor timing — measured from xrEndFrame duration
+		pTiming->m_flCompositorRenderGpuMs = measuredEndFrameMs > 0.0f ? measuredEndFrameMs : 1.5f;
+		pTiming->m_flCompositorRenderCpuMs = measuredEndFrameMs > 0.0f ? measuredEndFrameMs : 3.0f;
 
-		pTiming->m_flCompositorIdleCpuMs = 0.1f;
+		pTiming->m_flCompositorIdleCpuMs = measuredWaitFrameMs > 0.0f ? measuredWaitFrameMs : 0.1f;
 
 		/** Miscellaneous measured intervals. */
-		pTiming->m_flClientFrameIntervalMs = 11.1f; // time between calls to WaitGetPoses
-		pTiming->m_flPresentCallCpuMs = 0.0f; // time blocked on call to present (usually 0.0, but can go long)
-		pTiming->m_flWaitForPresentCpuMs = 0.0f; // time spent spin-waiting for frame index to change (not near-zero indicates wait object failure)
-		pTiming->m_flSubmitFrameMs = 0.0f; // time spent in IVRCompositor::Submit (not near-zero indicates driver issue)
+		pTiming->m_flClientFrameIntervalMs = measuredFrameIntervalMs > 0.0f ? measuredFrameIntervalMs : 11.1f;
+		pTiming->m_flPresentCallCpuMs = measuredEndFrameMs; // time blocked on xrEndFrame
+		pTiming->m_flWaitForPresentCpuMs = measuredWaitFrameMs; // time spent waiting in xrWaitFrame
+		pTiming->m_flSubmitFrameMs = measuredCpuFrameMs > 0.0f ? measuredCpuFrameMs : 0.0f; // app CPU frame time
 
 		/** The following are all relative to this frame's SystemTimeInSeconds */
 		pTiming->m_flWaitGetPosesCalledMs = 0.0f;

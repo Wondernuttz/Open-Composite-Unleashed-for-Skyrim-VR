@@ -64,9 +64,18 @@ namespace OpenCompositeConfigurator
         private CheckBox _chkInputSmoothing = null!;
         private NumericUpDown _nudInputWindow = null!;
         private CheckBox _chkControllerSmoothing = null!;
+        private NumericUpDown _nudPosSmoothMinCutoff = null!;
+        private NumericUpDown _nudPosSmoothBeta = null!;
+        private NumericUpDown _nudRotSmoothMinCutoff = null!;
+        private NumericUpDown _nudRotSmoothBeta = null!;
+        private Label _lblPosCutoff = null!;
+        private Label _lblPosBeta = null!;
+        private Label _lblRotCutoff = null!;
+        private Label _lblRotBeta = null!;
         private CheckBox _chkDisableTriggerTouch = null!;
         private CheckBox _chkDisableTrackpad = null!;
         private CheckBox _chkVRIKKnuckles = null!;
+        private CheckBox _chkGpuTiming = null!;
 
         // Keyboard display settings
         private NumericUpDown _nudDisplayTilt = null!;
@@ -82,6 +91,27 @@ namespace OpenCompositeConfigurator
         // Dead zones (Skyrim)
         private NumericUpDown _nudLeftDeadZone = null!;
         private NumericUpDown _nudRightDeadZone = null!;
+
+        // Controller axis adjustments (Skyrim)
+        private Panel _pnlAxisAdjust = null!;
+        private CheckBox _chkAdjustTilt = null!;
+        private NumericUpDown _nudTiltDeg = null!;
+        private CheckBox _chkLeftRotation = null!;
+        private NumericUpDown _nudLeftRotX = null!;
+        private NumericUpDown _nudLeftRotY = null!;
+        private NumericUpDown _nudLeftRotZ = null!;
+        private CheckBox _chkRightRotation = null!;
+        private NumericUpDown _nudRightRotX = null!;
+        private NumericUpDown _nudRightRotY = null!;
+        private NumericUpDown _nudRightRotZ = null!;
+        private CheckBox _chkLeftPosition = null!;
+        private NumericUpDown _nudLeftPosX = null!;
+        private NumericUpDown _nudLeftPosY = null!;
+        private NumericUpDown _nudLeftPosZ = null!;
+        private CheckBox _chkRightPosition = null!;
+        private NumericUpDown _nudRightPosX = null!;
+        private NumericUpDown _nudRightPosY = null!;
+        private NumericUpDown _nudRightPosZ = null!;
 
         // Ko-fi
         private PictureBox _picKofi = null!;
@@ -127,6 +157,7 @@ namespace OpenCompositeConfigurator
         private Label _lblKbStatus = null!;
         private Button _btnSaveBindings = null!;
         private Button _btnVRDefaults = null!;
+        private Button _btnVRIKDefaults = null!;
         private Button _btnResetDefaults = null!;
 
         private string? _selectedKeyId = null;
@@ -332,8 +363,8 @@ namespace OpenCompositeConfigurator
         private void InitializeUI()
         {
             Text = "OpenComposite Configurator";
-            Size = new Size(1280, 1040);
-            MinimumSize = new Size(1260, 980);
+            Size = new Size(1280, 1060);
+            MinimumSize = new Size(1260, 800);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(30, 30, 35);
             ForeColor = Color.FromArgb(220, 220, 220);
@@ -409,34 +440,98 @@ namespace OpenCompositeConfigurator
 
             y += 32;
 
-            // Panel 1: Settings — no scrollbar
+            // Panel 1: Settings
             _tabSettings = new Panel
             {
                 Location = new Point(leftMargin, y),
-                Size = new Size(rightEdge - leftMargin, 900),
+                Size = new Size(rightEdge - leftMargin, 800), // resized after content built
                 BackColor = Color.FromArgb(30, 30, 35),
                 AutoScroll = false,
                 Visible = true,
             };
             Controls.Add(_tabSettings);
 
-            // Panel 2: Keyboard Bindings — no scrollbar, window is big enough
+            // Panel 2: Keyboard Bindings
             _tabKeyboard = new Panel
             {
                 Location = new Point(leftMargin, y),
-                Size = new Size(rightEdge - leftMargin, 900),
+                Size = new Size(rightEdge - leftMargin, 800), // resized after content built
                 BackColor = Color.FromArgb(30, 30, 35),
                 AutoScroll = false,
                 Visible = false,
             };
             Controls.Add(_tabKeyboard);
 
-            // Build content for each tab
+            // Build content for each tab (each auto-sizes its panel)
             BuildSettingsTab();
             BuildKeyboardTab();
 
-            // Form size
-            ClientSize = new Size(ClientSize.Width, Math.Max(_tabSettings.Bottom + 20, 1000));
+            // Sync both tabs to the same height (tallest content)
+            int tallestTab = Math.Max(_tabSettings.Height, _tabKeyboard.Height);
+            _tabSettings.Size = new Size(_tabSettings.Width, tallestTab);
+            _tabKeyboard.Size = new Size(_tabKeyboard.Width, tallestTab);
+
+            // Ko-fi right after the tabs
+            int kofiY = _tabSettings.Location.Y + tallestTab + 4;
+
+            // ── KO-FI footer ──
+            var kofiSep = new Label
+            {
+                Location = new Point(leftMargin, kofiY),
+                Size = new Size(rightEdge - leftMargin, 1),
+                BackColor = Color.FromArgb(60, 60, 65)
+            };
+            Controls.Add(kofiSep);
+            kofiY += 6;
+
+            // One line: italic text + bold link + icon
+            var lblKofiMsg = new Label
+            {
+                Text = "I do this for free and for the love of VR gaming, and I always will. If you want to show some love,",
+                Location = new Point(leftMargin, kofiY),
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9f, FontStyle.Italic),
+                ForeColor = Color.FromArgb(160, 160, 160)
+            };
+            Controls.Add(lblKofiMsg);
+
+            int linkX = leftMargin + lblKofiMsg.PreferredWidth + 4;
+            var lblKofiLink = new LinkLabel
+            {
+                Text = "support me on Ko-fi",
+                Location = new Point(linkX, kofiY),
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                LinkColor = Color.FromArgb(41, 171, 226),
+                ActiveLinkColor = Color.FromArgb(80, 200, 255),
+                VisitedLinkColor = Color.FromArgb(41, 171, 226)
+            };
+            lblKofiLink.LinkClicked += (s, e) =>
+            {
+                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://ko-fi.com/wondernutts") { UseShellExecute = true }); }
+                catch { }
+            };
+            Controls.Add(lblKofiLink);
+
+            int iconX = linkX + lblKofiLink.PreferredWidth + 4;
+            _picKofi = new PictureBox
+            {
+                Location = new Point(iconX, kofiY - 2),
+                Size = new Size(22, 22),
+                SizeMode = PictureBoxSizeMode.Zoom,
+                BackColor = Color.Transparent,
+                Image = _kofiImage,
+                Cursor = Cursors.Hand
+            };
+            _picKofi.Click += (s, e) =>
+            {
+                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://ko-fi.com/wondernutts") { UseShellExecute = true }); }
+                catch { }
+            };
+            Controls.Add(_picKofi);
+
+            // Size form to fit tabs + Ko-fi
+            ClientSize = new Size(ClientSize.Width, kofiY + 26);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -456,21 +551,20 @@ namespace OpenCompositeConfigurator
             var lblMO2Note = new Label
             {
                 Location = new Point(leftMargin, y),
-                Size = new Size(rightEdge - leftMargin, 36),
-                Text = "MO2 Users: Place this EXE in your mod folder (e.g., \\mods\\OC Unleashed\\) " +
-                       "and create a desktop shortcut. Settings will auto-save to both locations.",
+                Size = new Size(rightEdge - leftMargin, 24),
+                Text = "MO2 Users: Place this EXE in your mod folder and create a desktop shortcut. Auto-saves to both locations.",
                 ForeColor = Color.FromArgb(150, 200, 250),
-                Font = new Font("Segoe UI", 9f, FontStyle.Italic),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Italic),
                 BackColor = Color.FromArgb(40, 45, 60),
                 BorderStyle = BorderStyle.FixedSingle,
-                Padding = new Padding(8, 8, 8, 8),
+                Padding = new Padding(6, 4, 6, 4),
                 AutoSize = false
             };
             container.Controls.Add(lblMO2Note);
 
-            y += 48;
+            y += 30;
             container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
-            y += 12;
+            y += 8;
 
             // ── SAVE/RELOAD BUTTONS (top right corner) ──
             _btnSave = MakeButton("Save opencomposite.ini", rightEdge - 310, y, 200, 30);
@@ -497,13 +591,13 @@ namespace OpenCompositeConfigurator
             lblComboHint.ForeColor = Color.FromArgb(130, 130, 130);
             lblComboHint.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
             container.Controls.Add(lblComboHint);
-            y += 42;
+            y += 38;
 
             // Controller image on the left
             _picControllers = new PictureBox
             {
                 Location = new Point(leftMargin, y),
-                Size = new Size(320, 180),
+                Size = new Size(300, 155),
                 SizeMode = PictureBoxSizeMode.Zoom,
                 BackColor = Color.FromArgb(40, 40, 48),
                 Image = _controllerImage
@@ -573,42 +667,36 @@ namespace OpenCompositeConfigurator
             }
 
             int imageBottom = _picControllers.Bottom + 10;
-            chkY += 28;
-            y = Math.Max(imageBottom, chkY);
+            chkY += 22;
 
-            // Tap count
-            var lblTaps = MakeLabel("Tap Count:", leftMargin, y + 3, 100);
-            container.Controls.Add(lblTaps);
-
-            int tapX = leftMargin + 105;
+            // ── Tap count (right under Trigger = Laser Click) ──
+            container.Controls.Add(MakeLabel("Tap:", cx, chkY + 3, 30));
             var tapPanel = new Panel
             {
-                Location = new Point(tapX, y),
-                Size = new Size(310, 26),
+                Location = new Point(cx + 32, chkY),
+                Size = new Size(260, 26),
                 BackColor = Color.Transparent
             };
-            _rdoX1 = MakeRadioButton("x1 Hold", 0, 1, 90);
-            _rdoX2 = MakeRadioButton("x2", 95, 1, 55);
-            _rdoX3 = MakeRadioButton("x3", 155, 1, 55);
-            _rdoX4 = MakeRadioButton("x4", 215, 1, 55);
+            _rdoX1 = MakeRadioButton("x1 Hold", 0, 1, 80);
+            _rdoX2 = MakeRadioButton("x2", 82, 1, 45);
+            _rdoX3 = MakeRadioButton("x3", 130, 1, 45);
+            _rdoX4 = MakeRadioButton("x4", 178, 1, 45);
             _rdoX2.Checked = true;
             tapPanel.Controls.AddRange(new Control[] { _rdoX1, _rdoX2, _rdoX3, _rdoX4 });
             container.Controls.Add(tapPanel);
+            chkY += 26;
 
-            var lblTiming = MakeLabel("Timing (ms):", leftMargin + 430, y + 3, 100);
-            container.Controls.Add(lblTiming);
-
+            // ── Timing (under tap, against the picture) ──
+            container.Controls.Add(MakeLabel("Timing:", cx, chkY + 3, 55));
             _nudTiming = new NumericUpDown
             {
-                Location = new Point(leftMargin + 535, y),
-                Width = 80,
+                Location = new Point(cx + 58, chkY),
+                Width = 70,
                 Minimum = 100, Maximum = 3000, Increment = 50, Value = 500,
-                BackColor = Color.FromArgb(50, 50, 55),
-                ForeColor = Color.White
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             container.Controls.Add(_nudTiming);
-
-            _lblTimingDesc = MakeLabel("Max time between taps", leftMargin + 625, y + 3, 220);
+            _lblTimingDesc = MakeLabel("ms", cx + 132, chkY + 3, 30);
             _lblTimingDesc.ForeColor = Color.FromArgb(140, 140, 140);
             container.Controls.Add(_lblTimingDesc);
 
@@ -616,98 +704,86 @@ namespace OpenCompositeConfigurator
             _rdoX2.CheckedChanged += (s, e) => UpdateTimingLabel();
             _rdoX3.CheckedChanged += (s, e) => UpdateTimingLabel();
             _rdoX4.CheckedChanged += (s, e) => UpdateTimingLabel();
+            chkY += 28;
 
-            y += 38;
+            // ── Right column: Display, feedback, sounds (next to controller image) ──
+            int rx = 680;
+            int ry = _picControllers.Top;
 
-            // ── KEYBOARD DISPLAY SETTINGS ──
-            var lblDisplay = MakeLabel("Keyboard Display:", leftMargin, y + 3, 140);
-            lblDisplay.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
-            lblDisplay.ForeColor = Color.FromArgb(180, 200, 255);
-            container.Controls.Add(lblDisplay);
-
-            var lblTilt = MakeLabel("Tilt:", leftMargin + 150, y + 3, 40);
-            container.Controls.Add(lblTilt);
+            // Row 1: Display settings
+            container.Controls.Add(MakeLabel("Tilt:", rx, ry + 3, 35));
             _nudDisplayTilt = new NumericUpDown
             {
-                Location = new Point(leftMargin + 190, y),
-                Width = 70,
+                Location = new Point(rx + 35, ry), Width = 65,
                 DecimalPlaces = 1, Increment = 1m, Minimum = -30m, Maximum = 80m, Value = 22.5m,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             container.Controls.Add(_nudDisplayTilt);
-            container.Controls.Add(MakeLabel("\u00B0", leftMargin + 265, y + 3, 20));
+            container.Controls.Add(MakeLabel("\u00B0", rx + 102, ry + 3, 16));
 
-            container.Controls.Add(MakeLabel("Transparency:", leftMargin + 320, y + 3, 110));
+            container.Controls.Add(MakeLabel("Trans:", rx + 130, ry + 3, 45));
             _nudDisplayOpacity = new NumericUpDown
             {
-                Location = new Point(leftMargin + 430, y),
-                Width = 70,
+                Location = new Point(rx + 178, ry), Width = 55,
                 Minimum = 1, Maximum = 100, Increment = 5, Value = 30,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             container.Controls.Add(_nudDisplayOpacity);
-            container.Controls.Add(MakeLabel("%", leftMargin + 505, y + 3, 25));
+            container.Controls.Add(MakeLabel("%", rx + 236, ry + 3, 20));
 
-            container.Controls.Add(MakeLabel("Size:", leftMargin + 545, y + 3, 40));
+            container.Controls.Add(MakeLabel("Size:", rx + 268, ry + 3, 35));
             _nudDisplayScale = new NumericUpDown
             {
-                Location = new Point(leftMargin + 585, y),
-                Width = 70,
+                Location = new Point(rx + 305, ry), Width = 55,
                 Minimum = 50, Maximum = 150, Increment = 5, Value = 100,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             container.Controls.Add(_nudDisplayScale);
-            container.Controls.Add(MakeLabel("%", leftMargin + 660, y + 3, 25));
+            container.Controls.Add(MakeLabel("%", rx + 363, ry + 3, 20));
+            ry += 30;
 
-            var lblDisplayHint = MakeLabel("(adjustable in VR)", leftMargin + 700, y + 3, 200);
-            lblDisplayHint.ForeColor = Color.FromArgb(130, 130, 130);
-            lblDisplayHint.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
-            container.Controls.Add(lblDisplayHint);
-
-            y += 34;
-
-            // ── KEYBOARD FEEDBACK SETTINGS ──
-            _chkSoundsEnabled = MakeCheckBox("Enable keyboard feedback", leftMargin, y);
+            // Row 3: Feedback checkbox
+            _chkSoundsEnabled = MakeCheckBox("Keyboard feedback", rx, ry);
             _chkSoundsEnabled.Checked = true;
             container.Controls.Add(_chkSoundsEnabled);
-            y += 26;
+            ry += 26;
 
-            container.Controls.Add(MakeLabel("Master Volume:", leftMargin + 28, y + 3, 120));
+            // Row 4: Volume controls
+            container.Controls.Add(MakeLabel("Master:", rx, ry + 3, 55));
             _nudSoundVolume = new NumericUpDown
             {
-                Location = new Point(leftMargin + 155, y),
-                Width = 70,
+                Location = new Point(rx + 55, ry), Width = 55,
                 Minimum = 0, Maximum = 100, Increment = 5, Value = 50,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             container.Controls.Add(_nudSoundVolume);
-            container.Controls.Add(MakeLabel("%", leftMargin + 230, y + 3, 25));
+            container.Controls.Add(MakeLabel("%", rx + 113, ry + 3, 20));
 
-            container.Controls.Add(MakeLabel("Key Press Volume:", leftMargin + 280, y + 3, 130));
+            container.Controls.Add(MakeLabel("Press:", rx + 148, ry + 3, 45));
             _nudPressVolume = new NumericUpDown
             {
-                Location = new Point(leftMargin + 415, y),
-                Width = 70,
+                Location = new Point(rx + 195, ry), Width = 55,
                 Minimum = 0, Maximum = 100, Increment = 5, Value = 50,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             container.Controls.Add(_nudPressVolume);
-            container.Controls.Add(MakeLabel("%", leftMargin + 490, y + 3, 25));
+            container.Controls.Add(MakeLabel("%", rx + 253, ry + 3, 20));
 
-            container.Controls.Add(MakeLabel("Haptic Feedback:", leftMargin + 540, y + 3, 120));
+            container.Controls.Add(MakeLabel("Haptic:", rx + 288, ry + 3, 50));
             _nudKbHapticStrength = new NumericUpDown
             {
-                Location = new Point(leftMargin + 665, y),
-                Width = 70,
+                Location = new Point(rx + 340, ry), Width = 55,
                 Minimum = 0, Maximum = 100, Increment = 5, Value = 50,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             container.Controls.Add(_nudKbHapticStrength);
-            container.Controls.Add(MakeLabel("%", leftMargin + 740, y + 3, 25));
+            container.Controls.Add(MakeLabel("%", rx + 398, ry + 3, 20));
 
-            y += 38;
-            container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
+            y = Math.Max(imageBottom, chkY);
+
             y += 12;
+            container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
+            y += 8;
 
             // ── RESTART NOTICE ──
             var lblRestartNote = MakeLabel("Settings below require game restart to take effect", leftMargin, y, rightEdge - leftMargin);
@@ -797,35 +873,101 @@ namespace OpenCompositeConfigurator
 
             _chkControllerSmoothing = MakeCheckBox("Controller smoothing", sc1, sy);
             _pnlSkyrimOnly.Controls.Add(_chkControllerSmoothing);
-            _chkDisableTriggerTouch = MakeCheckBox("Disable trigger touch", sc2, sy);
+            sy += 26;
+
+            // Controller smoothing fine-tuning (1€ filter parameters)
+            int smIndent = 16; // indent under the checkbox
+            _lblPosCutoff = MakeLabel("Pos cutoff:", sc1 + smIndent, sy + 3, 80);
+            _pnlSkyrimOnly.Controls.Add(_lblPosCutoff);
+            _nudPosSmoothMinCutoff = new NumericUpDown
+            {
+                Location = new Point(sc1 + smIndent + 80, sy), Width = 65,
+                DecimalPlaces = 2, Increment = 0.25m, Minimum = 0.01m, Maximum = 20.0m, Value = 1.25m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
+            };
+            _pnlSkyrimOnly.Controls.Add(_nudPosSmoothMinCutoff);
+            _lblPosBeta = MakeLabel("Pos beta:", sc2, sy + 3, 70);
+            _pnlSkyrimOnly.Controls.Add(_lblPosBeta);
+            _nudPosSmoothBeta = new NumericUpDown
+            {
+                Location = new Point(sc2 + 70, sy), Width = 65,
+                DecimalPlaces = 1, Increment = 1.0m, Minimum = 0.0m, Maximum = 100.0m, Value = 20.0m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
+            };
+            _pnlSkyrimOnly.Controls.Add(_nudPosSmoothBeta);
+            sy += 26;
+
+            _lblRotCutoff = MakeLabel("Rot cutoff:", sc1 + smIndent, sy + 3, 80);
+            _pnlSkyrimOnly.Controls.Add(_lblRotCutoff);
+            _nudRotSmoothMinCutoff = new NumericUpDown
+            {
+                Location = new Point(sc1 + smIndent + 80, sy), Width = 65,
+                DecimalPlaces = 2, Increment = 0.25m, Minimum = 0.01m, Maximum = 20.0m, Value = 1.50m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
+            };
+            _pnlSkyrimOnly.Controls.Add(_nudRotSmoothMinCutoff);
+            _lblRotBeta = MakeLabel("Rot beta:", sc2, sy + 3, 70);
+            _pnlSkyrimOnly.Controls.Add(_lblRotBeta);
+            _nudRotSmoothBeta = new NumericUpDown
+            {
+                Location = new Point(sc2 + 70, sy), Width = 65,
+                DecimalPlaces = 1, Increment = 0.1m, Minimum = 0.0m, Maximum = 10.0m, Value = 0.2m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
+            };
+            _pnlSkyrimOnly.Controls.Add(_nudRotSmoothBeta);
+            sy += 26;
+
+            // Enable/disable smoothing controls based on checkbox
+            _chkControllerSmoothing.CheckedChanged += (s, e) =>
+            {
+                bool en = _chkControllerSmoothing.Checked;
+                _nudPosSmoothMinCutoff.Enabled = en;
+                _nudPosSmoothBeta.Enabled = en;
+                _nudRotSmoothMinCutoff.Enabled = en;
+                _nudRotSmoothBeta.Enabled = en;
+                _lblPosCutoff.Enabled = en;
+                _lblPosBeta.Enabled = en;
+                _lblRotCutoff.Enabled = en;
+                _lblRotBeta.Enabled = en;
+            };
+
+            // ── Right column within Skyrim panel ──
+            int sc3 = 380;
+            int sc4 = 570;
+            int sy2 = 26; // aligned with first content row
+
+            _chkDisableTriggerTouch = MakeCheckBox("Disable trigger touch", sc3, sy2);
             _pnlSkyrimOnly.Controls.Add(_chkDisableTriggerTouch);
-            sy += 26;
-
-            _chkDisableTrackpad = MakeCheckBox("Disable trackpad", sc1, sy);
+            _chkDisableTrackpad = MakeCheckBox("Disable trackpad", sc4, sy2);
             _pnlSkyrimOnly.Controls.Add(_chkDisableTrackpad);
-            _chkVRIKKnuckles = MakeCheckBox("VRIK Knuckles support", sc2, sy);
-            _pnlSkyrimOnly.Controls.Add(_chkVRIKKnuckles);
-            sy += 26;
+            sy2 += 26;
 
-            _pnlSkyrimOnly.Controls.Add(MakeLabel("Left dead zone:", sc1, sy + 3, 110));
+            _chkVRIKKnuckles = MakeCheckBox("VRIK Knuckles support", sc3, sy2);
+            _pnlSkyrimOnly.Controls.Add(_chkVRIKKnuckles);
+            _chkGpuTiming = MakeCheckBox("GPU frame timing", sc4, sy2);
+            _chkGpuTiming.Checked = true;
+            _pnlSkyrimOnly.Controls.Add(_chkGpuTiming);
+            sy2 += 26;
+
+            _pnlSkyrimOnly.Controls.Add(MakeLabel("L dead zone:", sc3, sy2 + 3, 90));
             _nudLeftDeadZone = new NumericUpDown
             {
-                Location = new Point(sc1 + 110, sy), Width = 70,
+                Location = new Point(sc3 + 90, sy2), Width = 65,
                 DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.0m, Maximum = 1.0m, Value = 0.0m,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             _pnlSkyrimOnly.Controls.Add(_nudLeftDeadZone);
-            _pnlSkyrimOnly.Controls.Add(MakeLabel("Right:", sc2, sy + 3, 50));
+            _pnlSkyrimOnly.Controls.Add(MakeLabel("R:", sc3 + 165, sy2 + 3, 20));
             _nudRightDeadZone = new NumericUpDown
             {
-                Location = new Point(sc2 + 50, sy), Width = 70,
+                Location = new Point(sc3 + 185, sy2), Width = 65,
                 DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.0m, Maximum = 1.0m, Value = 0.0m,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             _pnlSkyrimOnly.Controls.Add(_nudRightDeadZone);
-            sy += 28;
+            sy2 += 28;
 
-            _pnlSkyrimOnly.Size = new Size(rightEdge - leftMargin - 440, sy);
+            _pnlSkyrimOnly.Size = new Size(rightEdge - leftMargin - 440, Math.Max(sy, sy2));
 
             int skyrimBottom = _gameType == "skyrim" ? settingsY + _pnlSkyrimOnly.Height : 0;
             y = Math.Max(generalBottom, skyrimBottom) + 8;
@@ -853,60 +995,129 @@ namespace OpenCompositeConfigurator
             container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
             y += 12;
 
-            // ── KO-FI SECTION ──
+            // ── CONTROLLER AXIS ADJUSTMENTS (Skyrim only) ──
             {
-                int kofiIconSize = 36;
-                _picKofi = new PictureBox
+                int axisTop = y;
+                _pnlAxisAdjust = new Panel
                 {
                     Location = new Point(leftMargin, y),
-                    Size = new Size(kofiIconSize, kofiIconSize),
-                    SizeMode = PictureBoxSizeMode.Zoom,
                     BackColor = Color.Transparent,
-                    Image = _kofiImage,
-                    Cursor = Cursors.Hand
+                    Visible = _gameType == "skyrim"
                 };
-                _picKofi.Click += (s, e) =>
-                {
-                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://ko-fi.com/wondernutts") { UseShellExecute = true }); }
-                    catch { }
-                };
-                container.Controls.Add(_picKofi);
+                container.Controls.Add(_pnlAxisAdjust);
 
-                var lblKofiLink = new LinkLabel
-                {
-                    Text = "Support me on Ko-fi",
-                    Location = new Point(leftMargin + kofiIconSize + 8, y + 2),
-                    AutoSize = true,
-                    Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-                    LinkColor = Color.FromArgb(41, 171, 226),
-                    ActiveLinkColor = Color.FromArgb(80, 200, 255),
-                    VisitedLinkColor = Color.FromArgb(41, 171, 226)
-                };
-                lblKofiLink.Click += (s, e) =>
-                {
-                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://ko-fi.com/wondernutts") { UseShellExecute = true }); }
-                    catch { }
-                };
-                container.Controls.Add(lblKofiLink);
+                int ay = 0;
+                int ax1 = 0;        // left group start
+                int ax2 = 620;      // right group start
 
-                var lblKofiQuote = MakeLabel(
-                    "\u201CI do this all for free and for the love of the VR gaming community, and I always will. "
-                    + "I\u2019ll never demand anything in return, but if you want to show support, I won\u2019t complain. "
-                    + "I love bringing VR to life with you all regardless.\u201D",
-                    leftMargin + kofiIconSize + 8, y + 24, rightEdge - leftMargin - kofiIconSize - 12);
-                lblKofiQuote.ForeColor = Color.FromArgb(160, 160, 160);
-                lblKofiQuote.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
-                lblKofiQuote.AutoSize = false;
-                lblKofiQuote.Size = new Size(rightEdge - leftMargin - kofiIconSize - 12, 48);
-                container.Controls.Add(lblKofiQuote);
+                var lblAxisSection = MakeSectionLabel("Controller Axis Adjustments", ax1, ay);
+                _pnlAxisAdjust.Controls.Add(lblAxisSection);
 
-                y += 80;
+                var btnResetAxis = MakeButton("Reset All to Defaults", 280, ay, 150, 24);
+                btnResetAxis.BackColor = Color.FromArgb(120, 60, 40);
+                btnResetAxis.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+                btnResetAxis.Click += BtnResetAxis_Click;
+                _pnlAxisAdjust.Controls.Add(btnResetAxis);
+
+                var lblAxisWarn = MakeLabel("(defaults are all 0 \u2014 only change if alignment feels off)", 450, ay + 3, 500);
+                lblAxisWarn.ForeColor = Color.FromArgb(160, 160, 160);
+                lblAxisWarn.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+                _pnlAxisAdjust.Controls.Add(lblAxisWarn);
+                ay += 24;
+
+                // Row 1: Tilt
+                _chkAdjustTilt = MakeCheckBox("Adjust tilt", ax1, ay);
+                _pnlAxisAdjust.Controls.Add(_chkAdjustTilt);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Tilt:", ax1 + 140, ay + 3, 35));
+                _nudTiltDeg = MakeAxisNud(ax1 + 175, ay, -90m, 90m, 0.5m, 1);
+                _pnlAxisAdjust.Controls.Add(_nudTiltDeg);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("\u00B0 (degrees)", ax1 + 245, ay + 3, 80));
+                _chkAdjustTilt.CheckedChanged += (s, e) => _nudTiltDeg.Enabled = _chkAdjustTilt.Checked;
+                ay += 24;
+
+                // Row 2: Left rotation + Left position
+                _chkLeftRotation = MakeCheckBox("Left rotation", ax1, ay);
+                _pnlAxisAdjust.Controls.Add(_chkLeftRotation);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax1 + 140, ay + 3, 16));
+                _nudLeftRotX = MakeAxisNud(ax1 + 158, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(_nudLeftRotX);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax1 + 230, ay + 3, 16));
+                _nudLeftRotY = MakeAxisNud(ax1 + 248, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(_nudLeftRotY);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax1 + 320, ay + 3, 16));
+                _nudLeftRotZ = MakeAxisNud(ax1 + 338, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(_nudLeftRotZ);
+                _chkLeftRotation.CheckedChanged += (s, e) =>
+                {
+                    bool en = _chkLeftRotation.Checked;
+                    _nudLeftRotX.Enabled = en; _nudLeftRotY.Enabled = en; _nudLeftRotZ.Enabled = en;
+                };
+
+                _chkLeftPosition = MakeCheckBox("Left position", ax2, ay);
+                _pnlAxisAdjust.Controls.Add(_chkLeftPosition);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax2 + 140, ay + 3, 16));
+                _nudLeftPosX = MakeAxisNud(ax2 + 158, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(_nudLeftPosX);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax2 + 230, ay + 3, 16));
+                _nudLeftPosY = MakeAxisNud(ax2 + 248, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(_nudLeftPosY);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax2 + 320, ay + 3, 16));
+                _nudLeftPosZ = MakeAxisNud(ax2 + 338, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(_nudLeftPosZ);
+                _chkLeftPosition.CheckedChanged += (s, e) =>
+                {
+                    bool en = _chkLeftPosition.Checked;
+                    _nudLeftPosX.Enabled = en; _nudLeftPosY.Enabled = en; _nudLeftPosZ.Enabled = en;
+                };
+                ay += 24;
+
+                // Row 3: Right rotation + Right position
+                _chkRightRotation = MakeCheckBox("Right rotation", ax1, ay);
+                _pnlAxisAdjust.Controls.Add(_chkRightRotation);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax1 + 140, ay + 3, 16));
+                _nudRightRotX = MakeAxisNud(ax1 + 158, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(_nudRightRotX);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax1 + 230, ay + 3, 16));
+                _nudRightRotY = MakeAxisNud(ax1 + 248, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(_nudRightRotY);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax1 + 320, ay + 3, 16));
+                _nudRightRotZ = MakeAxisNud(ax1 + 338, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(_nudRightRotZ);
+                _chkRightRotation.CheckedChanged += (s, e) =>
+                {
+                    bool en = _chkRightRotation.Checked;
+                    _nudRightRotX.Enabled = en; _nudRightRotY.Enabled = en; _nudRightRotZ.Enabled = en;
+                };
+
+                _chkRightPosition = MakeCheckBox("Right position", ax2, ay);
+                _pnlAxisAdjust.Controls.Add(_chkRightPosition);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax2 + 140, ay + 3, 16));
+                _nudRightPosX = MakeAxisNud(ax2 + 158, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(_nudRightPosX);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax2 + 230, ay + 3, 16));
+                _nudRightPosY = MakeAxisNud(ax2 + 248, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(_nudRightPosY);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax2 + 320, ay + 3, 16));
+                _nudRightPosZ = MakeAxisNud(ax2 + 338, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(_nudRightPosZ);
+                _chkRightPosition.CheckedChanged += (s, e) =>
+                {
+                    bool en = _chkRightPosition.Checked;
+                    _nudRightPosX.Enabled = en; _nudRightPosY.Enabled = en; _nudRightPosZ.Enabled = en;
+                };
+                ay += 24;
+
+                _pnlAxisAdjust.Size = new Size(rightEdge - leftMargin, ay);
+                if (_pnlAxisAdjust.Visible) y += ay;
             }
 
             // Status label at the bottom
             _lblStatus = MakeLabel("", leftMargin, y + 6, 600);
             _lblStatus.ForeColor = Color.FromArgb(100, 200, 100);
             container.Controls.Add(_lblStatus);
+
+            // Auto-size panel to fit content
+            container.Size = new Size(container.Width, y + 30);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -1096,7 +1307,7 @@ namespace OpenCompositeConfigurator
             container.Controls.Add(_chkDisableMouse);
 
             // Save button top right
-            _btnSaveBindings = MakeButton("Save controlmapvr.txt", rightEdge - 170, y, 180, 26);
+            _btnSaveBindings = MakeButton("Save Bindings & Combos", rightEdge - 170, y, 180, 26);
             _btnSaveBindings.BackColor = Color.FromArgb(40, 120, 40);
             _btnSaveBindings.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
             _btnSaveBindings.Click += BtnSaveBindings_Click;
@@ -1176,6 +1387,12 @@ namespace OpenCompositeConfigurator
             var lblCtrlSection = MakeSectionLabel("Controller Bindings", splitX + 10, y);
             container.Controls.Add(lblCtrlSection);
 
+            _btnVRIKDefaults = MakeButton("VRIK V2.1.0", rightEdge - 100, y, 100, 24);
+            _btnVRIKDefaults.BackColor = Color.FromArgb(120, 80, 40);
+            _btnVRIKDefaults.Font = new Font("Segoe UI", 8f);
+            _btnVRIKDefaults.Click += BtnVRIKDefaults_Click;
+            container.Controls.Add(_btnVRIKDefaults);
+
             // Type dropdown
             container.Controls.Add(MakeLabel("Type:", splitX + 200, y + 2, 40));
             _cmbCtrlType = new ComboBox
@@ -1250,7 +1467,7 @@ namespace OpenCompositeConfigurator
 
             // ── Right column: Controller image ──
             int imgWidth = rightEdge - splitX - 10;
-            int imgHeight = (int)(imgWidth / 1.78f); // 16:9 aspect
+            int imgHeight = (int)(imgWidth / 2.0f); // slightly wider ratio to save height
             _picBindingsController = new PictureBox
             {
                 Location = new Point(splitX + 10, sideY),
@@ -1308,6 +1525,9 @@ namespace OpenCompositeConfigurator
             _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
             container.Controls.Add(_lblKbStatus);
             y += 24;
+
+            // Auto-size panel to fit content
+            container.Size = new Size(container.Width, y + 10);
         }
 
         // ── Binding lookup helper ──
@@ -2099,6 +2319,37 @@ namespace OpenCompositeConfigurator
             _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
         }
 
+        private void BtnVRIKDefaults_Click(object? sender, EventArgs e)
+        {
+            var result = MessageBox.Show(
+                "This will restore all bindings to the VRIK Rift-Index-WMR Controller Bindings V2.1.0 preset.\n\nThis is the recommended binding scheme for VRIK users.\n\nAre you sure?",
+                "Restore VRIK V2.1.0 Bindings",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (result != DialogResult.Yes) return;
+
+            string filePath = GetControlmapSavePath();
+
+            var asm = Assembly.GetExecutingAssembly();
+            using var stream = asm.GetManifestResourceStream("OpenCompositeConfigurator.controlmapvr_vrik.txt");
+            if (stream == null)
+            {
+                MessageBox.Show("Embedded VRIK defaults not found!", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            using var reader = new StreamReader(stream);
+            File.WriteAllText(filePath, reader.ReadToEnd());
+
+            _keyBindings.Clear();
+            LoadDefaultKeyBindings();
+            TryLoadControlmapVR();
+
+            _lblKbStatus.Text = "VRIK V2.1.0 bindings restored! Restart the game to apply.";
+            _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
+        }
+
         private void BtnSaveBindings_Click(object? sender, EventArgs e)
         {
             if (string.IsNullOrEmpty(_gameDir))
@@ -2111,8 +2362,26 @@ namespace OpenCompositeConfigurator
             try
             {
                 SaveControlmapVR();
-                _lblKbStatus.Text = "Saved controlmapvr.txt! Restart the game to apply changes.";
+
+                // Also save combos to opencomposite.ini (combos live there, not in controlmapvr.txt)
+                if (_combos.Count > 0 || _ini.GetAllInSection("combos").Count > 0)
+                {
+                    WriteCombosToIni();
+                    string iniPath = Path.Combine(_gameDir, "opencomposite.ini");
+                    _ini.Save(iniPath);
+
+                    if (!string.IsNullOrEmpty(_mo2ModDir))
+                    {
+                        try { _ini.Save(Path.Combine(_mo2ModDir, "opencomposite.ini")); }
+                        catch { }
+                    }
+                }
+
+                string comboMsg = _combos.Count > 0 ? $" + {_combos.Count} combo(s)" : "";
+                _lblKbStatus.Text = $"Saved controlmapvr.txt{comboMsg}! Restart the game to apply binding changes.";
                 _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
+                _lblComboStatus.Text = _combos.Count > 0 ? "Combos saved" : "";
+                _lblComboStatus.ForeColor = Color.FromArgb(100, 200, 100);
             }
             catch (Exception ex)
             {
@@ -2477,7 +2746,7 @@ namespace OpenCompositeConfigurator
             {
                 _combos.Add(dlg.Result);
                 RebuildComboList();
-                _lblComboStatus.Text = "Combo added \u2014 click Save to apply";
+                _lblComboStatus.Text = "Combo added \u2014 click Save to apply!";
                 _lblComboStatus.ForeColor = Color.FromArgb(255, 200, 40);
             }
         }
@@ -2491,7 +2760,7 @@ namespace OpenCompositeConfigurator
             {
                 _combos[index] = dlg.Result;
                 RebuildComboList();
-                _lblComboStatus.Text = "Combo updated \u2014 click Save to apply";
+                _lblComboStatus.Text = "Combo updated \u2014 click Save to apply!";
                 _lblComboStatus.ForeColor = Color.FromArgb(255, 200, 40);
             }
         }
@@ -2502,7 +2771,7 @@ namespace OpenCompositeConfigurator
 
             _combos.RemoveAt(index);
             RebuildComboList();
-            _lblComboStatus.Text = "Combo removed \u2014 click Save to apply";
+            _lblComboStatus.Text = "Combo removed \u2014 click Save to apply!";
             _lblComboStatus.ForeColor = Color.FromArgb(255, 200, 40);
         }
 
@@ -2766,13 +3035,84 @@ namespace OpenCompositeConfigurator
             if (int.TryParse(_ini.Get("", "inputWindowSize", "5"), out int iw))
                 _nudInputWindow.Value = Math.Clamp(iw, 1, 20);
             _chkControllerSmoothing.Checked = ParseBool(_ini.Get("", "enableControllerSmoothing", "false"));
+            if (float.TryParse(_ini.Get("", "posSmoothMinCutoff", "1.25"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float pmc))
+                _nudPosSmoothMinCutoff.Value = (decimal)Math.Clamp(pmc, 0.01f, 20f);
+            if (float.TryParse(_ini.Get("", "posSmoothBeta", "20"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float pb))
+                _nudPosSmoothBeta.Value = (decimal)Math.Clamp(pb, 0f, 100f);
+            if (float.TryParse(_ini.Get("", "rotSmoothMinCutoff", "1.5"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rmc))
+                _nudRotSmoothMinCutoff.Value = (decimal)Math.Clamp(rmc, 0.01f, 20f);
+            if (float.TryParse(_ini.Get("", "rotSmoothBeta", "0.2"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rb))
+                _nudRotSmoothBeta.Value = (decimal)Math.Clamp(rb, 0f, 10f);
+            // Sync enable state of smoothing controls
+            {
+                bool en = _chkControllerSmoothing.Checked;
+                _nudPosSmoothMinCutoff.Enabled = en;
+                _nudPosSmoothBeta.Enabled = en;
+                _nudRotSmoothMinCutoff.Enabled = en;
+                _nudRotSmoothBeta.Enabled = en;
+                _lblPosCutoff.Enabled = en;
+                _lblPosBeta.Enabled = en;
+                _lblRotCutoff.Enabled = en;
+                _lblRotBeta.Enabled = en;
+            }
             _chkDisableTriggerTouch.Checked = ParseBool(_ini.Get("", "disableTriggerTouch", "false"));
             _chkDisableTrackpad.Checked = ParseBool(_ini.Get("", "disableTrackPad", "false"));
             _chkVRIKKnuckles.Checked = ParseBool(_ini.Get("", "enableVRIKKnucklesTrackPadSupport", "false"));
+            _chkGpuTiming.Checked = ParseBool(_ini.Get("", "enableGpuTiming", "true"));
             if (float.TryParse(_ini.Get("", "leftDeadZoneSize", "0.0"), out float ldz))
                 _nudLeftDeadZone.Value = (decimal)Math.Clamp(ldz, 0f, 1f);
             if (float.TryParse(_ini.Get("", "rightDeadZoneSize", "0.0"), out float rdz))
                 _nudRightDeadZone.Value = (decimal)Math.Clamp(rdz, 0f, 1f);
+
+            // Controller axis adjustments
+            _chkAdjustTilt.Checked = ParseBool(_ini.Get("", "adjustTilt", "false"));
+            if (float.TryParse(_ini.Get("", "tilt", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float tiltVal))
+                _nudTiltDeg.Value = (decimal)Math.Clamp(tiltVal, -90f, 90f);
+            _nudTiltDeg.Enabled = _chkAdjustTilt.Checked;
+
+            _chkLeftRotation.Checked = ParseBool(_ini.Get("", "adjustLeftRotation", "false"));
+            if (float.TryParse(_ini.Get("", "leftXRotation", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float lrx))
+                _nudLeftRotX.Value = (decimal)Math.Clamp(lrx, -90f, 90f);
+            if (float.TryParse(_ini.Get("", "leftYRotation", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float lry))
+                _nudLeftRotY.Value = (decimal)Math.Clamp(lry, -90f, 90f);
+            if (float.TryParse(_ini.Get("", "leftZRotation", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float lrz))
+                _nudLeftRotZ.Value = (decimal)Math.Clamp(lrz, -90f, 90f);
+            _nudLeftRotX.Enabled = _chkLeftRotation.Checked;
+            _nudLeftRotY.Enabled = _chkLeftRotation.Checked;
+            _nudLeftRotZ.Enabled = _chkLeftRotation.Checked;
+
+            _chkRightRotation.Checked = ParseBool(_ini.Get("", "adjustRightRotation", "false"));
+            if (float.TryParse(_ini.Get("", "rightXRotation", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rrx))
+                _nudRightRotX.Value = (decimal)Math.Clamp(rrx, -90f, 90f);
+            if (float.TryParse(_ini.Get("", "rightYRotation", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rry))
+                _nudRightRotY.Value = (decimal)Math.Clamp(rry, -90f, 90f);
+            if (float.TryParse(_ini.Get("", "rightZRotation", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rrz))
+                _nudRightRotZ.Value = (decimal)Math.Clamp(rrz, -90f, 90f);
+            _nudRightRotX.Enabled = _chkRightRotation.Checked;
+            _nudRightRotY.Enabled = _chkRightRotation.Checked;
+            _nudRightRotZ.Enabled = _chkRightRotation.Checked;
+
+            _chkLeftPosition.Checked = ParseBool(_ini.Get("", "adjustLeftPosition", "false"));
+            if (float.TryParse(_ini.Get("", "leftXPosition", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float lpx))
+                _nudLeftPosX.Value = (decimal)Math.Clamp(lpx, -0.5f, 0.5f);
+            if (float.TryParse(_ini.Get("", "leftYPosition", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float lpy))
+                _nudLeftPosY.Value = (decimal)Math.Clamp(lpy, -0.5f, 0.5f);
+            if (float.TryParse(_ini.Get("", "leftZPosition", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float lpz))
+                _nudLeftPosZ.Value = (decimal)Math.Clamp(lpz, -0.5f, 0.5f);
+            _nudLeftPosX.Enabled = _chkLeftPosition.Checked;
+            _nudLeftPosY.Enabled = _chkLeftPosition.Checked;
+            _nudLeftPosZ.Enabled = _chkLeftPosition.Checked;
+
+            _chkRightPosition.Checked = ParseBool(_ini.Get("", "adjustRightPosition", "false"));
+            if (float.TryParse(_ini.Get("", "rightXPosition", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rpx))
+                _nudRightPosX.Value = (decimal)Math.Clamp(rpx, -0.5f, 0.5f);
+            if (float.TryParse(_ini.Get("", "rightYPosition", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rpy))
+                _nudRightPosY.Value = (decimal)Math.Clamp(rpy, -0.5f, 0.5f);
+            if (float.TryParse(_ini.Get("", "rightZPosition", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float rpz))
+                _nudRightPosZ.Value = (decimal)Math.Clamp(rpz, -0.5f, 0.5f);
+            _nudRightPosX.Enabled = _chkRightPosition.Checked;
+            _nudRightPosY.Enabled = _chkRightPosition.Checked;
+            _nudRightPosZ.Enabled = _chkRightPosition.Checked;
 
             UpdateTimingLabel();
             _picControllers.Invalidate();
@@ -2795,7 +3135,7 @@ namespace OpenCompositeConfigurator
             else mode = "double_tap";
             _ini.Set("keyboard", "shortcutMode", mode);
             _ini.Set("keyboard", "shortcutTiming", ((int)_nudTiming.Value).ToString());
-            _ini.Set("keyboard", "displayTilt", _nudDisplayTilt.Value.ToString("0.0"));
+            _ini.Set("keyboard", "displayTilt", _nudDisplayTilt.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
             _ini.Set("keyboard", "displayOpacity", ((int)_nudDisplayOpacity.Value).ToString());
             _ini.Set("keyboard", "displayScale", ((int)_nudDisplayScale.Value).ToString());
             _ini.Set("keyboard", "soundsEnabled", _chkSoundsEnabled.Checked ? "true" : "false");
@@ -2803,7 +3143,7 @@ namespace OpenCompositeConfigurator
             _ini.Set("keyboard", "pressVolume", ((int)_nudPressVolume.Value).ToString());
             _ini.Set("keyboard", "hapticStrength", ((int)_nudKbHapticStrength.Value).ToString());
 
-            _ini.Set("", "supersampleRatio", _nudSuperSample.Value.ToString("0.0"));
+            _ini.Set("", "supersampleRatio", _nudSuperSample.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
             _ini.Set("", "renderCustomHands", _chkRenderHands.Checked ? "true" : "false");
             _ini.Set("", "haptics", _chkHaptics.Checked ? "true" : "false");
             _ini.Set("", "enableHiddenMeshFix", _chkHiddenMesh.Checked ? "true" : "false");
@@ -2814,15 +3154,40 @@ namespace OpenCompositeConfigurator
 
             if (_gameType == "skyrim")
             {
-                _ini.Set("", "hapticStrength", _nudHapticStrength.Value.ToString("0.00"));
+                _ini.Set("", "hapticStrength", _nudHapticStrength.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
                 _ini.Set("", "enableInputSmoothing", _chkInputSmoothing.Checked ? "true" : "false");
                 _ini.Set("", "inputWindowSize", ((int)_nudInputWindow.Value).ToString());
                 _ini.Set("", "enableControllerSmoothing", _chkControllerSmoothing.Checked ? "true" : "false");
+                _ini.Set("", "posSmoothMinCutoff", _nudPosSmoothMinCutoff.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "posSmoothBeta", _nudPosSmoothBeta.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "rotSmoothMinCutoff", _nudRotSmoothMinCutoff.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "rotSmoothBeta", _nudRotSmoothBeta.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
                 _ini.Set("", "disableTriggerTouch", _chkDisableTriggerTouch.Checked ? "true" : "false");
                 _ini.Set("", "disableTrackPad", _chkDisableTrackpad.Checked ? "true" : "false");
                 _ini.Set("", "enableVRIKKnucklesTrackPadSupport", _chkVRIKKnuckles.Checked ? "true" : "false");
-                _ini.Set("", "leftDeadZoneSize", _nudLeftDeadZone.Value.ToString("0.00"));
-                _ini.Set("", "rightDeadZoneSize", _nudRightDeadZone.Value.ToString("0.00"));
+                _ini.Set("", "enableGpuTiming", _chkGpuTiming.Checked ? "true" : "false");
+                _ini.Set("", "leftDeadZoneSize", _nudLeftDeadZone.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "rightDeadZoneSize", _nudRightDeadZone.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+
+                // Controller axis adjustments
+                _ini.Set("", "adjustTilt", _chkAdjustTilt.Checked ? "true" : "false");
+                _ini.Set("", "tilt", _nudTiltDeg.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "adjustLeftRotation", _chkLeftRotation.Checked ? "true" : "false");
+                _ini.Set("", "leftXRotation", _nudLeftRotX.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "leftYRotation", _nudLeftRotY.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "leftZRotation", _nudLeftRotZ.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "adjustRightRotation", _chkRightRotation.Checked ? "true" : "false");
+                _ini.Set("", "rightXRotation", _nudRightRotX.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "rightYRotation", _nudRightRotY.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "rightZRotation", _nudRightRotZ.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "adjustLeftPosition", _chkLeftPosition.Checked ? "true" : "false");
+                _ini.Set("", "leftXPosition", _nudLeftPosX.Value.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "leftYPosition", _nudLeftPosY.Value.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "leftZPosition", _nudLeftPosZ.Value.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "adjustRightPosition", _chkRightPosition.Checked ? "true" : "false");
+                _ini.Set("", "rightXPosition", _nudRightPosX.Value.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "rightYPosition", _nudRightPosY.Value.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
+                _ini.Set("", "rightZPosition", _nudRightPosZ.Value.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
             }
 
             WriteCombosToIni();
@@ -2889,6 +3254,7 @@ namespace OpenCompositeConfigurator
         {
             _chkLeftStick.Checked = true;
             _pnlSkyrimOnly.Visible = _gameType == "skyrim";
+            _pnlAxisAdjust.Visible = _gameType == "skyrim";
             UpdateTimingLabel();
             UpdateFormTitle();
         }
@@ -2944,5 +3310,28 @@ namespace OpenCompositeConfigurator
             Location = new Point(x, y), Size = new Size(width, 1),
             BackColor = Color.FromArgb(60, 60, 70)
         };
+
+        private static NumericUpDown MakeAxisNud(int x, int y, decimal min, decimal max, decimal inc, int decimals) => new()
+        {
+            Location = new Point(x, y), Width = 65,
+            DecimalPlaces = decimals, Increment = inc, Minimum = min, Maximum = max, Value = 0m,
+            BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+        };
+
+        private void BtnResetAxis_Click(object? sender, EventArgs e)
+        {
+            _chkAdjustTilt.Checked = false;
+            _nudTiltDeg.Value = 0m;
+            _chkLeftRotation.Checked = false;
+            _nudLeftRotX.Value = 0m; _nudLeftRotY.Value = 0m; _nudLeftRotZ.Value = 0m;
+            _chkRightRotation.Checked = false;
+            _nudRightRotX.Value = 0m; _nudRightRotY.Value = 0m; _nudRightRotZ.Value = 0m;
+            _chkLeftPosition.Checked = false;
+            _nudLeftPosX.Value = 0m; _nudLeftPosY.Value = 0m; _nudLeftPosZ.Value = 0m;
+            _chkRightPosition.Checked = false;
+            _nudRightPosX.Value = 0m; _nudRightPosY.Value = 0m; _nudRightPosZ.Value = 0m;
+            _lblStatus.Text = "Controller axis settings reset to defaults";
+            _lblStatus.ForeColor = Color.FromArgb(255, 200, 40);
+        }
     }
 }

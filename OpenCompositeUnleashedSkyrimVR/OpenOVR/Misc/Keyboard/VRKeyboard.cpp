@@ -500,7 +500,8 @@ static bool IsActionKey(wchar_t ch)
 // PostCharToGame also injects a GFxCharEvent — both reach Scaleform.
 // When ch == 0 (console mode, control keys), VK events are included since
 // PostCharToGame won't fire and the console needs WM_CHAR from TranslateMessage.
-static void SendVirtualKey(WORD vk, bool shift, wchar_t ch = 0)
+// Set postChar=false to send scancodes only (no VK, no PostCharToGame).
+static void SendVirtualKey(WORD vk, bool shift, wchar_t ch = 0, bool postChar = true)
 {
 	WORD scan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 	WORD shiftScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
@@ -578,7 +579,8 @@ static void SendVirtualKey(WORD vk, bool shift, wchar_t ch = 0)
 
 	// Post character directly to SKSE plugin for Scaleform injection.
 	// This is the ONLY path to Scaleform when ch != 0 (VK events skipped above).
-	if (ch)
+	// When postChar=false, skip this — scancode alone suffices for DirectInput.
+	if (ch && postChar)
 		PostCharToGame(ch);
 }
 #endif
@@ -719,6 +721,11 @@ VRKeyboard::VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength
 
 #ifdef _WIN32
 	EnsureGameForeground();
+	// Signal SKSE plugin that VR keyboard is active — SKSE suppresses WM_CHAR
+	// to prevent double character entry (scancode WM_CHAR + GFxCharEvent from PostCharToGame)
+	HWND kbHwnd = GetGameWindow();
+	if (kbHwnd)
+		SetPropW(kbHwnd, L"OC_KB_ACTIVE", (HANDLE)1);
 #endif
 
 	std::shared_ptr<BaseCompositor> cmp = GetBaseCompositor();
@@ -1033,6 +1040,13 @@ VRKeyboard::~VRKeyboard()
 	}
 	if (ctx)
 		ctx->Release();
+
+#ifdef _WIN32
+	// Clear OC_KB_ACTIVE so SKSE stops suppressing WM_CHAR
+	HWND kbHwnd = GetGameWindow();
+	if (kbHwnd)
+		SetPropW(kbHwnd, L"OC_KB_ACTIVE", (HANDLE)0);
+#endif
 }
 
 wstring VRKeyboard::contents()
@@ -2141,8 +2155,11 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 					}
 				} else {
 					// Player-opened keyboard during gameplay (sendInputOnly=true):
-					// Scancodes (for MCM hotkeys / DirectInput) + PostCharToGame (for Scaleform text).
-					// VK events are skipped by SendVirtualKey when ch != 0 (no double WM_CHAR).
+					// Scancodes for DirectInput/MCM hotkeys + PostCharToGame for
+					// Scaleform text input (SkyUI search, MCM text fields).
+					// ch != 0 suppresses VK events (no double WM_CHAR from VK path).
+					// WM_CHAR from scancodes is blocked by SKSE WndProc hook
+					// (OC_KB_ACTIVE property) to prevent double entry.
 					VkMapping mapping = CharToVK(ch);
 					if (mapping.vk != 0)
 						SendVirtualKey(mapping.vk, mapping.needsShift, ch);

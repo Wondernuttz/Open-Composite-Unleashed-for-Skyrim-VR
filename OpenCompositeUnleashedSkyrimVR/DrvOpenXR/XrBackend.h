@@ -107,6 +107,36 @@ private:
 
 	double frameSubmitTimeUs = 0.0;
 
+	// High-resolution timing (QueryPerformanceCounter)
+	LARGE_INTEGER qpcFrequency = {};
+	bool qpcInitialized = false;
+	LARGE_INTEGER waitFrameStart = {};
+	LARGE_INTEGER waitFrameEnd = {};
+	LARGE_INTEGER endFrameStart = {};
+	LARGE_INTEGER endFrameEnd = {};
+	LARGE_INTEGER cpuFrameStart = {};   // set at end of WaitForTrackingData
+	LARGE_INTEGER cpuFrameEnd = {};     // set at start of SubmitFrames
+	LARGE_INTEGER lastFrameSubmitQpc = {};
+	float measuredWaitFrameMs = 0.0f;   // xrWaitFrame duration (idle/wait)
+	float measuredEndFrameMs = 0.0f;    // xrEndFrame duration (compositor)
+	float measuredCpuFrameMs = 0.0f;    // app CPU time (WaitGetPoses return → Submit call)
+	float measuredFrameIntervalMs = 0.0f; // frame-to-frame interval
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	// GPU timing measurement via D3D11 timestamp queries
+	bool gpuTimingInitialized = false;
+	ID3D11Device* gpuTimingDevice = nullptr;
+	ID3D11DeviceContext* gpuTimingContext = nullptr;
+	ID3D11Query* gpuTimestampDisjoint = nullptr;
+	ID3D11Query* gpuTimestampBegin = nullptr;
+	ID3D11Query* gpuTimestampEnd = nullptr;
+	bool gpuTimingInFlight = false;
+	float measuredGpuTimeMs = 0.0f;
+	void InitGpuTiming(ID3D11Device* device);
+	void ReadGpuTimingResults();
+	void CleanupGpuTiming();
+#endif
+
 	// Action set and action used for querying for the interaction profile
 	inline static XrActionSet infoSet = XR_NULL_HANDLE;
 	XrAction infoAction = XR_NULL_HANDLE;

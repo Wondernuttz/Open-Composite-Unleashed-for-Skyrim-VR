@@ -102,16 +102,18 @@ invalid:
 
 static float parse_float(string orig, string name, int line)
 {
-	string val = str_tolower(orig);
+	// Replace comma with dot for locale independence (German/French use 1,0 not 1.0)
+	string fixed = orig;
+	std::replace(fixed.begin(), fixed.end(), ',', '.');
 
-	const char* str = orig.c_str();
+	const char* str = fixed.c_str();
 	char* end = NULL;
 	float result = strtof(str, &end);
 
-	if (end != str + orig.length()) {
-		string err = "Value " + orig + " for in config file for " + name + " on line "
-		    + to_string(line) + " is not a decimal number (eg 12.34)";
-		ABORT(err);
+	if (end != str + fixed.length()) {
+		OOVR_LOGF("Warning: config param %s value '%s' is not a decimal number on line %d, using default",
+		    name.c_str(), orig.c_str(), line);
+		return 0.0f;
 	}
 
 	OOVR_LOGF("Setting config param %s to %f", name.c_str(), result);
@@ -220,6 +222,12 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, rotSmoothMinCutoff);
 		CFGOPT(float, posSmoothBeta);
 		CFGOPT(float, rotSmoothBeta);
+		CFGOPT(bool, enableGpuTiming);
+	}
+
+	// Combos are parsed separately by BaseOverlay; just skip them here
+	if (section == "combos") {
+		return true;
 	}
 
 	if (section == "keyboard") {
@@ -241,8 +249,9 @@ int Config::ini_handler(void* user, const char* pSection,
 
 #undef CFGOPT
 
-	string err = "Unknown config option " + name + " on line " + to_string(lineno);
-	ABORT(err);
+	// Don't abort on unknown options — just log and ignore
+	OOVR_LOGF("Unknown config option '%s' in section [%s] on line %d", name.c_str(), section.c_str(), lineno);
+	return true;
 }
 
 static int wini_parse(const wchar_t* filename, ini_handler handler, void* user)

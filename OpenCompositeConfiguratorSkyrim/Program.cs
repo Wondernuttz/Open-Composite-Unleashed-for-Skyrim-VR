@@ -18,6 +18,7 @@ namespace OpenCompositeConfigurator
             else if (exeName.Contains("Skyrim", StringComparison.OrdinalIgnoreCase))
                 gameType = "skyrim";
 
+            Application.SetHighDpiMode(HighDpiMode.DpiUnaware);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm(gameType));

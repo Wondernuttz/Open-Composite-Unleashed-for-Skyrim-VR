@@ -23,6 +23,7 @@
     <EmbeddedResource Include="Resources\FO4Fox.png" />
     <EmbeddedResource Include="controlmapvr_template.txt" />
     <EmbeddedResource Include="controlmapvr_vrsafe.txt" />
+    <EmbeddedResource Include="controlmapvr_vrik.txt" />
   </ItemGroup>
 
 </Project>

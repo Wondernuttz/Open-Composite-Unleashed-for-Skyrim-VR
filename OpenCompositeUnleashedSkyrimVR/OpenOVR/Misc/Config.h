@@ -80,6 +80,8 @@ public:
 	float PosSmoothBeta() { return posSmoothBeta; }
 	float RotSmoothBeta() { return rotSmoothBeta; }
 
+	inline bool EnableGpuTiming() const { return enableGpuTiming; }
+
 private:
 	static int ini_handler(
 	    void* user, const char* section,
@@ -152,6 +154,7 @@ private:
 	float rotSmoothBeta = 0.2;
 	std::string keyboardText = "";
 	std::string controllerModel = "hands";
+	bool enableGpuTiming = true;
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;
