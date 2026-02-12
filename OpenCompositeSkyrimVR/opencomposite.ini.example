@@ -1,0 +1,297 @@
+; ============================================================================
+;  OpenComposite Configuration — Skyrim VR
+; ============================================================================
+;
+;  Place this file as "opencomposite.ini" in one of two locations:
+;    1. Next to the openvr_api.dll (global — applies to all games using this DLL)
+;    2. In the game's working directory (per-game — overrides global settings)
+;
+;  You can also use "opencomposite_ext.ini" in the working directory for
+;  additional overrides on top of both files above.
+;
+;  All settings are optional. If a line is commented out (starts with ;)
+;  the default value shown will be used automatically.
+;
+;  Boolean values: true / on / enabled  or  false / off / disabled
+;  Colours: #RRGGBB hex format (like CSS)
+;
+; ============================================================================
+
+
+; ----------------------------------------------------------------------------
+;  GENERAL / RENDERING
+; ----------------------------------------------------------------------------
+
+; Supersampling multiplier applied to the render resolution.
+; 1.0 = native,  1.5 = 150%,  0.8 = 80%.  Higher = sharper but heavier on GPU.
+; Default: 1.0
+;supersampleRatio=1.0
+
+; Render the default OpenComposite controller models.
+; Set to false if you prefer in-game hand models or use a mod like VRIK.
+; Default: true
+;renderCustomHands=true
+
+; Colour of the rendered controller models (hex #RRGGBB).
+; Only matters when renderCustomHands is true.
+; Default: #4D4D4D  (dark grey)
+;handColour=#4D4D4D
+
+; Enable controller haptic feedback (vibration).
+; Default: true
+;haptics=true
+
+; Strength of haptic feedback. Range 0.0 to 1.0.
+; Default: 0.1
+;hapticStrength=0.1
+
+; Enable the OpenXR composition layer system (overlays, keyboard, etc.).
+; Default: true
+;enableLayers=true
+
+; Use DX10 feature level instead of DX11.
+; Only enable if you have compatibility issues with older hardware.
+; Default: false
+;dx10Mode=false
+
+; Enable the hidden area mesh fix to reduce GPU load by skipping pixels
+; outside the visible lens area.
+; Default: true
+;enableHiddenMeshFix=true
+
+; Vertical scale factor for the hidden area mesh.
+; Adjust if you see black bars at the top/bottom of the view.
+; Default: 1.0
+;hiddenMeshVerticalScale=1.0
+
+; Invert the eye textures using shaders instead of a texture copy.
+; May fix upside-down rendering in some games.
+; Default: false
+;invertUsingShaders=false
+
+; Force OpenXR initialisation through Vulkan instead of DX11.
+; Only needed on systems where DX11 is unavailable (e.g. Linux/Proton).
+; Default: false
+;initUsingVulkan=false
+
+; Enable cubemap support when the application requests it.
+; Default: true
+;enableAppRequestedCubemap=true
+
+; Use three-part texture submission (separate left/right/both passes).
+; Default: true
+;threePartSubmit=true
+
+; Use the viewport stencil optimisation.
+; Default: false
+;useViewportStencil=false
+
+; Report Touch controllers as connected even if the runtime doesn't.
+; Useful for games that only check for specific controller types.
+; Default: true
+;forceConnectedTouch=true
+
+
+; ----------------------------------------------------------------------------
+;  AUDIO
+; ----------------------------------------------------------------------------
+
+; Automatically switch the Windows default audio device to match your headset
+; when the game starts.
+; Default: false
+;enableAudioSwitch=false
+
+; Name of the audio device to switch to (partial match is fine).
+; Only used when enableAudioSwitch is true.
+; Example: audioDeviceName=Rift Audio
+; Default: (empty)
+;audioDeviceName=
+
+
+; ----------------------------------------------------------------------------
+;  INPUT SMOOTHING  (thumbstick movement)
+; ----------------------------------------------------------------------------
+
+; Smooth thumbstick input to reduce jitter during locomotion.
+; Default: false
+;enableInputSmoothing=false
+
+; Number of frames to average for input smoothing. Higher = smoother but laggier.
+; Only used when enableInputSmoothing is true.
+; Default: 5
+;inputWindowSize=5
+
+
+; ----------------------------------------------------------------------------
+;  CONTROLLER POSITION/ROTATION ADJUSTMENTS
+; ----------------------------------------------------------------------------
+
+; Master switch for tilt adjustment.
+; Default: false
+;adjustTilt=false
+
+; Tilt angle in degrees. Positive tilts controllers forward.
+; Only used when adjustTilt is true.
+; Default: 0.0
+;tilt=0.0
+
+; Master switches for per-hand rotation adjustments.
+; Default: false
+;adjustLeftRotation=false
+;adjustRightRotation=false
+
+; Rotation offsets in degrees for each axis (pitch, yaw, roll).
+; Only used when the corresponding adjust*Rotation is true.
+; Default: 0.0 for all
+;leftXRotation=0.0
+;leftYRotation=0.0
+;leftZRotation=0.0
+;rightXRotation=0.0
+;rightYRotation=0.0
+;rightZRotation=0.0
+
+; Master switches for per-hand position adjustments.
+; Default: false
+;adjustLeftPosition=false
+;adjustRightPosition=false
+
+; Position offsets in metres for each axis.
+; Only used when the corresponding adjust*Position is true.
+; Default: 0.0 for all
+;leftXPosition=0.0
+;leftYPosition=0.0
+;leftZPosition=0.0
+;rightXPosition=0.0
+;rightYPosition=0.0
+;rightZPosition=0.0
+
+
+; ----------------------------------------------------------------------------
+;  DEAD ZONES  (thumbstick)
+; ----------------------------------------------------------------------------
+
+; Uniform dead zone radius. Set > 0 to ignore small stick movements.
+; Default: 0.0
+;leftDeadZoneSize=0.0
+;rightDeadZoneSize=0.0
+
+; Per-axis dead zones (override the uniform size if non-zero).
+; Default: 0.0
+;leftDeadZoneXSize=0.0
+;leftDeadZoneYSize=0.0
+;rightDeadZoneXSize=0.0
+;rightDeadZoneYSize=0.0
+
+
+; ----------------------------------------------------------------------------
+;  CONTROLLER SMOOTHING  (1-Euro filter for hand tracking)
+; ----------------------------------------------------------------------------
+
+; Smooth controller position/rotation to reduce jitter.
+; Useful for games that have shaky hand rendering.
+; Default: false
+;enableControllerSmoothing=false
+
+; 1-Euro filter parameters. Lower minCutoff = more smoothing (but more lag).
+; Higher beta = faster reaction to quick movements.
+; Position defaults: minCutoff=1.25, beta=20
+;posSmoothMinCutoff=1.25
+;posSmoothBeta=20
+
+; Rotation defaults: minCutoff=1.5, beta=0.2
+;rotSmoothMinCutoff=1.5
+;rotSmoothBeta=0.2
+
+
+; ----------------------------------------------------------------------------
+;  MISC
+; ----------------------------------------------------------------------------
+
+; Disable the trigger "touch" state (only report full press).
+; Some games behave oddly with trigger touch events.
+; Default: false
+;disableTriggerTouch=false
+
+; Disable trackpad emulation on thumbstick controllers.
+; Default: false
+;disableTrackPad=false
+
+; Enable VRIK-compatible Knuckles trackpad support.
+; Only relevant if you use the VRIK mod with Index controllers.
+; Default: false
+;enableVRIKKnucklesTrackPadSupport=false
+
+; Default text pre-filled in the VR keyboard when it opens.
+; Default: Adventurer
+;keyboardText=Adventurer
+
+; Allow unknown OpenVR properties without aborting.
+; Default: false
+;admitUnknownProps=false
+
+
+; ----------------------------------------------------------------------------
+;  LOGGING  (for troubleshooting — leave off unless debugging)
+; ----------------------------------------------------------------------------
+
+; Log all OpenVR API calls to the log file.
+; Default: false
+;logAllOpenVRCalls=false
+
+; Log tracked device property queries.
+; Default: false
+;logGetTrackedProperty=false
+
+; Stop execution on soft abort (for debugging).
+; Default: false
+;stopOnSoftAbort=false
+
+
+; ============================================================================
+;  VR KEYBOARD  —  Controller Shortcut & SendInput Mode
+; ============================================================================
+;
+;  The VR keyboard includes a "CONSOLE" button that sends the tilde key (~)
+;  to open/close the in-game console, and switches the keyboard to SendInput
+;  mode where every key press is injected as a Windows keystroke.
+;
+;  You can also open a SendInput-only keyboard anywhere in the game using
+;  a configurable controller shortcut (no text buffer — pure keystroke
+;  injection). This is useful for console commands, mod menus, etc.
+;
+;  The keyboard includes arrow keys (LT, DN, UP, RT) and ESC for
+;  navigating console history and closing menus.
+;
+;  To close the keyboard at any time, squeeze the grip button.
+;
+; ============================================================================
+
+[keyboard]
+
+; Enable the controller shortcut to open a SendInput keyboard anywhere.
+; Default: true
+;shortcutEnabled=true
+
+; Which button activates the shortcut.
+; Options:
+;   left_stick   — press the left thumbstick
+;   right_stick  — press the right thumbstick
+;   a            — A button (right controller)
+;   b            — B button (right controller)
+;   both_grips   — squeeze both grip buttons simultaneously
+; Default: left_stick
+;shortcutButton=left_stick
+
+; Activation mode for the shortcut button.
+; Options:
+;   double_tap   — press the button twice quickly
+;   triple_tap   — press the button three times quickly
+;   long_press   — hold the button down for the timing duration
+; Default: double_tap
+;shortcutMode=double_tap
+
+; Timing in milliseconds:
+;   For double_tap / triple_tap: maximum time between presses
+;   For long_press: how long you must hold the button
+; Default: 500
+;shortcutTiming=500

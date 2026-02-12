@@ -1,0 +1,46 @@
+# Build output
+build/
+bin/
+obj/
+publish/
+binPublish/
+out/
+x64/
+x86/
+Debug/
+Release/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# vcpkg
+vcpkg_installed/
+
+# NuGet
+packages/
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Compiled binaries
+*.dll
+*.exe
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.obj
+*.o
