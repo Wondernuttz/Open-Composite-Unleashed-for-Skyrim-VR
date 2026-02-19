@@ -25,8 +25,47 @@ namespace OpenCompositeConfigurator
         // Tab system (borderless panels with toggle buttons)
         private Button _btnTabSettings = null!;
         private Button _btnTabKeyboard = null!;
+        private Button _btnTabVideo = null!;
         private Panel _tabSettings = null!;
         private Panel _tabKeyboard = null!;
+        private Panel _tabVideo = null!;
+
+        // Video tab controls
+        private CheckBox _chkDlaaEnabled = null!;
+        private NumericUpDown _nudDlaaLambda = null!;
+        private NumericUpDown _nudDlaaEpsilon = null!;
+        private Label _lblDlaaLambda = null!;
+        private Label _lblDlaaEpsilon = null!;
+        private CheckBox _chkFsrEnabled = null!;
+        private CheckBox _chkCasEnabled = null!;
+        private NumericUpDown _nudFsrRenderScale = null!;
+        private NumericUpDown _nudCasSharpness = null!;
+        private Label _lblFsrRenderScale = null!;
+        private Label _lblCasSharpness = null!;
+
+        // VRS controls
+        private CheckBox _chkVrsEnabled = null!;
+        private NumericUpDown _nudVrsInnerRadius = null!;
+        private NumericUpDown _nudVrsMidRadius = null!;
+        private NumericUpDown _nudVrsOuterRadius = null!;
+        private CheckBox _chkVrsFavorHorizontal = null!;
+        private Label _lblVrsInnerRadius = null!;
+        private Label _lblVrsMidRadius = null!;
+        private Label _lblVrsOuterRadius = null!;
+        private ComboBox _cboVrsPreset = null!;
+        private Label _lblFsrStatus = null!;
+        private Label _lblVideoStatus = null!;
+
+        // OCUnleashed Custom Reconstruction controls
+        private CheckBox _chkWnEnabled = null!;
+        private NumericUpDown _nudWnCleanRadius = null!;
+        private NumericUpDown _nudWnStrength = null!;
+        private NumericUpDown _nudWnSharpness = null!;
+        private NumericUpDown _nudWnSensitivity = null!;
+        private Label _lblWnCleanRadius = null!;
+        private Label _lblWnStrength = null!;
+        private Label _lblWnSharpness = null!;
+        private Label _lblWnSensitivity = null!;
 
         // Controller image panel
         private PictureBox _picControllers = null!;
@@ -438,6 +477,22 @@ namespace OpenCompositeConfigurator
             _btnTabKeyboard.Click += (s, e) => SwitchTab(1);
             Controls.Add(_btnTabKeyboard);
 
+            _btnTabVideo = new Button
+            {
+                Text = "Video",
+                Location = new Point(leftMargin + 230, y),
+                Size = new Size(90, 30),
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 10f),
+                ForeColor = Color.FromArgb(160, 160, 160),
+                BackColor = Color.FromArgb(35, 35, 40),
+                Cursor = Cursors.Hand,
+            };
+            _btnTabVideo.FlatAppearance.BorderSize = 0;
+            _btnTabVideo.FlatAppearance.MouseOverBackColor = Color.FromArgb(50, 50, 55);
+            _btnTabVideo.Click += (s, e) => SwitchTab(2);
+            Controls.Add(_btnTabVideo);
+
             y += 32;
 
             // Panel 1: Settings
@@ -462,14 +517,27 @@ namespace OpenCompositeConfigurator
             };
             Controls.Add(_tabKeyboard);
 
+            // Panel 3: Video Settings
+            _tabVideo = new Panel
+            {
+                Location = new Point(leftMargin, y),
+                Size = new Size(rightEdge - leftMargin, 800), // resized after content built
+                BackColor = Color.FromArgb(30, 30, 35),
+                AutoScroll = false,
+                Visible = false,
+            };
+            Controls.Add(_tabVideo);
+
             // Build content for each tab (each auto-sizes its panel)
             BuildSettingsTab();
             BuildKeyboardTab();
+            BuildVideoTab();
 
-            // Sync both tabs to the same height (tallest content)
-            int tallestTab = Math.Max(_tabSettings.Height, _tabKeyboard.Height);
+            // Sync all tabs to the same height (tallest content)
+            int tallestTab = Math.Max(Math.Max(_tabSettings.Height, _tabKeyboard.Height), _tabVideo.Height);
             _tabSettings.Size = new Size(_tabSettings.Width, tallestTab);
             _tabKeyboard.Size = new Size(_tabKeyboard.Width, tallestTab);
+            _tabVideo.Size = new Size(_tabVideo.Width, tallestTab);
 
             // Ko-fi right after the tabs
             int kofiY = _tabSettings.Location.Y + tallestTab + 4;
@@ -591,7 +659,7 @@ namespace OpenCompositeConfigurator
             lblComboHint.ForeColor = Color.FromArgb(130, 130, 130);
             lblComboHint.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
             container.Controls.Add(lblComboHint);
-            y += 38;
+            y += 46;
 
             // Controller image on the left
             _picControllers = new PictureBox
@@ -2865,10 +2933,495 @@ namespace OpenCompositeConfigurator
             }
         }
 
+        // ═══════════════════════════════════════════════════════════════════════
+        // VIDEO TAB
+        // ═══════════════════════════════════════════════════════════════════════
+
+        private void BuildVideoTab()
+        {
+            var container = _tabVideo;
+            int y = 10;
+            int leftMargin = 6;
+            int rightEdge = container.ClientSize.Width - 20;
+            int halfWidth = (rightEdge - leftMargin) / 2;
+            int col2 = leftMargin + halfWidth + 10;
+
+            // ── ANTI-ALIASING ──
+            var lblAASection = MakeSectionLabel("Anti-Aliasing", leftMargin, y);
+            container.Controls.Add(lblAASection);
+            y += 26;
+
+            _chkDlaaEnabled = MakeCheckBox("DLAA Anti-Aliasing", leftMargin, y);
+            _chkDlaaEnabled.CheckedChanged += (s, e) =>
+            {
+                bool en = _chkDlaaEnabled.Checked;
+                _nudDlaaLambda.Enabled = en;
+                _nudDlaaEpsilon.Enabled = en;
+            };
+            container.Controls.Add(_chkDlaaEnabled);
+
+            // DLAA tuning controls on the RIGHT side (same row as checkbox)
+            _lblDlaaLambda = MakeLabel("Sensitivity:", col2, y + 3, 75);
+            container.Controls.Add(_lblDlaaLambda);
+            _nudDlaaLambda = new NumericUpDown
+            {
+                Location = new Point(col2 + 78, y), Width = 60,
+                DecimalPlaces = 1, Increment = 0.1m, Minimum = 1.0m, Maximum = 6.0m, Value = 3.0m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            container.Controls.Add(_nudDlaaLambda);
+
+            _lblDlaaEpsilon = MakeLabel("Threshold:", col2 + 150, y + 3, 70);
+            container.Controls.Add(_lblDlaaEpsilon);
+            _nudDlaaEpsilon = new NumericUpDown
+            {
+                Location = new Point(col2 + 223, y), Width = 60,
+                DecimalPlaces = 2, Increment = 0.01m, Minimum = 0.01m, Maximum = 0.50m, Value = 0.10m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            container.Controls.Add(_nudDlaaEpsilon);
+
+            y += 24;
+
+            var lblDlaaHint = MakeLabel("BlueSkyDefender's Reshade DLAA (2-pass edge AA). Works on all GPUs. Negligible perf cost.", leftMargin + 20, y, rightEdge - leftMargin - 20);
+            lblDlaaHint.ForeColor = Color.FromArgb(130, 130, 130);
+            lblDlaaHint.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            container.Controls.Add(lblDlaaHint);
+            y += 18;
+
+            var lblDlaaNvidia = MakeLabel("NVIDIA users: consider NVIDIA DLAA via the NVIDIA app instead (GPU-accelerated, better quality).", leftMargin + 20, y, rightEdge - leftMargin - 20);
+            lblDlaaNvidia.ForeColor = Color.FromArgb(110, 110, 110);
+            lblDlaaNvidia.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblDlaaNvidia);
+            y += 20;
+
+            container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
+            y += 10;
+
+            // ── FSR UPSCALING ──
+            var lblFsrSection = MakeSectionLabel("FSR Upscaling (EASU)", leftMargin, y);
+            container.Controls.Add(lblFsrSection);
+            y += 26;
+
+            _chkFsrEnabled = MakeCheckBox("Enable FSR Upscaling", leftMargin, y);
+            _chkFsrEnabled.CheckedChanged += (s, e) =>
+            {
+                bool en = _chkFsrEnabled.Checked;
+                _nudFsrRenderScale.Enabled = en;
+                UpdateFsrStatus();
+            };
+            container.Controls.Add(_chkFsrEnabled);
+            y += 24;
+
+            var lblFsrDesc = MakeLabel("Renders at lower resolution, then upscales with AMD FidelityFX EASU. Replaces vrperfkit.", leftMargin + 20, y, rightEdge - leftMargin - 20);
+            lblFsrDesc.ForeColor = Color.FromArgb(130, 130, 130);
+            lblFsrDesc.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            container.Controls.Add(lblFsrDesc);
+            y += 20;
+
+            // Render Scale
+            _lblFsrRenderScale = MakeLabel("Render Scale:", leftMargin + 20, y + 3, 95);
+            container.Controls.Add(_lblFsrRenderScale);
+
+            _nudFsrRenderScale = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 115, y), Width = 70,
+                DecimalPlaces = 2, Increment = 0.01m, Minimum = 0.50m, Maximum = 1.00m, Value = 0.77m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            _nudFsrRenderScale.ValueChanged += (s, e) => UpdateFsrStatus();
+            container.Controls.Add(_nudFsrRenderScale);
+
+            var lblScaleHint = MakeLabel("(0.50-1.00, lower = more GPU savings)", leftMargin + 190, y + 3, 220);
+            lblScaleHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblScaleHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblScaleHint);
+            y += 28;
+
+            // Status label
+            _lblFsrStatus = new Label
+            {
+                Location = new Point(leftMargin + 20, y),
+                Size = new Size(rightEdge - leftMargin - 20, 20),
+                Text = "FSR is disabled \u2014 game renders at native resolution.",
+                ForeColor = Color.FromArgb(160, 160, 160),
+                Font = new Font("Segoe UI", 8.5f),
+                AutoSize = false
+            };
+            container.Controls.Add(_lblFsrStatus);
+            y += 24;
+
+            // FSR Presets
+            var lblPresets = MakeLabel("Presets:", leftMargin + 20, y + 4, 55);
+            container.Controls.Add(lblPresets);
+
+            int px = leftMargin + 78;
+            var btnQuality = MakeButton("Quality", px, y, 80, 26);
+            btnQuality.Click += (s, e) => { _chkFsrEnabled.Checked = true; _chkCasEnabled.Checked = true; _nudFsrRenderScale.Value = 0.85m; _nudCasSharpness.Value = 0.15m; };
+            container.Controls.Add(btnQuality);
+            px += 84;
+
+            var btnBalanced = MakeButton("Balanced", px, y, 85, 26);
+            btnBalanced.Click += (s, e) => { _chkFsrEnabled.Checked = true; _chkCasEnabled.Checked = true; _nudFsrRenderScale.Value = 0.77m; _nudCasSharpness.Value = 0.20m; };
+            container.Controls.Add(btnBalanced);
+            px += 89;
+
+            var btnPerformance = MakeButton("Performance", px, y, 95, 26);
+            btnPerformance.Click += (s, e) => { _chkFsrEnabled.Checked = true; _chkCasEnabled.Checked = true; _nudFsrRenderScale.Value = 0.67m; _nudCasSharpness.Value = 0.30m; };
+            container.Controls.Add(btnPerformance);
+            px += 99;
+
+            var btnUltra = MakeButton("Ultra Perf", px, y, 85, 26);
+            btnUltra.Click += (s, e) => { _chkFsrEnabled.Checked = true; _chkCasEnabled.Checked = true; _nudFsrRenderScale.Value = 0.50m; _nudCasSharpness.Value = 0.40m; };
+            container.Controls.Add(btnUltra);
+            px += 89;
+
+            var btnOff = MakeButton("Off", px, y, 55, 26);
+            btnOff.BackColor = Color.FromArgb(120, 60, 40);
+            btnOff.Click += (s, e) => { _chkFsrEnabled.Checked = false; _nudFsrRenderScale.Value = 0.77m; };
+            container.Controls.Add(btnOff);
+            y += 34;
+
+            container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
+            y += 10;
+
+            // ── CAS SHARPENING ──
+            var lblCasSection = MakeSectionLabel("CAS Sharpening (RCAS)", leftMargin, y);
+            container.Controls.Add(lblCasSection);
+            y += 26;
+
+            _chkCasEnabled = MakeCheckBox("Enable CAS Sharpening", leftMargin, y);
+            _chkCasEnabled.CheckedChanged += (s, e) =>
+            {
+                bool en = _chkCasEnabled.Checked;
+                _nudCasSharpness.Enabled = en;
+            };
+            container.Controls.Add(_chkCasEnabled);
+            y += 24;
+
+            var lblCasDesc = MakeLabel("AMD FidelityFX RCAS contrast-adaptive sharpening. Works with or without FSR.", leftMargin + 20, y, rightEdge - leftMargin - 20);
+            lblCasDesc.ForeColor = Color.FromArgb(130, 130, 130);
+            lblCasDesc.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            container.Controls.Add(lblCasDesc);
+            y += 20;
+
+            // Sharpness
+            _lblCasSharpness = MakeLabel("Sharpness:", leftMargin + 20, y + 3, 80);
+            container.Controls.Add(_lblCasSharpness);
+
+            _nudCasSharpness = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 100, y), Width = 70,
+                DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.00m, Maximum = 1.00m, Value = 0.20m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            container.Controls.Add(_nudCasSharpness);
+
+            var lblSharpHint = MakeLabel("(0.0 = soft, 1.0 = maximum sharpness)", leftMargin + 175, y + 3, 250);
+            lblSharpHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblSharpHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblSharpHint);
+            y += 28;
+
+            container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
+            y += 10;
+
+            // ── NVIDIA FIXED FOVEATED RENDERING (VRS) ──
+            var lblVrsSection = MakeSectionLabel("NVIDIA Fixed Foveated Rendering (VRS)", leftMargin, y);
+            container.Controls.Add(lblVrsSection);
+            y += 26;
+
+            var lblVrsInfo = MakeLabel("Requires NVIDIA RTX or GTX 16xx series GPU. Reduces shading rate in peripheral vision for better performance.", leftMargin + 20, y, rightEdge - leftMargin - 20);
+            lblVrsInfo.ForeColor = Color.White;
+            lblVrsInfo.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            container.Controls.Add(lblVrsInfo);
+            y += 18;
+
+            var lblVrsEyeTrackNote = MakeLabel("Note: If your headset has built-in eye-tracked foveated rendering, this fixed foveated rendering is redundant and should be left disabled.", leftMargin + 20, y, rightEdge - leftMargin - 20);
+            lblVrsEyeTrackNote.ForeColor = Color.FromArgb(255, 200, 100);
+            lblVrsEyeTrackNote.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            container.Controls.Add(lblVrsEyeTrackNote);
+            y += 30;
+
+            _chkVrsEnabled = MakeCheckBox("Enable VRS Foveated Rendering", leftMargin, y);
+            _chkVrsEnabled.CheckedChanged += (s, e) =>
+            {
+                bool en = _chkVrsEnabled.Checked;
+                _cboVrsPreset.Enabled = en;
+                _nudVrsInnerRadius.Enabled = en;
+                _nudVrsMidRadius.Enabled = en;
+                _nudVrsOuterRadius.Enabled = en;
+                // Don't use .Enabled on CheckBox — WinForms renders disabled text black on dark backgrounds
+                _chkVrsFavorHorizontal.ForeColor = en ? Color.FromArgb(210, 210, 210) : Color.FromArgb(90, 90, 90);
+                _chkVrsFavorHorizontal.AutoCheck = en;
+            };
+            container.Controls.Add(_chkVrsEnabled);
+            y += 24;
+
+            // Preset dropdown
+            var lblVrsPreset = MakeLabel("Preset:", leftMargin + 20, y + 3, 55);
+            container.Controls.Add(lblVrsPreset);
+
+            _cboVrsPreset = new ComboBox
+            {
+                Location = new Point(leftMargin + 78, y), Width = 130,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            _cboVrsPreset.Items.AddRange(new[] { "Conservative", "Balanced", "Aggressive", "Custom" });
+            _cboVrsPreset.SelectedIndex = 0;
+            _cboVrsPreset.SelectedIndexChanged += (s, e) =>
+            {
+                switch (_cboVrsPreset.SelectedIndex)
+                {
+                    case 0: // Conservative (pancake-lens friendly)
+                        _nudVrsInnerRadius.Value = 0.70m; _nudVrsMidRadius.Value = 0.85m; _nudVrsOuterRadius.Value = 1.00m; break;
+                    case 1: // Balanced
+                        _nudVrsInnerRadius.Value = 0.60m; _nudVrsMidRadius.Value = 0.80m; _nudVrsOuterRadius.Value = 1.00m; break;
+                    case 2: // Aggressive
+                        _nudVrsInnerRadius.Value = 0.50m; _nudVrsMidRadius.Value = 0.70m; _nudVrsOuterRadius.Value = 0.90m; break;
+                    case 3: // Custom — don't change values
+                        break;
+                }
+            };
+            container.Controls.Add(_cboVrsPreset);
+
+            var lblPresetHint = MakeLabel("(Conservative recommended for pancake lenses like Quest 3)", leftMargin + 215, y + 3, 300);
+            lblPresetHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblPresetHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblPresetHint);
+            y += 28;
+
+            // Inner Radius
+            _lblVrsInnerRadius = MakeLabel("Inner Radius:", leftMargin + 20, y + 3, 90);
+            container.Controls.Add(_lblVrsInnerRadius);
+
+            _nudVrsInnerRadius = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 115, y), Width = 70,
+                DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.10m, Maximum = 1.00m, Value = 0.60m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            _nudVrsInnerRadius.ValueChanged += (s, e) => { if (_cboVrsPreset.SelectedIndex != 3) _cboVrsPreset.SelectedIndex = 3; };
+            container.Controls.Add(_nudVrsInnerRadius);
+
+            var lblInnerHint = MakeLabel("Full shading rate (1x1)", leftMargin + 190, y + 3, 170);
+            lblInnerHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblInnerHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblInnerHint);
+            y += 26;
+
+            // Mid Radius
+            _lblVrsMidRadius = MakeLabel("Mid Radius:", leftMargin + 20, y + 3, 90);
+            container.Controls.Add(_lblVrsMidRadius);
+
+            _nudVrsMidRadius = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 115, y), Width = 70,
+                DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.10m, Maximum = 1.50m, Value = 0.80m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            _nudVrsMidRadius.ValueChanged += (s, e) => { if (_cboVrsPreset.SelectedIndex != 3) _cboVrsPreset.SelectedIndex = 3; };
+            container.Controls.Add(_nudVrsMidRadius);
+
+            var lblMidHint = MakeLabel("Half shading rate (2x1)", leftMargin + 190, y + 3, 170);
+            lblMidHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblMidHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblMidHint);
+            y += 26;
+
+            // Outer Radius
+            _lblVrsOuterRadius = MakeLabel("Outer Radius:", leftMargin + 20, y + 3, 90);
+            container.Controls.Add(_lblVrsOuterRadius);
+
+            _nudVrsOuterRadius = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 115, y), Width = 70,
+                DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.10m, Maximum = 1.50m, Value = 1.00m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            _nudVrsOuterRadius.ValueChanged += (s, e) => { if (_cboVrsPreset.SelectedIndex != 3) _cboVrsPreset.SelectedIndex = 3; };
+            container.Controls.Add(_nudVrsOuterRadius);
+
+            var lblOuterHint = MakeLabel("Quarter shading rate (2x2)", leftMargin + 190, y + 3, 280);
+            lblOuterHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblOuterHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblOuterHint);
+            y += 26;
+
+            // Favor Horizontal
+            _chkVrsFavorHorizontal = MakeCheckBox("Favor Horizontal Resolution", leftMargin + 20, y);
+            _chkVrsFavorHorizontal.Checked = true;
+            _chkVrsFavorHorizontal.ForeColor = Color.FromArgb(90, 90, 90);
+            _chkVrsFavorHorizontal.AutoCheck = false;
+            container.Controls.Add(_chkVrsFavorHorizontal);
+
+            var lblFavorHint = MakeLabel("(reduces vertical resolution first, preserving horizontal detail)", leftMargin + 230, y + 3, 350);
+            lblFavorHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblFavorHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblFavorHint);
+            y += 28;
+
+            container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
+            y += 10;
+
+            // ── OCUNLEASHED CUSTOM RECONSTRUCTION ──
+            var lblWnSection = MakeSectionLabel("OCUnleashed Custom Reconstruction", leftMargin, y);
+            container.Controls.Add(lblWnSection);
+            y += 26;
+
+            var lblWnDesc = MakeLabel("Edge-aware bilateral smoothing that cleans VRS tile artifacts before upscaling. Runs at render resolution.", leftMargin + 20, y, rightEdge - leftMargin - 20);
+            lblWnDesc.ForeColor = Color.FromArgb(130, 130, 130);
+            lblWnDesc.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
+            container.Controls.Add(lblWnDesc);
+            y += 18;
+
+            var lblWnPipeline = MakeLabel("Pipeline: Game + VRS \u2192 Reconstruction \u2192 EASU/DLAA \u2192 CAS \u2192 Display", leftMargin + 20, y, rightEdge - leftMargin - 20);
+            lblWnPipeline.ForeColor = Color.FromArgb(110, 110, 110);
+            lblWnPipeline.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblWnPipeline);
+            y += 22;
+
+            _chkWnEnabled = MakeCheckBox("Enable OCUnleashed Reconstruction", leftMargin, y);
+            _chkWnEnabled.CheckedChanged += (s, e) =>
+            {
+                bool en = _chkWnEnabled.Checked;
+                _nudWnCleanRadius.Enabled = en;
+                _nudWnStrength.Enabled = en;
+                _nudWnSharpness.Enabled = en;
+                _nudWnSensitivity.Enabled = en;
+            };
+            container.Controls.Add(_chkWnEnabled);
+            y += 24;
+
+            // Clean Radius + Sensitivity (same row)
+            _lblWnCleanRadius = MakeLabel("Clean Radius:", leftMargin + 20, y + 3, 95);
+            container.Controls.Add(_lblWnCleanRadius);
+
+            _nudWnCleanRadius = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 115, y), Width = 70,
+                DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.00m, Maximum = 1.00m, Value = 0.35m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            container.Controls.Add(_nudWnCleanRadius);
+
+            var lblWnCleanHint = MakeLabel("Center zone with no processing (sharpening only)", leftMargin + 190, y + 3, 300);
+            lblWnCleanHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblWnCleanHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblWnCleanHint);
+
+            // Sensitivity — inline with Clean Radius, to the right
+            _lblWnSensitivity = MakeLabel("Sensitivity:", leftMargin + 500, y + 3, 75);
+            container.Controls.Add(_lblWnSensitivity);
+
+            _nudWnSensitivity = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 575, y), Width = 60,
+                DecimalPlaces = 1, Increment = 0.5m, Minimum = 1.0m, Maximum = 20.0m, Value = 6.0m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            container.Controls.Add(_nudWnSensitivity);
+
+            var lblWnSensHint = MakeLabel("Edge detection (lower = more smoothing)", leftMargin + 640, y + 3, 250);
+            lblWnSensHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblWnSensHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblWnSensHint);
+            y += 26;
+
+            // Strength
+            _lblWnStrength = MakeLabel("Strength:", leftMargin + 20, y + 3, 95);
+            container.Controls.Add(_lblWnStrength);
+
+            _nudWnStrength = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 115, y), Width = 70,
+                DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.00m, Maximum = 1.00m, Value = 0.80m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            container.Controls.Add(_nudWnStrength);
+
+            var lblWnStrengthHint = MakeLabel("Max reconstruction intensity at periphery", leftMargin + 190, y + 3, 280);
+            lblWnStrengthHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblWnStrengthHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblWnStrengthHint);
+            y += 26;
+
+            // Sharpness
+            _lblWnSharpness = MakeLabel("Sharpness:", leftMargin + 20, y + 3, 95);
+            container.Controls.Add(_lblWnSharpness);
+
+            _nudWnSharpness = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 115, y), Width = 70,
+                DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.00m, Maximum = 1.00m, Value = 0.50m,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, Enabled = false
+            };
+            container.Controls.Add(_nudWnSharpness);
+
+            var lblWnSharpHint = MakeLabel("Center zone CAS-style sharpening (0 = off)", leftMargin + 190, y + 3, 280);
+            lblWnSharpHint.ForeColor = Color.FromArgb(110, 110, 110);
+            lblWnSharpHint.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblWnSharpHint);
+            y += 28;
+
+            container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
+            y += 12;
+
+            // ── SAVE BUTTON ──
+            var btnSaveVideo = MakeButton("Save opencomposite.ini", leftMargin, y, 200, 30);
+            btnSaveVideo.BackColor = Color.FromArgb(40, 120, 40);
+            btnSaveVideo.ForeColor = Color.White;
+            btnSaveVideo.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+            btnSaveVideo.Click += BtnSave_Click;
+            container.Controls.Add(btnSaveVideo);
+
+            _lblVideoStatus = new Label
+            {
+                Location = new Point(leftMargin + 210, y + 6),
+                Size = new Size(rightEdge - leftMargin - 210, 20),
+                Text = "",
+                ForeColor = Color.FromArgb(160, 160, 160),
+                Font = new Font("Segoe UI", 9f),
+                AutoSize = false
+            };
+            container.Controls.Add(_lblVideoStatus);
+            y += 40;
+
+            // Resize panel to fit content
+            container.Size = new Size(container.Width, y + 10);
+        }
+
+        private int DetectVrsPreset()
+        {
+            decimal ir = _nudVrsInnerRadius.Value, mr = _nudVrsMidRadius.Value, or2 = _nudVrsOuterRadius.Value;
+            if (ir == 0.70m && mr == 0.85m && or2 == 1.00m) return 0; // Conservative
+            if (ir == 0.60m && mr == 0.80m && or2 == 1.00m) return 1; // Balanced
+            if (ir == 0.50m && mr == 0.70m && or2 == 0.90m) return 2; // Aggressive
+            return 3; // Custom
+        }
+
+        private void UpdateFsrStatus()
+        {
+            if (!_chkFsrEnabled.Checked)
+            {
+                _lblFsrStatus.Text = "FSR is disabled \u2014 game renders at native resolution.";
+                _lblFsrStatus.ForeColor = Color.FromArgb(160, 160, 160);
+                return;
+            }
+
+            decimal scale = _nudFsrRenderScale.Value;
+            int pctPixels = (int)(scale * scale * 100);
+            string quality = scale >= 0.85m ? "Quality" : scale >= 0.77m ? "Balanced" : scale >= 0.67m ? "Performance" : "Ultra Performance";
+            _lblFsrStatus.Text = $"FSR active: rendering {scale:0.00}x ({pctPixels}% pixels) \u2014 {quality} mode";
+            _lblFsrStatus.ForeColor = Color.FromArgb(100, 220, 100);
+        }
+
         private void SwitchTab(int index)
         {
             _tabSettings.Visible = (index == 0);
             _tabKeyboard.Visible = (index == 1);
+            _tabVideo.Visible = (index == 2);
 
             // Update button styles
             _btnTabSettings.Font = new Font("Segoe UI", 10f, index == 0 ? FontStyle.Bold : FontStyle.Regular);
@@ -2878,6 +3431,10 @@ namespace OpenCompositeConfigurator
             _btnTabKeyboard.Font = new Font("Segoe UI", 10f, index == 1 ? FontStyle.Bold : FontStyle.Regular);
             _btnTabKeyboard.ForeColor = index == 1 ? Color.White : Color.FromArgb(160, 160, 160);
             _btnTabKeyboard.BackColor = index == 1 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
+
+            _btnTabVideo.Font = new Font("Segoe UI", 10f, index == 2 ? FontStyle.Bold : FontStyle.Regular);
+            _btnTabVideo.ForeColor = index == 2 ? Color.White : Color.FromArgb(160, 160, 160);
+            _btnTabVideo.BackColor = index == 2 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -2905,40 +3462,57 @@ namespace OpenCompositeConfigurator
         {
             if (string.IsNullOrEmpty(_gameDir))
             {
-                MessageBox.Show("Please select a game folder first.", "No Folder Selected",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                _lblStatus.Text = "No game folder selected \u2014 click Browse first";
+                _lblStatus.ForeColor = Color.FromArgb(255, 100, 100);
+                _lblVideoStatus.Text = _lblStatus.Text;
+                _lblVideoStatus.ForeColor = _lblStatus.ForeColor;
                 return;
             }
 
             var selected = GetSelectedButtons();
             if (selected.Count == 0 && _chkShortcutEnabled.Checked)
             {
-                MessageBox.Show("Please select at least one button for the keyboard shortcut.",
-                    "No Button Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                _lblStatus.Text = "Cannot save \u2014 keyboard shortcut is enabled but no buttons are selected";
+                _lblStatus.ForeColor = Color.FromArgb(255, 180, 80);
+                _lblVideoStatus.Text = _lblStatus.Text;
+                _lblVideoStatus.ForeColor = _lblStatus.ForeColor;
                 return;
             }
 
-            WriteToIni();
-            string path = Path.Combine(_gameDir, "opencomposite.ini");
-            _ini.Save(path);
-
-            bool savedToMO2 = false;
-            if (!string.IsNullOrEmpty(_mo2ModDir))
+            try
             {
-                try
-                {
-                    string mo2Path = Path.Combine(_mo2ModDir, "opencomposite.ini");
-                    _ini.Save(mo2Path);
-                    savedToMO2 = true;
-                }
-                catch { }
-            }
+                WriteToIni();
+                string path = Path.Combine(_gameDir, "opencomposite.ini");
+                _ini.Save(path);
 
-            string locationMsg = savedToMO2
-                ? "Saved to game folder and MO2 mod folder"
-                : "Saved to game folder";
-            _lblStatus.Text = $"{locationMsg} \u2014 changes apply in-game within 1 second";
-            _lblStatus.ForeColor = Color.FromArgb(100, 200, 100);
+                bool savedToMO2 = false;
+                if (!string.IsNullOrEmpty(_mo2ModDir))
+                {
+                    try
+                    {
+                        string mo2Path = Path.Combine(_mo2ModDir, "opencomposite.ini");
+                        _ini.Save(mo2Path);
+                        savedToMO2 = true;
+                    }
+                    catch { }
+                }
+
+                string time = DateTime.Now.ToString("h:mm:ss tt");
+                string locationMsg = savedToMO2
+                    ? $"Saved to game folder and MO2 mod folder at {time}"
+                    : $"Saved to game folder at {time}";
+                _lblStatus.Text = $"{locationMsg} \u2014 restart game for changes";
+                _lblStatus.ForeColor = Color.FromArgb(100, 200, 100);
+                _lblVideoStatus.Text = $"{locationMsg} \u2014 restart game for changes";
+                _lblVideoStatus.ForeColor = Color.FromArgb(100, 200, 100);
+            }
+            catch (Exception ex)
+            {
+                _lblStatus.Text = $"Save failed: {ex.Message}";
+                _lblStatus.ForeColor = Color.FromArgb(255, 100, 100);
+                _lblVideoStatus.Text = _lblStatus.Text;
+                _lblVideoStatus.ForeColor = _lblStatus.ForeColor;
+            }
         }
 
         private void BtnReload_Click(object? sender, EventArgs e)
@@ -2954,12 +3528,18 @@ namespace OpenCompositeConfigurator
 
         private void LoadFromDir()
         {
+            // Prefer MO2 mod folder (root\) since that's where the DLL reads from
             string path = Path.Combine(_gameDir, "opencomposite.ini");
-            _ini.Load(path);
+            string? mo2Path = !string.IsNullOrEmpty(_mo2ModDir)
+                ? Path.Combine(_mo2ModDir, "opencomposite.ini")
+                : null;
 
-            if (File.Exists(path))
+            string loadPath = (mo2Path != null && File.Exists(mo2Path)) ? mo2Path : path;
+            _ini.Load(loadPath);
+
+            if (File.Exists(loadPath))
             {
-                _lblStatus.Text = $"Loaded {path}";
+                _lblStatus.Text = $"Loaded {loadPath}";
                 _lblStatus.ForeColor = Color.FromArgb(100, 200, 100);
             }
             else
@@ -3114,6 +3694,76 @@ namespace OpenCompositeConfigurator
             _nudRightPosY.Enabled = _chkRightPosition.Checked;
             _nudRightPosZ.Enabled = _chkRightPosition.Checked;
 
+            // DLAA settings
+            _chkDlaaEnabled.Checked = ParseBool(_ini.Get("", "dlaaEnabled", "false"));
+            if (float.TryParse(_ini.Get("", "dlaaLambda", "3.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float dlL))
+                _nudDlaaLambda.Value = (decimal)Math.Clamp(dlL, 1.0f, 6.0f);
+            if (float.TryParse(_ini.Get("", "dlaaEpsilon", "0.1"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float dlE))
+                _nudDlaaEpsilon.Value = (decimal)Math.Clamp(dlE, 0.01f, 0.50f);
+            {
+                bool en = _chkDlaaEnabled.Checked;
+                _nudDlaaLambda.Enabled = en;
+                _nudDlaaEpsilon.Enabled = en;
+            }
+
+            // FSR settings
+            _chkFsrEnabled.Checked = ParseBool(_ini.Get("", "fsrEnabled", "false"));
+            if (float.TryParse(_ini.Get("", "fsrRenderScale", "0.77"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float frs))
+                _nudFsrRenderScale.Value = (decimal)Math.Clamp(frs, 0.5f, 1.0f);
+            {
+                bool en = _chkFsrEnabled.Checked;
+                _nudFsrRenderScale.Enabled = en;
+            }
+            UpdateFsrStatus();
+
+            // CAS settings
+            _chkCasEnabled.Checked = ParseBool(_ini.Get("", "casEnabled", "false"));
+            if (float.TryParse(_ini.Get("", "fsrSharpness", "0.2"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float fsh))
+                _nudCasSharpness.Value = (decimal)Math.Clamp(fsh, 0f, 1f);
+            {
+                bool en = _chkCasEnabled.Checked;
+                _nudCasSharpness.Enabled = en;
+            }
+
+            // VRS settings
+            _chkVrsEnabled.Checked = ParseBool(_ini.Get("", "vrsEnabled", "false"));
+            if (float.TryParse(_ini.Get("", "vrsInnerRadius", "0.60"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float vrsIR))
+                _nudVrsInnerRadius.Value = (decimal)Math.Clamp(vrsIR, 0.10f, 1.00f);
+            if (float.TryParse(_ini.Get("", "vrsMidRadius", "0.80"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float vrsMR))
+                _nudVrsMidRadius.Value = (decimal)Math.Clamp(vrsMR, 0.10f, 1.50f);
+            if (float.TryParse(_ini.Get("", "vrsOuterRadius", "1.00"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float vrsOR))
+                _nudVrsOuterRadius.Value = (decimal)Math.Clamp(vrsOR, 0.10f, 1.50f);
+            _chkVrsFavorHorizontal.Checked = ParseBool(_ini.Get("", "vrsFavorHorizontal", "true"));
+            {
+                bool en = _chkVrsEnabled.Checked;
+                _cboVrsPreset.Enabled = en;
+                _nudVrsInnerRadius.Enabled = en;
+                _nudVrsMidRadius.Enabled = en;
+                _nudVrsOuterRadius.Enabled = en;
+                _chkVrsFavorHorizontal.ForeColor = en ? Color.FromArgb(210, 210, 210) : Color.FromArgb(90, 90, 90);
+                _chkVrsFavorHorizontal.AutoCheck = en;
+            }
+            // Detect which preset matches
+            _cboVrsPreset.SelectedIndex = DetectVrsPreset();
+
+            // OCUnleashed Custom Reconstruction settings
+            _chkWnEnabled.Checked = ParseBool(_ini.Get("", "wnEnabled", "false"));
+            if (float.TryParse(_ini.Get("", "wnCleanRadius", "0.35"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float wnCR))
+                _nudWnCleanRadius.Value = (decimal)Math.Clamp(wnCR, 0f, 1f);
+            if (float.TryParse(_ini.Get("", "wnStrength", "0.80"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float wnS))
+                _nudWnStrength.Value = (decimal)Math.Clamp(wnS, 0f, 1f);
+            if (float.TryParse(_ini.Get("", "wnSharpness", "0.50"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float wnSh))
+                _nudWnSharpness.Value = (decimal)Math.Clamp(wnSh, 0f, 1f);
+            if (float.TryParse(_ini.Get("", "wnSensitivity", "6.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float wnSe))
+                _nudWnSensitivity.Value = (decimal)Math.Clamp(wnSe, 1f, 20f);
+            {
+                bool wnEn = _chkWnEnabled.Checked;
+                _nudWnCleanRadius.Enabled = wnEn;
+                _nudWnStrength.Enabled = wnEn;
+                _nudWnSharpness.Enabled = wnEn;
+                _nudWnSensitivity.Enabled = wnEn;
+            }
+
             UpdateTimingLabel();
             _picControllers.Invalidate();
 
@@ -3189,6 +3839,33 @@ namespace OpenCompositeConfigurator
                 _ini.Set("", "rightYPosition", _nudRightPosY.Value.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
                 _ini.Set("", "rightZPosition", _nudRightPosZ.Value.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
             }
+
+            // DLAA settings
+            _ini.Set("", "dlaaEnabled", _chkDlaaEnabled.Checked ? "true" : "false");
+            _ini.Set("", "dlaaLambda", _nudDlaaLambda.Value.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+            _ini.Set("", "dlaaEpsilon", _nudDlaaEpsilon.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+
+            // FSR settings
+            _ini.Set("", "fsrEnabled", _chkFsrEnabled.Checked ? "true" : "false");
+            _ini.Set("", "fsrRenderScale", _nudFsrRenderScale.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+
+            // CAS settings
+            _ini.Set("", "casEnabled", _chkCasEnabled.Checked ? "true" : "false");
+            _ini.Set("", "fsrSharpness", _nudCasSharpness.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+
+            // VRS settings (NVIDIA only)
+            _ini.Set("", "vrsEnabled", _chkVrsEnabled.Checked ? "true" : "false");
+            _ini.Set("", "vrsInnerRadius", _nudVrsInnerRadius.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            _ini.Set("", "vrsMidRadius", _nudVrsMidRadius.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            _ini.Set("", "vrsOuterRadius", _nudVrsOuterRadius.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            _ini.Set("", "vrsFavorHorizontal", _chkVrsFavorHorizontal.Checked ? "true" : "false");
+
+            // OCUnleashed Custom Reconstruction settings
+            _ini.Set("", "wnEnabled", _chkWnEnabled.Checked ? "true" : "false");
+            _ini.Set("", "wnCleanRadius", _nudWnCleanRadius.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            _ini.Set("", "wnStrength", _nudWnStrength.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            _ini.Set("", "wnSharpness", _nudWnSharpness.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            _ini.Set("", "wnSensitivity", _nudWnSensitivity.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
 
             WriteCombosToIni();
         }

@@ -196,7 +196,8 @@ Compositor* BaseCompositor::CreateCompositorAPI(const vr::Texture_t* texture)
 			STUBBED();
 #endif
 
-		dxcomp = (DX11Compositor*)comp;
+		if (!dxcomp)  // Keep the first (eye) compositor — it lives the whole session
+			dxcomp = (DX11Compositor*)comp;
 		break;
 	}
 #endif

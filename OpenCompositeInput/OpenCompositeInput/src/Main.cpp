@@ -61,6 +61,37 @@ struct OCMenuTransform {
 };
 #pragma pack(pop)
 
+// =========================================================================
+// Shared memory struct — render target bridge for Open Composite FSR 2/3
+// Exposes ID3D11Texture2D* pointers for motion vectors and depth buffer.
+// Both DLLs live in the same process, so raw pointers are valid.
+// =========================================================================
+#pragma pack(push, 1)
+struct OCRenderTargetBridge {
+	static constexpr uint32_t MAGIC = 0x56544F4D; // 'MOTV'
+	static constexpr uint32_t VERSION = 1;
+
+	uint32_t magic;
+	uint32_t version;
+	uint32_t status;        // 0=not ready, 1=ready, 2=error
+
+	// Motion vector render target
+	uint64_t mvTexture;     // ID3D11Texture2D*
+	uint64_t mvSRV;         // ID3D11ShaderResourceView*
+	uint64_t mvUAV;         // ID3D11UnorderedAccessView*
+
+	// Depth buffer
+	uint64_t depthTexture;  // ID3D11Texture2D*
+	uint64_t depthSRV;      // ID3D11ShaderResourceView*
+
+	// D3D11 device and context (for receiver validation)
+	uint64_t d3dDevice;     // ID3D11Device*
+	uint64_t d3dContext;    // ID3D11DeviceContext*
+
+	uint8_t reserved[64];
+};
+#pragma pack(pop)
+
 namespace
 {
 	// =========================================================================
@@ -74,6 +105,12 @@ namespace
 	// =========================================================================
 	HANDLE           g_hMapFile = nullptr;
 	OCMenuTransform* g_pTransform = nullptr;
+
+	// =========================================================================
+	// Shared memory for render target bridge (read by Open Composite for FSR)
+	// =========================================================================
+	HANDLE                g_hBridgeMapFile = nullptr;
+	OCRenderTargetBridge* g_pBridge = nullptr;
 
 	void CreateSharedMemory()
 	{
@@ -102,6 +139,88 @@ namespace
 		g_pTransform->version = OCMenuTransform::VERSION;
 		g_pTransform->updateCounter = 0;
 		SKSE::log::info("Shared memory created: Local\\OpenCompositeMenuTransform ({} bytes)", sizeof(OCMenuTransform));
+	}
+
+	void CreateRenderTargetBridge()
+	{
+		// Create shared memory section
+		g_hBridgeMapFile = CreateFileMappingW(
+			INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+			0, sizeof(OCRenderTargetBridge), L"Local\\OpenCompositeRenderTargets");
+
+		if (!g_hBridgeMapFile) {
+			SKSE::log::error("RT Bridge: Failed to create shared memory (error: {})", GetLastError());
+			return;
+		}
+
+		g_pBridge = static_cast<OCRenderTargetBridge*>(
+			MapViewOfFile(g_hBridgeMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(OCRenderTargetBridge)));
+
+		if (!g_pBridge) {
+			SKSE::log::error("RT Bridge: Failed to map shared memory (error: {})", GetLastError());
+			CloseHandle(g_hBridgeMapFile);
+			g_hBridgeMapFile = nullptr;
+			return;
+		}
+
+		memset(g_pBridge, 0, sizeof(OCRenderTargetBridge));
+		g_pBridge->magic = OCRenderTargetBridge::MAGIC;
+		g_pBridge->version = OCRenderTargetBridge::VERSION;
+		g_pBridge->status = 0; // Not ready yet
+
+		// Access renderer to get render target pointers
+		auto renderer = RE::BSGraphics::Renderer::GetSingleton();
+		if (!renderer) {
+			SKSE::log::error("RT Bridge: Renderer singleton not available");
+			g_pBridge->status = 2;
+			return;
+		}
+
+		auto& runtimeData = renderer->GetRuntimeData();
+
+		// Motion vector render target (enum index 7 = kMOTION_VECTOR)
+		auto& mvRT = runtimeData.renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR];
+		if (!mvRT.texture) {
+			SKSE::log::error("RT Bridge: kMOTION_VECTOR texture is null");
+			g_pBridge->status = 2;
+			return;
+		}
+
+		g_pBridge->mvTexture = reinterpret_cast<uint64_t>(mvRT.texture);
+		g_pBridge->mvSRV     = reinterpret_cast<uint64_t>(mvRT.SRV);
+		g_pBridge->mvUAV     = reinterpret_cast<uint64_t>(mvRT.UAV);
+
+		SKSE::log::info("RT Bridge: kMOTION_VECTOR texture={:p} SRV={:p} UAV={:p}",
+			static_cast<void*>(mvRT.texture),
+			static_cast<void*>(mvRT.SRV),
+			static_cast<void*>(mvRT.UAV));
+
+		// Depth buffer
+		auto& depthData = renderer->GetDepthStencilData();
+		auto& mainDepth = depthData.depthStencils[RE::RENDER_TARGET_DEPTHSTENCIL::kMAIN];
+		if (!mainDepth.texture) {
+			SKSE::log::warn("RT Bridge: kMAIN depth texture is null (MV still available)");
+		} else {
+			g_pBridge->depthTexture = reinterpret_cast<uint64_t>(mainDepth.texture);
+			g_pBridge->depthSRV     = reinterpret_cast<uint64_t>(mainDepth.depthSRV);
+
+			SKSE::log::info("RT Bridge: Depth texture={:p} SRV={:p}",
+				static_cast<void*>(mainDepth.texture),
+				static_cast<void*>(mainDepth.depthSRV));
+		}
+
+		// D3D11 device and context (for receiver to validate same device)
+		g_pBridge->d3dDevice  = reinterpret_cast<uint64_t>(runtimeData.forwarder);
+		g_pBridge->d3dContext = reinterpret_cast<uint64_t>(runtimeData.context);
+
+		SKSE::log::info("RT Bridge: Device={:p} Context={:p}",
+			reinterpret_cast<void*>(runtimeData.forwarder),
+			reinterpret_cast<void*>(runtimeData.context));
+
+		// Mark as ready
+		g_pBridge->status = 1;
+		SKSE::log::info("RT Bridge: Ready — shared memory Local\\OpenCompositeRenderTargets ({} bytes)",
+			sizeof(OCRenderTargetBridge));
 	}
 
 	// Forward declaration — defined after g_activeTrackedMenus
@@ -719,6 +838,7 @@ namespace
 			InstallWndProcHook();
 			InstallVirtualKeyboardHook();
 			CreateSharedMemory();
+			CreateRenderTargetBridge();
 
 			// Register menu state watcher for MCM laser pointer system
 			if (auto ui = RE::UI::GetSingleton()) {
@@ -761,8 +881,9 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	SKSE::Init(a_skse);
 	SetupLogging();
 
-	SKSE::log::info("OpenCompositeInput v3.1.0 loaded");
+	SKSE::log::info("OpenCompositeInput v3.2.0 loaded");
 	SKSE::log::info("  VR keyboard bridge + Scaleform char injection + menu state tracking");
+	SKSE::log::info("  + Render target bridge (MV + depth) for FSR 2/3 integration");
 	SKSE::log::info("  [EXPERIMENTAL laser mouse injection DISABLED — Sovngarde bug]");
 
 	auto messaging = SKSE::GetMessagingInterface();

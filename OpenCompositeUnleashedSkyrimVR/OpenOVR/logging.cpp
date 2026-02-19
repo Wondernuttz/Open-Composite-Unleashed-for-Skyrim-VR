@@ -166,7 +166,7 @@ void oovr_log_raw(const char* file, long line, const char* func, const char* msg
 		stream.open(outputFilePath.c_str(), std::ios::out | std::ios::trunc);
 	}
 
-	stream << "[" << format_time() << "] " << func << ":" << line << "\t- " << (msg ? msg : "NULL") << std::endl;
+	stream << "[" << format_time() << "] " << func << ":" << line << "\t- " << (msg ? msg : "NULL") << '\n';
 
 	// Write it to stdout
 	// TODO on Windows, write it into the debug log
@@ -174,7 +174,18 @@ void oovr_log_raw(const char* file, long line, const char* func, const char* msg
 	printf("[OC] %s:%ld \t %s\n", func, line, msg);
 #endif
 
-	// Do we need to close the stream or something? What about multiple threads?
+	stream.flush();
+#endif
+}
+
+// Called from DLL_PROCESS_DETACH to flush and close the log stream
+void oovr_log_shutdown()
+{
+#ifndef ANDROID
+	if (stream.is_open()) {
+		stream.flush();
+		stream.close();
+	}
 #endif
 }
 

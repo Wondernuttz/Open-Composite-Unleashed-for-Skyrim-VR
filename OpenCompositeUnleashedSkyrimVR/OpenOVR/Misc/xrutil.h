@@ -49,6 +49,21 @@ public:
 	XrSystemProperties systemProperties = { XR_TYPE_SYSTEM_PROPERTIES };
 	XrSystemHandTrackingPropertiesEXT handTrackingProperties = { XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT };
 
+	// --- Pose latching (prevents xrLocateViews refinement drift within a frame) ---
+	// Latched once per frame in WaitForTrackingData(), consumed by XrHMD methods,
+	// cleared in SubmitFrames(). Prevents the runtime from returning refined poses
+	// mid-frame that don't match what the game actually rendered with.
+	bool viewsLatched = false;
+	XrView latchedViews[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };             // in tracking space (fov + pose)
+	XrViewStateFlags latchedViewStateFlags = 0;
+
+	// View-space views (for eye-to-head transforms and IPD) — latched LAZILY on first
+	// demand, NOT eagerly in WaitForTrackingData. A second xrLocateViews call on the
+	// critical frame-start path adds variable latency that disrupts VDXR frame pacing.
+	bool viewSpaceViewsLatched = false;
+	XrView latchedViewSpaceViews[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+	XrViewStateFlags latchedViewSpaceFlags = 0;
+
 	// Set by XrBackend
 	XrTime nextPredictedFrameTime = 1;
 

@@ -27,3 +27,6 @@ RES_O_CTRL_Q3_LEFT	RES_T_OBJ	"../assets/Quest3_Left.obj"
 RES_O_CTRL_Q3_RIGHT	RES_T_OBJ	"../assets/Quest3_Right.obj"
 RES_O_CTRL_Q3_LEFT	RES_T_PNG	"../assets/Quest3_Left.png"
 RES_O_CTRL_Q3_RIGHT	RES_T_PNG	"../assets/Quest3_Right.png"
+
+RES_O_FFX_A		RES_T_HLSL	"Compositor/fsr/ffx_a.h"
+RES_O_FFX_FSR1		RES_T_HLSL	"Compositor/fsr/ffx_fsr1.h"

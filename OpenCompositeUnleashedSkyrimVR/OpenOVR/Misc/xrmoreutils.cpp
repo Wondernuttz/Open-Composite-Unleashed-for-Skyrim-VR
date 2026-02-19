@@ -72,59 +72,55 @@ void xr_utils::PoseFromSpace(vr::TrackedDevicePose_t* pose, XrSpace space, vr::E
 		mat = mat * extraTransform.value();
 
 		if (oovr_global_configuration.EnableControllerSmoothing()) {
-			// Initialization and time computations
+			// Time computation — single map lookup via iterator
 			static std::map<int, long long> previousTimes;
 			long long currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
-			// OOVR_LOGF("currentTime %d", currentTime);
-
-			if (previousTimes[device] && currentTime - previousTimes[device] > 3) {
-				dt = (currentTime - previousTimes[device]) / 1000.0;
+			auto timeIt = previousTimes.find(device);
+			if (timeIt != previousTimes.end() && currentTime - timeIt->second > 3) {
+				dt = (currentTime - timeIt->second) / 1000.0;
+				timeIt->second = currentTime;
+			} else if (timeIt == previousTimes.end()) {
+				previousTimes.emplace(device, currentTime);
+			} else {
+				timeIt->second = currentTime;
 			}
-
-			previousTimes[device] = currentTime;
 
 			if (dt) {
 				float rate = 1.0 / dt;
-				// OOVR_LOGF("dt: %f rate: %f", dt, rate);
 
 				glm::vec3 position = glm::vec3(mat[3]);
 				glm::vec3 velocityVec(velocity.linearVelocity.x, velocity.linearVelocity.y, velocity.linearVelocity.z);
 				glm::vec3 angularVelocityVec(velocity.angularVelocity.x, velocity.angularVelocity.y, velocity.angularVelocity.z);
 
-				// Get the current rotation as a quaternion
 				glm::quat currentRotation = glm::quat_cast(mat);
 
-				if (posFilters.find(device) == posFilters.end()) {
-					posFilters[device] = OneEuroFilterPosition(rate, oovr_global_configuration.PosSmoothMinCutoff(), oovr_global_configuration.PosSmoothBeta(), 1);
+				// Position filter — single lookup via iterator
+				auto posIt = posFilters.find(device);
+				if (posIt == posFilters.end()) {
+					posIt = posFilters.emplace(device, OneEuroFilterPosition(rate, oovr_global_configuration.PosSmoothMinCutoff(), oovr_global_configuration.PosSmoothBeta(), 1)).first;
 				} else {
-					posFilters[device].setFreq(rate);
+					posIt->second.setFreq(rate);
+				}
+				position = posIt->second.filter(position, velocityVec);
+
+				// Rotation filter — single lookup via iterator
+				auto rotIt = rotationFilters.find(device);
+				if (rotIt == rotationFilters.end()) {
+					rotIt = rotationFilters.emplace(device, OneEuroFilterRotation(rate, oovr_global_configuration.RotSmoothMinCutoff(), oovr_global_configuration.RotSmoothBeta(), 1)).first;
+				} else {
+					rotIt->second.setFreq(rate);
 				}
 
-				position = posFilters[device].filter(position, velocityVec);
-
-				if (rotationFilters.find(device) == rotationFilters.end()) {
-					rotationFilters[device] = OneEuroFilterRotation(rate, oovr_global_configuration.RotSmoothMinCutoff(), oovr_global_configuration.RotSmoothBeta(), 1);
-				} else {
-					rotationFilters[device].setFreq(rate);
-				}
-
-				// Convert glm::quat to Quaternion
 				Quaternion tempQuat = toQuaternion(currentRotation);
+				Quaternion filteredQuat = rotIt->second.filter(tempQuat, angularVelocityVec.x, angularVelocityVec.y, angularVelocityVec.z);
 
-				// Apply the filter on the converted Quaternion
-				Quaternion filteredQuat = rotationFilters[device].filter(tempQuat, angularVelocityVec.x, angularVelocityVec.y, angularVelocityVec.z);
-
-				// Convert the filtered Quaternion back to glm::quat
-				currentRotation = toGLMQuat(filteredQuat);
-
-				// Normalize the quaternion to ensure it's a valid rotation
-				currentRotation = glm::normalize(currentRotation);
+				currentRotation = glm::normalize(toGLMQuat(filteredQuat));
 
 				glm::mat4 rotMat = glm::mat4_cast(currentRotation);
 				glm::mat4 transMat = glm::translate(glm::mat4(1.0f), position);
 
-				mat = transMat * rotMat; //
+				mat = transMat * rotMat;
 			}
 		}
 	}

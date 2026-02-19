@@ -18,6 +18,7 @@
 #include "Misc/lodepng.h"
 
 #include <cmath>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -732,8 +733,18 @@ VRKeyboard::VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength
 	if (!cmp)
 		OOVR_ABORT("Keyboard: Compositor must be active!");
 
-	if (!dev)
-		OOVR_ABORT("Keyboard currently only works on DX11, and game must have submitted at least a single frame");
+	// Validate the D3D device pointer rigorously.
+	// We've seen crashes with dev=0xF (dangling/corrupt pointer) even when callers
+	// checked the pointer value beforehand — likely a COM use-after-free race.
+	if (!dev || reinterpret_cast<uintptr_t>(dev) <= 0xFFFF) {
+		OOVR_LOGF("VRKeyboard: invalid device pointer 0x%llX — aborting keyboard creation",
+		    (unsigned long long)reinterpret_cast<uintptr_t>(dev));
+		throw std::runtime_error("VRKeyboard: invalid D3D11 device pointer");
+	}
+
+	// AddRef the device to prevent COM use-after-free. The compositor may release
+	// its device reference on another thread; holding our own ref keeps it alive.
+	dev->AddRef();
 
 	if (inputMode == EGamepadTextInputMode::k_EGamepadTextInputModePassword)
 		OOVR_ABORT("Password input mode not yet supported!");
@@ -846,7 +857,7 @@ VRKeyboard::VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength
 		OOVR_LOGF("Parchment bg loaded: %ux%u (%zu bytes)", parchmentW, parchmentH, parchmentBg.size());
 	}
 
-	// Create laser beam swapchains — tiny solid-color textures, one per hand
+	// Create laser beam swapchains — tiny solid-color textures, one per hand.
 	for (int i = 0; i < 2; i++) {
 		XrSwapchainCreateInfo laserSci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
 		laserSci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
@@ -907,7 +918,7 @@ VRKeyboard::VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength
 		laserLayer[i].subImage.imageArrayIndex = 0;
 	}
 
-	// Create target dot swapchains — small white dots (2 controllers + 1 headset)
+	// Create target dot swapchains — small white dots (2 controllers + 1 headset).
 	for (int i = 0; i < 3; i++) {
 		XrSwapchainCreateInfo dotSci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
 		dotSci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
@@ -990,7 +1001,10 @@ VRKeyboard::VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength
 		consoleSwapImages.resize(conImgCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
 		OOVR_FAILED_XR_ABORT(xrEnumerateSwapchainImages(consoleChain, conImgCount, &conImgCount,
 		    (XrSwapchainImageBaseHeader*)consoleSwapImages.data()));
+	}
 
+	// Console layer struct
+	{
 		memset(&consoleLayer, 0, sizeof(consoleLayer));
 		consoleLayer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
 		consoleLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -1040,6 +1054,8 @@ VRKeyboard::~VRKeyboard()
 	}
 	if (ctx)
 		ctx->Release();
+	if (dev)
+		dev->Release();
 
 #ifdef _WIN32
 	// Clear OC_KB_ACTIVE so SKSE stops suppressing WM_CHAR
@@ -2126,6 +2142,8 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 				// [T] key — toggle target mode (show dots from controllers and headset)
 				s_targetMode = !s_targetMode;
 				OOVR_LOGF("Target mode: %s", s_targetMode ? "ON" : "OFF");
+			} else if (ch == '\x1D') {
+				SendSingleVK(VK_END);
 			} else if (ch == '\x0E') {
 				// ESC — send to SkyUI/menus to cancel text input (does NOT close keyboard)
 				SendSingleVK(VK_ESCAPE);

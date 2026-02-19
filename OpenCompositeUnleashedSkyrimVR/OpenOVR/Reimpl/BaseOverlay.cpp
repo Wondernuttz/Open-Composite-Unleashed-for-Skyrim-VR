@@ -71,6 +71,20 @@ static HANDLE           s_hMapFile = nullptr;
 static OCMenuTransform* s_pTransform = nullptr;
 static bool             s_sharedMemTried = false;
 
+// Called from DLL_PROCESS_DETACH to release shared memory mapping
+void CleanupOverlaySharedMemory()
+{
+	if (s_pTransform) {
+		UnmapViewOfFile(s_pTransform);
+		s_pTransform = nullptr;
+	}
+	if (s_hMapFile) {
+		CloseHandle(s_hMapFile);
+		s_hMapFile = nullptr;
+	}
+	s_sharedMemTried = false;
+}
+
 static void OpenSharedMemory()
 {
 	if (s_pTransform) // Already connected
@@ -491,6 +505,7 @@ public:
 	bool highQuality = false;
 	uint64_t flags = 0;
 	float texelAspect = 1;
+	uint32_t sortOrder = 0; // Higher values render on top of lower values
 	std::queue<VREvent_t> eventQueue;
 	std::mutex eventMutex; // protects eventQueue (written from main thread, read by SkyUI bg thread)
 
@@ -545,6 +560,29 @@ BaseOverlay::~BaseOverlay()
 	}
 }
 
+// Helper — find the main visible window for our process (used by Prisma text-input detection).
+#ifdef _WIN32
+static BOOL CALLBACK FindVisibleWindowForPID(HWND hwnd, LPARAM lParam) {
+	DWORD pid;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd)) {
+		*reinterpret_cast<HWND*>(lParam) = hwnd;
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static HWND GetGameWindowLocal() {
+	static HWND cached = nullptr;
+	if (cached && IsWindow(cached))
+		return cached;
+	HWND found = nullptr;
+	EnumWindows(FindVisibleWindowForPID, reinterpret_cast<LPARAM>(&found));
+	cached = found;
+	return cached;
+}
+#endif
+
 // SEH helper — reads ControlMap::textEntryCount safely.
 // Must be a standalone function (no C++ objects with destructors) for __try/__except.
 #ifdef _WIN32
@@ -567,6 +605,44 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 	layerHeaders.clear();
 	if (sceneLayer)
 		layerHeaders.push_back(sceneLayer);
+
+	// [KB-DIAG] Periodic device health check — only log once when corruption is detected
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	{
+		static bool s_deviceCorruptionLogged = false;
+		if (BaseCompositor::dxcomp && !s_deviceCorruptionLogged) {
+			ID3D11Device* checkDev = BaseCompositor::dxcomp->GetDevice();
+			if (reinterpret_cast<uintptr_t>(checkDev) <= 0xFFFF) {
+				OOVR_LOGF("[KB-DIAG] *** DEVICE CORRUPTION DETECTED *** dxcomp=0x%llX GetDevice()=0x%llX frame=%llu",
+				    (unsigned long long)(uintptr_t)BaseCompositor::dxcomp,
+				    (unsigned long long)(uintptr_t)checkDev,
+				    (unsigned long long)GetTickCount64());
+				s_deviceCorruptionLogged = true;
+			}
+		}
+	}
+
+	// D3D11 state hygiene: wipe all pipeline bindings so OC starts from a known-good state.
+	// The game, Prisma, and other hooks all share one ID3D11DeviceContext and none save/restore
+	// state. Without this, OC inherits stale shaders, blend states, and render targets — causing
+	// audio crackling, occasional frame stutters, and rendering glitches.
+	// ClearState() is CPU-only (microseconds). No GPU sync penalty.
+	{
+		static ID3D11DeviceContext* s_cachedCtx = nullptr;
+		static ID3D11Device* s_cachedDev = nullptr;
+		ID3D11Device* dev = BaseCompositor::dxcomp->GetDevice();
+		if (dev && reinterpret_cast<uintptr_t>(dev) > 0xFFFF) {
+			if (dev != s_cachedDev) {
+				if (s_cachedCtx) s_cachedCtx->Release();
+				s_cachedCtx = nullptr;
+				dev->GetImmediateContext(&s_cachedCtx);
+				s_cachedDev = dev;
+			}
+			if (s_cachedCtx)
+				s_cachedCtx->ClearState();
+		}
+	}
+#endif
 
 	// Controller shortcut to open a SendInput-only keyboard (configurable via opencomposite.ini)
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
@@ -608,19 +684,19 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 	if (!keyboard && s_shortcutEnabled && BaseCompositor::dxcomp) {
 		BaseSystem* sys = GetUnsafeBaseSystem();
 		if (sys) {
-			const std::string& btnName = s_shortcutButton;
 			const std::string& modeName = s_shortcutMode;
 			int timing = s_shortcutTiming;
 
-			// Parse button combo string (e.g. "left_grip+right_grip" or "left_stick")
-			// Each token maps to a controller index (0=left, 1=right) and a button mask.
+			// Cached parsed button combo — only re-parse when s_shortcutButton changes
 			struct BtnReq { int ctrl; uint64_t mask; };
-			std::vector<BtnReq> requirements;
-			{
-				std::istringstream ss(btnName);
+			static std::vector<BtnReq> requirements;
+			static std::string s_cachedBtnName;
+			if (s_cachedBtnName != s_shortcutButton) {
+				s_cachedBtnName = s_shortcutButton;
+				requirements.clear();
+				std::istringstream ss(s_shortcutButton);
 				std::string token;
 				while (std::getline(ss, token, '+')) {
-					// trim whitespace
 					while (!token.empty() && token.front() == ' ') token.erase(token.begin());
 					while (!token.empty() && token.back() == ' ') token.pop_back();
 					if (token.empty()) continue;
@@ -633,7 +709,6 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 					else if (token == "b")            { ci = 1; bm = ButtonMaskFromId(k_EButton_ApplicationMenu); }
 					else if (token == "x")            { ci = 0; bm = ButtonMaskFromId(k_EButton_A); }
 					else if (token == "y")            { ci = 0; bm = ButtonMaskFromId(k_EButton_ApplicationMenu); }
-					// Grip buttons reserved for "Exit Keyboard", triggers reserved for laser click — skip both
 					else if (token == "left_grip" || token == "right_grip" || token == "both_grips") { continue; }
 					else if (token == "left_trigger" || token == "right_trigger") { continue; }
 					if (bm != 0)
@@ -719,16 +794,43 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 				}
 
 				if (activate) {
-					VRKeyboard::eventDispatch_t dispatch = [](VREvent_t ev) {
-						BaseSystem* sys = GetUnsafeBaseSystem();
-						if (sys) {
-							sys->_EnqueueEvent(ev);
+					// Clear any dirty D3D11 pipeline state left by overlay rendering (PrismaUI etc.)
+					if (BaseCompositor::dxcomp) {
+						ID3D11Device* clearDev = BaseCompositor::dxcomp->GetDevice();
+						if (clearDev && reinterpret_cast<uintptr_t>(clearDev) > 0xFFFF) {
+							ID3D11DeviceContext* clearCtx = nullptr;
+							clearDev->GetImmediateContext(&clearCtx);
+							if (clearCtx) {
+								clearCtx->ClearState();
+								clearCtx->Flush();
+								clearCtx->Release();
+								OOVR_LOG("[KB-DIAG] ClearState()+Flush() before shortcut keyboard");
+							}
 						}
-					};
-					keyboard = make_unique<VRKeyboard>(
-					    BaseCompositor::dxcomp->GetDevice(), 0, 256, false, dispatch,
-					    VRKeyboard::EGamepadTextInputMode::k_EGamepadTextInputModeNormal);
-					keyboard->SetSendInputOnly(true);
+					}
+					ID3D11Device* kbDev = BaseCompositor::dxcomp ? BaseCompositor::dxcomp->GetDevice() : nullptr;
+					OOVR_LOGF("[KB-DIAG] shortcut: dxcomp=0x%llX GetDevice()=0x%llX",
+					    (unsigned long long)(uintptr_t)BaseCompositor::dxcomp,
+					    (unsigned long long)(uintptr_t)kbDev);
+					if (kbDev && reinterpret_cast<uintptr_t>(kbDev) > 0xFFFF) {
+						try {
+							VRKeyboard::eventDispatch_t dispatch = [](VREvent_t ev) {
+								BaseSystem* sys = GetUnsafeBaseSystem();
+								if (sys) {
+									sys->_EnqueueEvent(ev);
+								}
+							};
+							keyboard = make_unique<VRKeyboard>(
+							    kbDev, 0, 256, false, dispatch,
+							    VRKeyboard::EGamepadTextInputMode::k_EGamepadTextInputModeNormal);
+							keyboard->SetSendInputOnly(true);
+						} catch (const std::exception& e) {
+							OOVR_LOGF("Keyboard creation failed (shortcut): %s", e.what());
+							keyboard.reset();
+						}
+					} else {
+						OOVR_LOG("Keyboard activation skipped - D3D device unavailable");
+					}
 					shortcutTapCount = 0;
 					shortcutHoldStart = 0;
 				}
@@ -778,21 +880,62 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 			// Safe memory read helper (SEH can't be in functions with C++ destructors)
 			int8_t textEntryCount = ReadTextEntryCount(gameBase);
 			bool textInputActive = textEntryCount > 0;
+			bool prismaTextInput = false;
+
+			// Prisma UI VR bridge: check if a Prisma text input has focus.
+			// PrismaVR sets this window property when document.activeElement
+			// is an <input>/<textarea>/contentEditable in a Prisma HTML panel.
+			if (!textInputActive) {
+				HWND hwnd = GetGameWindowLocal();
+				if (hwnd && GetPropW(hwnd, L"OC_PRISMA_TEXT")) {
+					textInputActive = true;
+					prismaTextInput = true;
+				}
+			}
 
 			// Transition: text input just became active — auto-open keyboard
 			if (textInputActive && !textInputWasActive && !keyboard) {
 				OOVR_LOGF("TextInput auto-detect: textEntryCount=%d, opening VR keyboard", textEntryCount);
+				// Clear any dirty D3D11 pipeline state left by overlay rendering (PrismaUI etc.)
+				{
+					ID3D11Device* clearDev2 = BaseCompositor::dxcomp->GetDevice();
+					if (clearDev2 && reinterpret_cast<uintptr_t>(clearDev2) > 0xFFFF) {
+						ID3D11DeviceContext* clearCtx2 = nullptr;
+						clearDev2->GetImmediateContext(&clearCtx2);
+						if (clearCtx2) {
+							clearCtx2->ClearState();
+							clearCtx2->Flush();
+							clearCtx2->Release();
+							OOVR_LOG("[KB-DIAG] ClearState()+Flush() before auto-detect keyboard");
+						}
+					}
+				}
 				VRKeyboard::eventDispatch_t dispatch = [](VREvent_t ev) {
 					BaseSystem* sys = GetUnsafeBaseSystem();
 					if (sys) {
 						sys->_EnqueueEvent(ev);
 					}
 				};
-				keyboard = make_unique<VRKeyboard>(
-				    BaseCompositor::dxcomp->GetDevice(), 0, 256, false, dispatch,
-				    VRKeyboard::EGamepadTextInputMode::k_EGamepadTextInputModeNormal);
-				keyboard->SetSendInputOnly(true);
-				autoOpenedKeyboard = true;
+				ID3D11Device* kbDev2 = BaseCompositor::dxcomp->GetDevice();
+				OOVR_LOGF("[KB-DIAG] auto-detect: dxcomp=0x%llX GetDevice()=0x%llX",
+				    (unsigned long long)(uintptr_t)BaseCompositor::dxcomp,
+				    (unsigned long long)(uintptr_t)kbDev2);
+				if (kbDev2 && reinterpret_cast<uintptr_t>(kbDev2) > 0xFFFF) {
+					try {
+						keyboard = make_unique<VRKeyboard>(
+						    kbDev2, 0, 256, false, dispatch,
+						    VRKeyboard::EGamepadTextInputMode::k_EGamepadTextInputModeNormal);
+						// Prisma text inputs → VR MODE (no scancodes, no game hotkeys)
+						// Game text inputs   → PC MODE (scancodes for DirectInput/MCM)
+						keyboard->SetSendInputOnly(!prismaTextInput);
+						autoOpenedKeyboard = true;
+					} catch (const std::exception& e) {
+						OOVR_LOGF("Keyboard creation failed (auto-detect): %s", e.what());
+						keyboard.reset();
+					}
+				} else {
+					OOVR_LOG("Auto keyboard skipped - D3D device unavailable");
+				}
 			}
 
 			// Transition: text input ended while we auto-opened — close keyboard
@@ -984,9 +1127,10 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 			// Create menu laser system on first detection
 			static bool s_feedbackWritten = false;
 
-			if (!menuLaser && BaseCompositor::dxcomp) {
+			ID3D11Device* laserDev = BaseCompositor::dxcomp ? BaseCompositor::dxcomp->GetDevice() : nullptr;
+			if (!menuLaser && laserDev && reinterpret_cast<uintptr_t>(laserDev) > 0xFFFF) {
 				OOVR_LOG("Creating VRMenuLaser system");
-				menuLaser = std::make_unique<VRMenuLaser>(BaseCompositor::dxcomp->GetDevice());
+				menuLaser = std::make_unique<VRMenuLaser>(laserDev);
 				s_mqHasAnchor = false; // Re-anchor from current head on menu reopen
 				s_feedbackWritten = false; // Write feedback on first anchored frame
 
@@ -1352,45 +1496,75 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 		goto done;
 	}
 
-	for (const auto& kv : overlays) {
-		if (kv.second) {
-			OverlayData& overlay = *kv.second;
-
-			// Skip hiddden overlays, and those without a valid texture (eg, after calling ClearOverlayTexture).
-			if (!overlay.visible || overlay.texture.handle == nullptr)
-				continue;
-
-			// Quick hack to get around Boneworks creating overlays and setting them to an opacity of
-			// zero to hide them. Leave 1% of margin in case of weird float issues.
-			// if (overlay.colour.a < 0.01)
-			//	continue;
-
-			if ((uint64_t)overlay.layerQuad.subImage.swapchain == 0) {
-				continue;
+	{ // Scope block to avoid goto-past-initialization errors
+		// Collect visible overlays, then sort by sortOrder so higher values render on top.
+		std::vector<OverlayData*> sortedOverlays;
+		for (const auto& kv : overlays) {
+			if (kv.second) {
+				OverlayData& overlay = *kv.second;
+				if (!overlay.visible || overlay.texture.handle == nullptr)
+					continue;
+				if ((uint64_t)overlay.layerQuad.subImage.swapchain == 0)
+					continue;
+				const XrRect2Di& srcSize = overlay.layerQuad.subImage.imageRect;
+				if (srcSize.extent.height <= 8 && srcSize.extent.width <= 8)
+					continue;
+				sortedOverlays.push_back(&overlay);
 			}
+		}
+		std::sort(sortedOverlays.begin(), sortedOverlays.end(),
+			[](const OverlayData* a, const OverlayData* b) { return a->sortOrder < b->sortOrder; });
 
-			const XrRect2Di& srcSize = overlay.layerQuad.subImage.imageRect;
-			if (srcSize.extent.height <= 8 && srcSize.extent.width <= 8) {
-				// Hack for F1 22 which creates a low res texture to fade between scenes
-				// but ends up just leaving a black square that takes up half the screen.
-				continue;
-			}
+		for (OverlayData* overlayPtr : sortedOverlays) {
+			OverlayData& overlay = *overlayPtr;
 
 			// Calculate the texture's aspect ratio
+			const XrRect2Di& srcSize = overlay.layerQuad.subImage.imageRect;
 			const float aspect = srcSize.extent.height > 0 ? (float)srcSize.extent.width / (float)srcSize.extent.height : 1.0f;
-			// ... and use that to set the size of the overlay, as it will appear to the user
-			// Note we shouldn't do this when setting the texture, as the user may change the width of
-			//  the overlay without changing the texture.
-			overlay.layerQuad.size.width = overlay.widthMeters * overlay.overlayTransform[0][0];
-			overlay.layerQuad.size.height = overlay.widthMeters * overlay.overlayTransform[1][1] / aspect;
+			overlay.layerQuad.size.width = overlay.widthMeters;
+			overlay.layerQuad.size.height = overlay.widthMeters / aspect;
 
-			// Finally, add it to the list of layers to be sent to LibOVR
-			overlay.layerQuad.pose = { { 0.f, 0.f, 0.f, 1.f },
-				{ overlay.overlayTransform[0][3], overlay.overlayTransform[1][3], overlay.overlayTransform[2][3] } };
+			// Extract position + rotation from the overlay transform.
+			// overlayTransform is stored via S2O_om44 which copies HmdMatrix34_t
+			// without transposing: overlayTransform[y][x] = hmd.m[y][x].
+			// Since GLM is column-major, this means the data is transposed from
+			// GLM's perspective. We extract values treating [y][x] as row y, col x.
+			const auto& M = overlay.overlayTransform;
+			overlay.layerQuad.pose.position = { M[0][3], M[1][3], M[2][3] };
+
+			// Quaternion from rotation matrix (Shepperd method, row-major access)
+			float trace = M[0][0] + M[1][1] + M[2][2];
+			XrQuaternionf q;
+			if (trace > 0.0f) {
+				float s = sqrtf(trace + 1.0f) * 2.0f;
+				q.w = 0.25f * s;
+				q.x = (M[2][1] - M[1][2]) / s;
+				q.y = (M[0][2] - M[2][0]) / s;
+				q.z = (M[1][0] - M[0][1]) / s;
+			} else if (M[0][0] > M[1][1] && M[0][0] > M[2][2]) {
+				float s = sqrtf(1.0f + M[0][0] - M[1][1] - M[2][2]) * 2.0f;
+				q.w = (M[2][1] - M[1][2]) / s;
+				q.x = 0.25f * s;
+				q.y = (M[0][1] + M[1][0]) / s;
+				q.z = (M[0][2] + M[2][0]) / s;
+			} else if (M[1][1] > M[2][2]) {
+				float s = sqrtf(1.0f + M[1][1] - M[0][0] - M[2][2]) * 2.0f;
+				q.w = (M[0][2] - M[2][0]) / s;
+				q.x = (M[0][1] + M[1][0]) / s;
+				q.y = 0.25f * s;
+				q.z = (M[1][2] + M[2][1]) / s;
+			} else {
+				float s = sqrtf(1.0f + M[2][2] - M[0][0] - M[1][1]) * 2.0f;
+				q.w = (M[1][0] - M[0][1]) / s;
+				q.x = (M[0][2] + M[2][0]) / s;
+				q.y = (M[1][2] + M[2][1]) / s;
+				q.z = 0.25f * s;
+			}
+			overlay.layerQuad.pose.orientation = q;
 
 			layerHeaders.push_back((XrCompositionLayerBaseHeader*)&overlay.layerQuad);
 		}
-	}
+	} // end sort-order scope
 
 done:
 	layers = layerHeaders.data();
@@ -1436,9 +1610,36 @@ EVROverlayError BaseOverlay::DestroyOverlay(VROverlayHandle_t ulOverlayHandle)
 	if (highQualityOverlay == ulOverlayHandle)
 		highQualityOverlay = vr::k_ulOverlayHandleInvalid;
 
+	// [KB-DIAG] Check dxcomp health BEFORE overlay destruction
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	{
+		ID3D11Device* preDeviceCheck = BaseCompositor::dxcomp ? BaseCompositor::dxcomp->GetDevice() : nullptr;
+		OOVR_LOGF("[KB-DIAG] DestroyOverlay BEFORE: key='%s' overlay=0x%llX compositor=0x%llX dxcomp=0x%llX dxcomp->dev=0x%llX",
+		    overlay->key.c_str(),
+		    (unsigned long long)(uintptr_t)overlay,
+		    (unsigned long long)(uintptr_t)overlay->compositor.get(),
+		    (unsigned long long)(uintptr_t)BaseCompositor::dxcomp,
+		    (unsigned long long)(uintptr_t)preDeviceCheck);
+	}
+#endif
+
 	overlays.erase(overlay->key);
 	validOverlays.erase(overlay);
 	delete overlay;
+
+	// [KB-DIAG] Check dxcomp health AFTER overlay destruction
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	{
+		ID3D11Device* postDeviceCheck = BaseCompositor::dxcomp ? BaseCompositor::dxcomp->GetDevice() : nullptr;
+		OOVR_LOGF("[KB-DIAG] DestroyOverlay AFTER: dxcomp=0x%llX dxcomp->dev=0x%llX",
+		    (unsigned long long)(uintptr_t)BaseCompositor::dxcomp,
+		    (unsigned long long)(uintptr_t)postDeviceCheck);
+		if (postDeviceCheck && reinterpret_cast<uintptr_t>(postDeviceCheck) <= 0xFFFF) {
+			OOVR_LOGF("[KB-DIAG] *** CORRUPTION DETECTED IN DestroyOverlay *** dxcomp->dev=0x%llX",
+			    (unsigned long long)(uintptr_t)postDeviceCheck);
+		}
+	}
+#endif
 
 	return VROverlayError_None;
 }
@@ -1639,12 +1840,16 @@ EVROverlayError BaseOverlay::GetOverlayTexelAspect(VROverlayHandle_t ulOverlayHa
 }
 EVROverlayError BaseOverlay::SetOverlaySortOrder(VROverlayHandle_t ulOverlayHandle, uint32_t unSortOrder)
 {
-	// TODO
+	USEH();
+	overlay->sortOrder = unSortOrder;
 	return VROverlayError_None;
 }
 EVROverlayError BaseOverlay::GetOverlaySortOrder(VROverlayHandle_t ulOverlayHandle, uint32_t* punSortOrder)
 {
-	STUBBED();
+	USEH();
+	if (punSortOrder)
+		*punSortOrder = overlay->sortOrder;
+	return VROverlayError_None;
 }
 EVROverlayError BaseOverlay::SetOverlayWidthInMeters(VROverlayHandle_t ulOverlayHandle, float fWidthInMeters)
 {
@@ -1888,15 +2093,241 @@ EVROverlayError BaseOverlay::SetOverlayMouseScale(VROverlayHandle_t ulOverlayHan
 }
 bool BaseOverlay::ComputeOverlayIntersection(VROverlayHandle_t ulOverlayHandle, const OOVR_VROverlayIntersectionParams_t* pParams, OOVR_VROverlayIntersectionResults_t* pResults)
 {
-	STUBBED();
+	USEHB();
+
+	if (!pParams || !pResults)
+		return false;
+
+	// Extract overlay basis vectors and position from the transform matrix.
+	// overlayTransform uses S2O_om44 convention (non-transposing copy from HmdMatrix34_t),
+	// so overlayTransform[glmCol][glmRow] = HMD m[glmCol][glmRow].
+	// In HmdMatrix34_t (row-major), the columns of the rotation part are basis vectors:
+	//   HMD col 0 = right, col 1 = up, col 2 = normal, col 3 = translation.
+	// To extract HMD column C: read overlayTransform[0][C], [1][C], [2][C].
+	const MfMatrix4f& xform = overlay->overlayTransform;
+
+	vec3 right(xform[0][0], xform[1][0], xform[2][0]);
+	vec3 up(xform[0][1], xform[1][1], xform[2][1]);
+	vec3 normal(xform[0][2], xform[1][2], xform[2][2]);
+	vec3 overlayPos(xform[0][3], xform[1][3], xform[2][3]);
+
+	// Normalize basis vectors (should already be unit length, but be safe)
+	float rightLen = glm::length(right);
+	float upLen = glm::length(up);
+	if (rightLen < 1e-6f || upLen < 1e-6f)
+		return false;
+	vec3 rightNorm = right / rightLen;
+	vec3 upNorm = up / upLen;
+	vec3 normalNorm = glm::normalize(normal);
+
+	// Ray parameters
+	vec3 rayOrigin(pParams->vSource.v[0], pParams->vSource.v[1], pParams->vSource.v[2]);
+	vec3 rayDir(pParams->vDirection.v[0], pParams->vDirection.v[1], pParams->vDirection.v[2]);
+
+	// Ray-plane intersection: t = dot(P0 - O, N) / dot(D, N)
+	float denom = glm::dot(rayDir, normalNorm);
+	if (fabsf(denom) < 1e-6f)
+		return false; // Ray parallel to overlay plane
+
+	float t = glm::dot(overlayPos - rayOrigin, normalNorm) / denom;
+	if (t < 0.0f)
+		return false; // Intersection behind the ray origin
+
+	// Hit point in world space
+	vec3 hitPoint = rayOrigin + t * rayDir;
+
+	// Project hit point into overlay local space (distance along each axis)
+	vec3 localOffset = hitPoint - overlayPos;
+	float localX = glm::dot(localOffset, rightNorm);
+	float localY = glm::dot(localOffset, upNorm);
+
+	// Overlay dimensions: width is set directly, height derived from aspect ratio.
+	// mouseScale is typically set to texture dimensions (e.g. {1920, 1080}).
+	float width = overlay->widthMeters;
+	float aspectRatio = (overlay->mouseScale.v[0] > 0.0f)
+		? overlay->mouseScale.v[1] / overlay->mouseScale.v[0]
+		: 1.0f;
+	float height = width * aspectRatio;
+
+	// Convert to UV coordinates [0,1] x [0,1]
+	// OpenVR convention: u=0 left edge, u=1 right edge
+	//                    v=0 top edge (+Y), v=1 bottom edge (-Y)
+	float u = (localX / width) + 0.5f;
+	float v = 0.5f - (localY / height);
+
+	// Check bounds
+	if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f)
+		return false;
+
+	// Fill results
+	pResults->vPoint.v[0] = hitPoint.x;
+	pResults->vPoint.v[1] = hitPoint.y;
+	pResults->vPoint.v[2] = hitPoint.z;
+
+	pResults->vNormal.v[0] = normalNorm.x;
+	pResults->vNormal.v[1] = normalNorm.y;
+	pResults->vNormal.v[2] = normalNorm.z;
+
+	pResults->vUVs.v[0] = u;
+	pResults->vUVs.v[1] = v;
+
+	pResults->fDistance = t;
+
+	return true;
 }
 bool BaseOverlay::HandleControllerOverlayInteractionAsMouse(VROverlayHandle_t ulOverlayHandle, TrackedDeviceIndex_t unControllerDeviceIndex)
 {
-	STUBBED();
+	USEHB();
+
+	// Track previous trigger state per overlay+controller for edge detection
+	struct InteractionState {
+		bool wasTriggerPressed = false;
+		float lastMouseX = 0.0f;
+		float lastMouseY = 0.0f;
+	};
+	static std::map<std::pair<VROverlayHandle_t, TrackedDeviceIndex_t>, InteractionState> s_interactionState;
+
+	auto system = GetBaseSystem();
+	if (!system)
+		return false;
+
+	// Get controller pose
+	TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
+	system->GetDeviceToAbsoluteTrackingPose(TrackingUniverseStanding, 0.0f, poses, vr::k_unMaxTrackedDeviceCount);
+
+	if (unControllerDeviceIndex >= vr::k_unMaxTrackedDeviceCount || !poses[unControllerDeviceIndex].bPoseIsValid)
+		return false;
+
+	const HmdMatrix34_t& poseMat = poses[unControllerDeviceIndex].mDeviceToAbsoluteTracking;
+
+	// Extract controller position (column 3 of the row-major matrix)
+	vec3 controllerPos(poseMat.m[0][3], poseMat.m[1][3], poseMat.m[2][3]);
+
+	// Controller forward direction is -Z in controller local space
+	vec3 controllerFwd(-poseMat.m[0][2], -poseMat.m[1][2], -poseMat.m[2][2]);
+	controllerFwd = glm::normalize(controllerFwd);
+
+	// Build intersection params
+	OOVR_VROverlayIntersectionParams_t params;
+	params.vSource.v[0] = controllerPos.x;
+	params.vSource.v[1] = controllerPos.y;
+	params.vSource.v[2] = controllerPos.z;
+	params.vDirection.v[0] = controllerFwd.x;
+	params.vDirection.v[1] = controllerFwd.y;
+	params.vDirection.v[2] = controllerFwd.z;
+	params.eOrigin = TrackingUniverseStanding;
+
+	OOVR_VROverlayIntersectionResults_t results;
+	bool hit = ComputeOverlayIntersection(ulOverlayHandle, &params, &results);
+
+	auto stateKey = std::make_pair(ulOverlayHandle, unControllerDeviceIndex);
+	auto& state = s_interactionState[stateKey];
+
+	if (hit) {
+		// Convert UV to mouse coordinates using overlay's mouseScale
+		// Mouse events use GL convention: (0,0) = bottom-left
+		float mouseX = results.vUVs.v[0] * overlay->mouseScale.v[0];
+		float mouseY = (1.0f - results.vUVs.v[1]) * overlay->mouseScale.v[1];
+
+		// Generate mouse move event
+		VREvent_t moveEvent = {};
+		moveEvent.eventType = VREvent_MouseMove;
+		moveEvent.trackedDeviceIndex = unControllerDeviceIndex;
+		moveEvent.data.mouse.x = mouseX;
+		moveEvent.data.mouse.y = mouseY;
+		moveEvent.data.mouse.button = 0;
+
+		{
+			std::lock_guard<std::mutex> lock(overlay->eventMutex);
+			overlay->eventQueue.push(moveEvent);
+		}
+
+		// Check trigger state for button events
+		VRControllerState_t controllerState;
+		if (system->GetControllerState(unControllerDeviceIndex, &controllerState, sizeof(controllerState))) {
+			bool triggerPressed = (controllerState.ulButtonPressed & ButtonMaskFromId(k_EButton_SteamVR_Trigger)) != 0;
+
+			if (triggerPressed && !state.wasTriggerPressed) {
+				// Trigger just pressed — mouse button down
+				VREvent_t downEvent = {};
+				downEvent.eventType = VREvent_MouseButtonDown;
+				downEvent.trackedDeviceIndex = unControllerDeviceIndex;
+				downEvent.data.mouse.x = mouseX;
+				downEvent.data.mouse.y = mouseY;
+				downEvent.data.mouse.button = VRMouseButton_Left;
+
+				std::lock_guard<std::mutex> lock(overlay->eventMutex);
+				overlay->eventQueue.push(downEvent);
+			} else if (!triggerPressed && state.wasTriggerPressed) {
+				// Trigger just released — mouse button up
+				VREvent_t upEvent = {};
+				upEvent.eventType = VREvent_MouseButtonUp;
+				upEvent.trackedDeviceIndex = unControllerDeviceIndex;
+				upEvent.data.mouse.x = mouseX;
+				upEvent.data.mouse.y = mouseY;
+				upEvent.data.mouse.button = VRMouseButton_Left;
+
+				std::lock_guard<std::mutex> lock(overlay->eventMutex);
+				overlay->eventQueue.push(upEvent);
+			}
+
+			state.wasTriggerPressed = triggerPressed;
+		}
+
+		state.lastMouseX = mouseX;
+		state.lastMouseY = mouseY;
+	} else {
+		// Not hitting overlay — if trigger was pressed, send button up
+		if (state.wasTriggerPressed) {
+			VREvent_t upEvent = {};
+			upEvent.eventType = VREvent_MouseButtonUp;
+			upEvent.trackedDeviceIndex = unControllerDeviceIndex;
+			upEvent.data.mouse.x = state.lastMouseX;
+			upEvent.data.mouse.y = state.lastMouseY;
+			upEvent.data.mouse.button = VRMouseButton_Left;
+
+			std::lock_guard<std::mutex> lock(overlay->eventMutex);
+			overlay->eventQueue.push(upEvent);
+		}
+		state.wasTriggerPressed = false;
+	}
+
+	return hit;
 }
 bool BaseOverlay::IsHoverTargetOverlay(VROverlayHandle_t ulOverlayHandle)
 {
-	STUBBED();
+	USEHB();
+
+	// Check if either controller is currently pointing at this overlay
+	auto system = GetBaseSystem();
+	if (!system)
+		return false;
+
+	TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
+	system->GetDeviceToAbsoluteTrackingPose(TrackingUniverseStanding, 0.0f, poses, vr::k_unMaxTrackedDeviceCount);
+
+	for (TrackedDeviceIndex_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
+		if (!poses[i].bPoseIsValid)
+			continue;
+		if (system->GetTrackedDeviceClass(i) != TrackedDeviceClass_Controller)
+			continue;
+
+		const HmdMatrix34_t& poseMat = poses[i].mDeviceToAbsoluteTracking;
+		vec3 pos(poseMat.m[0][3], poseMat.m[1][3], poseMat.m[2][3]);
+		vec3 fwd(-poseMat.m[0][2], -poseMat.m[1][2], -poseMat.m[2][2]);
+		fwd = glm::normalize(fwd);
+
+		OOVR_VROverlayIntersectionParams_t params;
+		params.vSource = { pos.x, pos.y, pos.z };
+		params.vDirection = { fwd.x, fwd.y, fwd.z };
+		params.eOrigin = TrackingUniverseStanding;
+
+		OOVR_VROverlayIntersectionResults_t results;
+		if (ComputeOverlayIntersection(ulOverlayHandle, &params, &results))
+			return true;
+	}
+
+	return false;
 }
 VROverlayHandle_t BaseOverlay::GetGamepadFocusOverlay()
 {
@@ -1952,9 +2383,27 @@ EVROverlayError BaseOverlay::SetOverlayTexture(VROverlayHandle_t ulOverlayHandle
 	if (!oovr_global_configuration.EnableLayers() || !BackendManager::Instance().IsGraphicsConfigured())
 		return VROverlayError_None;
 
-	if (!overlay->compositor) {
+	bool creatingNew = !overlay->compositor;
+	if (creatingNew) {
 		overlay->compositor.reset(GetUnsafeBaseCompositor()->CreateCompositorAPI(pTexture));
+		overlay->compositor->isOverlay = true;
 	}
+
+	// [KB-DIAG] Check dxcomp health after overlay compositor creation (only on first call per overlay)
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	if (creatingNew && BaseCompositor::dxcomp) {
+		ID3D11Device* ovlDevCheck = BaseCompositor::dxcomp->GetDevice();
+		OOVR_LOGF("[KB-DIAG] SetOverlayTexture NEW compositor: overlay=0x%llX ovl_comp=0x%llX dxcomp=0x%llX dxcomp->dev=0x%llX",
+		    (unsigned long long)(uintptr_t)overlay,
+		    (unsigned long long)(uintptr_t)overlay->compositor.get(),
+		    (unsigned long long)(uintptr_t)BaseCompositor::dxcomp,
+		    (unsigned long long)(uintptr_t)ovlDevCheck);
+		if (ovlDevCheck && reinterpret_cast<uintptr_t>(ovlDevCheck) <= 0xFFFF) {
+			OOVR_LOGF("[KB-DIAG] *** CORRUPTION DETECTED after overlay compositor creation *** dxcomp->dev=0x%llX",
+			    (unsigned long long)(uintptr_t)ovlDevCheck);
+		}
+	}
+#endif
 
 	overlay->compositor->LoadSubmitContext();
 	auto revertToCallerContext = MakeScopeGuard([&]() {
@@ -2048,10 +2497,38 @@ EVROverlayError BaseOverlay::ShowKeyboardWithDispatch(EGamepadTextInputMode eInp
 	if (eLineInputMode != k_EGamepadTextInputLineModeSingleLine)
 		OOVR_ABORTF("Only single-line keyboard entry mode is currently supported (as opposed to ID=%d)", eLineInputMode);
 
-	keyboard = make_unique<VRKeyboard>(BaseCompositor::dxcomp->GetDevice(), uUserValue, unCharMax, bUseMinimalMode, eventDispatch,
-	    (VRKeyboard::EGamepadTextInputMode)eInputMode);
+	// Clear any dirty D3D11 pipeline state left by overlay rendering (PrismaUI etc.)
+	{
+		ID3D11Device* clearDev3 = BaseCompositor::dxcomp->GetDevice();
+		if (clearDev3 && reinterpret_cast<uintptr_t>(clearDev3) > 0xFFFF) {
+			ID3D11DeviceContext* clearCtx3 = nullptr;
+			clearDev3->GetImmediateContext(&clearCtx3);
+			if (clearCtx3) {
+				clearCtx3->ClearState();
+				clearCtx3->Flush();
+				clearCtx3->Release();
+				OOVR_LOG("[KB-DIAG] ClearState()+Flush() before ShowKeyboard");
+			}
+		}
+	}
 
-	keyboard->contents(VRKeyboard::CHAR_CONV.from_bytes(pchExistingText));
+	ID3D11Device* skDev = BaseCompositor::dxcomp->GetDevice();
+	if (!skDev || reinterpret_cast<uintptr_t>(skDev) <= 0xFFFF) {
+		SubmitPlaceholderKeyboardEvent(VREvent_KeyboardDone, eventDispatch, uUserValue);
+		keyboardCache = "Adventurer";
+		return VROverlayError_None;
+	}
+	try {
+		keyboard = make_unique<VRKeyboard>(skDev, uUserValue, unCharMax, bUseMinimalMode, eventDispatch,
+		    (VRKeyboard::EGamepadTextInputMode)eInputMode);
+		keyboard->contents(VRKeyboard::CHAR_CONV.from_bytes(pchExistingText));
+	} catch (const std::exception& e) {
+		OOVR_LOGF("Keyboard creation failed (ShowKeyboard): %s", e.what());
+		keyboard.reset();
+		SubmitPlaceholderKeyboardEvent(VREvent_KeyboardDone, eventDispatch, uUserValue);
+		keyboardCache = "Adventurer";
+		return VROverlayError_None;
+	}
 #else
 	// No DX11 support — fall back to placeholder
 	SubmitPlaceholderKeyboardEvent(VREvent_KeyboardDone, eventDispatch, uUserValue);
@@ -2091,7 +2568,8 @@ EVROverlayError BaseOverlay::ShowKeyboard(EGamepadTextInputMode eInputMode, EGam
 EVROverlayError BaseOverlay::ShowKeyboard(EGamepadTextInputMode eInputMode, EGamepadTextInputLineMode eLineInputMode, uint32_t unFlags,
     const char* pchDescription, uint32_t unCharMax, const char* pchExistingText, uint64_t uUserValue)
 {
-	STUBBED();
+	bool bUseMinimalMode = (unFlags & 1) != 0;
+	return ShowKeyboard(eInputMode, eLineInputMode, pchDescription, unCharMax, pchExistingText, bUseMinimalMode, uUserValue);
 }
 EVROverlayError BaseOverlay::ShowKeyboardForOverlay(VROverlayHandle_t ulOverlayHandle,
     EGamepadTextInputMode eInputMode, EGamepadTextInputLineMode eLineInputMode,
@@ -2112,7 +2590,15 @@ EVROverlayError BaseOverlay::ShowKeyboardForOverlay(VROverlayHandle_t ulOverlayH
     EGamepadTextInputLineMode eLineInputMode, uint32_t unFlags, const char* pchDescription, uint32_t unCharMax,
     const char* pchExistingText, uint64_t uUserValue)
 {
-	STUBBED();
+	USEH();
+
+	VRKeyboard::eventDispatch_t dispatch = [overlay](VREvent_t ev) {
+		std::lock_guard<std::mutex> lock(overlay->eventMutex);
+		overlay->eventQueue.push(ev);
+	};
+
+	bool bUseMinimalMode = (unFlags & 1) != 0;
+	return ShowKeyboardWithDispatch(eInputMode, eLineInputMode, pchDescription, unCharMax, pchExistingText, bUseMinimalMode, uUserValue, dispatch);
 }
 uint32_t BaseOverlay::GetKeyboardText(char* pchText, uint32_t cchText)
 {
@@ -2133,8 +2619,23 @@ void BaseOverlay::HideKeyboard()
 		OOVR_LOG("HideKeyboard: keyboard already null");
 	}
 
+	// Check device pointer health before and after destruction
+	{
+		ID3D11Device* preDestroyDev = BaseCompositor::dxcomp ? BaseCompositor::dxcomp->GetDevice() : nullptr;
+		OOVR_LOGF("[KB-DIAG] HideKeyboard BEFORE destroy: dxcomp=0x%llX GetDevice()=0x%llX",
+		    (unsigned long long)(uintptr_t)BaseCompositor::dxcomp,
+		    (unsigned long long)(uintptr_t)preDestroyDev);
+	}
+
 	// Delete the keyboard instance
 	keyboard.reset();
+
+	{
+		ID3D11Device* postDestroyDev = BaseCompositor::dxcomp ? BaseCompositor::dxcomp->GetDevice() : nullptr;
+		OOVR_LOGF("[KB-DIAG] HideKeyboard AFTER destroy: dxcomp=0x%llX GetDevice()=0x%llX",
+		    (unsigned long long)(uintptr_t)BaseCompositor::dxcomp,
+		    (unsigned long long)(uintptr_t)postDestroyDev);
+	}
 	OOVR_LOG("HideKeyboard: keyboard instance destroyed");
 }
 void BaseOverlay::SetKeyboardTransformAbsolute(ETrackingUniverseOrigin eTrackingOrigin, const HmdMatrix34_t* pmatTrackingOriginToKeyboardTransform)

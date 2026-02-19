@@ -62,6 +62,7 @@ void oovr_soft_abort_raw(const char* file, long line, const char* func, int* hit
 		}                                                                                          \
 	} while (false)
 
+void oovr_log_shutdown();
 void oovr_message_raw(const char* message, const char* title);
 #define OOVR_MESSAGE(message, title) oovr_message_raw(message, title);
 

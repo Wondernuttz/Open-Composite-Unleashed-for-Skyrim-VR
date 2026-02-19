@@ -49,7 +49,8 @@ void DrvOpenXR::GetXRAppName(char (&appName)[128])
 	std::string exeName = GetExeName();
 	if (exeName.size() > 0) {
 		std::string ocAppName{ "OpenComposite_" };
-		ocAppName.append(exeName);
+		ocAppName += exeName;
+		// Strip .exe so VD can match game profiles but Steam won't auto-launch SteamVR
 		auto pos = ocAppName.find(".exe");
 		if (pos != std::string::npos && pos > 0)
 			ocAppName = ocAppName.substr(0, pos);
@@ -307,9 +308,6 @@ void DrvOpenXR::ShutdownSession()
 			backend->PrepareForSessionShutdown();
 	}
 
-	delete xr_gbl;
-	xr_gbl = nullptr;
-
 	if (currentBackend->sessionActive) {
 		// Hey it turns out that xrDestroySession can be called whenever - how convenient
 		OOVR_FAILED_XR_ABORT(xrRequestExitSession(xr_session.get()));
@@ -330,6 +328,11 @@ void DrvOpenXR::ShutdownSession()
 
 	OOVR_FAILED_XR_ABORT(xrDestroySession(xr_session.get()));
 	xr_session.reset();
+
+	// Delete xr_gbl AFTER session is fully destroyed — PumpEvents() and other
+	// shutdown code may still reference xr_gbl->seatedSpace, nextPredictedFrameTime, etc.
+	delete xr_gbl;
+	xr_gbl = nullptr;
 
 	CreateSystemID();
 }

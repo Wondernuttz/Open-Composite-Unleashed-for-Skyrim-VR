@@ -10,7 +10,6 @@ public:
 	float SupersampleRatio() const { return supersampleRatio; }
 	bool Haptics() const { return haptics; }
 	bool AdmitUnknownProps() const { return admitUnknownProps; }
-	inline bool ThreePartSubmit() const { return threePartSubmit; }
 	inline bool UseViewportStencil() const { return useViewportStencil; }
 	inline bool ForceConnectedTouch() const { return forceConnectedTouch; }
 	inline bool LogGetTrackedProperty() const { return logGetTrackedProperty; }
@@ -82,6 +81,39 @@ public:
 
 	inline bool EnableGpuTiming() const { return enableGpuTiming; }
 
+	inline bool DlaaEnabled() const { return dlaaEnabled; }
+	inline float DlaaLambda() const { return dlaaLambda; }
+	inline float DlaaEpsilon() const { return dlaaEpsilon; }
+
+	// FSR upscaling (EASU)
+	inline bool FsrEnabled() const { return fsrEnabled; }
+	inline float FsrRenderScale() const { return fsrRenderScale; }
+
+	// CAS sharpening (RCAS) — independent of FSR
+	inline bool CasEnabled() const { return casEnabled; }
+	inline float CasSharpness() const { return fsrSharpness; }
+
+	// FSR radius optimization
+	inline bool FsrRadiusEnabled() const { return fsrRadiusEnabled; }
+	inline float FsrRadius() const { return fsrRadius; }
+
+	// MIP LOD bias correction
+	inline bool MipBiasEnabled() const { return mipBiasEnabled; }
+
+	// NVIDIA VRS foveated rendering
+	inline bool VrsEnabled() const { return vrsEnabled; }
+	inline float VrsInnerRadius() const { return vrsInnerRadius; }
+	inline float VrsMidRadius() const { return vrsMidRadius; }
+	inline float VrsOuterRadius() const { return vrsOuterRadius; }
+	inline bool VrsFavorHorizontal() const { return vrsFavorHorizontal; }
+
+	// OCUnleashed Custom Reconstruction
+	inline bool WnEnabled() const { return wnEnabled; }
+	inline float WnCleanRadius() const { return wnCleanRadius; }
+	inline float WnStrength() const { return wnStrength; }
+	inline float WnSharpness() const { return wnSharpness; }
+	inline float WnSensitivity() const { return wnSensitivity; }
+
 private:
 	static int ini_handler(
 	    void* user, const char* section,
@@ -93,7 +125,6 @@ private:
 	float supersampleRatio = 1.0f;
 	bool haptics = true;
 	bool admitUnknownProps = false;
-	bool threePartSubmit = true;
 	bool useViewportStencil = false;
 	bool forceConnectedTouch = true;
 	bool logGetTrackedProperty = false;
@@ -155,6 +186,39 @@ private:
 	std::string keyboardText = "";
 	std::string controllerModel = "hands";
 	bool enableGpuTiming = true;
+
+	bool dlaaEnabled = false;
+	float dlaaLambda = 3.0f;        // edge detection sensitivity (1.0-6.0)
+	float dlaaEpsilon = 0.1f;       // luminance threshold offset (0.01-0.50)
+
+	// FSR upscaling (EASU)
+	bool fsrEnabled = false;
+	float fsrRenderScale = 0.77f;   // 0.5 - 1.0, lower = more GPU savings
+
+	// CAS sharpening (RCAS) — independent of FSR
+	bool casEnabled = false;
+	float fsrSharpness = 0.2f;      // 0.0 - 1.0, higher = sharper
+
+	// FSR radius optimization
+	bool fsrRadiusEnabled = false;
+	float fsrRadius = 0.60f;        // fraction of screen height
+
+	// MIP LOD bias correction
+	bool mipBiasEnabled = true;
+
+	// NVIDIA VRS foveated rendering
+	bool vrsEnabled = false;
+	float vrsInnerRadius = 0.60f;
+	float vrsMidRadius = 0.80f;
+	float vrsOuterRadius = 1.00f;
+	bool vrsFavorHorizontal = true;
+
+	// OCUnleashed Custom Reconstruction
+	bool wnEnabled = false;
+	float wnCleanRadius = 0.35f;    // center zone radius (0.0-1.0)
+	float wnStrength = 0.80f;       // max reconstruction intensity (0.0-1.0)
+	float wnSharpness = 0.50f;      // center zone sharpening (0.0-1.0)
+	float wnSensitivity = 6.0f;     // bilateral edge sensitivity (1.0-20.0)
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;

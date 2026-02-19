@@ -1144,9 +1144,12 @@ EVRInputError BaseInput::UpdateActionState(VR_ARRAY_COUNT(unSetCount) VRActiveAc
 		}
 	}
 
-	std::vector<XrActiveActionSet> aas(unSetCount + 1);
+	// Stack array avoids per-frame heap allocation (typically 2-4 action sets)
+	constexpr uint32_t kMaxActionSets = 8;
+	OOVR_FALSE_ABORT(unSetCount + 1 <= kMaxActionSets);
+	XrActiveActionSet aas[kMaxActionSets] = {};
 
-	for (int i = 0; i < unSetCount; i++) {
+	for (uint32_t i = 0; i < unSetCount; i++) {
 		VRActiveActionSet_t& set = pSets[i];
 
 		ActionSet* as = cast_ASH(set.ulActionSet);
@@ -1161,12 +1164,12 @@ EVRInputError BaseInput::UpdateActionState(VR_ARRAY_COUNT(unSetCount) VRActiveAc
 		}
 	}
 
-	// Ad the last set, the legacy input set
-	aas.at(unSetCount).actionSet = legacyInputsSet;
+	// Add the last set, the legacy input set
+	aas[unSetCount].actionSet = legacyInputsSet;
 
 	XrActionsSyncInfo syncInfo = { XR_TYPE_ACTIONS_SYNC_INFO };
-	syncInfo.activeActionSets = aas.data();
-	syncInfo.countActiveActionSets = aas.size();
+	syncInfo.activeActionSets = aas;
+	syncInfo.countActiveActionSets = unSetCount + 1;
 	OOVR_FAILED_XR_ABORT(xrSyncActions(xr_session.get(), &syncInfo));
 	syncSerial++;
 

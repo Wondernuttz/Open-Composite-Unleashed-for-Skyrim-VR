@@ -77,6 +77,8 @@ static wchar_t escapeChar(const wstring& str)
 		return '\x0F'; // Mouse click (console crosshair)
 	case 'v':
 		return '\x1C'; // Target mode toggle
+	case 'E':
+		return '\x1D'; // End key
 	case 'f':
 		// F1-F12 keys: \f1 through \f12
 		// str format: "\f1", "\f2", ..., "\f10", "\f11", "\f12"

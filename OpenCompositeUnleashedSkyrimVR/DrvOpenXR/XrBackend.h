@@ -117,10 +117,13 @@ private:
 	LARGE_INTEGER cpuFrameStart = {};   // set at end of WaitForTrackingData
 	LARGE_INTEGER cpuFrameEnd = {};     // set at start of SubmitFrames
 	LARGE_INTEGER lastFrameSubmitQpc = {};
+	LARGE_INTEGER beginFrameQpc = {};    // set when xrBeginFrame is called (deferred)
 	float measuredWaitFrameMs = 0.0f;   // xrWaitFrame duration (idle/wait)
 	float measuredEndFrameMs = 0.0f;    // xrEndFrame duration (compositor)
 	float measuredCpuFrameMs = 0.0f;    // app CPU time (WaitGetPoses return → Submit call)
 	float measuredFrameIntervalMs = 0.0f; // frame-to-frame interval
+	float predictedDisplayPeriodMs = 0.0f; // runtime-reported frame interval (from xrWaitFrame)
+	float compositorOverheadMs = 0.0f;  // estimated compositor GPU time (residual calculation)
 
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 	// GPU timing measurement via D3D11 timestamp queries

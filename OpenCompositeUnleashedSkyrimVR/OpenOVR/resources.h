@@ -29,6 +29,11 @@
 #define RES_O_CTRL_Q3_LEFT 5
 #define RES_O_CTRL_Q3_RIGHT 6
 
+// AMD FidelityFX FSR 1.0 shader headers (HLSL source embedded as resources)
+#define RES_O_FFX_A 13
+#define RES_O_FFX_FSR1 14
+#define RES_T_HLSL 261
+
 // Resource list, used on Linux
 // clang-format off
 #define RES_LIST_LINUX(f) \

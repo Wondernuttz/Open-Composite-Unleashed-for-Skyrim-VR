@@ -73,10 +73,10 @@ private:
 
 	// OpenXR swap chain and composition layer
 	XrSwapchain chain = XR_NULL_HANDLE;
+	std::vector<XrSwapchainImageD3D11KHR> swapchainImages;
 	uint32_t texWidth = 1024;
 	uint32_t texHeight = 560; // Increased from 478 to accommodate F-key row
 	XrCompositionLayerQuad layer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-	std::vector<XrSwapchainImageD3D11KHR> swapchainImages;
 
 	std::unique_ptr<SudoFontMeta> font;
 	std::unique_ptr<KeyboardLayout> layout;
@@ -86,10 +86,10 @@ private:
 	unsigned int parchmentW = 0, parchmentH = 0;
 
 	// These use the OpenVR eye constants
-	float lastInputTime[2];
-	int repeatCount[2];
-	int selected[2];
-	uint64_t lastButtonState[2];
+	float lastInputTime[2] = { 0, 0 };
+	int repeatCount[2] = { 0, 0 };
+	int selected[2] = { -1, -1 };
+	uint64_t lastButtonState[2] = { 0, 0 };
 
 	// SendInput mode — injects Windows keystrokes instead of buffering text
 	bool sendInputMode = true;  // Always SendInput — keyboard tied to Windows keyboard
@@ -144,10 +144,10 @@ private:
 	bool consoleActive = false;
 	bool consoleDirty = true;
 	XrSwapchain consoleChain = XR_NULL_HANDLE;
+	std::vector<XrSwapchainImageD3D11KHR> consoleSwapImages;
 	static constexpr uint32_t consoleTexWidth = 1024;
 	static constexpr uint32_t consoleTexHeight = 120;
 	XrCompositionLayerQuad consoleLayer = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-	std::vector<XrSwapchainImageD3D11KHR> consoleSwapImages;
 
 	void Refresh();
 	void RefreshConsole();

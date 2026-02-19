@@ -170,7 +170,6 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, supersampleRatio);
 		CFGOPT(bool, haptics);
 		CFGOPT(bool, admitUnknownProps);
-		CFGOPT(bool, threePartSubmit);
 		CFGOPT(bool, useViewportStencil);
 		CFGOPT(bool, forceConnectedTouch);
 		CFGOPT(bool, logGetTrackedProperty);
@@ -223,6 +222,26 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, posSmoothBeta);
 		CFGOPT(float, rotSmoothBeta);
 		CFGOPT(bool, enableGpuTiming);
+		CFGOPT(bool, dlaaEnabled);
+		CFGOPT(float, dlaaLambda);
+		CFGOPT(float, dlaaEpsilon);
+		CFGOPT(bool, fsrEnabled);
+		CFGOPT(float, fsrRenderScale);
+		CFGOPT(bool, casEnabled);
+		CFGOPT(float, fsrSharpness);
+		CFGOPT(bool, fsrRadiusEnabled);
+		CFGOPT(float, fsrRadius);
+		CFGOPT(bool, mipBiasEnabled);
+		CFGOPT(bool, vrsEnabled);
+		CFGOPT(float, vrsInnerRadius);
+		CFGOPT(float, vrsMidRadius);
+		CFGOPT(float, vrsOuterRadius);
+		CFGOPT(bool, vrsFavorHorizontal);
+		CFGOPT(bool, wnEnabled);
+		CFGOPT(float, wnCleanRadius);
+		CFGOPT(float, wnStrength);
+		CFGOPT(float, wnSharpness);
+		CFGOPT(float, wnSensitivity);
 	}
 
 	// Combos are parsed separately by BaseOverlay; just skip them here

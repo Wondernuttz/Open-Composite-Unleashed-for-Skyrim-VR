@@ -44,6 +44,10 @@ public:
 	virtual void LoadSubmitContext(){};
 	virtual void ResetSubmitContext(){};
 
+	// When true, skip all post-processing (FSR/DLAA/CAS) and use direct copy.
+	// Set for overlay compositors — post-processing is designed for game eye textures only.
+	bool isOverlay = false;
+
 protected:
 	XrSwapchain chain = XR_NULL_HANDLE;
 

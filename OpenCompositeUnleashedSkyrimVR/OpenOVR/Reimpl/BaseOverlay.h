@@ -203,6 +203,9 @@ public:
 	// Builds the collection of layers to be submitted to LibOVR
 	int _BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompositionLayerBaseHeader const* const*& result);
 
+	// Returns true if the VR keyboard object exists (safe to run GPU timing through _BuildLayers)
+	bool IsKeyboardActive() const { return keyboard != nullptr; }
+
 	// ---------------------------------------------
 	// Overlay management methods
 	// ---------------------------------------------

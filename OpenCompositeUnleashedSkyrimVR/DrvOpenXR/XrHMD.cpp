@@ -14,8 +14,15 @@
 
 void XrHMD::GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* height)
 {
-	*width = (uint32_t)((float)xr_main_view(XruEyeLeft).recommendedImageRectWidth * oovr_global_configuration.SupersampleRatio());
-	*height = (uint32_t)((float)xr_main_view(XruEyeLeft).recommendedImageRectHeight * oovr_global_configuration.SupersampleRatio());
+	float scale = oovr_global_configuration.SupersampleRatio();
+
+	// FSR: tell the game to render at a lower resolution — we upscale in the compositor
+	if (oovr_global_configuration.FsrEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+		scale *= std::max(0.5f, oovr_global_configuration.FsrRenderScale());
+	}
+
+	*width = (uint32_t)((float)xr_main_view(XruEyeLeft).recommendedImageRectWidth * scale);
+	*height = (uint32_t)((float)xr_main_view(XruEyeLeft).recommendedImageRectHeight * scale);
 }
 
 // from BaseSystem
@@ -27,27 +34,27 @@ vr::HmdMatrix44_t XrHMD::GetProjectionMatrix(vr::EVREye eEye, float fNearZ, floa
 
 	XrViewConfigurationView& eye = xr_main_view((XruEye)eEye);
 
-	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
-	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-	locateInfo.displayTime = xr_gbl->GetBestTime();
-
-	// Seated space is available first when starting up, depending on the runtime implementation. We quickly get accurate
-	// values from xrLocateViews, but that doesn't help if the app only calls GetProjectionMatrix once and stores the
-	// bad values.
-	// TODO A better way to solve this would be to submit a few blank frames when we're using the temporary device to
-	// let this value settle, along with any other similar data.
-	locateInfo.space = xr_gbl->seatedSpace; // Should make no difference to the FOV
-
-	XrViewState state = { XR_TYPE_VIEW_STATE };
-	uint32_t viewCount = 0;
 	XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
-	OOVR_FAILED_XR_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
-	OOVR_FALSE_ABORT(viewCount == XruEyeCount);
+
+	if (xr_gbl->viewsLatched) {
+		{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetProjectionMatrix: LATCHED path"); } }
+		views[0] = xr_gbl->latchedViews[0];
+		views[1] = xr_gbl->latchedViews[1];
+	} else {
+		{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetProjectionMatrix: FALLBACK path"); } }
+		// Pre-first-frame fallback
+		XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+		locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		locateInfo.displayTime = xr_gbl->GetBestTime();
+		locateInfo.space = xr_gbl->seatedSpace;
+
+		XrViewState state = { XR_TYPE_VIEW_STATE };
+		uint32_t viewCount = 0;
+		OOVR_FAILED_XR_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
+		OOVR_FALSE_ABORT(viewCount == XruEyeCount);
+	}
 
 	// Build the projection matrix
-	// It looks like there aren't any functions in glm that can take different l/r/t/b FOV values, so do it ourselves
-	// Also calculate the projection matrix as row major (so one column determines one value when multiplied with a
-	// vector) and then transpose it back to being a column-major vector.
 	XrFovf& fov = views[eEye].fov;
 
 	float twoNear = fNearZ * 2;
@@ -94,23 +101,27 @@ void XrHMD::GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, flo
 	if (eEye < 0 || (int)eEye >= 2)
 		eEye = vr::Eye_Left;
 
-	// TODO deduplicate with GetProjectionMatrix
-	XrViewConfigurationView& eye = xr_main_view((XruEye)eEye);
-
-	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
-	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-	locateInfo.displayTime = xr_gbl->GetBestTime();
-
-	// Seated space is available first when starting up
-	locateInfo.space = xr_gbl->seatedSpace; // Should make no difference to the FOV
-
-	XrViewState state = { XR_TYPE_VIEW_STATE };
-	uint32_t viewCount = 0;
 	XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
-	OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
-	if (viewCount != XruEyeCount) {
-		OOVR_LOG_ONCEF("Eye count is incorrect: %d", viewCount);
-		return;
+
+	if (xr_gbl->viewsLatched) {
+		{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetProjectionRaw: LATCHED path"); } }
+		views[0] = xr_gbl->latchedViews[0];
+		views[1] = xr_gbl->latchedViews[1];
+	} else {
+		{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetProjectionRaw: FALLBACK path"); } }
+		// Pre-first-frame fallback
+		XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+		locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		locateInfo.displayTime = xr_gbl->GetBestTime();
+		locateInfo.space = xr_gbl->seatedSpace;
+
+		XrViewState state = { XR_TYPE_VIEW_STATE };
+		uint32_t viewCount = 0;
+		OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
+		if (viewCount != XruEyeCount) {
+			OOVR_LOG_ONCEF("Eye count is incorrect: %d", viewCount);
+			return;
+		}
 	}
 
 	XrFovf& fov = views[eEye].fov;
@@ -166,6 +177,38 @@ vr::HmdMatrix34_t XrHMD::GetEyeToHeadTransform(vr::EVREye eEye)
 	if (eEye < 0 || (int)eEye >= 2)
 		eEye = vr::Eye_Left;
 
+	if (xr_gbl->viewsLatched) {
+		{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetEyeToHeadTransform: LATCHED path"); } }
+		// Lazy-latch view-space views on first demand within this frame.
+		// Done here instead of WaitForTrackingData to avoid a second xrLocateViews
+		// call on the critical frame-start path (which disrupts VDXR frame pacing).
+		if (!xr_gbl->viewSpaceViewsLatched) {
+			XrViewLocateInfo vsLocateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+			vsLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+			vsLocateInfo.displayTime = xr_gbl->nextPredictedFrameTime;
+			vsLocateInfo.space = xr_gbl->viewSpace;
+
+			XrViewState vsState = { XR_TYPE_VIEW_STATE };
+			uint32_t vsCount = 0;
+			XrView vsViews[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+			OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &vsLocateInfo, &vsState, XruEyeCount, &vsCount, vsViews));
+
+			if (vsCount == XruEyeCount) {
+				xr_gbl->latchedViewSpaceViews[0] = vsViews[0];
+				xr_gbl->latchedViewSpaceViews[1] = vsViews[1];
+				xr_gbl->latchedViewSpaceFlags = vsState.viewStateFlags;
+			}
+			xr_gbl->viewSpaceViewsLatched = true;
+		}
+
+		if (xr_gbl->latchedViewSpaceFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT
+			&& xr_gbl->latchedViewSpaceFlags & XR_VIEW_STATE_POSITION_VALID_BIT) {
+			return G2S_m34(X2G_om34_pose(xr_gbl->latchedViewSpaceViews[eEye].pose));
+		}
+	}
+
+	// Pre-first-frame fallback: query directly (with existing time-based caching)
+	{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetEyeToHeadTransform: FALLBACK path"); } }
 	if (time != xr_gbl->GetBestTime()) {
 		XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
 		locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -302,11 +345,92 @@ void XrHMD::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDevicePose_t*
 		using namespace std::chrono_literals;
 		std::this_thread::sleep_for(20ms);
 	}
+
+	if (xr_gbl->viewsLatched
+		&& (xr_gbl->latchedViewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)
+		&& (xr_gbl->latchedViewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
+		{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetPose: LATCHED path (deriving head from xrLocateViews)"); } }
+
+		// Derive head-center pose from latched xrLocateViews per-eye data.
+		// This is the critical fix for correct reprojection: the head pose returned
+		// to the game MUST be consistent with the per-eye poses we submit to xrEndFrame.
+		// Previously, GetPose used xrLocateSpace (a different OpenXR call at a different
+		// time), which could return different results — breaking the reprojection delta.
+		// Now both derive from the same xrLocateViews call in WaitForTrackingData.
+		const XrPosef& leftPose = xr_gbl->latchedViews[XruEyeLeft].pose;
+		const XrPosef& rightPose = xr_gbl->latchedViews[XruEyeRight].pose;
+
+		// Head position = midpoint of left and right eye positions
+		XrPosef headPose;
+		headPose.position.x = (leftPose.position.x + rightPose.position.x) * 0.5f;
+		headPose.position.y = (leftPose.position.y + rightPose.position.y) * 0.5f;
+		headPose.position.z = (leftPose.position.z + rightPose.position.z) * 0.5f;
+		// Head orientation = left eye orientation (eyes share the same head rotation)
+		headPose.orientation = leftPose.orientation;
+
+		glm::mat4 mat = X2G_om34_pose(headPose);
+
+		pose->bDeviceIsConnected = true;
+		pose->bPoseIsValid = true;
+		pose->mDeviceToAbsoluteTracking = G2S_m34(mat);
+		pose->eTrackingResult = vr::TrackingResult_Running_OK;
+
+		// Get velocity from xrLocateSpace — velocity isn't used for reprojection,
+		// so it's safe to source it separately.
+		auto baseSpace = xr_space_from_tracking_origin(origin);
+		XrSpaceVelocity velocity{ XR_TYPE_SPACE_VELOCITY };
+		XrSpaceLocation locInfo{ XR_TYPE_SPACE_LOCATION, &velocity, 0, {} };
+		if (XR_SUCCEEDED(xrLocateSpace(xr_gbl->viewSpace, baseSpace, xr_gbl->nextPredictedFrameTime, &locInfo))) {
+			pose->vVelocity = X2S_v3f(velocity.linearVelocity);
+			pose->vAngularVelocity = X2S_v3f(velocity.angularVelocity);
+		} else {
+			pose->vVelocity = {};
+			pose->vAngularVelocity = {};
+		}
+		return;
+	}
+
+	// Pre-first-frame fallback: use original xrLocateSpace path
+	{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetPose: FALLBACK path (xrLocateSpace)"); } }
 	xr_utils::PoseFromSpace(pose, xr_gbl->viewSpace, origin);
 }
 
 float XrHMD::GetIPD()
 {
+	static float ipd = 0.0064f;
+
+	if (xr_gbl->viewsLatched) {
+		{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetIPD: LATCHED path"); } }
+		// Lazy-latch view-space views (same as GetEyeToHeadTransform)
+		if (!xr_gbl->viewSpaceViewsLatched) {
+			XrViewLocateInfo vsLocateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+			vsLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+			vsLocateInfo.displayTime = xr_gbl->nextPredictedFrameTime;
+			vsLocateInfo.space = xr_gbl->viewSpace;
+
+			XrViewState vsState = { XR_TYPE_VIEW_STATE };
+			uint32_t vsCount = 0;
+			XrView vsViews[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+			OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &vsLocateInfo, &vsState, XruEyeCount, &vsCount, vsViews));
+
+			if (vsCount == XruEyeCount) {
+				xr_gbl->latchedViewSpaceViews[0] = vsViews[0];
+				xr_gbl->latchedViewSpaceViews[1] = vsViews[1];
+				xr_gbl->latchedViewSpaceFlags = vsState.viewStateFlags;
+			}
+			xr_gbl->viewSpaceViewsLatched = true;
+		}
+
+		if (xr_gbl->latchedViewSpaceFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT
+			&& xr_gbl->latchedViewSpaceFlags & XR_VIEW_STATE_POSITION_VALID_BIT) {
+			ipd = xr_gbl->latchedViewSpaceViews[vr::Eye_Right].pose.position.x
+				- xr_gbl->latchedViewSpaceViews[vr::Eye_Left].pose.position.x;
+		}
+		return ipd;
+	}
+
+	// Pre-first-frame fallback
+	{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] GetIPD: FALLBACK path"); } }
 	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
 	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 	locateInfo.displayTime = xr_gbl->GetBestTime();
@@ -318,8 +442,6 @@ float XrHMD::GetIPD()
 
 	OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
 	OOVR_FALSE_ABORT(viewCount == XruEyeCount);
-
-	static float ipd = 0.0064;
 
 	if (state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT && state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)
 		ipd = views[vr::Eye_Right].pose.position.x - views[vr::Eye_Left].pose.position.x;
