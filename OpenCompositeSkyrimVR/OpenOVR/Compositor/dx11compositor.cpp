@@ -1,0 +1,2111 @@
+#include "stdafx.h"
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+
+#include "dx11compositor.h"
+#include "../Reimpl/BaseCompositor.h"
+
+#include "../Misc/Config.h"
+#include "../Misc/xr_ext.h"
+
+#include <d3dcompiler.h> // For compiling shaders! D3DCompile
+#include <cmath>
+#include <string>
+
+#pragma comment(lib, "d3dcompiler.lib")
+
+// AMD FidelityFX FSR 1.0 — CPU-side constant setup functions (FsrEasuCon, FsrRcasCon)
+#define A_CPU
+#include "fsr/ffx_a.h"
+#include "fsr/ffx_fsr1.h"
+#undef A_CPU
+
+#ifdef OC_HAS_FSR3
+#include "Fsr3Upscaler.h"
+#endif
+
+#include "../../DrvOpenXR/ASWProvider.h"
+
+// ============================================================================
+// SKSE Render Target Bridge — shared memory for motion vectors + depth
+// ============================================================================
+#pragma pack(push, 1)
+struct OCRenderTargetBridge {
+	static constexpr uint32_t MAGIC = 0x56544F4D; // 'MOTV'
+	static constexpr uint32_t VERSION = 1;
+
+	uint32_t magic;
+	uint32_t version;
+	uint32_t status;        // 0=not ready, 1=ready, 2=error
+
+	uint64_t mvTexture;     // ID3D11Texture2D*
+	uint64_t mvSRV;         // ID3D11ShaderResourceView*
+	uint64_t mvUAV;         // ID3D11UnorderedAccessView*
+
+	uint64_t depthTexture;  // ID3D11Texture2D*
+	uint64_t depthSRV;      // ID3D11ShaderResourceView*
+
+	uint64_t d3dDevice;     // ID3D11Device*
+	uint64_t d3dContext;    // ID3D11DeviceContext*
+
+	uint8_t reserved[64];
+};
+#pragma pack(pop)
+
+static HANDLE              s_hBridgeMap = nullptr;
+static OCRenderTargetBridge* s_pBridge = nullptr;
+static bool                s_bridgeTried = false;
+
+static void OpenRenderTargetBridge()
+{
+	if (s_pBridge) return;
+
+	// Retry every ~2 seconds (assuming ~90fps, every 180 frames)
+	static int retryCounter = 0;
+	if (s_bridgeTried && (++retryCounter % 180) != 0) return;
+	s_bridgeTried = true;
+
+	s_hBridgeMap = OpenFileMappingW(FILE_MAP_READ, FALSE,
+	    L"Local\\OpenCompositeRenderTargets");
+	if (!s_hBridgeMap) return;
+
+	s_pBridge = static_cast<OCRenderTargetBridge*>(
+	    MapViewOfFile(s_hBridgeMap, FILE_MAP_READ, 0, 0, sizeof(OCRenderTargetBridge)));
+	if (!s_pBridge) {
+		CloseHandle(s_hBridgeMap);
+		s_hBridgeMap = nullptr;
+		return;
+	}
+
+	// Validate
+	if (s_pBridge->magic != OCRenderTargetBridge::MAGIC || s_pBridge->version != OCRenderTargetBridge::VERSION) {
+		OOVR_LOG("RT Bridge: Invalid magic/version — wrong SKSE plugin version?");
+		UnmapViewOfFile(s_pBridge); s_pBridge = nullptr;
+		CloseHandle(s_hBridgeMap); s_hBridgeMap = nullptr;
+		return;
+	}
+
+	OOVR_LOG("RT Bridge: Connected to SKSE shared memory");
+}
+
+// OCU ASW — PC-side Asynchronous SpaceWarp (global g_aswProvider in ASWProvider.h)
+
+#ifdef OC_HAS_FSR3
+static Fsr3Upscaler* s_fsr3Upscaler = nullptr;
+static std::chrono::steady_clock::time_point s_fsr3LastFrameTime;
+static float s_fsr3CameraFovY = 1.57f; // Radians, updated from XR view each frame
+static bool s_fsr3FirstDispatch = true;
+static float s_fsr3RenderJitterX = 0.0f; // Jitter that was applied to current frame's rendering
+static float s_fsr3RenderJitterY = 0.0f;
+static uint32_t s_fsr3ViewportW = 0; // FSR3 output viewport (for crop when swapchain > output)
+static uint32_t s_fsr3ViewportH = 0;
+
+// Validate a raw texture pointer from the SKSE shared-memory bridge.
+// The bridge stores void* pointers to game render targets WITHOUT AddRef —
+// when the game releases the RT (VD session restart, resolution change, etc.),
+// the NVIDIA driver decommits the backing pages. VirtualQuery detects this
+// before we dereference the stale pointer and crash the driver.
+static bool ValidateBridgeTexture(const void* ptr, const char* name) {
+	if (!ptr) return false;
+	MEMORY_BASIC_INFORMATION mbi = {};
+	if (!VirtualQuery(ptr, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) {
+		static int count = 0;
+		if (count++ < 10 || count % 500 == 0)
+			OOVR_LOGF("FSR3: %s texture at %p is STALE (state=0x%lX) — skipping FSR3 dispatch",
+			    name, ptr, mbi.State);
+		return false;
+	}
+	return true;
+}
+
+// Safely call GetDesc on a bridge texture pointer, catching access violations
+// from TOCTOU race conditions (pointer valid at VirtualQuery but freed before
+// GetDesc). Must be in a separate function — __try/__except cannot coexist
+// with C++ objects that have destructors (MSVC error C2712).
+static bool SafeGetTextureDesc(ID3D11Texture2D* tex, D3D11_TEXTURE2D_DESC* outDesc) {
+	__try {
+		tex->GetDesc(outDesc);
+		return true;
+	} __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+	    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+		return false;
+	}
+}
+
+// Safely call CopySubresourceRegion with a bridge texture as source.
+// Closes the TOCTOU gap: texture can be freed between VirtualQuery/GetDesc
+// and the actual copy. The D3D11 runtime dereferences the source texture
+// internally, so a stale pointer causes an AV here too.
+static bool SafeCopyFromBridgeTexture(ID3D11DeviceContext* ctx,
+    ID3D11Resource* dst, UINT dstSub, UINT dstX, UINT dstY, UINT dstZ,
+    ID3D11Resource* src, UINT srcSub, const D3D11_BOX* srcBox) {
+	__try {
+		ctx->CopySubresourceRegion(dst, dstSub, dstX, dstY, dstZ, src, srcSub, srcBox);
+		return true;
+	} __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+	    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+		static int count = 0;
+		if (count++ < 10)
+			OOVR_LOG("TOCTOU: Bridge texture freed during CopySubresourceRegion — skipping");
+		return false;
+	}
+}
+
+// Global jitter state — accessed by XrHMD.cpp for projection matrix injection
+int g_fsr3FrameIndex = 0;
+float g_fsr3JitterX = 0.0f;
+float g_fsr3JitterY = 0.0f;
+bool g_fsr3JitterEnabled = false;
+int g_fsr3JitterPhaseCount = 0;
+// Camera near/far — captured from game's GetProjectionMatrix in XrHMD.cpp
+float g_fsr3CameraNear = 5.0f;
+float g_fsr3CameraFar = 100000.0f;
+#endif
+
+// Shader HLSL headers are embedded as Win32 resources (avoids MSVC string literal size limits)
+#include "../resources.h"
+
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+#define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
+
+static std::string LoadHLSLResource(int resourceId)
+{
+	HRSRC hRes = FindResource(HINST_THISCOMPONENT, MAKEINTRESOURCE(resourceId), MAKEINTRESOURCE(RES_T_HLSL));
+	if (!hRes) return "";
+	HGLOBAL hData = LoadResource(HINST_THISCOMPONENT, hRes);
+	if (!hData) return "";
+	DWORD size = SizeofResource(HINST_THISCOMPONENT, hRes);
+	const char* data = static_cast<const char*>(LockResource(hData));
+	return std::string(data, size);
+}
+
+constexpr char fs_shader_code[] = R"_(
+Texture2D shaderTexture : register(t0);
+
+SamplerState SampleType : register(s0);
+
+struct psIn {
+	float4 pos : SV_POSITION;
+	float2 tex : TEXCOORD0;
+};
+
+psIn vs_fs(uint vI : SV_VERTEXID)
+{
+	psIn output;
+    output.tex = float2(vI&1,vI>>1);
+    output.pos = float4((output.tex.x-0.5f)*2,-(output.tex.y-0.5f)*2,0,1);
+	output.tex.y = 1.0f - output.tex.y;
+	return output;
+}
+
+float4 ps_fs(psIn inputPS) : SV_TARGET
+{
+	float4 textureColor = shaderTexture.Sample(SampleType, inputPS.tex);
+	return textureColor;
+})_";
+
+// ── DLAA: Directionally Localized Anti-Aliasing ──
+// Based on Dmitry Andreev's algorithm (LucasArts, GDC 2011).
+// Ported from BlueSkyDefender's ReShade implementation (CC BY 3.0).
+// Two-pass post-process: PreFilter detects edges, then short+long edge AA smooths jaggies.
+constexpr char dlaa_shader_code[] = R"_(
+cbuffer DLAACB : register(b0) {
+	float2 rcpFrame;    // 1.0/width, 1.0/height
+	float dlaaLambda;   // edge sensitivity (default 3.0)
+	float dlaaEpsilon;  // luminance threshold (default 0.1)
+};
+
+Texture2D srcTex : register(t0);
+Texture2D preTex : register(t1);  // pre-filtered texture (pass 2 only)
+SamplerState pointSamp : register(s0);
+
+struct VsOut {
+	float4 pos : SV_POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VsOut vs_dlaa(uint id : SV_VERTEXID) {
+	VsOut o;
+	o.uv  = float2(id & 1, id >> 1);
+	o.pos = float4((o.uv.x - 0.5) * 2.0, -(o.uv.y - 0.5) * 2.0, 0, 1);
+	return o;
+}
+
+// Luminance via green channel (perceptually dominant)
+float LI(float3 v) { return dot(v.ggg, float3(0.333, 0.333, 0.333)); }
+
+// Helper: sample source texture at pixel offset
+float4 LP(float2 uv, float ox, float oy) {
+	return srcTex.SampleLevel(pointSamp, uv + float2(ox, oy) * rcpFrame, 0);
+}
+
+// ── Pass 1: PreFilter — compute edge luminance, store in alpha ──
+float4 ps_dlaa_pre(VsOut input) : SV_TARGET {
+	float4 center = LP(input.uv,  0,  0);
+	float4 left   = LP(input.uv, -1,  0);
+	float4 right  = LP(input.uv,  1,  0);
+	float4 top    = LP(input.uv,  0, -1);
+	float4 bottom = LP(input.uv,  0,  1);
+
+	float4 edges = 4.0 * abs((left + right + top + bottom) - 4.0 * center);
+	float edgesLum = LI(edges.rgb);
+
+	return float4(center.rgb, edgesLum);
+}
+
+// Helper: sample pre-filtered texture at pixel offset
+float4 SLP(float2 uv, float ox, float oy) {
+	return preTex.SampleLevel(pointSamp, uv + float2(ox, oy) * rcpFrame, 0);
+}
+
+// ── Pass 2: DLAA — short edge + long edge anti-aliasing ──
+float4 ps_dlaa_main(VsOut input) : SV_TARGET {
+	// dlaaLambda and dlaaEpsilon come from DLAACB constant buffer
+
+	// Short edge filter: sample center + 4 neighbors from pre-filtered texture
+	float4 Center = SLP(input.uv, 0, 0);
+	float4 Left   = SLP(input.uv, -1.0, 0);
+	float4 Right  = SLP(input.uv,  1.0, 0);
+	float4 Up     = SLP(input.uv,  0, -1.0);
+	float4 Down   = SLP(input.uv,  0,  1.0);
+
+	float4 combH = 2.0 * (Left + Right);
+	float4 combV = 2.0 * (Up + Down);
+
+	float4 CenterDiffH = abs(combH - 4.0 * Center) / 4.0;
+	float4 CenterDiffV = abs(combV - 4.0 * Center) / 4.0;
+
+	float4 blurredH = (combH + 2.0 * Center) / 6.0;
+	float4 blurredV = (combV + 2.0 * Center) / 6.0;
+
+	float LumH  = LI(CenterDiffH.rgb);
+	float LumV  = LI(CenterDiffV.rgb);
+	float LumHB = LI(blurredH.rgb);
+	float LumVB = LI(blurredV.rgb);
+
+	float satAmountH = saturate((dlaaLambda * LumH - dlaaEpsilon) / LumVB);
+	float satAmountV = saturate((dlaaLambda * LumV - dlaaEpsilon) / LumHB);
+
+	// Apply short edge AA
+	float4 DLAA = lerp(Center, blurredH, satAmountV);
+	DLAA = lerp(DLAA, blurredV, satAmountH * 0.5);
+
+	// Long edge filter: 16 additional samples along H and V axes
+	float4 HNeg  = Left;
+	float4 HNegA = SLP(input.uv, -3.5, 0.0);
+	float4 HNegB = SLP(input.uv, -5.5, 0.0);
+	float4 HNegC = SLP(input.uv, -7.5, 0.0);
+	float4 HPos  = Right;
+	float4 HPosA = SLP(input.uv,  3.5, 0.0);
+	float4 HPosB = SLP(input.uv,  5.5, 0.0);
+	float4 HPosC = SLP(input.uv,  7.5, 0.0);
+
+	float4 VNeg  = Up;
+	float4 VNegA = SLP(input.uv, 0.0, -3.5);
+	float4 VNegB = SLP(input.uv, 0.0, -5.5);
+	float4 VNegC = SLP(input.uv, 0.0, -7.5);
+	float4 VPos  = Down;
+	float4 VPosA = SLP(input.uv, 0.0,  3.5);
+	float4 VPosB = SLP(input.uv, 0.0,  5.5);
+	float4 VPosC = SLP(input.uv, 0.0,  7.5);
+
+	float4 AvgBlurH = (HNeg + HNegA + HNegB + HNegC + HPos + HPosA + HPosB + HPosC) / 8.0;
+	float4 AvgBlurV = (VNeg + VNegA + VNegB + VNegC + VPos + VPosA + VPosB + VPosC) / 8.0;
+
+	// Edge activation from alpha channel (pre-computed edge luminance)
+	float EAH = saturate(AvgBlurH.a * 2.0 - 1.0);
+	float EAV = saturate(AvgBlurV.a * 2.0 - 1.0);
+
+	float longEdge = abs(EAH - EAV) + abs(LumH + LumV);
+
+	if (longEdge > 0.2) {
+		// Re-read original pixels for accurate blending
+		float4 left_  = LP(input.uv, -1, 0);
+		float4 right_ = LP(input.uv,  1, 0);
+		float4 up_    = LP(input.uv,  0, -1);
+		float4 down_  = LP(input.uv,  0,  1);
+
+		float LongBlurLumH = LI(AvgBlurH.rgb);
+		float LongBlurLumV = LI(AvgBlurV.rgb);
+
+		float centerLI = LI(Center.rgb);
+		float leftLI   = LI(left_.rgb);
+		float rightLI  = LI(right_.rgb);
+		float upLI     = LI(up_.rgb);
+		float downLI   = LI(down_.rgb);
+
+		float blurUp    = saturate(0.0 + (LongBlurLumH - upLI)     / (centerLI - upLI + 0.0001));
+		float blurLeft  = saturate(0.0 + (LongBlurLumV - leftLI)   / (centerLI - leftLI + 0.0001));
+		float blurDown  = saturate(1.0 + (LongBlurLumH - centerLI) / (centerLI - downLI + 0.0001));
+		float blurRight = saturate(1.0 + (LongBlurLumV - centerLI) / (centerLI - rightLI + 0.0001));
+
+		float4 UDLR = float4(blurLeft, blurRight, blurUp, blurDown);
+		if (UDLR.r == 0 && UDLR.g == 0 && UDLR.b == 0 && UDLR.a == 0)
+			UDLR = float4(1, 1, 1, 1);
+
+		float4 V = lerp(left_,  Center, UDLR.x);
+		V = lerp(right_, V, UDLR.y);
+		float4 H = lerp(up_,    Center, UDLR.z);
+		H = lerp(down_,  H, UDLR.w);
+
+		DLAA = lerp(DLAA, V, EAV);
+		DLAA = lerp(DLAA, H, EAH);
+	}
+
+	return float4(DLAA.rgb, 1.0);
+}
+)_";
+
+// ── FSR upscale: AMD FidelityFX Super Resolution 1.0 (MIT license) ──
+// Official AMD EASU + RCAS shaders, compiled from embedded ffx_a.h + ffx_fsr1.h at runtime.
+// Pixel shader wrappers provide Gather/Load callbacks and entry points.
+
+// EASU wrapper: edge-adaptive 12-tap Lanczos upscaler using Gather operations
+// VrsRadius: x=projCenterX, y=projCenterY, z=innerRadiusSq, w=flag (>0.5=enabled)
+// When VRS radius matching is active:
+//   - Inside inner radius: full 12-tap EASU (clean 1x1 pixels)
+//   - Beyond inner radius: cheap bilinear (avoids shimmer from VRS-degraded input)
+static const char fsr_easu_wrapper[] = R"_(
+cbuffer CB : register(b0) { uint4 Const0; uint4 Const1; uint4 Const2; uint4 Const3; float4 VrsRadius; };
+Texture2D InputTexture : register(t0);
+SamplerState samLinearClamp : register(s0);
+AF4 FsrEasuRF(AF2 p) { return InputTexture.GatherRed(samLinearClamp, p); }
+AF4 FsrEasuGF(AF2 p) { return InputTexture.GatherGreen(samLinearClamp, p); }
+AF4 FsrEasuBF(AF2 p) { return InputTexture.GatherBlue(samLinearClamp, p); }
+struct VsOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+VsOut vs_fsr(uint id : SV_VERTEXID) {
+	VsOut o;
+	o.uv = float2(id & 1, id >> 1);
+	o.pos = float4((o.uv.x - 0.5) * 2.0, -(o.uv.y - 0.5) * 2.0, 0, 1);
+	return o;
+}
+float4 ps_easu(VsOut input) : SV_TARGET {
+	// VRS radius matching: outside the VRS inner radius, use bilinear instead of EASU
+	if (VrsRadius.w > 0.5) {
+		float2 dc = input.uv - VrsRadius.xy;
+		float distSq = dot(dc, dc);
+		if (distSq > VrsRadius.z) {
+			return InputTexture.SampleLevel(samLinearClamp, input.uv, 0);
+		}
+	}
+	AF3 c;
+	FsrEasuF(c, AU2(input.pos.xy), Const0, Const1, Const2, Const3);
+	return float4(c, 1.0);
+}
+)_";
+
+// RCAS wrapper: robust contrast-adaptive sharpening (5-tap cross)
+// VrsRadius matching: skip sharpening outside VRS inner radius (sharpening VRS-degraded pixels amplifies artifacts)
+static const char fsr_rcas_wrapper[] = R"_(
+cbuffer CB : register(b0) { uint4 Const0; uint4 Const1; uint4 Const2; uint4 Const3; float4 VrsRadius; };
+Texture2D InputTexture : register(t0);
+SamplerState samLinearClamp : register(s0);
+AF4 FsrRcasLoadF(ASU2 p) { return InputTexture.Load(int3(p, 0)); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+struct VsOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+VsOut vs_fsr(uint id : SV_VERTEXID) {
+	VsOut o;
+	o.uv = float2(id & 1, id >> 1);
+	o.pos = float4((o.uv.x - 0.5) * 2.0, -(o.uv.y - 0.5) * 2.0, 0, 1);
+	return o;
+}
+float4 ps_rcas(VsOut input) : SV_TARGET {
+	// VRS radius matching: outside the VRS inner radius, skip sharpening (just pass through)
+	if (VrsRadius.w > 0.5) {
+		float2 dc = input.uv - VrsRadius.xy;
+		if (dot(dc, dc) > VrsRadius.z) {
+			return InputTexture.Load(int3(input.pos.xy, 0));
+		}
+	}
+	AF1 r, g, b;
+	FsrRcasF(r, g, b, AU2(input.pos.xy), Const0);
+	return float4(r, g, b, 1.0);
+}
+)_";
+
+static void XTrace(LPCSTR lpszFormat, ...)
+{
+	va_list args;
+	va_start(args, lpszFormat);
+	int nBuf;
+	char szBuffer[512]; // get rid of this hard-coded buffer
+	nBuf = _vsnprintf_s(szBuffer, 511, lpszFormat, args);
+	OutputDebugStringA(szBuffer);
+	OOVR_LOG(szBuffer);
+	va_end(args);
+}
+
+#define ERR(msg)                                                                                                                                       \
+	{                                                                                                                                                  \
+		std::string str = "Hit DX11-related error " + string(msg) + " at " __FILE__ ":" + std::to_string(__LINE__) + " func " + std::string(__func__); \
+		OOVR_LOG(str.c_str());                                                                                                                         \
+		OOVR_MESSAGE(str.c_str(), "Errored func!");                                                                                                    \
+		/**((int*)NULL) = 0;*/                                                                                                                         \
+		throw str;                                                                                                                                     \
+	}
+
+void DX11Compositor::ThrowIfFailed(HRESULT test)
+{
+	if ((test) != S_OK) {
+		OOVR_FAILED_DX_ABORT(device->GetDeviceRemovedReason());
+		throw "ThrowIfFailed err";
+	}
+}
+
+ID3DBlob* d3d_compile_shader(const char* hlsl, const char* entrypoint, const char* target)
+{
+	DWORD flags = D3DCOMPILE_PACK_MATRIX_COLUMN_MAJOR | D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_WARNINGS_ARE_ERRORS;
+#ifdef _DEBUG
+	flags |= D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_DEBUG;
+#else
+	flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#endif
+
+	ID3DBlob *compiled, *errors;
+	if (FAILED(D3DCompile(hlsl, strlen(hlsl), nullptr, nullptr, nullptr, entrypoint, target, flags, 0, &compiled, &errors)))
+		OOVR_ABORTF("Error: D3DCompile failed %s", (char*)errors->GetBufferPointer());
+	if (errors)
+		errors->Release();
+
+	return compiled;
+}
+
+ID3D11RenderTargetView* d3d_make_rtv(ID3D11Device* d3d_device, XrBaseInStructure& swapchain_img, const DXGI_FORMAT& format)
+{
+	ID3D11RenderTargetView* result = nullptr;
+
+	// Get information about the swapchain image that OpenXR made for us
+	XrSwapchainImageD3D11KHR& d3d_swapchain_img = (XrSwapchainImageD3D11KHR&)swapchain_img;
+
+	// Create a render target view resource for the swapchain image
+	D3D11_RENDER_TARGET_VIEW_DESC target_desc = {};
+	target_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+	target_desc.Format = format;
+	target_desc.Texture2D.MipSlice = 0;
+	OOVR_FAILED_DX_ABORT(d3d_device->CreateRenderTargetView(d3d_swapchain_img.texture, &target_desc, &result));
+
+	return result;
+}
+
+DX11Compositor::DX11Compositor(ID3D11Texture2D* initial)
+{
+	initial->GetDevice(&device);
+	device->GetImmediateContext(&context);
+
+	// Shaders for inverting copy
+	ID3DBlob* fs_vert_shader_blob = d3d_compile_shader(fs_shader_code, "vs_fs", "vs_5_0");
+	ID3DBlob* fs_pixel_shader_blob = d3d_compile_shader(fs_shader_code, "ps_fs", "ps_5_0");
+	OOVR_FAILED_DX_ABORT(device->CreateVertexShader(fs_vert_shader_blob->GetBufferPointer(), fs_vert_shader_blob->GetBufferSize(), nullptr, &fs_vshader));
+	OOVR_FAILED_DX_ABORT(device->CreatePixelShader(fs_pixel_shader_blob->GetBufferPointer(), fs_pixel_shader_blob->GetBufferSize(), nullptr, &fs_pshader));
+
+	// Create a texture sampler state description.
+	D3D11_SAMPLER_DESC samplerDesc;
+	samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samplerDesc.MipLODBias = 0.0f;
+	samplerDesc.MaxAnisotropy = 4;
+	samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+	samplerDesc.BorderColor[0] = 0;
+	samplerDesc.BorderColor[1] = 0;
+	samplerDesc.BorderColor[2] = 0;
+	samplerDesc.BorderColor[3] = 0;
+	samplerDesc.MinLOD = 0;
+	samplerDesc.MaxLOD = 0;
+
+	// Create the texture sampler state.
+	OOVR_FAILED_DX_ABORT(device->CreateSamplerState(&samplerDesc, &quad_sampleState));
+
+	// ── DLAA shader init (two-pass: pre-filter + directional AA) ──
+	if (oovr_global_configuration.DlaaEnabled()) {
+		ID3DBlob* dlaa_vs_blob = d3d_compile_shader(dlaa_shader_code, "vs_dlaa", "vs_5_0");
+		ID3DBlob* dlaa_pre_blob = d3d_compile_shader(dlaa_shader_code, "ps_dlaa_pre", "ps_5_0");
+		ID3DBlob* dlaa_main_blob = d3d_compile_shader(dlaa_shader_code, "ps_dlaa_main", "ps_5_0");
+		if (dlaa_vs_blob && dlaa_pre_blob && dlaa_main_blob) {
+			HRESULT hr1 = device->CreateVertexShader(dlaa_vs_blob->GetBufferPointer(), dlaa_vs_blob->GetBufferSize(), nullptr, &dlaa_vshader);
+			HRESULT hr2 = device->CreatePixelShader(dlaa_pre_blob->GetBufferPointer(), dlaa_pre_blob->GetBufferSize(), nullptr, &dlaa_pre_pshader);
+			HRESULT hr3 = device->CreatePixelShader(dlaa_main_blob->GetBufferPointer(), dlaa_main_blob->GetBufferSize(), nullptr, &dlaa_main_pshader);
+			dlaa_vs_blob->Release();
+			dlaa_pre_blob->Release();
+			dlaa_main_blob->Release();
+
+			if (SUCCEEDED(hr1) && SUCCEEDED(hr2) && SUCCEEDED(hr3)) {
+				// Constant buffer: float2 rcpFrame + float2 pad = 16 bytes
+				D3D11_BUFFER_DESC cbd = {};
+				cbd.ByteWidth = 16;
+				cbd.Usage = D3D11_USAGE_DYNAMIC;
+				cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+				cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+				// Point sampler for DLAA (we use SampleLevel with point filtering)
+				D3D11_SAMPLER_DESC psd = {};
+				psd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+				psd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+				psd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+				psd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+				psd.MaxLOD = 0;
+
+				if (SUCCEEDED(device->CreateBuffer(&cbd, nullptr, &dlaa_cbuffer)) &&
+				    SUCCEEDED(device->CreateSamplerState(&psd, &dlaa_pointSampler))) {
+					dlaaReady = true;
+					OOVR_LOG("DLAA: Shaders compiled and ready");
+				}
+			}
+		} else {
+			if (dlaa_vs_blob) dlaa_vs_blob->Release();
+			if (dlaa_pre_blob) dlaa_pre_blob->Release();
+			if (dlaa_main_blob) dlaa_main_blob->Release();
+		}
+		if (!dlaaReady) {
+			OOVR_LOG("DLAA: Shader compilation failed — falling back to no AA");
+		}
+	}
+
+	// ── FSR upscale shader init: AMD FidelityFX EASU + RCAS (two-pass) ──
+	// Compile shaders when either FSR (EASU upscaling) or CAS (RCAS sharpening) is enabled
+	if (oovr_global_configuration.FsrEnabled() || oovr_global_configuration.CasEnabled()) {
+		// Load AMD FidelityFX headers from Win32 resources
+		std::string ffx_a_src = LoadHLSLResource(RES_O_FFX_A);
+		std::string ffx_fsr1_src = LoadHLSLResource(RES_O_FFX_FSR1);
+		if (ffx_a_src.empty() || ffx_fsr1_src.empty()) {
+			OOVR_LOG("FSR: Failed to load AMD FidelityFX HLSL resources");
+		}
+
+		// Build shader sources by concatenating AMD headers + our pixel shader wrappers
+		std::string easu_hlsl = std::string("#define A_GPU 1\n#define A_HLSL 1\n#define FSR_EASU_F 1\n")
+		    + ffx_a_src + "\n" + ffx_fsr1_src + "\n" + fsr_easu_wrapper;
+		std::string rcas_hlsl = std::string("#define A_GPU 1\n#define A_HLSL 1\n#define FSR_RCAS_F 1\n#define FSR_RCAS_DENOISE 1\n")
+		    + ffx_a_src + "\n" + ffx_fsr1_src + "\n" + fsr_rcas_wrapper;
+
+		ID3DBlob* fsr_vs_blob = d3d_compile_shader(easu_hlsl.c_str(), "vs_fsr", "vs_5_0");
+		ID3DBlob* easu_ps_blob = d3d_compile_shader(easu_hlsl.c_str(), "ps_easu", "ps_5_0");
+		ID3DBlob* rcas_ps_blob = d3d_compile_shader(rcas_hlsl.c_str(), "ps_rcas", "ps_5_0");
+		if (fsr_vs_blob && easu_ps_blob && rcas_ps_blob) {
+			HRESULT hr1 = device->CreateVertexShader(fsr_vs_blob->GetBufferPointer(), fsr_vs_blob->GetBufferSize(), nullptr, &fsr_vshader);
+			HRESULT hr2 = device->CreatePixelShader(easu_ps_blob->GetBufferPointer(), easu_ps_blob->GetBufferSize(), nullptr, &fsr_pshader);
+			HRESULT hr3 = device->CreatePixelShader(rcas_ps_blob->GetBufferPointer(), rcas_ps_blob->GetBufferSize(), nullptr, &cas_pshader);
+			fsr_vs_blob->Release();
+			easu_ps_blob->Release();
+			rcas_ps_blob->Release();
+
+			if (SUCCEEDED(hr1) && SUCCEEDED(hr2) && SUCCEEDED(hr3)) {
+				D3D11_BUFFER_DESC cbd = {};
+				cbd.ByteWidth = 80; // AMD FSR: 4x uint4 (64 bytes) + VrsRadius float4 (16 bytes)
+				cbd.Usage = D3D11_USAGE_DYNAMIC;
+				cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+				cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+				if (SUCCEEDED(device->CreateBuffer(&cbd, nullptr, &fsr_cbuffer))) {
+					fsrReady = true;
+					OOVR_LOGF("FSR/CAS shaders initialized (fsr=%s scale=%.2f, cas=%s sharpness=%.2f)",
+					    oovr_global_configuration.FsrEnabled() ? "on" : "off",
+					    oovr_global_configuration.FsrRenderScale(),
+					    oovr_global_configuration.CasEnabled() ? "on" : "off",
+					    oovr_global_configuration.CasSharpness());
+				}
+			}
+		}
+		if (!fsrReady) {
+			OOVR_LOG("FSR AMD shader compilation failed — falling back to normal rendering");
+		}
+	}
+
+	// Alpha-fix shader: forces alpha=1.0 on swapchain after FSR3 output.
+	// VirtualDesktop-OpenXR doesn't clear alpha for layer 0 (assumes app writes alpha=1.0),
+	// but FSR3 preserves the game's alpha values which can be < 1.0 in Creation Engine.
+	// The OVR compositor uses premultiplied alpha, so alpha < 1.0 = semi-transparent ghosting.
+	if (!alphaFix_pshader) {
+		static const char* alphaFixSrc = "float4 main() : SV_Target { return float4(0, 0, 0, 1); }";
+		ID3DBlob* blob = d3d_compile_shader(alphaFixSrc, "main", "ps_5_0");
+		if (blob) {
+			device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &alphaFix_pshader);
+			blob->Release();
+		}
+	}
+	if (!alphaFix_blendState) {
+		D3D11_BLEND_DESC bd = {};
+		bd.RenderTarget[0].BlendEnable = FALSE;
+		bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALPHA;
+		device->CreateBlendState(&bd, &alphaFix_blendState);
+	}
+
+	// NOTE: VRS is NOT initialized here — it's lazily initialized in the outer Invoke()
+	// only on the dxcomp compositor. This prevents temporary compositors from calling
+	// NvAPI_Initialize/Disable/Unload and interfering with the active VRS state.
+
+}
+
+DX11Compositor::~DX11Compositor()
+{
+	// [KB-DIAG] Log which compositor is being destroyed and check proximity to dxcomp
+	bool iAmDxcomp = (BaseCompositor::dxcomp == this);
+	ID3D11Device* preDtorDev = nullptr;
+	if (BaseCompositor::dxcomp && !iAmDxcomp) {
+		preDtorDev = BaseCompositor::dxcomp->GetDevice();
+	}
+	OOVR_LOGF("[KB-DIAG] ~DX11Compositor: this=0x%llX dxcomp=0x%llX iAmDxcomp=%d dev=0x%llX dxcomp->dev=0x%llX chain=0x%llX",
+	    (unsigned long long)(uintptr_t)this,
+	    (unsigned long long)(uintptr_t)BaseCompositor::dxcomp,
+	    (int)iAmDxcomp,
+	    (unsigned long long)(uintptr_t)device,
+	    (unsigned long long)(uintptr_t)preDtorDev,
+	    (unsigned long long)(uintptr_t)chain);
+
+	// ClearState unbinds all pipeline references, then Flush drains pending commands.
+	// Without this, the NVIDIA driver retains stale internal pointers to our textures.
+	if (context) {
+		context->ClearState();
+		context->Flush();
+	}
+
+	for (auto&& rtv : swapchain_rtvs)
+		rtv->Release();
+
+	swapchain_rtvs.clear();
+
+	for (auto&& tex : resolvedMSAATextures)
+		tex->Release();
+
+	resolvedMSAATextures.clear();
+
+	// Cached SRV cleanup
+	if (cachedSrcSRV) cachedSrcSRV->Release();
+	for (auto&& srv : resolvedMSAA_SRVs)
+		if (srv) srv->Release();
+	resolvedMSAA_SRVs.clear();
+
+	// DLAA cleanup
+	if (dlaa_vshader) dlaa_vshader->Release();
+	if (dlaa_pre_pshader) dlaa_pre_pshader->Release();
+	if (dlaa_main_pshader) dlaa_main_pshader->Release();
+	if (dlaa_cbuffer) dlaa_cbuffer->Release();
+	if (dlaaIntermediateRTV) dlaaIntermediateRTV->Release();
+	if (dlaaIntermediateSRV) dlaaIntermediateSRV->Release();
+	if (dlaaIntermediate) dlaaIntermediate->Release();
+	if (dlaaOutputRTV) dlaaOutputRTV->Release();
+	if (dlaaOutputSRV) dlaaOutputSRV->Release();
+	if (dlaaOutput) dlaaOutput->Release();
+	if (dlaa_pointSampler) dlaa_pointSampler->Release();
+
+	// FSR cleanup
+	if (fsr_vshader) fsr_vshader->Release();
+	if (fsr_pshader) fsr_pshader->Release();
+	if (cas_pshader) cas_pshader->Release();
+	if (fsr_cbuffer) fsr_cbuffer->Release();
+	if (alphaFix_pshader) alphaFix_pshader->Release();
+	if (alphaFix_blendState) alphaFix_blendState->Release();
+
+	// VRS cleanup: only the dxcomp compositor should call Shutdown (which calls Disable).
+	// Non-dxcomp compositors must NOT call Disable() or it will turn off VRS mid-frame.
+	if (iAmDxcomp) {
+		vrsManager.Shutdown();
+	}
+
+#ifdef OC_HAS_FSR3
+	// FSR3 cleanup: destroy upscaler when the dxcomp compositor dies (session restart).
+	// The upscaler holds shared DX11↔DX12 textures tied to THIS device — they become
+	// stale pointers after the device is released. Must be recreated with the new
+	// session's device. Matches VRS cleanup pattern (dxcomp-only).
+	if (iAmDxcomp && s_fsr3Upscaler) {
+		OOVR_LOG("FSR3: Shutting down upscaler (dxcomp destroyed — VR session restart)");
+		delete s_fsr3Upscaler;
+		s_fsr3Upscaler = nullptr;
+		s_fsr3FirstDispatch = true;
+		s_fsr3ViewportW = 0;
+		s_fsr3ViewportH = 0;
+	}
+#endif
+
+	// OCU ASW cleanup: compute shader + XR swapchains tied to this session
+	if (iAmDxcomp && g_aswProvider) {
+		OOVR_LOG("ASW: Shutting down (dxcomp destroyed — VR session restart)");
+		delete g_aswProvider;
+		g_aswProvider = nullptr;
+	}
+
+	context->Release();
+	device->Release();
+
+	// [KB-DIAG] Check dxcomp health after device/context Release
+	if (BaseCompositor::dxcomp && !iAmDxcomp) {
+		ID3D11Device* postRelDev = BaseCompositor::dxcomp->GetDevice();
+		OOVR_LOGF("[KB-DIAG] ~DX11Compositor post-Release: dxcomp->dev=0x%llX (was 0x%llX)",
+		    (unsigned long long)(uintptr_t)postRelDev,
+		    (unsigned long long)(uintptr_t)preDtorDev);
+		if (postRelDev && reinterpret_cast<uintptr_t>(postRelDev) <= 0xFFFF) {
+			OOVR_LOGF("[KB-DIAG] *** CORRUPTION in ~DX11Compositor *** dxcomp->dev=0x%llX AFTER device->Release()",
+			    (unsigned long long)(uintptr_t)postRelDev);
+		}
+	}
+
+	// Prevent dangling dxcomp after this compositor is destroyed
+	if (iAmDxcomp)
+		BaseCompositor::dxcomp = nullptr;
+}
+
+void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds, bool cube)
+{
+	XrSwapchainCreateInfo& desc = createInfo;
+
+	auto* src = (ID3D11Texture2D*)texture->handle;
+
+	D3D11_TEXTURE2D_DESC srcDesc;
+	src->GetDesc(&srcDesc);
+
+	if (bounds) {
+		if (std::fabs(bounds->uMax - bounds->uMin) > 0.1)
+			srcDesc.Width = uint32_t(float(srcDesc.Width) * std::fabs(bounds->uMax - bounds->uMin));
+		if (std::fabs(bounds->vMax - bounds->vMin) > 0.1)
+			srcDesc.Height = uint32_t(float(srcDesc.Height) * std::fabs(bounds->vMax - bounds->vMin));
+	}
+
+	if (cube) {
+		// LibOVR can only use square cubemaps, while SteamVR can use any shape
+		// Note we use CopySubresourceRegion later on, so this won't cause problems with that
+		srcDesc.Height = srcDesc.Width = std::min(srcDesc.Height, srcDesc.Width);
+	}
+
+	// ── FSR: determine output dimensions (skip for overlay textures) ──
+	bool fsrActive = fsrReady && oovr_global_configuration.FsrEnabled()
+	    && oovr_global_configuration.FsrRenderScale() < 0.99f && !cube && !isOverlay;
+#ifdef OC_HAS_FSR3
+	// FSR 3 can handle stereo-combined textures (bounds present); FSR 1 cannot
+	if (fsrActive && bounds) {
+		fsrActive = s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
+		    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
+		    && oovr_global_configuration.MotionVectorsEnabled();
+	}
+#else
+	if (bounds) fsrActive = false;
+#endif
+	uint32_t outWidth = srcDesc.Width;
+	uint32_t outHeight = srcDesc.Height;
+	if (fsrActive && !bounds) {
+		// FSR 1 (non-stereo): inflate swapchain to display resolution for EASU upscale
+		float invScale = 1.0f / std::max(0.5f, oovr_global_configuration.FsrRenderScale());
+		outWidth = (uint32_t)(srcDesc.Width * invScale);
+		outHeight = (uint32_t)(srcDesc.Height * invScale);
+	}
+	// FSR 3 (stereo-combined / bounds): swapchain stays at render resolution (srcDesc).
+	bool fsrConfigured = fsrActive;
+
+	// Check if existing chain is compatible (compare against OUTPUT dimensions)
+	bool usable = false;
+	if (chain != NULL) {
+		if (fsrConfigured) {
+			// FSR: chain was created at output size, input may differ from chain dims
+			usable = (outWidth == createInfo.width && outHeight == createInfo.height
+			    && srcDesc.Width == fsrInputWidth && srcDesc.Height == fsrInputHeight
+			    && srcDesc.Format == createInfoFormat);
+		} else {
+			usable = CheckChainCompatible(srcDesc, texture->eColorSpace);
+		}
+	}
+
+	if (!usable) {
+		OOVR_LOG("Generating new swap chain");
+
+		if (bounds)
+			OOVR_LOGF("Bounds: uMin %f uMax %f vMin %f vMax %f", bounds->uMin, bounds->uMax, bounds->vMin, bounds->vMax);
+		OOVR_LOGF("Texture desc format: %d", srcDesc.Format);
+		OOVR_LOGF("Texture desc bind flags: %d", srcDesc.BindFlags);
+		OOVR_LOGF("Texture desc MiscFlags: %d", srcDesc.MiscFlags);
+		OOVR_LOGF("Texture desc Usage: %d", srcDesc.Usage);
+		OOVR_LOGF("Texture desc width: %d", srcDesc.Width);
+		OOVR_LOGF("Texture desc height: %d", srcDesc.Height);
+		if (fsrActive)
+			OOVR_LOGF("FSR output: %dx%d (scale %.2f)", outWidth, outHeight,
+			    oovr_global_configuration.FsrRenderScale());
+
+		// ClearState unbinds all SRVs/RTVs/UAVs from the pipeline, releasing the
+		// NVIDIA driver's internal tracking references to our textures. Without
+		// this, destroying the swapchain leaves stale pointers in the driver's
+		// descriptor cache — crash on next frame at the same deterministic address.
+		// Flush then drains any remaining GPU commands that reference those resources.
+		context->ClearState();
+		context->Flush();
+
+#ifdef OC_HAS_FSR3
+		// If FSR3 is active, drain its DX12 queue too — shared textures cross both APIs
+		if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady()) {
+			s_fsr3Upscaler->Shutdown();
+			delete s_fsr3Upscaler;
+			s_fsr3Upscaler = nullptr;
+			s_fsr3FirstDispatch = true;
+			s_fsr3ViewportW = 0;
+			s_fsr3ViewportH = 0;
+		}
+#endif
+
+		// First, delete the old chain if necessary
+		if (chain) {
+			OOVR_FAILED_XR_ABORT(xrDestroySwapchain(chain));
+			chain = XR_NULL_HANDLE;
+		}
+
+		for (auto&& rtv : swapchain_rtvs)
+			rtv->Release();
+
+		swapchain_rtvs.clear();
+
+		for (auto&& tex : resolvedMSAATextures)
+			tex->Release();
+
+		resolvedMSAATextures.clear();
+
+		// Invalidate cached game texture SRV
+		if (cachedSrcSRV) { cachedSrcSRV->Release(); cachedSrcSRV = nullptr; }
+		cachedSrcTex = nullptr;
+		for (auto&& srv : resolvedMSAA_SRVs)
+			if (srv) srv->Release();
+		resolvedMSAA_SRVs.clear();
+
+		// Figure out what format we need to use
+		DxgiFormatInfo info = {};
+		if (!GetFormatInfo(srcDesc.Format, info)) {
+			OOVR_ABORTF("Unknown (by OC) DXGI texture format %d", srcDesc.Format);
+		}
+		bool useLinearFormat;
+		switch (texture->eColorSpace) {
+		case vr::ColorSpace_Gamma:
+			useLinearFormat = false;
+			break;
+		case vr::ColorSpace_Linear:
+			useLinearFormat = true;
+			break;
+		default:
+			// As per the docs for the auto mode, at eight bits per channel or less it assumes gamma
+			// (using such small channels for linear colour would result in significant banding)
+			useLinearFormat = info.bpc > 8;
+			break;
+		}
+
+		DXGI_FORMAT type = useLinearFormat ? info.linear : info.srgb;
+
+		if (type == DXGI_FORMAT_UNKNOWN) {
+			OOVR_ABORTF("Invalid DXGI target format found: useLinear=%d type=DXGI_FORMAT_UNKNOWN fmt=%d", useLinearFormat, srcDesc.Format);
+		}
+
+		// Set aside the old format for checking later
+		createInfoFormat = srcDesc.Format;
+
+		// Track FSR input dimensions for compatibility checks
+		fsrInputWidth = srcDesc.Width;
+		fsrInputHeight = srcDesc.Height;
+
+		// Make eye render buffer (FSR: output at full resolution)
+		desc = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+		// TODO desc.Type = cube ? ovrTexture_Cube : ovrTexture_2D;
+		desc.faceCount = cube ? 6 : 1;
+		desc.width = outWidth;
+		desc.height = outHeight;
+		desc.format = type;
+		desc.mipCount = srcDesc.MipLevels;
+		desc.sampleCount = 1;
+		desc.arraySize = 1;
+		desc.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+
+		XrResult result = xrCreateSwapchain(xr_session.get(), &desc, &chain);
+		if (!XR_SUCCEEDED(result))
+			OOVR_ABORTF("Cannot create DX texture swap chain: err %d", result);
+
+		// Go through the images and retrieve them - this will be used later in Invoke, since OpenXR doesn't
+		// have a convenient way to request one specific image.
+		uint32_t imageCount;
+		OOVR_FAILED_XR_ABORT(xrEnumerateSwapchainImages(chain, 0, &imageCount, nullptr));
+
+		imagesHandles = std::vector<XrSwapchainImageD3D11KHR>(imageCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
+		OOVR_FAILED_XR_ABORT(xrEnumerateSwapchainImages(chain,
+		    imagesHandles.size(), &imageCount, (XrSwapchainImageBaseHeader*)imagesHandles.data()));
+
+		OOVR_FALSE_ABORT(imageCount == imagesHandles.size());
+
+		swapchain_rtvs.resize(imageCount, nullptr);
+
+		for (uint32_t i = 0; i < imageCount; i++) {
+			swapchain_rtvs[i] = d3d_make_rtv(device, (XrBaseInStructure&)imagesHandles[i], type);
+		}
+
+		if (srcDesc.SampleDesc.Count > 1) {
+			OOVR_LOGF("Creating resolver textures for MSAA source with sample count x%d", srcDesc.SampleDesc.Count);
+			D3D11_TEXTURE2D_DESC resDesc = srcDesc;
+			resDesc.SampleDesc.Count = 1;
+
+			resolvedMSAATextures.resize(imageCount, nullptr);
+
+			resolvedMSAA_SRVs.resize(imageCount, nullptr);
+			for (uint32_t i = 0; i < imageCount; i++) {
+				device->CreateTexture2D(&resDesc, nullptr, &resolvedMSAATextures[i]);
+				device->CreateShaderResourceView(resolvedMSAATextures[i], nullptr, &resolvedMSAA_SRVs[i]);
+			}
+		}
+
+		// ── DLAA: create intermediate + output textures (game resolution, skip for overlays) ──
+		if (dlaaReady && !isOverlay) {
+			// Release old textures
+			if (dlaaIntermediateRTV) { dlaaIntermediateRTV->Release(); dlaaIntermediateRTV = nullptr; }
+			if (dlaaIntermediateSRV) { dlaaIntermediateSRV->Release(); dlaaIntermediateSRV = nullptr; }
+			if (dlaaIntermediate) { dlaaIntermediate->Release(); dlaaIntermediate = nullptr; }
+			if (dlaaOutputRTV) { dlaaOutputRTV->Release(); dlaaOutputRTV = nullptr; }
+			if (dlaaOutputSRV) { dlaaOutputSRV->Release(); dlaaOutputSRV = nullptr; }
+			if (dlaaOutput) { dlaaOutput->Release(); dlaaOutput = nullptr; }
+
+			// DLAA operates at the game's render resolution (srcDesc dimensions)
+			uint32_t dw = srcDesc.Width;
+			uint32_t dh = srcDesc.Height;
+
+			// Intermediate: RGBA8 (RGB = pre-filtered color, A = edge luminance)
+			D3D11_TEXTURE2D_DESC diDesc = {};
+			diDesc.Width = dw;
+			diDesc.Height = dh;
+			diDesc.MipLevels = 1;
+			diDesc.ArraySize = 1;
+			diDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			diDesc.SampleDesc.Count = 1;
+			diDesc.Usage = D3D11_USAGE_DEFAULT;
+			diDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+			// Output: same format as game texture
+			D3D11_TEXTURE2D_DESC doDesc = diDesc;
+			doDesc.Format = srcDesc.Format;
+
+			HRESULT hr1 = device->CreateTexture2D(&diDesc, nullptr, &dlaaIntermediate);
+			HRESULT hr2 = device->CreateTexture2D(&doDesc, nullptr, &dlaaOutput);
+			if (SUCCEEDED(hr1) && SUCCEEDED(hr2)) {
+				device->CreateShaderResourceView(dlaaIntermediate, nullptr, &dlaaIntermediateSRV);
+				device->CreateShaderResourceView(dlaaOutput, nullptr, &dlaaOutputSRV);
+				D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+				rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+				rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				device->CreateRenderTargetView(dlaaIntermediate, &rtvDesc, &dlaaIntermediateRTV);
+				rtvDesc.Format = srcDesc.Format;
+				device->CreateRenderTargetView(dlaaOutput, &rtvDesc, &dlaaOutputRTV);
+				dlaaWidth = dw;
+				dlaaHeight = dh;
+				OOVR_LOGF("DLAA textures created: %dx%d", dw, dh);
+			} else {
+				OOVR_LOG("DLAA texture creation failed — disabling DLAA");
+				dlaaReady = false;
+			}
+		}
+
+		// TODO do we need to release the images at some point, or does the swapchain do that for us?
+	}
+}
+
+// VRS + FSR radius matching: these statics are set by the outer Invoke (with eye param)
+// and read by the inner Invoke (FSR code) to pass per-eye projection centers to shaders.
+static float s_vrsProjX[2] = { 0.5f, 0.5f };
+static float s_vrsProjY[2] = { 0.5f, 0.5f };
+static int s_vrsEyeW = 0, s_vrsEyeH = 0;
+static bool s_vrsInitialFrameDone = false;
+static int s_currentEyeIdx = 0;
+
+void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBounds_t* bounds)
+{
+	auto* src = (ID3D11Texture2D*)texture->handle;
+
+	// OpenXR swap chain doesn't support weird formats like DXGI_FORMAT_BC1_TYPELESS
+	D3D11_TEXTURE2D_DESC srcDesc;
+	src->GetDesc(&srcDesc);
+	if (srcDesc.Format == DXGI_FORMAT_BC1_TYPELESS) {
+		if (chain) {
+			OOVR_FAILED_XR_ABORT(xrDestroySwapchain(chain));
+			chain = XR_NULL_HANDLE;
+		}
+		return;
+	}
+
+	CheckCreateSwapChain(texture, bounds, false);
+
+	// Update cached game texture SRV (Skyrim VR submits the same texture every frame)
+	if (!isOverlay && src != cachedSrcTex) {
+		if (cachedSrcSRV) { cachedSrcSRV->Release(); cachedSrcSRV = nullptr; }
+		device->CreateShaderResourceView(src, nullptr, &cachedSrcSRV);
+		cachedSrcTex = src;
+	}
+
+	// First reserve an image from the swapchain
+	XrSwapchainImageAcquireInfo acquireInfo{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	uint32_t currentIndex = 0;
+	OOVR_FAILED_XR_ABORT(xrAcquireSwapchainImage(chain, &acquireInfo, &currentIndex));
+
+	// Wait until the swapchain is ready - this makes sure the compositor isn't writing to it
+	// We don't have to pass in currentIndex since it uses the oldest acquired-but-not-waited-on
+	// image, so we should be careful with concurrency here.
+	// XR_TIMEOUT_EXPIRED is considered successful but swapchain still can't be used so need to handle that
+	XrSwapchainImageWaitInfo waitInfo{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	waitInfo.timeout = 500000000; // time out in nano seconds - 500ms
+	XrResult res;
+	OOVR_FAILED_XR_ABORT(res = xrWaitSwapchainImage(chain, &waitInfo));
+
+	if (res == XR_TIMEOUT_EXPIRED)
+		OOVR_ABORTF("xrWaitSwapchainImage timeout");
+
+	// Copy the source to the destination image
+	// Use SOURCE texture dimensions for region (not swapchain — they differ when FSR upscales)
+	D3D11_BOX sourceRegion;
+	if (bounds) {
+		uint32_t srcEyeW = (uint32_t)(srcDesc.Width * std::fabs(bounds->uMax - bounds->uMin));
+		uint32_t srcEyeH = srcDesc.Height;
+		sourceRegion.left = (uint32_t)(bounds->uMin * srcDesc.Width);
+		sourceRegion.right = sourceRegion.left + srcEyeW;
+		sourceRegion.top = 0;
+		sourceRegion.bottom = srcEyeH;
+	} else {
+		sourceRegion.left = 0;
+		sourceRegion.right = srcDesc.Width;
+		sourceRegion.top = 0;
+		sourceRegion.bottom = srcDesc.Height;
+	}
+	sourceRegion.front = 0;
+	sourceRegion.back = 1;
+
+	// Bounds describe an inverted image so copy texture using pixel shader inverting on copy
+	if (bounds && bounds->vMin > bounds->vMax && oovr_global_configuration.InvertUsingShaders() && !swapchain_rtvs.empty()) {
+		auto* src = (ID3D11Texture2D*)texture->handle;
+
+		context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+
+		UINT numViewPorts = 0;
+		context->RSGetViewports(&numViewPorts, nullptr);
+		D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		if (numViewPorts) context->RSGetViewports(&numViewPorts, viewports);
+
+		UINT numScissors = 0;
+		context->RSGetScissorRects(&numScissors, nullptr);
+		D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		if (numScissors) context->RSGetScissorRects(&numScissors, scissors);
+
+		ID3D11RasterizerState* pRSState;
+		context->RSGetState(&pRSState);
+		context->RSSetState(nullptr);
+
+		D3D11_VIEWPORT viewport = CD3D11_VIEWPORT(src, swapchain_rtvs[currentIndex]);
+		context->RSSetViewports(1, &viewport);
+		D3D11_RECT rects[1];
+		rects[0].top = 0;
+		rects[0].left = 0;
+		rects[0].bottom = createInfo.height;
+		rects[0].right = createInfo.width;
+		context->RSSetScissorRects(1, rects);
+
+		// Set up for rendering
+		context->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
+		float clear_colour[4] = { 0.f, 0.f, 0.f, 0.f };
+		context->ClearRenderTargetView(swapchain_rtvs[currentIndex], clear_colour);
+
+		// Set the active shaders and constant buffers.
+		context->PSSetShaderResources(0, 1, &cachedSrcSRV);
+		context->VSSetShader(fs_vshader, nullptr, 0);
+		context->PSSetShader(fs_pshader, nullptr, 0);
+		context->PSSetSamplers(0, 1, &quad_sampleState);
+
+		// Set up the mesh's information
+		D3D11_PRIMITIVE_TOPOLOGY currTopology;
+		context->IAGetPrimitiveTopology(&currTopology);
+		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		context->Draw(4, 0);
+		context->IASetPrimitiveTopology(currTopology);
+
+		if (numViewPorts)
+			context->RSSetViewports(numViewPorts, viewports);
+		if (numScissors)
+			context->RSSetScissorRects(numScissors, scissors);
+
+		context->RSSetState(pRSState);
+	}
+#ifdef OC_HAS_FSR3
+	// ── FSR 3 temporal upscaling path (DX12 interop) ──
+	// Takes priority over FSR 1 when the SKSE bridge provides motion vectors + depth.
+	else if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
+	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
+	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
+	    && oovr_global_configuration.MotionVectorsEnabled()
+	    && oovr_global_configuration.FsrEnabled()
+	    && oovr_global_configuration.FsrRenderScale() < 0.99f
+	    && !isOverlay && !swapchain_rtvs.empty()) {
+
+		{ static int s_fsr3Hits = 0; s_fsr3Hits++;
+		  if (s_fsr3Hits <= 4 || s_fsr3Hits % 200 == 0)
+			OOVR_LOGF("FSR3: dispatch path hit #%d — eye=%d bounds=%s", s_fsr3Hits, s_currentEyeIdx, bounds ? "yes" : "no");
+		}
+
+		// ╔══════════════════════════════════════════════════════════════════╗
+		// ║ [DIAG] FSR3 BYPASS — skip DX12 dispatch, copy render-res       ║
+		// ║ directly to display-res swapchain. If ghost disappears,        ║
+		// ║ FSR3/DX12 interop is the problem. Remove this block to         ║
+		// ║ re-enable FSR3.                                                ║
+		// ╚══════════════════════════════════════════════════════════════════╝
+		#define FSR3_BYPASS_FOR_DIAG 0
+		#if FSR3_BYPASS_FOR_DIAG
+		{
+			// Clear swapchain to black first (display res is larger than render res)
+			float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+			context->ClearRenderTargetView(swapchain_rtvs[currentIndex], black);
+
+			// Copy render-res per-eye region to top-left of display-res swapchain
+			if (bounds) {
+				uint32_t eyeL = (uint32_t)(bounds->uMin * srcDesc.Width);
+				uint32_t eyeR = (uint32_t)(bounds->uMax * srcDesc.Width);
+				uint32_t eyeT = 0, eyeB = srcDesc.Height;
+				if (bounds->vMin > bounds->vMax) { eyeT = (uint32_t)(bounds->vMax * srcDesc.Height); eyeB = (uint32_t)(bounds->vMin * srcDesc.Height); }
+				else { eyeT = (uint32_t)(bounds->vMin * srcDesc.Height); eyeB = (uint32_t)(bounds->vMax * srcDesc.Height); }
+				D3D11_BOX box = { eyeL, eyeT, 0, eyeR, eyeB, 1 };
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, src, 0, &box);
+			} else {
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, src, 0, nullptr);
+			}
+			{ static bool s = false; if (!s) { s = true;
+				OOVR_LOG("FSR3-BYPASS: Skipping DX12 dispatch — direct render-res copy to swapchain");
+			}}
+		}
+		#else
+		// ── Normal FSR3 dispatch path (not bypassed) ──
+		{
+
+		ID3D11Texture2D* fsrSrc = src;
+
+		// Resolve MSAA first if needed
+		if (srcDesc.SampleDesc.Count > 1 && !resolvedMSAATextures.empty()) {
+			context->ResolveSubresource(resolvedMSAATextures[currentIndex], 0, src, 0, srcDesc.Format);
+			fsrSrc = resolvedMSAATextures[currentIndex];
+		}
+
+		D3D11_TEXTURE2D_DESC fsrSrcDesc;
+		fsrSrc->GetDesc(&fsrSrcDesc);
+
+		// Per-eye color region: extract from stereo-combined texture when bounds is present
+		D3D11_BOX colorRegion = {};
+		D3D11_BOX* colorRegionPtr = nullptr;
+		uint32_t perEyeRenderW = fsrSrcDesc.Width;
+		uint32_t perEyeRenderH = fsrSrcDesc.Height;
+		if (bounds) {
+			colorRegion.left = (uint32_t)(bounds->uMin * fsrSrcDesc.Width);
+			colorRegion.right = (uint32_t)(bounds->uMax * fsrSrcDesc.Width);
+			if (bounds->vMin <= bounds->vMax) {
+				colorRegion.top = (uint32_t)(bounds->vMin * fsrSrcDesc.Height);
+				colorRegion.bottom = (uint32_t)(bounds->vMax * fsrSrcDesc.Height);
+			} else {
+				colorRegion.top = (uint32_t)(bounds->vMax * fsrSrcDesc.Height);
+				colorRegion.bottom = (uint32_t)(bounds->vMin * fsrSrcDesc.Height);
+			}
+			colorRegion.front = 0;
+			colorRegion.back = 1;
+			colorRegionPtr = &colorRegion;
+			perEyeRenderW = colorRegion.right - colorRegion.left;
+			perEyeRenderH = colorRegion.bottom - colorRegion.top;
+		}
+
+		// Get MV + depth textures from SKSE bridge. These are raw pointers into the
+		// game's renderer — they can become stale if the renderer resets (e.g., load
+		// screen) between the VirtualQuery check above and the GetDesc call here.
+		// SafeGetTextureDesc catches use-after-free and we fall back to a direct copy.
+		auto* mvTex = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->mvTexture);
+		auto* depthTex = s_pBridge->depthTexture
+		    ? reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture) : nullptr;
+		if (depthTex && !ValidateBridgeTexture(depthTex, "Depth"))
+			depthTex = nullptr;
+
+		D3D11_TEXTURE2D_DESC mvDesc;
+		if (!SafeGetTextureDesc(mvTex, &mvDesc)) {
+			OOVR_LOG("FSR3: Bridge MV texture became stale (TOCTOU race) — fallback copy this frame");
+			goto fsr3_fallback_copy;
+		}
+		{ // Scoped block — goto fsr3_fallback_copy jumps past this entire scope
+
+		// Diagnostic: log MV and depth texture info + sample MV center pixel values
+		{ static int mvDiag = 0; if (mvDiag < 5) { mvDiag++;
+			OOVR_LOGF("FSR3-MV: dims=%ux%u fmt=%u bindFlags=0x%X miscFlags=0x%X",
+			    mvDesc.Width, mvDesc.Height, mvDesc.Format, mvDesc.BindFlags, mvDesc.MiscFlags);
+			OOVR_LOGF("FSR3-MV: perEyeRender=%ux%u srcTex=%ux%u bounds=%s",
+			    perEyeRenderW, perEyeRenderH, fsrSrcDesc.Width, fsrSrcDesc.Height,
+			    bounds ? "yes" : "no");
+			if (depthTex) {
+				D3D11_TEXTURE2D_DESC depthDesc;
+				depthTex->GetDesc(&depthDesc);
+				OOVR_LOGF("FSR3-DEPTH: dims=%ux%u fmt=%u", depthDesc.Width, depthDesc.Height, depthDesc.Format);
+			}
+
+			// GPU readback: sample center pixel of MV texture to determine value range
+			// (pixel-space vs UV-space vs NDC). R16G16_FLOAT = two half-floats.
+			static ID3D11Texture2D* mvStaging = nullptr;
+			if (!mvStaging) {
+				D3D11_TEXTURE2D_DESC stgDesc = {};
+				stgDesc.Width = 1;
+				stgDesc.Height = 1;
+				stgDesc.MipLevels = 1;
+				stgDesc.ArraySize = 1;
+				stgDesc.Format = mvDesc.Format;
+				stgDesc.SampleDesc.Count = 1;
+				stgDesc.Usage = D3D11_USAGE_STAGING;
+				stgDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+				device->CreateTexture2D(&stgDesc, nullptr, &mvStaging);
+			}
+			if (mvStaging) {
+				// Copy a 1x1 region from center of MV texture
+				uint32_t cx = mvDesc.Width / 2;
+				uint32_t cy = mvDesc.Height / 2;
+				D3D11_BOX box = { cx, cy, 0, cx + 1, cy + 1, 1 };
+				if (!SafeCopyFromBridgeTexture(context, mvStaging, 0, 0, 0, 0, mvTex, 0, &box))
+					goto fsr3_fallback_copy;
+
+				D3D11_MAPPED_SUBRESOURCE mapped;
+				if (SUCCEEDED(context->Map(mvStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
+					uint16_t* raw = (uint16_t*)mapped.pData;
+					// Half-float to float: quick conversion
+					auto h2f = [](uint16_t h) -> float {
+						uint32_t s = (h >> 15) & 1;
+						uint32_t e = (h >> 10) & 0x1F;
+						uint32_t m = h & 0x3FF;
+						if (e == 0) return (s ? -1.0f : 1.0f) * ldexpf((float)m, -24);
+						if (e == 31) return s ? -INFINITY : INFINITY;
+						return (s ? -1.0f : 1.0f) * ldexpf(1.0f + m / 1024.0f, (int)e - 15);
+					};
+					float mvX = h2f(raw[0]);
+					float mvY = h2f(raw[1]);
+					OOVR_LOGF("FSR3-MV-VALUES: center pixel raw=0x%04X,0x%04X float=%.6f,%.6f "
+					    "(if pixel-space: ~%.1f,%.1fpx; if UV: ~%.1f,%.1fpx)",
+					    raw[0], raw[1], mvX, mvY,
+					    mvX, mvY,
+					    mvX * perEyeRenderW, mvY * perEyeRenderH);
+					context->Unmap(mvStaging, 0);
+				}
+			}
+		}}
+
+		// MV region: detect if stereo-combined (double width) or per-eye
+		bool mvStereoCombined = (mvDesc.Width >= perEyeRenderW * 2 - 4); // Allow small rounding error
+		D3D11_BOX mvRegion = {};
+		if (mvStereoCombined) {
+			// Stereo-combined: each eye in its own half
+			uint32_t mvEyeWidth = mvDesc.Width / 2;
+			mvRegion.left = (s_currentEyeIdx == 0) ? 0 : mvEyeWidth;
+			mvRegion.right = mvRegion.left + mvEyeWidth;
+		} else {
+			// Per-eye: engine overwrites MV RT for each eye, use full texture
+			mvRegion.left = 0;
+			mvRegion.right = mvDesc.Width;
+		}
+		mvRegion.top = 0;
+		mvRegion.bottom = mvDesc.Height;
+		mvRegion.front = 0;
+		mvRegion.back = 1;
+
+		// Frame delta time
+		auto now = std::chrono::steady_clock::now();
+		float deltaMs = 11.1f; // Default ~90fps
+		if (s_fsr3LastFrameTime.time_since_epoch().count() > 0) {
+			auto delta = std::chrono::duration_cast<std::chrono::microseconds>(now - s_fsr3LastFrameTime);
+			deltaMs = std::max(1.0f, std::min(100.0f, delta.count() / 1000.0f));
+		}
+		if (s_currentEyeIdx == 0) s_fsr3LastFrameTime = now;
+
+		// Build dispatch parameters
+		Fsr3Upscaler::DispatchParams fsr3Params = {};
+		fsr3Params.color = fsrSrc;
+		fsr3Params.colorSourceRegion = colorRegionPtr;
+		fsr3Params.motionVectors = mvTex;
+		fsr3Params.mvSourceRegion = &mvRegion;
+		fsr3Params.depth = depthTex;
+		// Depth is stereo-combined (same layout as color): extract per-eye region
+		D3D11_BOX depthRegion = {};
+		D3D11_BOX* depthRegionPtr = nullptr;
+		if (depthTex && bounds) {
+			D3D11_TEXTURE2D_DESC depthDesc;
+			if (!SafeGetTextureDesc(depthTex, &depthDesc)) {
+				OOVR_LOG("FSR3: Bridge depth texture became stale — disabling depth for this frame");
+				depthTex = nullptr;
+			} else {
+				bool depthStereoCombined = (depthDesc.Width >= perEyeRenderW * 2 - 4);
+				if (depthStereoCombined) {
+					uint32_t depthEyeW = depthDesc.Width / 2;
+					depthRegion.left = (s_currentEyeIdx == 0) ? 0 : depthEyeW;
+					depthRegion.right = depthRegion.left + depthEyeW;
+					depthRegion.top = 0;
+					depthRegion.bottom = depthDesc.Height;
+					depthRegion.front = 0;
+					depthRegion.back = 1;
+					depthRegionPtr = &depthRegion;
+				}
+			}
+		}
+		fsr3Params.depthSourceRegion = depthRegionPtr;
+		fsr3Params.jitterX = s_fsr3RenderJitterX; // Use the jitter that was applied to rendering
+		fsr3Params.jitterY = s_fsr3RenderJitterY;
+		fsr3Params.deltaTimeMs = deltaMs;
+		fsr3Params.renderWidth = perEyeRenderW;
+		fsr3Params.renderHeight = perEyeRenderH;
+		float fsr3InvScale = 1.0f / std::max(0.5f, oovr_global_configuration.FsrRenderScale());
+		uint32_t perEyeDisplayW = (uint32_t)(perEyeRenderW * fsr3InvScale);
+		uint32_t perEyeDisplayH = perEyeRenderH; // Capped: display height would exceed swapchain
+		perEyeDisplayW = std::min(perEyeDisplayW, (uint32_t)createInfo.width);
+		perEyeDisplayH = std::min(perEyeDisplayH, (uint32_t)createInfo.height);
+		fsr3Params.outputWidth = perEyeDisplayW;
+		fsr3Params.outputHeight = perEyeDisplayH;
+		fsr3Params.cameraNear = g_fsr3CameraNear;
+		fsr3Params.cameraFar = g_fsr3CameraFar;
+		fsr3Params.cameraFovY = s_fsr3CameraFovY;
+		fsr3Params.sharpness = oovr_global_configuration.Fsr3Sharpness();
+		fsr3Params.reset = s_fsr3FirstDispatch;
+		fsr3Params.jitterCancellation = oovr_global_configuration.Fsr3JitterCancellation();
+		fsr3Params.viewToMeters = oovr_global_configuration.Fsr3ViewToMeters();
+		fsr3Params.mvScale = oovr_global_configuration.MotionVectorScale();
+
+		bool fsr3Ok = s_fsr3Upscaler->Dispatch(s_currentEyeIdx, context, fsr3Params);
+		s_fsr3FirstDispatch = false;
+
+		if (fsr3Ok) {
+			ID3D11Texture2D* fsr3Output = s_fsr3Upscaler->GetOutputDX11(s_currentEyeIdx);
+
+			// Dimension verification logging
+			{ static int dimLog = 0; if (dimLog++ < 4) {
+				D3D11_TEXTURE2D_DESC outDesc, swapDesc;
+				fsr3Output->GetDesc(&outDesc);
+				imagesHandles[currentIndex].texture->GetDesc(&swapDesc);
+				OOVR_LOGF("FSR3-OUTPUT eye=%d output=%ux%u swap=%ux%u bounds=(%.3f,%.3f,%.3f,%.3f)",
+				    s_currentEyeIdx, outDesc.Width, outDesc.Height, swapDesc.Width, swapDesc.Height,
+				    bounds ? bounds->uMin : -1.f, bounds ? bounds->vMin : -1.f,
+				    bounds ? bounds->uMax : -1.f, bounds ? bounds->vMax : -1.f);
+			}}
+
+			// FSR3 output and swapchain are both per-eye display resolution.
+			// FSR3 has built-in RCAS sharpening — skip our CAS post-pass to avoid double sharpening.
+			// Our CAS checkbox only applies to the CAS-only path (native res without FSR3).
+			bool doCas = false;
+
+			if (doCas) {
+				// Create temporary SRV for FSR3 output texture
+				ID3D11ShaderResourceView* fsr3OutputSRV = nullptr;
+				device->CreateShaderResourceView(fsr3Output, nullptr, &fsr3OutputSRV);
+				if (fsr3OutputSRV) {
+					// Update constant buffer: AMD FsrRcasCon (sharpness)
+					D3D11_MAPPED_SUBRESOURCE mapped;
+					if (SUCCEEDED(context->Map(fsr_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+						AU1* con = (AU1*)mapped.pData;
+						memset(con, 0, 80);
+						float sharpLin = std::max(0.001f, std::min(1.0f, oovr_global_configuration.CasSharpness()));
+						float stops = -log2f(sharpLin);
+						FsrRcasCon(con, stops);
+						context->Unmap(fsr_cbuffer, 0);
+					}
+
+					// Save and set viewport/scissors
+					UINT numVP = 0;
+					context->RSGetViewports(&numVP, nullptr);
+					D3D11_VIEWPORT savedVP[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+					if (numVP) context->RSGetViewports(&numVP, savedVP);
+					UINT numSR = 0;
+					context->RSGetScissorRects(&numSR, nullptr);
+					D3D11_RECT savedSR[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+					if (numSR) context->RSGetScissorRects(&numSR, savedSR);
+					ID3D11RasterizerState* savedRS = nullptr;
+					context->RSGetState(&savedRS);
+					context->RSSetState(nullptr);
+					D3D11_PRIMITIVE_TOPOLOGY savedTopo;
+					context->IAGetPrimitiveTopology(&savedTopo);
+
+					D3D11_VIEWPORT vp = {};
+					vp.Width = (float)perEyeDisplayW;
+					vp.Height = (float)perEyeDisplayH;
+					vp.MaxDepth = 1.0f;
+					context->RSSetViewports(1, &vp);
+					D3D11_RECT sr = { 0, 0, (LONG)perEyeDisplayW, (LONG)perEyeDisplayH };
+					context->RSSetScissorRects(1, &sr);
+
+					// Render: FSR3 output → RCAS → swapchain
+					context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+					context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+					context->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
+					context->PSSetShaderResources(0, 1, &fsr3OutputSRV);
+					context->VSSetShader(fsr_vshader, nullptr, 0);
+					context->PSSetShader(cas_pshader, nullptr, 0);
+					context->PSSetConstantBuffers(0, 1, &fsr_cbuffer);
+					context->PSSetSamplers(0, 1, &quad_sampleState);
+					context->Draw(4, 0);
+
+					// Unbind and restore
+					ID3D11ShaderResourceView* nullSRV = nullptr;
+					context->PSSetShaderResources(0, 1, &nullSRV);
+					ID3D11RenderTargetView* nullRTV = nullptr;
+					context->OMSetRenderTargets(1, &nullRTV, nullptr);
+					context->IASetPrimitiveTopology(savedTopo);
+					if (numVP) context->RSSetViewports(numVP, savedVP);
+					if (numSR) context->RSSetScissorRects(numSR, savedSR);
+					context->RSSetState(savedRS);
+					if (savedRS) savedRS->Release();
+
+					fsr3OutputSRV->Release();
+					{ static bool s = false; if (!s) { s = true;
+						OOVR_LOG("FSR3+CAS: RCAS sharpening applied to FSR3 output"); } }
+				} else {
+					// SRV creation failed — fall back to direct copy
+					context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+					    0, 0, 0, fsr3Output, 0, nullptr);
+				}
+			} else {
+				// No CAS — direct copy
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, fsr3Output, 0, nullptr);
+			}
+
+			// Set viewport to display resolution — FSR3 filled the full swapchain
+			s_fsr3ViewportW = perEyeDisplayW;
+			s_fsr3ViewportH = perEyeDisplayH;
+
+			{ static bool s = false; if (!s) { s = true;
+				OOVR_LOGF("FSR3: First output — upscale %ux%u→%ux%u, swapchain %ux%u, cas=%s",
+				    perEyeRenderW, perEyeRenderH, perEyeDisplayW, perEyeDisplayH,
+				    createInfo.width, createInfo.height,
+				    doCas ? "on" : "off");
+			} }
+		} else {
+			// Async pipeline warmup: no output yet. Copy render-res game content
+			// as fallback into the display-res swapchain. Viewport stays at 0
+			// (reset at frame start) so the fallback path uses source dimensions.
+			if (colorRegionPtr) {
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, fsrSrc, 0, colorRegionPtr);
+			} else {
+				D3D11_BOX srcBox = { 0, 0, 0, perEyeRenderW, perEyeRenderH, 1 };
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, fsrSrc, 0, &srcBox);
+			}
+			{ static bool s = false; if (!s) { s = true; OOVR_LOG("FSR3: Dispatch warmup — fallback render-res copy to display-res swapchain"); } }
+		}
+		} // end scoped block (goto fsr3_fallback_copy jumps past here)
+		goto fsr3_end;
+
+		// Reached via goto when bridge MV texture becomes stale between VirtualQuery
+		// and GetDesc (TOCTOU race). Copy render-res content so we don't show black.
+		fsr3_fallback_copy:
+		{
+			if (colorRegionPtr) {
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, fsrSrc, 0, colorRegionPtr);
+			} else {
+				D3D11_BOX srcBox = { 0, 0, 0, perEyeRenderW, perEyeRenderH, 1 };
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, fsrSrc, 0, &srcBox);
+			}
+			{ static bool s = false; if (!s) { s = true; OOVR_LOG("FSR3: Stale bridge texture — fallback render-res copy"); } }
+		}
+		fsr3_end:;
+		} // close #else block
+		#endif // FSR3_BYPASS_FOR_DIAG
+	}
+#endif
+	else if (fsrReady && oovr_global_configuration.CasEnabled() && !isOverlay
+	    && oovr_global_configuration.CasSharpness() > 0.0f
+	    && !bounds && !swapchain_rtvs.empty()) {
+		// ── CAS-only path: RCAS sharpening at native resolution (no upscaling) ──
+		ID3D11Texture2D* casSrc = src;
+
+		// Resolve MSAA first if needed
+		if (srcDesc.SampleDesc.Count > 1 && !resolvedMSAATextures.empty()) {
+			context->ResolveSubresource(resolvedMSAATextures[currentIndex], 0, src, 0, srcDesc.Format);
+			casSrc = resolvedMSAATextures[currentIndex];
+		}
+
+		// ── DLAA pre-pass (before CAS): anti-alias at native resolution ──
+		if (dlaaReady && oovr_global_configuration.DlaaEnabled() && dlaaIntermediate && dlaaOutput) {
+			ID3D11ShaderResourceView* srcSRV = (casSrc == src) ? cachedSrcSRV : resolvedMSAA_SRVs[currentIndex];
+
+			D3D11_MAPPED_SUBRESOURCE mapped;
+			if (SUCCEEDED(context->Map(dlaa_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+				float cbData[4] = { 1.0f / dlaaWidth, 1.0f / dlaaHeight, oovr_global_configuration.DlaaLambda(), oovr_global_configuration.DlaaEpsilon() };
+				memcpy(mapped.pData, cbData, 16);
+				context->Unmap(dlaa_cbuffer, 0);
+			}
+
+			D3D11_PRIMITIVE_TOPOLOGY prevTopo;
+			context->IAGetPrimitiveTopology(&prevTopo);
+			context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+			D3D11_VIEWPORT dv = {}; dv.Width = (float)dlaaWidth; dv.Height = (float)dlaaHeight; dv.MaxDepth = 1.0f;
+			context->RSSetViewports(1, &dv);
+			D3D11_RECT dr = { 0, 0, (LONG)dlaaWidth, (LONG)dlaaHeight };
+			context->RSSetScissorRects(1, &dr);
+
+			context->OMSetRenderTargets(1, &dlaaIntermediateRTV, nullptr);
+			context->PSSetShaderResources(0, 1, &srcSRV);
+			context->VSSetShader(dlaa_vshader, nullptr, 0);
+			context->PSSetShader(dlaa_pre_pshader, nullptr, 0);
+			context->PSSetSamplers(0, 1, &dlaa_pointSampler);
+			context->PSSetConstantBuffers(0, 1, &dlaa_cbuffer);
+			context->Draw(4, 0);
+
+			ID3D11RenderTargetView* nullRTV = nullptr;
+			context->OMSetRenderTargets(1, &nullRTV, nullptr);
+
+			context->OMSetRenderTargets(1, &dlaaOutputRTV, nullptr);
+			ID3D11ShaderResourceView* srvs[2] = { srcSRV, dlaaIntermediateSRV };
+			context->PSSetShaderResources(0, 2, srvs);
+			context->PSSetShader(dlaa_main_pshader, nullptr, 0);
+			context->Draw(4, 0);
+
+			ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+			context->PSSetShaderResources(0, 2, nullSRVs);
+			context->OMSetRenderTargets(1, &nullRTV, nullptr);
+			context->IASetPrimitiveTopology(prevTopo);
+
+			casSrc = dlaaOutput;
+		}
+
+		// Use cached SRV: dlaaOutputSRV if DLAA ran, cachedSrcSRV for game tex, or pre-created MSAA SRV
+		ID3D11ShaderResourceView* gameSRV;
+		if (casSrc == dlaaOutput)
+			gameSRV = dlaaOutputSRV;
+		else if (casSrc == src)
+			gameSRV = cachedSrcSRV;
+		else
+			gameSRV = resolvedMSAA_SRVs[currentIndex];
+
+		UINT numViewPorts = 0;
+		context->RSGetViewports(&numViewPorts, nullptr);
+		D3D11_VIEWPORT savedViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		if (numViewPorts) context->RSGetViewports(&numViewPorts, savedViewports);
+
+		UINT numScissors = 0;
+		context->RSGetScissorRects(&numScissors, nullptr);
+		D3D11_RECT savedScissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		if (numScissors) context->RSGetScissorRects(&numScissors, savedScissors);
+
+		ID3D11RasterizerState* savedRSState = nullptr;
+		context->RSGetState(&savedRSState);
+		context->RSSetState(nullptr);
+
+		D3D11_PRIMITIVE_TOPOLOGY savedTopology;
+		context->IAGetPrimitiveTopology(&savedTopology);
+		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+
+		D3D11_TEXTURE2D_DESC casSrcDesc;
+		casSrc->GetDesc(&casSrcDesc);
+
+		// Update constant buffer for RCAS-only pass (AMD FsrRcasCon)
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		if (SUCCEEDED(context->Map(fsr_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+			AU1* con = (AU1*)mapped.pData;
+			memset(con, 0, 80); // Clear full buffer including VrsRadius
+			float sharpLin = std::max(0.001f, std::min(1.0f, oovr_global_configuration.CasSharpness()));
+			float stops = -log2f(sharpLin);
+			FsrRcasCon(con, stops);
+			context->Unmap(fsr_cbuffer, 0);
+		}
+
+		D3D11_VIEWPORT vp = {};
+		vp.Width = (float)createInfo.width;
+		vp.Height = (float)createInfo.height;
+		vp.MaxDepth = 1.0f;
+		context->RSSetViewports(1, &vp);
+
+		D3D11_RECT scissorRect = { 0, 0, (LONG)createInfo.width, (LONG)createInfo.height };
+		context->RSSetScissorRects(1, &scissorRect);
+
+		// Single pass: game texture → RCAS → swapchain
+		context->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
+		context->PSSetShaderResources(0, 1, &gameSRV);
+		context->VSSetShader(fsr_vshader, nullptr, 0);
+		context->PSSetShader(cas_pshader, nullptr, 0);
+		context->PSSetConstantBuffers(0, 1, &fsr_cbuffer);
+		context->Draw(4, 0);
+
+		ID3D11ShaderResourceView* nullSRV = nullptr;
+		context->PSSetShaderResources(0, 1, &nullSRV);
+
+		context->IASetPrimitiveTopology(savedTopology);
+
+		if (numViewPorts)
+			context->RSSetViewports(numViewPorts, savedViewports);
+		if (numScissors)
+			context->RSSetScissorRects(numScissors, savedScissors);
+		context->RSSetState(savedRSState);
+	} else if (dlaaReady && oovr_global_configuration.DlaaEnabled() && !isOverlay
+	    && dlaaIntermediate && dlaaOutput && !bounds && !swapchain_rtvs.empty()) {
+		// ── DLAA-only path (no FSR/CAS) ──
+		ID3D11Texture2D* dlaaSrc = src;
+		if (srcDesc.SampleDesc.Count > 1 && !resolvedMSAATextures.empty()) {
+			context->ResolveSubresource(resolvedMSAATextures[currentIndex], 0, src, 0, srcDesc.Format);
+			dlaaSrc = resolvedMSAATextures[currentIndex];
+		}
+
+		ID3D11ShaderResourceView* srcSRV = (dlaaSrc == src) ? cachedSrcSRV : resolvedMSAA_SRVs[currentIndex];
+
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		if (SUCCEEDED(context->Map(dlaa_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+			float cbData[4] = { 1.0f / dlaaWidth, 1.0f / dlaaHeight, 0, 0 };
+			memcpy(mapped.pData, cbData, 16);
+			context->Unmap(dlaa_cbuffer, 0);
+		}
+
+		UINT numViewPorts = 0;
+		context->RSGetViewports(&numViewPorts, nullptr);
+		D3D11_VIEWPORT savedVPs[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		if (numViewPorts) context->RSGetViewports(&numViewPorts, savedVPs);
+		UINT numScissors = 0;
+		context->RSGetScissorRects(&numScissors, nullptr);
+		D3D11_RECT savedSR[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		if (numScissors) context->RSGetScissorRects(&numScissors, savedSR);
+		ID3D11RasterizerState* savedRS = nullptr;
+		context->RSGetState(&savedRS);
+		context->RSSetState(nullptr);
+
+		D3D11_PRIMITIVE_TOPOLOGY savedTopo;
+		context->IAGetPrimitiveTopology(&savedTopo);
+		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+
+		D3D11_VIEWPORT dv = {}; dv.Width = (float)dlaaWidth; dv.Height = (float)dlaaHeight; dv.MaxDepth = 1.0f;
+		context->RSSetViewports(1, &dv);
+		D3D11_RECT dr = { 0, 0, (LONG)dlaaWidth, (LONG)dlaaHeight };
+		context->RSSetScissorRects(1, &dr);
+
+		// Pass 1: PreFilter
+		context->OMSetRenderTargets(1, &dlaaIntermediateRTV, nullptr);
+		context->PSSetShaderResources(0, 1, &srcSRV);
+		context->VSSetShader(dlaa_vshader, nullptr, 0);
+		context->PSSetShader(dlaa_pre_pshader, nullptr, 0);
+		context->PSSetSamplers(0, 1, &dlaa_pointSampler);
+		context->PSSetConstantBuffers(0, 1, &dlaa_cbuffer);
+		context->Draw(4, 0);
+
+		ID3D11RenderTargetView* nullRTV = nullptr;
+		context->OMSetRenderTargets(1, &nullRTV, nullptr);
+
+		// Pass 2: Main AA → swapchain directly
+		D3D11_VIEWPORT sv = {}; sv.Width = (float)createInfo.width; sv.Height = (float)createInfo.height; sv.MaxDepth = 1.0f;
+		context->RSSetViewports(1, &sv);
+		D3D11_RECT sr = { 0, 0, (LONG)createInfo.width, (LONG)createInfo.height };
+		context->RSSetScissorRects(1, &sr);
+
+		context->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
+		ID3D11ShaderResourceView* srvs[2] = { srcSRV, dlaaIntermediateSRV };
+		context->PSSetShaderResources(0, 2, srvs);
+		context->PSSetShader(dlaa_main_pshader, nullptr, 0);
+		context->Draw(4, 0);
+
+		ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+		context->PSSetShaderResources(0, 2, nullSRVs);
+
+		context->IASetPrimitiveTopology(savedTopo);
+		if (numViewPorts) context->RSSetViewports(numViewPorts, savedVPs);
+		if (numScissors) context->RSSetScissorRects(numScissors, savedSR);
+		context->RSSetState(savedRS);
+	} else {
+		// ── Normal copy path (no FSR/CAS/DLAA) ──
+		{ static int s_defaultHits = 0; s_defaultHits++;
+		  if (s_defaultHits <= 10 || s_defaultHits % 100 == 0)
+			OOVR_LOGF("WARNING: Default copy path hit #%d — FSR3/FSR1/CAS/DLAA all skipped! "
+			    "src=%ux%u swap=%ux%u bounds=%s sourceRegion=[%u,%u,%u,%u]",
+			    s_defaultHits, srcDesc.Width, srcDesc.Height, createInfo.width, createInfo.height,
+			    bounds ? "yes" : "no",
+			    sourceRegion.left, sourceRegion.right, sourceRegion.top, sourceRegion.bottom);
+		}
+		// Clear swapchain to black when it's larger than source (FSR configured but not yet active)
+		// to avoid garbage pixels in the unused region during loading/transition
+		if (bounds && !swapchain_rtvs.empty() && createInfo.width != srcDesc.Width) {
+			float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+			context->ClearRenderTargetView(swapchain_rtvs[currentIndex], black);
+		}
+		if (srcDesc.SampleDesc.Count > 1) {
+			D3D11_TEXTURE2D_DESC resDesc = srcDesc;
+			resDesc.SampleDesc.Count = 1;
+			context->ResolveSubresource(resolvedMSAATextures[currentIndex], 0, src, 0, resDesc.Format);
+			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0, 0, 0, 0, resolvedMSAATextures[currentIndex], 0, &sourceRegion);
+		} else {
+			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0, 0, 0, 0, src, 0, &sourceRegion);
+		}
+	}
+
+	// Release the swapchain - OpenXR will use the last-released image in a swapchain
+	// No manual Flush() needed — xrReleaseSwapchainImage handles GPU synchronization internally.
+	XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	OOVR_FAILED_XR_ABORT(xrReleaseSwapchainImage(chain, &releaseInfo));
+}
+
+void DX11Compositor::InvokeCubemap(const vr::Texture_t* textures)
+{
+	CheckCreateSwapChain(&textures[0], nullptr, true);
+
+#ifdef OC_XR_PORT
+	ID3D11Texture2D* tex = nullptr;
+	ERR("TODO cubemap");
+#else
+	int currentIndex = 0;
+	OOVR_FAILED_OVR_ABORT(ovr_GetTextureSwapChainCurrentIndex(OVSS, chain, &currentIndex));
+
+	OOVR_FAILED_OVR_ABORT(ovr_GetTextureSwapChainBufferDX(OVSS, chain, currentIndex, IID_PPV_ARGS(&tex)));
+#endif
+
+	ID3D11Texture2D* faceSrc;
+
+	// Front
+	faceSrc = (ID3D11Texture2D*)textures[0].handle;
+	context->CopySubresourceRegion(tex, 5, 0, 0, 0, faceSrc, 0, nullptr);
+
+	// Back
+	faceSrc = (ID3D11Texture2D*)textures[1].handle;
+	context->CopySubresourceRegion(tex, 4, 0, 0, 0, faceSrc, 0, nullptr);
+
+	// Left
+	faceSrc = (ID3D11Texture2D*)textures[2].handle;
+	context->CopySubresourceRegion(tex, 0, 0, 0, 0, faceSrc, 0, nullptr);
+
+	// Right
+	faceSrc = (ID3D11Texture2D*)textures[3].handle;
+	context->CopySubresourceRegion(tex, 1, 0, 0, 0, faceSrc, 0, nullptr);
+
+	// Top
+	faceSrc = (ID3D11Texture2D*)textures[4].handle;
+	context->CopySubresourceRegion(tex, 2, 0, 0, 0, faceSrc, 0, nullptr);
+
+	// Bottom
+	faceSrc = (ID3D11Texture2D*)textures[5].handle;
+	context->CopySubresourceRegion(tex, 3, 0, 0, 0, faceSrc, 0, nullptr);
+
+	tex->Release();
+}
+
+void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::VRTextureBounds_t* ptrBounds,
+    vr::EVRSubmitFlags submitFlags, XrCompositionLayerProjectionView& layer)
+{
+#ifdef OC_HAS_FSR3
+	// Reset FSR3 viewport crop — set by FSR3 dispatch if it runs this frame
+	s_fsr3ViewportW = 0;
+	s_fsr3ViewportH = 0;
+#endif
+
+	// ── VRS: lazy-init on dxcomp only, then disable before our post-processing shaders ──
+	VRSManager* vrsMgr = nullptr;
+	if (BaseCompositor::dxcomp && oovr_global_configuration.VrsEnabled()) {
+		vrsMgr = BaseCompositor::dxcomp->GetVRSManager();
+		// Lazy-init: only initialize VRS on the dxcomp compositor (not temporary compositors)
+		if (vrsMgr && !vrsMgr->IsAvailable()) {
+			if (vrsMgr->Initialize(BaseCompositor::dxcomp->GetDevice())) {
+				OOVR_LOG("VRS: NVIDIA Variable Rate Shading initialized (lazy, on dxcomp)");
+			} else {
+				OOVR_LOG("VRS: Not available (requires NVIDIA RTX or GTX 16xx series)");
+			}
+		}
+		if (vrsMgr->IsAvailable()) {
+			vrsMgr->Disable();
+		} else {
+			vrsMgr = nullptr; // Not available, skip all VRS code below
+		}
+	}
+
+	// Set current eye index for FSR radius matching (inner Invoke reads this)
+	s_currentEyeIdx = (eye == XruEyeLeft) ? 0 : 1;
+
+#ifdef OC_HAS_FSR3
+	// ── FSR 3: lazy-init upscaler and update per-frame jitter ──
+	if (oovr_global_configuration.FsrEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+		// Try to open the SKSE render target bridge (MV + depth)
+		OpenRenderTargetBridge();
+
+		// Lazy-init the FSR 3 upscaler (DX12 device + FidelityFX DLLs)
+		if (!s_fsr3Upscaler && s_pBridge && s_pBridge->status == 1) {
+			s_fsr3Upscaler = new Fsr3Upscaler();
+			if (!s_fsr3Upscaler->Initialize(device)) {
+				OOVR_LOG("FSR3: Initialization failed — falling back to FSR 1");
+				delete s_fsr3Upscaler;
+				s_fsr3Upscaler = nullptr;
+			}
+		}
+
+		// Save jitter and camera FOV on left eye (once per stereo frame).
+		// IMPORTANT: Do NOT compute next-frame jitter here — right eye's GetProjectionRaw
+		// hasn't been called yet and would pick up the wrong (next) jitter value.
+		if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady() && eye == XruEyeLeft) {
+			// Save the jitter that was applied to THIS frame's rendering
+			// (g_fsr3JitterX/Y were set after the PREVIOUS frame's right eye submit)
+			s_fsr3RenderJitterX = g_fsr3JitterX;
+			s_fsr3RenderJitterY = g_fsr3JitterY;
+		#if FSR3_BYPASS_FOR_DIAG
+			g_fsr3JitterEnabled = false; // No jitter when bypassing FSR3
+		#else
+			g_fsr3JitterEnabled = true;
+		#endif
+
+			// Capture vertical FOV from OpenXR view
+			s_fsr3CameraFovY = fabsf(layer.fov.angleUp) + fabsf(layer.fov.angleDown);
+		}
+	} else {
+		g_fsr3JitterEnabled = false;
+	}
+#endif
+
+	// OCU ASW: lazy-init (needs bridge MV for texture dimensions + eye resolution)
+	if (oovr_global_configuration.ASWEnabled()) {
+		OpenRenderTargetBridge();
+		if (!g_aswProvider && s_pBridge && s_pBridge->status == 1) {
+			// Get eye resolution from the submitted texture
+			auto* src = (ID3D11Texture2D*)texture->handle;
+			D3D11_TEXTURE2D_DESC srcDesc;
+			if (SafeGetTextureDesc(src, &srcDesc)) {
+				uint32_t eyeW = ptrBounds ? srcDesc.Width / 2 : srcDesc.Width;
+				g_aswProvider = new ASWProvider();
+				if (!g_aswProvider->Initialize(device, eyeW, srcDesc.Height)) {
+					OOVR_LOG("ASW: Initialization failed — disabling");
+					delete g_aswProvider;
+					g_aswProvider = nullptr;
+				}
+			}
+		}
+	}
+
+	// Copy the texture across
+	Invoke(texture, ptrBounds);
+
+	// OCU ASW: cache frame data (color + MV + depth + pose) for warping
+	layer.next = nullptr;
+	if (g_aswProvider && g_aswProvider->IsReady()
+	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
+	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "ASW-MV")) {
+
+		auto* mvTex = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->mvTexture);
+		auto* depthTex = s_pBridge->depthTexture
+		    ? reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture) : nullptr;
+		if (depthTex && !ValidateBridgeTexture(depthTex, "ASW-Depth"))
+			depthTex = nullptr;
+
+		D3D11_TEXTURE2D_DESC mvDesc;
+		if (SafeGetTextureDesc(mvTex, &mvDesc)) {
+			uint32_t mvEyeW = mvDesc.Width / 2;
+			int eyeIdx = s_currentEyeIdx;
+
+			// Build per-eye MV region (bridge texture is stereo-combined)
+			D3D11_BOX mvRegion = {};
+			mvRegion.left = eyeIdx * mvEyeW;
+			mvRegion.right = mvRegion.left + mvEyeW;
+			mvRegion.top = 0;
+			mvRegion.bottom = mvDesc.Height;
+			mvRegion.front = 0;
+			mvRegion.back = 1;
+
+			// Build per-eye color region from submitted texture
+			auto* colorSrc = (ID3D11Texture2D*)texture->handle;
+			D3D11_TEXTURE2D_DESC colorDesc;
+			D3D11_BOX colorRegion = {};
+			if (SafeGetTextureDesc(colorSrc, &colorDesc)) {
+				uint32_t colorEyeW = ptrBounds ? colorDesc.Width / 2 : colorDesc.Width;
+				colorRegion.left = ptrBounds ? eyeIdx * colorEyeW : 0;
+				colorRegion.right = colorRegion.left + colorEyeW;
+				colorRegion.top = 0;
+				colorRegion.bottom = colorDesc.Height;
+				colorRegion.front = 0;
+				colorRegion.back = 1;
+			}
+
+			// Build per-eye depth region
+			D3D11_BOX depthRegion = {};
+			if (depthTex) {
+				D3D11_TEXTURE2D_DESC depthDesc;
+				if (SafeGetTextureDesc(depthTex, &depthDesc)) {
+					uint32_t depthEyeW = depthDesc.Width / 2;
+					depthRegion.left = eyeIdx * depthEyeW;
+					depthRegion.right = depthRegion.left + depthEyeW;
+					depthRegion.top = 0;
+					depthRegion.bottom = depthDesc.Height;
+					depthRegion.front = 0;
+					depthRegion.back = 1;
+				} else {
+					depthTex = nullptr;
+				}
+			}
+
+			g_aswProvider->CacheFrame(eyeIdx, context,
+			    colorSrc, &colorRegion,
+			    mvTex, &mvRegion,
+			    depthTex, depthTex ? &depthRegion : nullptr,
+			    layer.pose, layer.fov,
+			    g_fsr3CameraNear, g_fsr3CameraFar);
+		}
+	}
+
+#ifdef OC_HAS_FSR3
+	// After right eye: compute NEXT frame's jitter and increment frame counter.
+	// This must happen AFTER both eyes have rendered and dispatched with the current jitter.
+	// Previously this was in the left-eye block, which caused the right eye to pick up
+	// the wrong (next-frame) jitter in GetProjectionRaw — producing temporal instability.
+	if (g_fsr3JitterEnabled && eye == XruEyeRight) {
+		auto* src = (ID3D11Texture2D*)texture->handle;
+		D3D11_TEXTURE2D_DESC srcDesc;
+		src->GetDesc(&srcDesc);
+		uint32_t renderW = ptrBounds ? srcDesc.Width / 2 : srcDesc.Width;
+		uint32_t displayW = xr_main_view(XruEyeLeft).recommendedImageRectWidth;
+
+		g_fsr3JitterPhaseCount = Fsr3Upscaler::GetJitterPhaseCount(renderW, displayW);
+		Fsr3Upscaler::GetJitterOffset(&g_fsr3JitterX, &g_fsr3JitterY,
+		    g_fsr3FrameIndex, g_fsr3JitterPhaseCount);
+		// Apply jitter scale — lower values reduce temporal instability in VR
+		float jScale = oovr_global_configuration.Fsr3JitterScale();
+		g_fsr3JitterX *= jScale;
+		g_fsr3JitterY *= jScale;
+		g_fsr3FrameIndex++;
+	}
+#endif
+
+	// ── VRS: update projection centers and re-enable for the NEXT eye's rendering ──
+	if (vrsMgr && vrsMgr->IsAvailable() && oovr_global_configuration.VrsEnabled()) {
+		int eyeIdx = (eye == XruEyeLeft) ? 0 : 1;
+
+		// Extract projection center from this eye's FOV
+		float tanL = tanf(layer.fov.angleLeft);
+		float tanR = tanf(layer.fov.angleRight);
+		float tanU = tanf(layer.fov.angleUp);
+		float tanD = tanf(layer.fov.angleDown);
+		s_vrsProjX[eyeIdx] = (-tanL) / (tanR - tanL);
+		s_vrsProjY[eyeIdx] = tanU / (tanU - tanD);
+
+		// On left eye, record the single-eye texture dimensions
+		if (eyeIdx == 0) {
+			auto* src = (ID3D11Texture2D*)texture->handle;
+			D3D11_TEXTURE2D_DESC desc;
+			src->GetDesc(&desc);
+			s_vrsEyeW = ptrBounds ? desc.Width / 2 : desc.Width;
+			s_vrsEyeH = desc.Height;
+		}
+
+		// After right eye (frame complete): update patterns for both eyes
+		if (eyeIdx == 1 && s_vrsEyeW > 0 && s_vrsEyeH > 0) {
+			vrsMgr->SetProjectionCenters(s_vrsProjX[0], s_vrsProjY[0], s_vrsProjX[1], s_vrsProjY[1]);
+			vrsMgr->UpdatePatterns(s_vrsEyeW, s_vrsEyeH);
+
+			if (!s_vrsInitialFrameDone) {
+				OOVR_LOGF("VRS: First frame complete — eye %dx%d, projL=(%.3f,%.3f) projR=(%.3f,%.3f)",
+				    s_vrsEyeW, s_vrsEyeH,
+				    s_vrsProjX[0], s_vrsProjY[0], s_vrsProjX[1], s_vrsProjY[1]);
+				s_vrsInitialFrameDone = true;
+			}
+		}
+
+		// After left eye submit: apply RIGHT eye VRS pattern for game's right eye rendering
+		// After right eye submit: apply LEFT eye VRS pattern for next frame's left eye rendering
+		if (s_vrsInitialFrameDone) {
+			int nextEye = (eyeIdx == 0) ? 1 : 0;
+			vrsMgr->ApplyForEye(nextEye);
+		}
+	}
+
+	// Set the viewport up
+	// TODO deduplicate with dx11compositor, and use for all compositors
+	XrSwapchainSubImage& subImage = layer.subImage;
+	subImage.swapchain = chain;
+	subImage.imageArrayIndex = 0; // This is *not* the swapchain index
+	XrRect2Di& viewport = subImage.imageRect;
+	if (ptrBounds) {
+		vr::VRTextureBounds_t bounds = *ptrBounds;
+
+		if (bounds.vMin > bounds.vMax && !oovr_global_configuration.InvertUsingShaders()) {
+			std::swap(layer.fov.angleUp, layer.fov.angleDown);
+			std::swap(bounds.vMin, bounds.vMax);
+		}
+
+		viewport.offset.x = 0;
+		viewport.offset.y = 0;
+#ifdef OC_HAS_FSR3
+		// When FSR3 has produced output, use FSR3's display-res viewport
+		if (s_fsr3ViewportW > 0 && s_fsr3ViewportH > 0) {
+			viewport.extent.width = s_fsr3ViewportW;
+			viewport.extent.height = s_fsr3ViewportH;
+		} else
+#endif
+		{
+			viewport.extent.width = createInfo.width;
+			viewport.extent.height = createInfo.height;
+		}
+	} else {
+		viewport.offset.x = viewport.offset.y = 0;
+		viewport.extent.width = createInfo.width;
+		viewport.extent.height = createInfo.height;
+	}
+
+}
+
+bool DX11Compositor::CheckChainCompatible(D3D11_TEXTURE2D_DESC& inputDesc, vr::EColorSpace colourSpace)
+{
+	bool usable = true;
+#define FAIL(name)                             \
+	do {                                       \
+		usable = false;                        \
+		OOVR_LOG("Resource mismatch: " #name); \
+	} while (0);
+#define CHECK(name, chainName)                  \
+	if (inputDesc.name != createInfo.chainName) \
+		FAIL(name);
+
+	CHECK(Width, width)
+	CHECK(Height, height)
+	CHECK(MipLevels, mipCount)
+
+	if (inputDesc.Format != createInfoFormat) {
+		FAIL("Format");
+	}
+
+	// CHECK_ADV(SampleDesc.Count, SampleCount);
+	// CHECK_ADV(SampleDesc.Quality);
+#undef CHECK
+#undef FAIL
+
+	return usable;
+}
+
+bool DX11Compositor::GetFormatInfo(DXGI_FORMAT format, DX11Compositor::DxgiFormatInfo& out)
+{
+#define DEF_FMT_BASE(typeless, linear, srgb, bpp, bpc, channels)            \
+	{                                                                       \
+		out = DxgiFormatInfo{ srgb, linear, typeless, bpp, bpc, channels }; \
+		return true;                                                        \
+	}
+
+#define DEF_FMT_NOSRGB(name, bpp, bpc, channels) \
+	case name##_TYPELESS:                        \
+	case name##_UNORM:                           \
+		DEF_FMT_BASE(name##_TYPELESS, name##_UNORM, DXGI_FORMAT_UNKNOWN, bpp, bpc, channels)
+
+#define DEF_FMT(name, bpp, bpc, channels) \
+	case name##_TYPELESS:                 \
+	case name##_UNORM:                    \
+	case name##_UNORM_SRGB:               \
+		DEF_FMT_BASE(name##_TYPELESS, name##_UNORM, name##_UNORM_SRGB, bpp, bpc, channels)
+
+#define DEF_FMT_UNORM(linear, bpp, bpc, channels) \
+	case linear:                                  \
+		DEF_FMT_BASE(DXGI_FORMAT_UNKNOWN, linear, DXGI_FORMAT_UNKNOWN, bpp, bpc, channels)
+
+	// Note that this *should* have pretty much all the types we'll ever see in games
+	// Filtering out the non-typeless and non-unorm/srgb types, this is all we're left with
+	// (note that types that are only typeless and don't have unorm/srgb variants are dropped too)
+	switch (format) {
+		// The relatively traditional 8bpp 32-bit types
+		DEF_FMT(DXGI_FORMAT_R8G8B8A8, 32, 8, 4)
+		DEF_FMT(DXGI_FORMAT_B8G8R8A8, 32, 8, 4)
+		DEF_FMT(DXGI_FORMAT_B8G8R8X8, 32, 8, 3)
+
+		// Some larger linear-only types
+		DEF_FMT_NOSRGB(DXGI_FORMAT_R16G16B16A16, 64, 16, 4)
+		DEF_FMT_NOSRGB(DXGI_FORMAT_R10G10B10A2, 32, 10, 4)
+
+		// A jumble of other weird types
+		DEF_FMT_UNORM(DXGI_FORMAT_B5G6R5_UNORM, 16, 5, 3)
+		DEF_FMT_UNORM(DXGI_FORMAT_B5G5R5A1_UNORM, 16, 5, 4)
+		DEF_FMT_UNORM(DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, 32, 10, 4)
+		DEF_FMT_UNORM(DXGI_FORMAT_B4G4R4A4_UNORM, 16, 4, 4)
+		DEF_FMT(DXGI_FORMAT_BC1, 64, 16, 4)
+
+	default:
+		// Unknown type
+		return false;
+	}
+
+#undef DEF_FMT
+#undef DEF_FMT_NOSRGB
+#undef DEF_FMT_BASE
+#undef DEF_FMT_UNORM
+}
+
+#endif
