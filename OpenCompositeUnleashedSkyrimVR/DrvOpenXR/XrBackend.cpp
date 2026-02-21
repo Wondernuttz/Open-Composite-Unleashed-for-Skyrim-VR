@@ -21,7 +21,6 @@
 #include "../OpenOVR/Misc/android_api.h"
 #endif
 
-// FIXME find a better way to send the OnPostFrame call?
 #include "../OpenOVR/Reimpl/BaseInput.h"
 #include "../OpenOVR/Reimpl/BaseOverlay.h"
 #include "../OpenOVR/Reimpl/BaseSystem.h"
@@ -41,14 +40,21 @@
 #endif
 
 #include <chrono>
+#include <cinttypes>
+#include <mutex>
 #include <ranges>
 #include <type_traits>
 
+extern XrInstance xr_instance;
+extern SessionWrapper xr_session;
+extern XrSystemId xr_system;
+extern XrSessionGlobals* xr_gbl;
+
 using namespace vr;
 
-static bool testOnlyOne = false;
-
+std::mutex inputRestartMutex;
 std::unique_ptr<TemporaryGraphics> XrBackend::temporaryGraphics = nullptr;
+
 XrBackend::XrBackend(bool useVulkanTmpGfx, bool useD3D11TmpGfx)
 {
 	memset(projectionViews, 0, sizeof(projectionViews));
@@ -470,6 +476,9 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 {
 	// Always pump events, even if the session isn't active - this is what makes the session active
 	// in the first place.
+	static std::mutex submitMutex;
+    std::lock_guard<std::mutex> lock(submitMutex);
+
 	PumpEvents();
 
 	// If we are getting calls from PostPresentHandOff then skip the calls from other functions as
@@ -748,15 +757,19 @@ bool XrBackend::IsInputAvailable()
 void XrBackend::PumpEvents()
 {
 	BaseInput* input = GetUnsafeBaseInput();
-	if (!testOnlyOne && input && !input->AreActionsLoaded() && sessionState == XR_SESSION_STATE_FOCUSED && !hand_left && !hand_right) {
-		QueryForInteractionProfile();
-		testOnlyOne = true;
+	if (input && sessionState == XR_SESSION_STATE_FOCUSED && !hand_left && !hand_right) {
+		if (input->AreActionsLoaded()) {
+			// Once app/legacy action sets are loaded, query current interaction profiles directly so
+			// controller devices can be created even if no profile-changed event is emitted.
+			UpdateInteractionProfile();
+		}
 	}
+	// Keyboard text input is handled by the in-VR overlay interaction path.
 	// Poll for OpenXR events
-	// TODO filter by session?
 	while (true) {
 		XrEventDataBuffer ev = { XR_TYPE_EVENT_DATA_BUFFER };
 		XrResult res;
+
 		OOVR_FAILED_XR_ABORT(res = xrPollEvent(xr_instance, &ev));
 
 		if (res == XR_EVENT_UNAVAILABLE) {
@@ -800,7 +813,6 @@ void XrBackend::PumpEvents()
 			}
 			case XR_SESSION_STATE_LOSS_PENDING: {
 				// If the headset is unplugged or the user decides to exit the app
-				// TODO just kill the app after awhile, unless it sends a message to stop that - read the OpenVR wiki docs for more info
 				VREvent_t quit = { VREvent_Quit };
 				auto system = GetBaseSystem();
 				if (system)
@@ -815,7 +827,6 @@ void XrBackend::PumpEvents()
 			UpdateInteractionProfile();
 			break;
 		}
-
 	} // while loop
 
 	/*
@@ -1033,6 +1044,9 @@ void XrBackend::BindInfoSet()
 			    [&path_name](std::string s) -> bool {
 				    return s.find("/click") != s.npos && s.find(path_name) != s.npos;
 			    });
+			if (click_path == profile->GetValidInputPaths().end()) {
+				continue;
+			}
 			XrPath path;
 			OOVR_FAILED_XR_ABORT(xrStringToPath(xr_instance, click_path->c_str(), &path));
 			bindings.push_back({ .action = infoAction, .binding = path });

@@ -241,8 +241,8 @@ int Config::ini_handler(void* user, const char* pSection,
 
 #undef CFGOPT
 
-	string err = "Unknown config option " + name + " on line " + to_string(lineno);
-	ABORT(err);
+	OOVR_LOGF("WARNING: Unknown config option '%s' on line %d, ignoring", name.c_str(), lineno);
+	return true;
 }
 
 static int wini_parse(const wchar_t* filename, ini_handler handler, void* user)
