@@ -20,6 +20,7 @@
 
 static XrBackend* currentBackend;
 static bool initialised = false;
+static std::shared_ptr<BaseInput> sessionInputKeepalive;
 
 #ifdef _WIN32
 std::string GetExeName()
@@ -289,10 +290,21 @@ void DrvOpenXR::SetupSession()
 	OOVR_LOGF("Started OpenXR session on runtime '%s', hand tracking supported: %d",
 	    xr_gbl->systemProperties.systemName, xr_gbl->handTrackingProperties.supportsHandTracking);
 
-	// If required, re-setup the input system for this new session
-	BaseInput* input = GetUnsafeBaseInput();
-	if (input)
-		input->BindInputsForSession();
+	// Attach inputs early so implicit layers (like VD) see an attached
+	// action set before the first xrSyncActions / xrWaitFrame.
+	auto inputShared = GetBaseInput();
+	if (!inputShared) {
+		inputShared = GetCreateBaseInput();
+	}
+	sessionInputKeepalive = inputShared;
+	BaseInput* input = inputShared.get();
+	if (input) {
+		if (!input->AreActionsLoaded()) {
+			input->LoadEmptyManifestIfRequired(false);
+		} else {
+			input->BindInputsForSession();
+		}
+	}
 
 	currentBackend->OnSessionCreated();
 }
@@ -357,4 +369,5 @@ void DrvOpenXR::FullShutdown()
 
 	initialised = false;
 	currentBackend = nullptr;
+	sessionInputKeepalive.reset();
 }
