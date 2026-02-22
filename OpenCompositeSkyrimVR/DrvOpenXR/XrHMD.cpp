@@ -109,16 +109,10 @@ vr::HmdMatrix44_t XrHMD::GetProjectionMatrix(vr::EVREye eEye, float fNearZ, floa
 		// Jitter is in [-0.5, +0.5] pixel range (screen-space, Y-down).
 		// Projection matrix is in clip-space (Y-up), so Y must be NEGATED.
 		// See AMD FSR3 sample: jitterY = -2.0f * m_JitterY / renderHeight.
-		if (g_fsr3JitterEnabled) {
-			uint32_t renderW = 0, renderH = 0;
-			GetRecommendedRenderTargetSize(&renderW, &renderH);
-			if (renderW > 0 && renderH > 0) {
-				float projJitterX =  2.0f * g_fsr3JitterX / static_cast<float>(renderW);
-				float projJitterY = -2.0f * g_fsr3JitterY / static_cast<float>(renderH);
-				m[0][2] += projJitterX;
-				m[1][2] += projJitterY;
-			}
-		}
+		// NOTE: Jitter is applied in GetProjectionRaw, NOT here.
+		// Skyrim VR (and many other games) builds its own projection matrix from
+		// GetProjectionRaw values and caches GetProjectionMatrix. Jittering here
+		// would only affect the first frame.
 #endif
 
 	} else {
@@ -196,6 +190,41 @@ void XrHMD::GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, flo
 	*pfBottom = tanf(fov.angleUp);
 	*pfLeft = tanf(fov.angleLeft);
 	*pfRight = tanf(fov.angleRight);
+
+#ifdef OC_HAS_FSR3
+	// Unconditional call counter — verify Skyrim calls GetProjectionRaw per frame
+	{ static int rawCallCount = 0; rawCallCount++;
+	  if (rawCallCount <= 3 || rawCallCount % 500 == 0)
+		OOVR_LOGF("FSR3-DIAG: GetProjectionRaw call#%d eye=%d jitterEnabled=%d jitter=%.4f,%.4f",
+		    rawCallCount, (int)eEye, (int)g_fsr3JitterEnabled, g_fsr3JitterX, g_fsr3JitterY);
+	}
+
+	// FSR 3 jitter: shift the raw FOV tangent values by a sub-pixel offset.
+	// Skyrim VR calls GetProjectionRaw per frame (NOT GetProjectionMatrix) and
+	// builds its own projection. Shifting both left/right (or top/bottom) by the
+	// same amount changes the projection center without altering FOV extent:
+	//   ndcJitter = 2 * shift / (pfRight - pfLeft) = 2 * jitterPixels / renderWidth
+	if (g_fsr3JitterEnabled) {
+		uint32_t renderW = 0, renderH = 0;
+		GetRecommendedRenderTargetSize(&renderW, &renderH);
+		if (renderW > 0 && renderH > 0) {
+			float hSpan = *pfRight - *pfLeft;
+			float vSpan = *pfBottom - *pfTop;
+			float shiftX = g_fsr3JitterX * hSpan / static_cast<float>(renderW);
+			float shiftY = g_fsr3JitterY * vSpan / static_cast<float>(renderH);
+			*pfLeft  += shiftX;
+			*pfRight += shiftX;
+			*pfTop    += shiftY;
+			*pfBottom += shiftY;
+
+			static int jitterCallCount = 0; jitterCallCount++;
+			if (jitterCallCount <= 5 || jitterCallCount % 400 == 0) {
+				OOVR_LOGF("FSR3-JITTER: GetProjectionRaw eye=%d call#%d jitter=%.4f,%.4f shift=%.6f,%.6f",
+				    (int)eEye, jitterCallCount, g_fsr3JitterX, g_fsr3JitterY, shiftX, shiftY);
+			}
+		}
+	}
+#endif
 }
 
 bool XrHMD::ComputeDistortion(vr::EVREye eEye, float fU, float fV, vr::DistortionCoordinates_t* pDistortionCoordinates)

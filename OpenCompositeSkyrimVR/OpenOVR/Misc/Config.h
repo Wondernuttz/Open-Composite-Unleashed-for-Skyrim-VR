@@ -91,7 +91,18 @@ public:
 	inline float Fsr3Sharpness() const { return fsr3Sharpness; }
 	inline float Fsr3JitterScale() const { return fsr3JitterScale; }
 	inline bool Fsr3JitterCancellation() const { return fsr3JitterCancellation; }
+	inline float Fsr3ShadingChangeScale() const { return fsr3ShadingChangeScale; }
+	inline float Fsr3ReactivenessScale() const { return fsr3ReactivenessScale; }
+	inline float Fsr3AccumulationPerFrame() const { return fsr3AccumulationPerFrame; }
+	inline float Fsr3MinDisocclusionAccumulation() const { return fsr3MinDisocclusionAccumulation; }
+	inline float Fsr3ReactiveBase() const { return fsr3ReactiveBase; }
+	inline float Fsr3ReactiveEdgeBoost() const { return fsr3ReactiveEdgeBoost; }
+	inline bool Fsr3CameraMV() const { return fsr3CameraMV; }
 	inline float Fsr3ViewToMeters() const { return fsr3ViewToMeters; }
+	inline int Fsr3DebugMode() const { return fsr3DebugMode; }
+	inline float Fsr3LocoReactiveBase() const { return fsr3LocoReactiveBase; }
+	inline float Fsr3LocoSmoothUp() const { return fsr3LocoSmoothUp; }
+	inline float Fsr3LocoSmoothDown() const { return fsr3LocoSmoothDown; }
 
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	inline bool MotionVectorsEnabled() const { return motionVectorsEnabled; }
@@ -208,10 +219,23 @@ private:
 	// FSR upscaling
 	bool fsrEnabled = false;
 	float fsrRenderScale = 0.77f;   // 0.5 - 1.0, lower = more GPU savings
-	float fsr3Sharpness = 0.5f;     // 0.0 - 1.0, FSR3 built-in RCAS sharpness
-	float fsr3JitterScale = 1.0f;   // 0.0 - 1.0, jitter amplitude (lower = more stable)
-	bool fsr3JitterCancellation = true; // MVs include jitter — tell FSR3 to compensate
+	float fsr3Sharpness = 0.3f;     // 0.0 - 1.0, FSR3 built-in RCAS sharpness
+	float fsr3JitterScale = 0.7f;   // 0.0 - 1.0, jitter amplitude (lower = more stable, higher = better temporal AA)
+	bool fsr3JitterCancellation = false; // Skyrim MVs don't include jitter (view-space velocity)
+	float fsr3ShadingChangeScale = 1.5f; // Higher = more reactive to shading changes (reduces ghosting on trees)
+	float fsr3ReactivenessScale = 1.0f; // Multiplier on reactive mask values (higher = more aggressive ghosting reduction)
+	float fsr3AccumulationPerFrame = 0.5f; // Lower = less ghosting but more flicker on thin geometry (0.0-1.0)
+	float fsr3MinDisocclusionAccumulation = 0.0f; // Higher = less flicker on swaying thin objects (-1.0 to 1.0)
+	float fsr3ReactiveBase = 0.08f;    // Baseline when standing still
+	float fsr3ReactiveEdgeBoost = 0.20f; // Extra reactiveness at depth edges (tree silhouettes, thin geometry)
+	bool fsr3CameraMV = false;         // Camera MVs from depth + pose deltas (experimental — causes smearing)
 	float fsr3ViewToMeters = 0.01428f;  // Skyrim: ~70 units = 1 meter
+	int fsr3DebugMode = 0;             // 0=off, 1=FSR3 debug overlay, 2=bypass (raw game), 3=depth viz
+
+	// Locomotion-aware reactive mask boost
+	float fsr3LocoReactiveBase = 0.30f; // ReactiveBase during locomotion (0=same as static, higher=less ghosting)
+	float fsr3LocoSmoothUp = 0.15f;     // EMA alpha for ramp-up (0.01=slow, 0.5=fast)
+	float fsr3LocoSmoothDown = 0.03f;   // EMA alpha for ramp-down (0.01=slow, 0.5=fast)
 
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	bool motionVectorsEnabled = true;
