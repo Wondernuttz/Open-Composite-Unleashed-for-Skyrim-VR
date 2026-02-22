@@ -3,6 +3,7 @@
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11) && defined(OC_HAS_FSR3)
 
 #include "Fsr3Upscaler.h"
+#include "../Misc/Config.h"
 
 // FidelityFX SDK headers (high-level API)
 #include <ffx_api.h>
@@ -363,6 +364,11 @@ bool Fsr3Upscaler::EnsureSharedTextures(uint32_t renderW, uint32_t renderH,
 		        &e.depthDX12, &e.depthDX11, &e.depthHandle))
 			return false;
 
+		// Reactive mask: render resolution, R8_UNORM (depth-edge reactiveness for ghosting reduction)
+		if (!CreateSharedTexture(renderW, renderH, DXGI_FORMAT_R8_UNORM, false,
+		        &e.reactiveDX12, &e.reactiveDX11, &e.reactiveHandle))
+			return false;
+
 		// Output: output resolution, same format as color, with UAV for FSR writes
 		// Double-buffered: DX12 writes one while DX11 reads the other (async pipeline)
 		for (int buf = 0; buf < 2; buf++) {
@@ -384,6 +390,7 @@ void Fsr3Upscaler::DestroySharedTextures()
 		DestroySharedTexture(&e.colorDX12, &e.colorDX11, &e.colorHandle);
 		DestroySharedTexture(&e.mvDX12, &e.mvDX11, &e.mvHandle);
 		DestroySharedTexture(&e.depthDX12, &e.depthDX11, &e.depthHandle);
+		DestroySharedTexture(&e.reactiveDX12, &e.reactiveDX11, &e.reactiveHandle);
 		for (int buf = 0; buf < 2; buf++)
 			DestroySharedTexture(&e.outputDX12[buf], &e.outputDX11[buf], &e.outputHandle[buf]);
 
@@ -401,7 +408,7 @@ void Fsr3Upscaler::DestroySharedTextures()
 // ============================================================================
 
 bool Fsr3Upscaler::EnsureFsrContexts(uint32_t renderW, uint32_t renderH,
-    uint32_t outputW, uint32_t outputH)
+    uint32_t outputW, uint32_t outputH, bool jitterCancellation)
 {
 	if (m_fsrContextsCreated) return true;
 
@@ -410,8 +417,14 @@ bool Fsr3Upscaler::EnsureFsrContexts(uint32_t renderW, uint32_t renderH,
 		ffxCreateContextDescUpscale upscaleDesc = {};
 		upscaleDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
 		upscaleDesc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE
-		    | FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
-		// Note: NOT setting DEPTH_INVERTED — Skyrim VR uses standard depth [0=near, 1=far]
+		    | FFX_UPSCALE_ENABLE_DEPTH_INVERTED
+		    | FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION;
+		if (jitterCancellation)
+			upscaleDesc.flags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
+		OOVR_LOGF("FSR3: Context creation flags=0x%X (jitterCancel=%s)",
+		    upscaleDesc.flags, jitterCancellation ? "ON" : "OFF");
+		// Skyrim VR uses reversed-Z depth [1=near, 0=far] — confirmed by
+		// ReverbG2OpenXr FSR2 depth dilation (closestDepth = max in 3×3 neighbourhood).
 		// Note: NOT setting DEPTH_INFINITE — Skyrim VR uses finite far plane
 		upscaleDesc.maxRenderSize = { renderW, renderH };
 		upscaleDesc.maxUpscaleSize = { outputW, outputH };
@@ -440,6 +453,7 @@ bool Fsr3Upscaler::EnsureFsrContexts(uint32_t renderW, uint32_t renderH,
 
 	m_fsrContextsCreated = true;
 	OOVR_LOGF("FSR3: Upscaler contexts created — render=%ux%u output=%ux%u", renderW, renderH, outputW, outputH);
+
 	return true;
 }
 
@@ -462,6 +476,7 @@ void Fsr3Upscaler::DestroyFsrContexts()
 	}
 
 	m_fsrContextsCreated = false;
+	m_fsrConfigApplied = false;
 }
 
 // ============================================================================
@@ -483,18 +498,19 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 		return false;
 
 	if (!EnsureFsrContexts(params.renderWidth, params.renderHeight,
-	        params.outputWidth, params.outputHeight))
+	        params.outputWidth, params.outputHeight, params.jitterCancellation))
 		return false;
 
 	auto& eye = m_eye[eyeIdx];
 
-	// ── Async check: is previous DX12 work for this eye complete? ──
-	// Non-blocking CPU fence check — if DX12 hasn't finished, fall back to FSR 1
+	// ── Synchronous wait: ensure previous DX12 work for this eye is complete ──
+	// Must complete before resetting command allocator or submitting new work.
 	if (m_eyeFence[eyeIdx] > 0) {
 		uint64_t completed = m_d3d12Fence->GetCompletedValue();
 		if (completed < m_eyeFence[eyeIdx]) {
-			// DX12 still processing previous frame — can't reset allocator or submit new work
-			return false;
+			// DX12 still processing — CPU-wait for completion
+			m_d3d12Fence->SetEventOnCompletion(m_eyeFence[eyeIdx], m_fenceEvent);
+			WaitForSingleObject(m_fenceEvent, 5000);
 		}
 	}
 
@@ -538,7 +554,10 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 		}
 	}
 
-	// Depth: copy from D32_FLOAT / R32_FLOAT source → R32_FLOAT shared staging
+	// Depth: copy R32_FLOAT source → R32_FLOAT shared staging
+	// NOTE: Caller (dx11compositor) must pre-convert D24/R24G8 depth to R32F
+	// via the DepthExtract compute shader — CopySubresourceRegion requires
+	// format-compatible textures (R24G8 → R32F is NOT copy-compatible).
 	if (params.depth) {
 		if (params.depthSourceRegion) {
 			d3d11Ctx->CopySubresourceRegion(eye.depthDX11, 0, 0, 0, 0,
@@ -546,6 +565,17 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 		} else {
 			d3d11Ctx->CopySubresourceRegion(eye.depthDX11, 0, 0, 0, 0,
 			    params.depth, 0, nullptr);
+		}
+	}
+
+	// Reactive mask: copy R8_UNORM source → R8_UNORM shared staging (same sub-region as depth)
+	if (params.reactiveMask) {
+		if (params.reactiveSourceRegion) {
+			d3d11Ctx->CopySubresourceRegion(eye.reactiveDX11, 0, 0, 0, 0,
+			    params.reactiveMask, 0, params.reactiveSourceRegion);
+		} else {
+			d3d11Ctx->CopySubresourceRegion(eye.reactiveDX11, 0, 0, 0, 0,
+			    params.reactiveMask, 0, nullptr);
 		}
 	}
 
@@ -563,6 +593,34 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 	m_cmdList[eyeIdx]->Reset(m_cmdAlloc[eyeIdx], nullptr);
 	auto cmdList = m_cmdList[eyeIdx];
 
+	// Apply runtime tuning once per context lifetime (reduces ghosting on thin geometry)
+	if (!m_fsrConfigApplied && m_ffxConfigure) {
+		m_fsrConfigApplied = true;
+		struct { uint64_t key; float value; const char* name; } cfgEntries[] = {
+			{ FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE,
+			  oovr_global_configuration.Fsr3ShadingChangeScale(), "fShadingChangeScale" },
+			{ FFX_API_CONFIGURE_UPSCALE_KEY_FREACTIVENESSSCALE,
+			  oovr_global_configuration.Fsr3ReactivenessScale(), "fReactivenessScale" },
+			{ FFX_API_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME,
+			  oovr_global_configuration.Fsr3AccumulationPerFrame(), "fAccumulationAddedPerFrame" },
+			{ FFX_API_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION,
+			  oovr_global_configuration.Fsr3MinDisocclusionAccumulation(), "fMinDisocclusionAccumulation" },
+		};
+		for (auto& entry : cfgEntries) {
+			ffxConfigureDescUpscaleKeyValue cfg = {};
+			cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+			cfg.key = entry.key;
+			cfg.ptr = &entry.value;
+			for (int e = 0; e < 2; e++) {
+				ffxReturnCode_t rc = m_ffxConfigure(&m_fsrContext[e], &cfg.header);
+				if (rc != 0) {
+					OOVR_LOGF("FSR3: ffxConfigure %s eye=%d failed (rc=%d)", entry.name, e, (int)rc);
+				}
+			}
+			OOVR_LOGF("FSR3: Configured %s=%.3f", entry.name, entry.value);
+		}
+	}
+
 	// Build FSR 3 dispatch descriptor (high-level API)
 	ffxDispatchDescUpscale dispatchDesc = {};
 	dispatchDesc.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -577,6 +635,12 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 	dispatchDesc.motionVectors = ffxApiGetResourceDX12(
 	    eye.mvDX12, FFX_API_RESOURCE_STATE_COMPUTE_READ);
 
+	// Reactive mask: depth-edge detection (reduces ghosting on thin geometry like trees)
+	if (params.reactiveMask) {
+		dispatchDesc.reactive = ffxApiGetResourceDX12(
+		    eye.reactiveDX12, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+	}
+
 	// Output resource — write to the current write buffer (double-buffered)
 	dispatchDesc.output = ffxApiGetResourceDX12(
 	    eye.outputDX12[writeBuf], FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
@@ -584,9 +648,11 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 	// Jitter and motion vector parameters
 	dispatchDesc.jitterOffset = { params.jitterX, params.jitterY };
 	// Skyrim's kMOTION_VECTOR RT stores screen-space velocity in UV-space [0..1].
-	// Diagnostic confirmed: raw values ~0.001–0.025, giving 3–60px when * renderDims.
 	// Scale converts UV→pixel: motionVectorScale = {perEyeRenderW, perEyeRenderH}.
-	// User-tunable mvScale multiplier adjusts magnitude (1.0 = raw, <1 = dampen smear).
+	// Note: The FSR2 reference project negates MVs in its custom accumulate shader,
+	// but it uses a custom FSR2 implementation. Testing confirmed that negating MVs
+	// with AMD's FSR3 SDK causes full-screen smearing when turning — the SDK's
+	// convention expects positive scale for Skyrim's MV format.
 	float mvScale = params.mvScale;
 	dispatchDesc.motionVectorScale = { (float)params.renderWidth * mvScale, (float)params.renderHeight * mvScale };
 
@@ -601,22 +667,27 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 	dispatchDesc.enableSharpening = (params.sharpness > 0.0f);
 	dispatchDesc.sharpness = params.sharpness;
 	dispatchDesc.viewSpaceToMetersFactor = params.viewToMeters;
-	dispatchDesc.flags = params.jitterCancellation
-	    ? FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION : 0;
+	// IMPORTANT: dispatch flags use FFX_UPSCALE_FLAG_* constants, NOT creation-time
+	// FFX_UPSCALE_ENABLE_* constants! These share the same bit positions but mean
+	// different things. Jitter cancellation is a creation-time-only flag (already set
+	// in EnsureFsrContexts). Setting it here would accidentally enable
+	// FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ (also bit 2), causing FSR3 to treat
+	// SDR color as HDR PQ and breaking temporal accumulation.
+	dispatchDesc.flags = (params.debugMode == 1 ? FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW : 0);
 
-	// Diagnostic: log dispatch parameters on first call per eye
-	{ static int dispatchLog[2] = {0, 0}; if (dispatchLog[eyeIdx]++ < 2) {
-		OOVR_LOGF("FSR3-DISPATCH eye=%d render=%ux%u output=%ux%u jitter=%.4f,%.4f dt=%.1fms",
+	// Diagnostic: log dispatch parameters — first 2 per eye + every 200th during gameplay
+	{ static int dispatchLog[2] = {0, 0}; static int dispatchFrame[2] = {0, 0};
+	  dispatchFrame[eyeIdx]++;
+	  bool doLog = (dispatchLog[eyeIdx] < 2)
+	      || (dispatchFrame[eyeIdx] % 200 == 0 && dispatchLog[eyeIdx] < 20);
+	  if (doLog) { dispatchLog[eyeIdx]++;
+		OOVR_LOGF("FSR3-DISPATCH eye=%d render=%ux%u output=%ux%u jitter=%.4f,%.4f dt=%.1fms flags=0x%X",
 		    eyeIdx, params.renderWidth, params.renderHeight,
 		    params.outputWidth, params.outputHeight,
-		    params.jitterX, params.jitterY, params.deltaTimeMs);
-		OOVR_LOGF("FSR3-DISPATCH color.usage=0x%X depth.usage=0x%X mv.usage=0x%X out.usage=0x%X",
-		    dispatchDesc.color.description.usage, dispatchDesc.depth.description.usage,
-		    dispatchDesc.motionVectors.description.usage, dispatchDesc.output.description.usage);
-		OOVR_LOGF("FSR3-DISPATCH color.fmt=%u depth.fmt=%u mv.fmt=%u out.fmt=%u writeBuf=%d",
-		    dispatchDesc.color.description.format, dispatchDesc.depth.description.format,
-		    dispatchDesc.motionVectors.description.format, dispatchDesc.output.description.format,
-		    writeBuf);
+		    params.jitterX, params.jitterY, params.deltaTimeMs, dispatchDesc.flags);
+		OOVR_LOGF("FSR3-DISPATCH mvScale=%.1f,%.1f near=%.1f far=%.0f fovY=%.3f viewToM=%.5f",
+		    dispatchDesc.motionVectorScale.x, dispatchDesc.motionVectorScale.y,
+		    params.cameraNear, params.cameraFar, params.cameraFovY, params.viewToMeters);
 	}}
 
 	// Record FSR 3 commands onto our command list

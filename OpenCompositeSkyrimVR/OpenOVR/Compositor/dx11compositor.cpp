@@ -48,7 +48,11 @@ struct OCRenderTargetBridge {
 	uint64_t d3dDevice;     // ID3D11Device*
 	uint64_t d3dContext;    // ID3D11DeviceContext*
 
-	uint8_t reserved[64];
+	// Camera data for locomotion-aware motion vectors (added v1.1)
+	uint64_t worldToCamPtr;   // float* → NiCamera::worldToCam[0][0] (row-major 4x4, 64 bytes)
+	uint64_t playerPosPtr;    // float* → PlayerCamera::pos.x (3 floats: x, y, z)
+	uint64_t playerYawPtr;    // float* → PlayerCamera::yaw (1 float, radians)
+	uint8_t  reserved2[40];   // Future use (64 - 24 = 40 bytes)
 };
 #pragma pack(pop)
 
@@ -99,6 +103,686 @@ static float s_fsr3RenderJitterX = 0.0f; // Jitter that was applied to current f
 static float s_fsr3RenderJitterY = 0.0f;
 static uint32_t s_fsr3ViewportW = 0; // FSR3 output viewport (for crop when swapchain > output)
 static uint32_t s_fsr3ViewportH = 0;
+
+// ── Reactive mask resources (depth-edge detection for FSR3 ghosting reduction) ──
+static ID3D11ComputeShader*        s_reactiveMaskCS = nullptr;
+static ID3D11Texture2D*            s_reactiveMaskTex = nullptr;
+static ID3D11UnorderedAccessView*  s_reactiveMaskUAV = nullptr;
+static ID3D11ShaderResourceView*   s_reactiveMaskDepthSRV = nullptr;
+static ID3D11Texture2D*            s_reactiveMaskDepthSRVTex = nullptr;
+static uint32_t                    s_reactiveMaskW = 0;
+static uint32_t                    s_reactiveMaskH = 0;
+
+// ── Depth extraction resources ──
+// Skyrim VR's main depth-stencil is R24G8_TYPELESS (24-bit depth + 8-bit stencil).
+// CopySubresourceRegion from R24G8 → R32F silently fails (different format families).
+// We use a compute shader to read depth via R24_UNORM_X8_TYPELESS SRV → write R32_FLOAT.
+static ID3D11ComputeShader*        s_depthExtractCS = nullptr;
+static ID3D11Texture2D*            s_depthR32F = nullptr;       // Full-size R32F copy of bridge depth
+static ID3D11UnorderedAccessView*  s_depthR32FUAV = nullptr;
+static ID3D11ShaderResourceView*   s_depthBridgeSRV = nullptr;  // SRV on bridge depth (R24_UNORM_X8_TYPELESS)
+static ID3D11Texture2D*            s_depthBridgeSRVTex = nullptr; // Cached: which tex the SRV was created for
+static uint32_t                    s_depthR32FWidth = 0;
+static uint32_t                    s_depthR32FHeight = 0;
+
+static constexpr char s_depthExtractHLSL[] = R"HLSL(
+Texture2D<float>   DepthIn  : register(t0);  // R24_UNORM_X8_TYPELESS view of depth-stencil
+RWTexture2D<float> DepthOut : register(u0);  // R32_FLOAT output
+
+[numthreads(8, 8, 1)]
+void CS_DepthExtract(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    DepthOut.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    DepthOut[id.xy] = DepthIn.Load(int3(id.xy, 0));
+}
+)HLSL";
+
+// ── Reactive mask compute shader ──
+// Compensates for Skyrim VR's zero motion vectors on static geometry during locomotion.
+// Base reactiveness reduces ghosting everywhere; depth-edge bonus adds extra reactiveness
+// at object silhouettes (tree branches against sky).  Tunable via opencomposite.ini.
+static constexpr char s_reactiveMaskHLSL[] = R"HLSL(
+Texture2D<float>       DepthIn     : register(t0);
+RWTexture2D<float>     ReactiveOut : register(u0);
+
+cbuffer ReactiveCB : register(b0) {
+    float baseReactiveness;  // Global minimum (compensates for zero MVs)
+    float edgeBoost;         // Extra reactiveness at depth edges
+    float edgeThreshold;     // Depth diff below which edge = 0
+    float edgeScale;         // Ramp speed for edge detection
+};
+
+[numthreads(8, 8, 1)]
+void CS_ReactiveMask(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    ReactiveOut.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+
+    float center = DepthIn.Load(int3(id.xy, 0));
+    float maxDiff = 0.0;
+    static const int2 offsets[8] = {
+        int2(-1, 0), int2(1, 0), int2(0,-1), int2(0, 1),
+        int2(-3, 0), int2(3, 0), int2(0,-3), int2(0, 3),
+    };
+    [unroll] for (int i = 0; i < 8; i++) {
+        int2 coord = clamp(int2(id.xy) + offsets[i], int2(0,0), int2(w-1, h-1));
+        maxDiff = max(maxDiff, abs(center - DepthIn.Load(int3(coord, 0))));
+    }
+    float edge = saturate((maxDiff - edgeThreshold) * edgeScale) * edgeBoost;
+
+    ReactiveOut[id.xy] = min(baseReactiveness + edge, 0.95);
+}
+)HLSL";
+static ID3D11Buffer* s_reactiveMaskCB = nullptr;
+
+// ── Camera MV resources (compute per-pixel camera motion from depth + pose deltas) ──
+// Replaces Skyrim's zero-valued MVs for static geometry during character locomotion.
+// Uses depth buffer + current/previous view-projection matrices to compute per-pixel
+// screen-space motion in UV space — directly usable by FSR3 temporal upscaler.
+static ID3D11ComputeShader*       s_cameraMVCS = nullptr;
+static ID3D11Texture2D*           s_cameraMVTex = nullptr;
+static ID3D11UnorderedAccessView* s_cameraMVUAV = nullptr;
+static ID3D11ShaderResourceView*  s_cameraMVDepthSRV = nullptr;
+static ID3D11Texture2D*           s_cameraMVDepthSRVTex = nullptr;
+static ID3D11Buffer*              s_cameraMVCB = nullptr;
+static uint32_t                   s_cameraMVW = 0, s_cameraMVH = 0;
+
+// Per-eye previous VP matrix for camera MV computation (column-major float[16])
+static float s_prevVP[2][16] = {};
+static bool  s_hasPrevVP[2] = {false, false};
+
+// Per-eye pose/fov captured in outer Invoke, consumed by camera MV in inner Invoke
+static XrPosef s_fsr3EyePose[2] = {};
+static XrFovf  s_fsr3EyeFov[2] = {};
+
+static constexpr char s_cameraMVHLSL[] = R"HLSL(
+Texture2D<float>       DepthIn  : register(t0);
+RWTexture2D<float2>    MVOut    : register(u0);
+
+cbuffer CameraMVCB : register(b0) {
+    column_major float4x4 invCurrentVP;  // inverse of current view-projection
+    column_major float4x4 prevVP;         // previous frame's view-projection
+    float2 renderSize;                     // per-eye render resolution
+    int2 depthOffset;                      // offset into stereo-combined depth texture
+};
+
+[numthreads(8, 8, 1)]
+void CS_CameraMV(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    MVOut.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+
+    float depth = DepthIn.Load(int3(int2(id.xy) + depthOffset, 0));
+
+    // Skip sky pixels (reversed-Z: depth near 0 = far plane / sky)
+    if (depth < 0.0001) {
+        MVOut[id.xy] = float2(0, 0);
+        return;
+    }
+
+    // Pixel center -> UV -> NDC
+    float2 uv = (float2(id.xy) + 0.5) / renderSize;
+    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+
+    // Unproject from NDC+depth to world space using inverse current VP
+    float4 clipPos = float4(ndc, depth, 1.0);
+    float4 worldPos = mul(invCurrentVP, clipPos);
+    worldPos /= worldPos.w;
+
+    // Reproject to previous frame's screen space
+    float4 prevClip = mul(prevVP, worldPos);
+    float2 prevNDC = prevClip.xy / prevClip.w;
+    float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
+
+    // MV in UV space: points from current frame to previous frame
+    // FSR3 convention: MV = prevPos - currentPos (where to find previous data)
+    MVOut[id.xy] = prevUV - uv;
+}
+)HLSL";
+
+// Lazily compile the depth extraction CS and create output texture + UAV.
+// Returns true if depth extraction is available.
+static bool EnsureDepthExtractResources(ID3D11Device* device, uint32_t depthW, uint32_t depthH)
+{
+	// Compile CS once
+	if (!s_depthExtractCS) {
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errors = nullptr;
+		HRESULT hr = D3DCompile(s_depthExtractHLSL, sizeof(s_depthExtractHLSL) - 1,
+		    "DepthExtract", nullptr, nullptr, "CS_DepthExtract", "cs_5_0", 0, 0, &blob, &errors);
+		if (FAILED(hr)) {
+			if (errors) {
+				OOVR_LOGF("DepthExtract CS compile failed: %s", (char*)errors->GetBufferPointer());
+				errors->Release();
+			}
+			return false;
+		}
+		if (errors) errors->Release();
+		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_depthExtractCS);
+		blob->Release();
+		if (FAILED(hr)) {
+			OOVR_LOGF("DepthExtract: CreateComputeShader failed (hr=0x%08X)", hr);
+			return false;
+		}
+		OOVR_LOG("DepthExtract: Compute shader compiled OK");
+	}
+
+	// Create/recreate R32F output texture if dimensions changed
+	if (!s_depthR32F || s_depthR32FWidth != depthW || s_depthR32FHeight != depthH) {
+		if (s_depthR32FUAV) { s_depthR32FUAV->Release(); s_depthR32FUAV = nullptr; }
+		if (s_depthR32F)    { s_depthR32F->Release();    s_depthR32F = nullptr; }
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = depthW;
+		td.Height = depthH;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R32_FLOAT;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+		HRESULT hr = device->CreateTexture2D(&td, nullptr, &s_depthR32F);
+		if (FAILED(hr)) {
+			OOVR_LOGF("DepthExtract: CreateTexture2D(%ux%u R32F) failed (hr=0x%08X)", depthW, depthH, hr);
+			return false;
+		}
+
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+		uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		hr = device->CreateUnorderedAccessView(s_depthR32F, &uavDesc, &s_depthR32FUAV);
+		if (FAILED(hr)) {
+			OOVR_LOGF("DepthExtract: CreateUAV failed (hr=0x%08X)", hr);
+			s_depthR32F->Release(); s_depthR32F = nullptr;
+			return false;
+		}
+
+		s_depthR32FWidth = depthW;
+		s_depthR32FHeight = depthH;
+		OOVR_LOGF("DepthExtract: R32F output %ux%u created", depthW, depthH);
+	}
+
+	return true;
+}
+
+// Create an SRV on the bridge depth texture with R24_UNORM_X8_TYPELESS format.
+// The SRV is cached and recreated when the bridge texture pointer changes.
+static ID3D11ShaderResourceView* GetOrCreateDepthSRV(ID3D11Device* device, ID3D11Texture2D* depthTex,
+    DXGI_FORMAT depthFmt, uint32_t depthW, uint32_t depthH)
+{
+	if (s_depthBridgeSRVTex == depthTex && s_depthBridgeSRV)
+		return s_depthBridgeSRV;
+
+	// Texture changed — release old SRV
+	if (s_depthBridgeSRV) { s_depthBridgeSRV->Release(); s_depthBridgeSRV = nullptr; }
+	s_depthBridgeSRVTex = nullptr;
+
+	// Determine the SRV format based on the depth texture format
+	DXGI_FORMAT srvFmt = DXGI_FORMAT_UNKNOWN;
+	if (depthFmt == DXGI_FORMAT_R24G8_TYPELESS || depthFmt == DXGI_FORMAT_D24_UNORM_S8_UINT)
+		srvFmt = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+	else if (depthFmt == DXGI_FORMAT_R32G8X24_TYPELESS || depthFmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+		srvFmt = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+	else if (depthFmt == DXGI_FORMAT_R32_TYPELESS || depthFmt == DXGI_FORMAT_D32_FLOAT)
+		srvFmt = DXGI_FORMAT_R32_FLOAT;
+	else {
+		OOVR_LOGF("DepthExtract: Unsupported depth format %u — cannot create SRV", depthFmt);
+		return nullptr;
+	}
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Format = srvFmt;
+	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+
+	HRESULT hr = device->CreateShaderResourceView(depthTex, &srvDesc, &s_depthBridgeSRV);
+	if (FAILED(hr)) {
+		OOVR_LOGF("DepthExtract: CreateSRV(fmt=%u on depth fmt=%u) failed (hr=0x%08X) — trying bridge SRV",
+		    srvFmt, depthFmt, hr);
+		// Fall back: use the SKSE bridge's pre-created depthSRV
+		if (s_pBridge && s_pBridge->depthSRV) {
+			s_depthBridgeSRV = reinterpret_cast<ID3D11ShaderResourceView*>(s_pBridge->depthSRV);
+			// Note: NOT calling AddRef — bridge SRV is owned by the game
+			s_depthBridgeSRVTex = depthTex;
+			OOVR_LOG("DepthExtract: Using bridge depthSRV as fallback");
+			return s_depthBridgeSRV;
+		}
+		return nullptr;
+	}
+
+	s_depthBridgeSRVTex = depthTex;
+	OOVR_LOGF("DepthExtract: SRV created (srvFmt=%u depthFmt=%u %ux%u)", srvFmt, depthFmt, depthW, depthH);
+	return s_depthBridgeSRV;
+}
+
+// Run depth extraction CS: bridge depth → R32F output texture
+static bool ExtractDepthToR32F(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
+    uint32_t width, uint32_t height)
+{
+	// Save current CS state
+	ID3D11ComputeShader* oldCS = nullptr;
+	ID3D11ShaderResourceView* oldSRV = nullptr;
+	ID3D11UnorderedAccessView* oldUAV = nullptr;
+	context->CSGetShader(&oldCS, nullptr, nullptr);
+	context->CSGetShaderResources(0, 1, &oldSRV);
+	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
+
+	// Set shader + resources
+	context->CSSetShader(s_depthExtractCS, nullptr, 0);
+	context->CSSetShaderResources(0, 1, &depthSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &s_depthR32FUAV, nullptr);
+
+	// Dispatch
+	uint32_t groupsX = (width + 7) / 8;
+	uint32_t groupsY = (height + 7) / 8;
+	context->Dispatch(groupsX, groupsY, 1);
+
+	// Restore CS state
+	context->CSSetShader(oldCS, nullptr, 0);
+	context->CSSetShaderResources(0, 1, &oldSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
+	if (oldCS)  oldCS->Release();
+	if (oldSRV) oldSRV->Release();
+	if (oldUAV) oldUAV->Release();
+
+	return true;
+}
+
+// ── Reactive mask generation ──
+
+static bool EnsureReactiveMaskResources(ID3D11Device* device, uint32_t w, uint32_t h)
+{
+	// Compile CS once
+	if (!s_reactiveMaskCS) {
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errors = nullptr;
+		HRESULT hr = D3DCompile(s_reactiveMaskHLSL, sizeof(s_reactiveMaskHLSL) - 1,
+		    "ReactiveMask", nullptr, nullptr, "CS_ReactiveMask", "cs_5_0", 0, 0, &blob, &errors);
+		if (FAILED(hr)) {
+			if (errors) { OOVR_LOGF("ReactiveMask CS compile failed: %s", (char*)errors->GetBufferPointer()); errors->Release(); }
+			return false;
+		}
+		if (errors) errors->Release();
+		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_reactiveMaskCS);
+		blob->Release();
+		if (FAILED(hr)) { OOVR_LOGF("ReactiveMask: CreateComputeShader failed (hr=0x%08X)", hr); return false; }
+		OOVR_LOG("ReactiveMask: Compute shader compiled OK");
+	}
+
+	// Create/recreate R8_UNORM output texture if dimensions changed
+	if (!s_reactiveMaskTex || s_reactiveMaskW != w || s_reactiveMaskH != h) {
+		if (s_reactiveMaskUAV) { s_reactiveMaskUAV->Release(); s_reactiveMaskUAV = nullptr; }
+		if (s_reactiveMaskTex) { s_reactiveMaskTex->Release(); s_reactiveMaskTex = nullptr; }
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		HRESULT hr = device->CreateTexture2D(&td, nullptr, &s_reactiveMaskTex);
+		if (FAILED(hr)) { OOVR_LOGF("ReactiveMask: CreateTexture2D(%ux%u) failed (hr=0x%08X)", w, h, hr); return false; }
+
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+		uavDesc.Format = DXGI_FORMAT_R8_UNORM;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		hr = device->CreateUnorderedAccessView(s_reactiveMaskTex, &uavDesc, &s_reactiveMaskUAV);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ReactiveMask: CreateUAV failed (hr=0x%08X)", hr);
+			s_reactiveMaskTex->Release(); s_reactiveMaskTex = nullptr;
+			return false;
+		}
+		s_reactiveMaskW = w; s_reactiveMaskH = h;
+		OOVR_LOGF("ReactiveMask: R8_UNORM output %ux%u created", w, h);
+	}
+
+	// Create constant buffer once
+	if (!s_reactiveMaskCB) {
+		D3D11_BUFFER_DESC bd = {};
+		bd.ByteWidth = 16; // 4 floats = 16 bytes (one CB slot)
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		HRESULT hr = device->CreateBuffer(&bd, nullptr, &s_reactiveMaskCB);
+		if (FAILED(hr)) { OOVR_LOGF("ReactiveMask: CreateBuffer(CB) failed (hr=0x%08X)", hr); return false; }
+	}
+	return true;
+}
+
+static ID3D11ShaderResourceView* GetOrCreateReactiveMaskDepthSRV(ID3D11Device* device, ID3D11Texture2D* depthR32F)
+{
+	if (s_reactiveMaskDepthSRVTex == depthR32F && s_reactiveMaskDepthSRV)
+		return s_reactiveMaskDepthSRV;
+	if (s_reactiveMaskDepthSRV) { s_reactiveMaskDepthSRV->Release(); s_reactiveMaskDepthSRV = nullptr; }
+	s_reactiveMaskDepthSRVTex = nullptr;
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+	HRESULT hr = device->CreateShaderResourceView(depthR32F, &srvDesc, &s_reactiveMaskDepthSRV);
+	if (FAILED(hr)) { OOVR_LOGF("ReactiveMask: CreateSRV failed (hr=0x%08X)", hr); return nullptr; }
+	s_reactiveMaskDepthSRVTex = depthR32F;
+	return s_reactiveMaskDepthSRV;
+}
+
+static bool GenerateReactiveMask(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
+    uint32_t width, uint32_t height,
+    float baseReactiveness, float edgeBoost, float edgeThreshold, float edgeScale)
+{
+	// Update constant buffer
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (SUCCEEDED(context->Map(s_reactiveMaskCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+		float* cb = (float*)mapped.pData;
+		cb[0] = baseReactiveness;
+		cb[1] = edgeBoost;
+		cb[2] = edgeThreshold;
+		cb[3] = edgeScale;
+		context->Unmap(s_reactiveMaskCB, 0);
+	}
+
+	// Save current CS state
+	ID3D11ComputeShader* oldCS = nullptr;
+	ID3D11ShaderResourceView* oldSRV = nullptr;
+	ID3D11UnorderedAccessView* oldUAV = nullptr;
+	ID3D11Buffer* oldCB = nullptr;
+	context->CSGetShader(&oldCS, nullptr, nullptr);
+	context->CSGetShaderResources(0, 1, &oldSRV);
+	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
+	context->CSGetConstantBuffers(0, 1, &oldCB);
+
+	context->CSSetShader(s_reactiveMaskCS, nullptr, 0);
+	context->CSSetShaderResources(0, 1, &depthSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &s_reactiveMaskUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &s_reactiveMaskCB);
+	context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+
+	// Restore CS state
+	context->CSSetShader(oldCS, nullptr, 0);
+	context->CSSetShaderResources(0, 1, &oldSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &oldCB);
+	if (oldCS)  oldCS->Release();
+	if (oldSRV) oldSRV->Release();
+	if (oldUAV) oldUAV->Release();
+	if (oldCB)  oldCB->Release();
+	return true;
+}
+
+// ── Camera MV matrix helpers + generation ──
+// All matrices are column-major float[16]: m[col*4 + row]
+
+// Build view matrix (world-to-eye transform) from XrPosef (eye-in-world)
+static void BuildViewMatrix(const XrPosef& pose, float out[16]) {
+	float qx = pose.orientation.x, qy = pose.orientation.y;
+	float qz = pose.orientation.z, qw = pose.orientation.w;
+	float xx = qx*qx, yy = qy*qy, zz = qz*qz;
+	float xy = qx*qy, xz = qx*qz, yz = qy*qz;
+	float wx = qw*qx, wy = qw*qy, wz = qw*qz;
+	// Rotation part (transposed = inverse rotation)
+	float r00 = 1-2*(yy+zz), r01 = 2*(xy+wz), r02 = 2*(xz-wy);
+	float r10 = 2*(xy-wz),   r11 = 1-2*(xx+zz), r12 = 2*(yz+wx);
+	float r20 = 2*(xz+wy),   r21 = 2*(yz-wx),   r22 = 1-2*(xx+yy);
+	// Translation: -R^T * t
+	float tx = pose.position.x, ty = pose.position.y, tz = pose.position.z;
+	float vx = -(r00*tx + r01*ty + r02*tz);
+	float vy = -(r10*tx + r11*ty + r12*tz);
+	float vz = -(r20*tx + r21*ty + r22*tz);
+	out[ 0]=r00; out[ 1]=r10; out[ 2]=r20; out[ 3]=0;
+	out[ 4]=r01; out[ 5]=r11; out[ 6]=r21; out[ 7]=0;
+	out[ 8]=r02; out[ 9]=r12; out[10]=r22; out[11]=0;
+	out[12]=vx;  out[13]=vy;  out[14]=vz;  out[15]=1;
+}
+
+// Build reversed-Z off-axis projection from XrFovf tangent angles
+// Reversed-Z: near plane → ndcZ=1, far plane → ndcZ=0
+static void BuildReversedZProjection(const XrFovf& fov, float nearZ, float farZ, float out[16]) {
+	float tanL = tanf(fov.angleLeft),  tanR = tanf(fov.angleRight);
+	float tanU = tanf(fov.angleUp),    tanD = tanf(fov.angleDown);
+	float w = tanR - tanL, h = tanU - tanD;
+	memset(out, 0, 16 * sizeof(float));
+	out[ 0] = 2.0f / w;                          // col0.row0
+	out[ 5] = 2.0f / h;                          // col1.row1
+	out[ 8] = (tanR + tanL) / w;                 // col2.row0
+	out[ 9] = (tanU + tanD) / h;                 // col2.row1
+	out[10] = nearZ / (farZ - nearZ);            // col2.row2 (reversed-Z)
+	out[11] = -1.0f;                             // col2.row3
+	out[14] = nearZ * farZ / (farZ - nearZ);     // col3.row2 (reversed-Z)
+}
+
+// Multiply two column-major 4x4 matrices: out = A * B
+static void Mat4Mul(const float A[16], const float B[16], float out[16]) {
+	for (int c = 0; c < 4; c++)
+		for (int r = 0; r < 4; r++) {
+			float s = 0;
+			for (int k = 0; k < 4; k++) s += A[k*4+r] * B[c*4+k];
+			out[c*4+r] = s;
+		}
+}
+
+// Invert a column-major 4x4 matrix (general cofactor method)
+static bool Mat4Inv(const float m[16], float out[16]) {
+	float a00=m[0],a01=m[1],a02=m[2],a03=m[3];
+	float a10=m[4],a11=m[5],a12=m[6],a13=m[7];
+	float a20=m[8],a21=m[9],a22=m[10],a23=m[11];
+	float a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+	float b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10;
+	float b03=a01*a12-a02*a11, b04=a01*a13-a03*a11, b05=a02*a13-a03*a12;
+	float b06=a20*a31-a21*a30, b07=a20*a32-a22*a30, b08=a20*a33-a23*a30;
+	float b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+	float det = b00*b11 - b01*b10 + b02*b09 + b03*b08 - b04*b07 + b05*b06;
+	if (fabsf(det) < 1e-10f) return false;
+	float id = 1.0f / det;
+	out[ 0]=( a11*b11-a12*b10+a13*b09)*id; out[ 1]=(-a01*b11+a02*b10-a03*b09)*id;
+	out[ 2]=( a31*b05-a32*b04+a33*b03)*id; out[ 3]=(-a21*b05+a22*b04-a23*b03)*id;
+	out[ 4]=(-a10*b11+a12*b08-a13*b07)*id; out[ 5]=( a00*b11-a02*b08+a03*b07)*id;
+	out[ 6]=(-a30*b05+a32*b02-a33*b01)*id; out[ 7]=( a20*b05-a22*b02+a23*b01)*id;
+	out[ 8]=( a10*b10-a11*b08+a13*b06)*id; out[ 9]=(-a00*b10+a01*b08-a03*b06)*id;
+	out[10]=( a30*b04-a31*b02+a33*b00)*id; out[11]=(-a20*b04+a21*b02-a23*b00)*id;
+	out[12]=(-a10*b09+a11*b07-a12*b06)*id; out[13]=( a00*b09-a01*b07+a02*b06)*id;
+	out[14]=(-a30*b03+a31*b01-a32*b00)*id; out[15]=( a20*b03-a21*b01+a22*b00)*id;
+	return true;
+}
+
+static bool EnsureCameraMVResources(ID3D11Device* device, uint32_t w, uint32_t h) {
+	// Compile CS once
+	if (!s_cameraMVCS) {
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errors = nullptr;
+		HRESULT hr = D3DCompile(s_cameraMVHLSL, sizeof(s_cameraMVHLSL) - 1,
+		    "CameraMV", nullptr, nullptr, "CS_CameraMV", "cs_5_0", 0, 0, &blob, &errors);
+		if (FAILED(hr)) {
+			if (errors) { OOVR_LOGF("CameraMV CS compile failed: %s", (char*)errors->GetBufferPointer()); errors->Release(); }
+			return false;
+		}
+		if (errors) errors->Release();
+		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_cameraMVCS);
+		blob->Release();
+		if (FAILED(hr)) { OOVR_LOGF("CameraMV: CreateComputeShader failed (hr=0x%08X)", hr); return false; }
+		OOVR_LOG("CameraMV: Compute shader compiled OK");
+	}
+
+	// Create/recreate R16G16_FLOAT output texture if dimensions changed
+	if (!s_cameraMVTex || s_cameraMVW != w || s_cameraMVH != h) {
+		if (s_cameraMVUAV) { s_cameraMVUAV->Release(); s_cameraMVUAV = nullptr; }
+		if (s_cameraMVTex) { s_cameraMVTex->Release(); s_cameraMVTex = nullptr; }
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R16G16_FLOAT;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		HRESULT hr = device->CreateTexture2D(&td, nullptr, &s_cameraMVTex);
+		if (FAILED(hr)) { OOVR_LOGF("CameraMV: CreateTexture2D(%ux%u) failed (hr=0x%08X)", w, h, hr); return false; }
+
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+		uavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		hr = device->CreateUnorderedAccessView(s_cameraMVTex, &uavDesc, &s_cameraMVUAV);
+		if (FAILED(hr)) {
+			OOVR_LOGF("CameraMV: CreateUAV failed (hr=0x%08X)", hr);
+			s_cameraMVTex->Release(); s_cameraMVTex = nullptr;
+			return false;
+		}
+		s_cameraMVW = w; s_cameraMVH = h;
+		OOVR_LOGF("CameraMV: R16G16_FLOAT output %ux%u created", w, h);
+	}
+
+	// Create constant buffer once (2x mat4x4 + float2 renderSize + int2 depthOffset = 144 bytes)
+	if (!s_cameraMVCB) {
+		D3D11_BUFFER_DESC bd = {};
+		bd.ByteWidth = 144; // 9 * 16 bytes
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		HRESULT hr = device->CreateBuffer(&bd, nullptr, &s_cameraMVCB);
+		if (FAILED(hr)) { OOVR_LOGF("CameraMV: CreateBuffer(CB) failed (hr=0x%08X)", hr); return false; }
+	}
+	return true;
+}
+
+static ID3D11ShaderResourceView* GetOrCreateCameraMVDepthSRV(ID3D11Device* device, ID3D11Texture2D* depthR32F) {
+	if (s_cameraMVDepthSRVTex == depthR32F && s_cameraMVDepthSRV)
+		return s_cameraMVDepthSRV;
+	if (s_cameraMVDepthSRV) { s_cameraMVDepthSRV->Release(); s_cameraMVDepthSRV = nullptr; }
+	s_cameraMVDepthSRVTex = nullptr;
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+	HRESULT hr = device->CreateShaderResourceView(depthR32F, &srvDesc, &s_cameraMVDepthSRV);
+	if (FAILED(hr)) { OOVR_LOGF("CameraMV: CreateSRV failed (hr=0x%08X)", hr); return nullptr; }
+	s_cameraMVDepthSRVTex = depthR32F;
+	return s_cameraMVDepthSRV;
+}
+
+// Generate camera-derived motion vectors from depth + VP matrix deltas
+static bool GenerateCameraMVs(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
+    uint32_t outputW, uint32_t outputH, const float invCurrentVP[16], const float prevVP[16],
+    int depthOffsetX, int depthOffsetY)
+{
+	// Update constant buffer
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (SUCCEEDED(context->Map(s_cameraMVCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+		float* cb = (float*)mapped.pData;
+		memcpy(cb, invCurrentVP, 64);       // offset 0: invCurrentVP (16 floats = 64 bytes)
+		memcpy(cb + 16, prevVP, 64);         // offset 64: prevVP (16 floats = 64 bytes)
+		cb[32] = (float)outputW;             // offset 128: renderSize.x
+		cb[33] = (float)outputH;             // offset 132: renderSize.y
+		int32_t* cbi = (int32_t*)mapped.pData;
+		cbi[34] = depthOffsetX;              // offset 136: depthOffset.x
+		cbi[35] = depthOffsetY;              // offset 140: depthOffset.y
+		context->Unmap(s_cameraMVCB, 0);
+	}
+
+	// Save current CS state
+	ID3D11ComputeShader* oldCS = nullptr;
+	ID3D11ShaderResourceView* oldSRV = nullptr;
+	ID3D11UnorderedAccessView* oldUAV = nullptr;
+	ID3D11Buffer* oldCB = nullptr;
+	context->CSGetShader(&oldCS, nullptr, nullptr);
+	context->CSGetShaderResources(0, 1, &oldSRV);
+	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
+	context->CSGetConstantBuffers(0, 1, &oldCB);
+
+	context->CSSetShader(s_cameraMVCS, nullptr, 0);
+	context->CSSetShaderResources(0, 1, &depthSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &s_cameraMVUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &s_cameraMVCB);
+	context->Dispatch((outputW + 7) / 8, (outputH + 7) / 8, 1);
+
+	// Restore CS state
+	context->CSSetShader(oldCS, nullptr, 0);
+	context->CSSetShaderResources(0, 1, &oldSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &oldCB);
+	if (oldCS)  oldCS->Release();
+	if (oldSRV) oldSRV->Release();
+	if (oldUAV) oldUAV->Release();
+	if (oldCB)  oldCB->Release();
+	return true;
+}
+
+// ── Debug visualization shaders ──
+// Mode 3: Depth → grayscale (reversed-Z: near=1=white, far=0=black)
+// Mode 4: Motion vectors → RG color (red=horizontal, green=vertical, abs scaled)
+static ID3D11PixelShader* s_debugDepthPS = nullptr;
+static ID3D11PixelShader* s_debugMvPS = nullptr;
+
+// Shared constant buffer layout for debug viz: maps screen UV to a sub-region of the source texture
+static constexpr char s_debugCBHLSL[] = R"HLSL(
+cbuffer DebugCB : register(b0) {
+    float2 uvMin;   // top-left UV of the sub-region in the source texture
+    float2 uvMax;   // bottom-right UV of the sub-region
+};
+)HLSL";
+
+static constexpr char s_debugDepthHLSL[] = R"HLSL(
+cbuffer DebugCB : register(b0) { float2 uvMin; float2 uvMax; };
+Texture2D<float> DepthTex : register(t0);
+struct VsOut { float4 pos : SV_POSITION; float2 tex : TEXCOORD0; };
+float4 PS_DebugDepth(VsOut input) : SV_TARGET
+{
+    float2 sampleUV = uvMin + input.tex * (uvMax - uvMin);
+    uint w, h;
+    DepthTex.GetDimensions(w, h);
+    float d = DepthTex.Load(int3(sampleUV * float2(w, h), 0));
+    // Reversed-Z: 1=near, 0=far → display as-is (white=near, black=far)
+    return float4(d, d, d, 1.0);
+}
+)HLSL";
+
+static constexpr char s_debugMvHLSL[] = R"HLSL(
+cbuffer DebugCB : register(b0) { float2 uvMin; float2 uvMax; };
+Texture2D<float2> MVTex : register(t0);
+struct VsOut { float4 pos : SV_POSITION; float2 tex : TEXCOORD0; };
+float4 PS_DebugMV(VsOut input) : SV_TARGET
+{
+    float2 sampleUV = uvMin + input.tex * (uvMax - uvMin);
+    uint w, h;
+    MVTex.GetDimensions(w, h);
+    float2 mv = MVTex.Load(int3(sampleUV * float2(w, h), 0));
+    // Scale for visibility: UV-space values ~0.001-0.025 → amplify 20x
+    float r = saturate(abs(mv.x) * 20.0);
+    float g = saturate(abs(mv.y) * 20.0);
+    return float4(r, g, 0.0, 1.0);
+}
+)HLSL";
+
+static ID3D11Buffer* s_debugCB = nullptr;
+
+static void EnsureDebugShaders(ID3D11Device* device) {
+	auto compilePS = [&](const char* src, size_t len, const char* entry, ID3D11PixelShader** out) {
+		if (*out) return;
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errors = nullptr;
+		HRESULT hr = D3DCompile(src, len, entry, nullptr, nullptr, entry, "ps_5_0", 0, 0, &blob, &errors);
+		if (FAILED(hr)) {
+			if (errors) { OOVR_LOGF("Debug %s compile failed: %s", entry, (char*)errors->GetBufferPointer()); errors->Release(); }
+			return;
+		}
+		if (errors) errors->Release();
+		device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, out);
+		blob->Release();
+	};
+	compilePS(s_debugDepthHLSL, sizeof(s_debugDepthHLSL) - 1, "PS_DebugDepth", &s_debugDepthPS);
+	compilePS(s_debugMvHLSL, sizeof(s_debugMvHLSL) - 1, "PS_DebugMV", &s_debugMvPS);
+
+	if (!s_debugCB) {
+		D3D11_BUFFER_DESC cbd = {};
+		cbd.ByteWidth = 16; // float2 uvMin + float2 uvMax = 4 floats = 16 bytes
+		cbd.Usage = D3D11_USAGE_DYNAMIC;
+		cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		device->CreateBuffer(&cbd, nullptr, &s_debugCB);
+	}
+}
 
 // Validate a raw texture pointer from the SKSE shared-memory bridge.
 // The bridge stores void* pointers to game render targets WITHOUT AddRef —
@@ -713,6 +1397,7 @@ DX11Compositor::~DX11Compositor()
 		s_fsr3FirstDispatch = true;
 		s_fsr3ViewportW = 0;
 		s_fsr3ViewportH = 0;
+		s_hasPrevVP[0] = s_hasPrevVP[1] = false;
 	}
 #endif
 
@@ -780,13 +1465,13 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 #endif
 	uint32_t outWidth = srcDesc.Width;
 	uint32_t outHeight = srcDesc.Height;
-	if (fsrActive && !bounds) {
-		// FSR 1 (non-stereo): inflate swapchain to display resolution for EASU upscale
+	if (fsrActive) {
+		// FSR 1 (non-stereo) or FSR 3 (stereo-combined): inflate swapchain to display
+		// resolution so the upscaler has room to write the full-res output.
 		float invScale = 1.0f / std::max(0.5f, oovr_global_configuration.FsrRenderScale());
 		outWidth = (uint32_t)(srcDesc.Width * invScale);
 		outHeight = (uint32_t)(srcDesc.Height * invScale);
 	}
-	// FSR 3 (stereo-combined / bounds): swapchain stays at render resolution (srcDesc).
 	bool fsrConfigured = fsrActive;
 
 	// Check if existing chain is compatible (compare against OUTPUT dimensions)
@@ -834,6 +1519,7 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 			s_fsr3FirstDispatch = true;
 			s_fsr3ViewportW = 0;
 			s_fsr3ViewportH = 0;
+			s_hasPrevVP[0] = s_hasPrevVP[1] = false;
 		}
 #endif
 
@@ -1217,7 +1903,10 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		{ // Scoped block — goto fsr3_fallback_copy jumps past this entire scope
 
 		// Diagnostic: log MV and depth texture info + sample MV center pixel values
-		{ static int mvDiag = 0; if (mvDiag < 5) { mvDiag++;
+		// Sample first 5 frames + every 200th frame up to 2000 to catch gameplay values
+		{ static int mvDiag = 0; static int mvFrame = 0; mvFrame++;
+		  bool mvDoSample = (mvDiag < 5) || (mvFrame % 200 == 0 && mvDiag < 20);
+		  if (mvDoSample) { mvDiag++;
 			OOVR_LOGF("FSR3-MV: dims=%ux%u fmt=%u bindFlags=0x%X miscFlags=0x%X",
 			    mvDesc.Width, mvDesc.Height, mvDesc.Format, mvDesc.BindFlags, mvDesc.MiscFlags);
 			OOVR_LOGF("FSR3-MV: perEyeRender=%ux%u srcTex=%ux%u bounds=%s",
@@ -1276,7 +1965,198 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			}
 		}}
 
+		// ── Depth format conversion ──
+		// Skyrim's depth-stencil is typically R24G8_TYPELESS (D24_UNORM_S8_UINT).
+		// CopySubresourceRegion from D24/R24G8 → R32F silently fails (incompatible format families).
+		// Extract depth via compute shader when needed, replacing depthTex with the R32F output.
+		if (depthTex) {
+			D3D11_TEXTURE2D_DESC depthDesc;
+			if (SafeGetTextureDesc(depthTex, &depthDesc)) {
+				bool needsExtract = (depthDesc.Format != DXGI_FORMAT_R32_FLOAT
+				    && depthDesc.Format != DXGI_FORMAT_D32_FLOAT
+				    && depthDesc.Format != DXGI_FORMAT_R32_TYPELESS);
+
+				if (needsExtract) {
+					if (EnsureDepthExtractResources(device, depthDesc.Width, depthDesc.Height)) {
+						auto* depthSRV = GetOrCreateDepthSRV(device, depthTex,
+						    depthDesc.Format, depthDesc.Width, depthDesc.Height);
+						if (depthSRV) {
+							ExtractDepthToR32F(context, depthSRV, depthDesc.Width, depthDesc.Height);
+							depthTex = s_depthR32F; // Use extracted R32F for FSR3 + debug modes
+							{ static bool s = false; if (!s) { s = true;
+								OOVR_LOGF("DepthExtract: Converted depth fmt=%u → R32F (%ux%u)",
+								    depthDesc.Format, depthDesc.Width, depthDesc.Height); } }
+						} else {
+							{ static bool s = false; if (!s) { s = true;
+								OOVR_LOGF("DepthExtract: Failed to create SRV for fmt=%u — depth unavailable", depthDesc.Format); } }
+							depthTex = nullptr;
+						}
+					} else {
+						{ static bool s = false; if (!s) { s = true;
+							OOVR_LOG("DepthExtract: Failed to init resources — depth unavailable"); } }
+						depthTex = nullptr;
+					}
+				}
+				// else: R32_FLOAT/D32_FLOAT/R32_TYPELESS → copy-compatible with R32F, no extraction needed
+			}
+		}
+
+		// ── Reactive mask generation (depth-edge detection) ──
+		// After depth is available as R32F, generate a per-pixel reactiveness map
+		// from depth discontinuities. This tells FSR3 to use more current-frame data
+		// for depth edges (tree branches against sky), reducing temporal ghosting.
+		ID3D11Texture2D* reactiveMaskTex = nullptr;
+		if (depthTex) {
+			D3D11_TEXTURE2D_DESC dDesc;
+			depthTex->GetDesc(&dDesc);
+			if (EnsureReactiveMaskResources(device, dDesc.Width, dDesc.Height)) {
+				auto* rmDepthSRV = GetOrCreateReactiveMaskDepthSRV(device, depthTex);
+				if (rmDepthSRV) {
+					GenerateReactiveMask(context, rmDepthSRV, dDesc.Width, dDesc.Height,
+					    oovr_global_configuration.Fsr3ReactiveBase(),
+					    oovr_global_configuration.Fsr3ReactiveEdgeBoost(),
+					    0.005f,  // edge threshold (depth diff below which edge = 0)
+					    30.0f);  // edge scale (ramp speed)
+					reactiveMaskTex = s_reactiveMaskTex;
+					{ static bool s = false; if (!s) { s = true;
+						OOVR_LOGF("ReactiveMask: Generated %ux%u from depth", dDesc.Width, dDesc.Height); } }
+				}
+			}
+		}
+
+		// Diagnostic: readback center depth value from extracted R32F to verify values
+		// Sample first 5 frames + every 200th frame up to 2000 to catch gameplay values
+		{ static int depthDiag = 0; static int depthFrame = 0; depthFrame++;
+		  bool doSample = (depthDiag < 5) || (depthFrame % 200 == 0 && depthDiag < 20);
+		  if (depthTex && doSample) { depthDiag++;
+			static ID3D11Texture2D* depthStaging = nullptr;
+			if (!depthStaging) {
+				D3D11_TEXTURE2D_DESC stg = {};
+				stg.Width = 1; stg.Height = 1; stg.MipLevels = 1; stg.ArraySize = 1;
+				stg.Format = DXGI_FORMAT_R32_FLOAT; stg.SampleDesc.Count = 1;
+				stg.Usage = D3D11_USAGE_STAGING; stg.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+				device->CreateTexture2D(&stg, nullptr, &depthStaging);
+			}
+			if (depthStaging) {
+				D3D11_TEXTURE2D_DESC dd; depthTex->GetDesc(&dd);
+				uint32_t cx = dd.Width / 2, cy = dd.Height / 2;
+				D3D11_BOX box = { cx, cy, 0, cx + 1, cy + 1, 1 };
+				context->CopySubresourceRegion(depthStaging, 0, 0, 0, 0, depthTex, 0, &box);
+				D3D11_MAPPED_SUBRESOURCE mapped;
+				if (SUCCEEDED(context->Map(depthStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
+					float depthVal = *(float*)mapped.pData;
+					context->Unmap(depthStaging, 0);
+					OOVR_LOGF("FSR3-DEPTH-VALUE: center=%.6f (reversed-Z: 1=near, 0=far) texDims=%ux%u near=%.1f far=%.0f",
+					    depthVal, dd.Width, dd.Height, g_fsr3CameraNear, g_fsr3CameraFar);
+				}
+			}
+		}}
+
+		// ── Camera MV generation ──
+		// Compute per-pixel motion vectors from depth + view-projection matrix deltas.
+		// PRIMARY: Use game's NiCamera::worldToCam (captures HMD tracking + locomotion).
+		// FALLBACK: Use OpenXR layer.pose (HMD tracking only, no locomotion).
+		ID3D11Texture2D* cameraMVTex = nullptr;
+		if (depthTex && oovr_global_configuration.Fsr3CameraMV()) {
+			int eye = s_currentEyeIdx;
+			// Build current VP matrix for this eye
+			float viewMat[16], projMat[16], vpMat[16], invVP[16];
+
+			// Try game's actual worldToCam first (includes locomotion + HMD tracking)
+			bool haveGameView = false;
+			if (s_pBridge && s_pBridge->worldToCamPtr) {
+				const float* g = reinterpret_cast<const float*>(s_pBridge->worldToCamPtr);
+				// g is row-major 4x4 from NiCamera::worldToCam (Gamebryo/Creation Engine).
+				// Rows 0-2 are rotation*scale + translation. Row 3 is auxiliary (not affine).
+				//
+				// Game WORLD space: X-right, Y-forward, Z-up
+				// OpenXR WORLD space: X-right, Y-up, Z-backward
+				// World axis remap: OXR_X = game_X, OXR_Y = game_Z, OXR_Z = -game_Y
+				//
+				// Rotation columns represent world-axis contributions to camera axes.
+				// Remap columns for world axis conversion + negate row 2 for cam Z flip:
+				//   Col 0 (world X): game col 0
+				//   Col 1 (world Y_oxr = game Z): game col 2
+				//   Col 2 (world Z_oxr = -game Y): -game col 1
+				//   Row 2 negated throughout (LH forward → RH backward).
+				// Translation (col 3) is in CAMERA space — only row 2 negate, NO col swap.
+				float s = sqrtf(g[0]*g[0] + g[1]*g[1] + g[2]*g[2]);
+				if (s < 0.001f) s = 1.0f;
+				float invS = 1.0f / s;
+
+				// Col 0 (OXR world X = game world X)
+				viewMat[0]  =  g[0]  * invS;   // row0: cam X
+				viewMat[1]  =  g[4]  * invS;   // row1: cam Y
+				viewMat[2]  = -g[8]  * invS;   // row2: cam Z (negated)
+				viewMat[3]  = 0.0f;
+				// Col 1 (OXR world Y = game world Z): game col 2
+				viewMat[4]  =  g[2]  * invS;   // row0
+				viewMat[5]  =  g[6]  * invS;   // row1
+				viewMat[6]  = -g[10] * invS;   // row2 (negated)
+				viewMat[7]  = 0.0f;
+				// Col 2 (OXR world Z = -game world Y): -game col 1
+				viewMat[8]  = -g[1]  * invS;   // row0
+				viewMat[9]  = -g[5]  * invS;   // row1
+				viewMat[10] =  g[9]  * invS;   // row2 (double negate)
+				viewMat[11] = 0.0f;
+				// Col 3: translation is in CAMERA space, not world space.
+				// Only row 2 negate applies — NO world-axis column swap.
+				viewMat[12] =  g[3]  * invS;   // cam X translation
+				viewMat[13] =  g[7]  * invS;   // cam Y translation
+				viewMat[14] = -g[11] * invS;   // cam Z translation (negated)
+				viewMat[15] = 1.0f;
+
+				haveGameView = true;
+			}
+			// Fallback: OpenXR pose (head rotation only)
+			if (!haveGameView) {
+				BuildViewMatrix(s_fsr3EyePose[eye], viewMat);
+			}
+
+			BuildReversedZProjection(s_fsr3EyeFov[eye], g_fsr3CameraNear, g_fsr3CameraFar, projMat);
+
+			// Build current and previous VP matrices for camera MV generation.
+			// Uses file-scope s_prevVP/s_hasPrevVP (reset on teleport/session restart).
+			// No translation shifting — float32 precision is adequate for typical
+			// game-world translations (~100s of units). Previous camera-space shifting
+			// was mathematically wrong: subtracting translations in different rotated
+			// coordinate systems introduces errors proportional to ||t|| * delta_rotation.
+			{
+			float curVP[16], curInvVP[16];
+			Mat4Mul(projMat, viewMat, curVP);
+
+			if (s_hasPrevVP[eye]) {
+				if (Mat4Inv(curVP, curInvVP)) {
+					D3D11_TEXTURE2D_DESC dDesc;
+					depthTex->GetDesc(&dDesc);
+					int depthOffX = 0, depthOffY = 0;
+					bool depthIsStereo = (dDesc.Width >= perEyeRenderW * 2 - 4);
+					if (depthIsStereo && eye == 1)
+						depthOffX = (int)(dDesc.Width / 2);
+
+					if (EnsureCameraMVResources(device, perEyeRenderW, perEyeRenderH)) {
+						auto* cmvDepthSRV = GetOrCreateCameraMVDepthSRV(device, depthTex);
+						if (cmvDepthSRV) {
+							GenerateCameraMVs(context, cmvDepthSRV,
+							    perEyeRenderW, perEyeRenderH,
+							    curInvVP, s_prevVP[eye],
+							    depthOffX, depthOffY);
+							cameraMVTex = s_cameraMVTex;
+							{ static bool s = false; if (!s) { s = true;
+								OOVR_LOGF("CameraMV: Generated %ux%u eye=%d depthOff=%d,%d",
+								    perEyeRenderW, perEyeRenderH, eye, depthOffX, depthOffY); } }
+						}
+					}
+				}
+			}
+
+			memcpy(s_prevVP[eye], curVP, sizeof(curVP));
+			s_hasPrevVP[eye] = true;
+			}
+		}
+
 		// MV region: detect if stereo-combined (double width) or per-eye
+		// (used as fallback when camera MVs are not available)
 		bool mvStereoCombined = (mvDesc.Width >= perEyeRenderW * 2 - 4); // Allow small rounding error
 		D3D11_BOX mvRegion = {};
 		if (mvStereoCombined) {
@@ -1294,21 +2174,33 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		mvRegion.front = 0;
 		mvRegion.back = 1;
 
-		// Frame delta time
+		// Frame delta time — both eyes of a stereo pair should use the same dt.
+		// Measured on left eye (eye 0); right eye reuses it. Without this fix,
+		// right eye would measure ~1ms (time since left eye dispatch, not real frame time).
+		static float s_fsr3StereoFrameDeltaMs = 11.1f;
 		auto now = std::chrono::steady_clock::now();
-		float deltaMs = 11.1f; // Default ~90fps
-		if (s_fsr3LastFrameTime.time_since_epoch().count() > 0) {
-			auto delta = std::chrono::duration_cast<std::chrono::microseconds>(now - s_fsr3LastFrameTime);
-			deltaMs = std::max(1.0f, std::min(100.0f, delta.count() / 1000.0f));
+		if (s_currentEyeIdx == 0) {
+			float deltaMs = 11.1f; // Default ~90fps
+			if (s_fsr3LastFrameTime.time_since_epoch().count() > 0) {
+				auto delta = std::chrono::duration_cast<std::chrono::microseconds>(now - s_fsr3LastFrameTime);
+				deltaMs = std::max(1.0f, std::min(100.0f, delta.count() / 1000.0f));
+			}
+			s_fsr3StereoFrameDeltaMs = deltaMs;
+			s_fsr3LastFrameTime = now;
 		}
-		if (s_currentEyeIdx == 0) s_fsr3LastFrameTime = now;
+		float deltaMs = s_fsr3StereoFrameDeltaMs;
 
 		// Build dispatch parameters
 		Fsr3Upscaler::DispatchParams fsr3Params = {};
 		fsr3Params.color = fsrSrc;
 		fsr3Params.colorSourceRegion = colorRegionPtr;
-		fsr3Params.motionVectors = mvTex;
-		fsr3Params.mvSourceRegion = &mvRegion;
+		if (cameraMVTex) {
+			fsr3Params.motionVectors = cameraMVTex;
+			fsr3Params.mvSourceRegion = nullptr; // Camera MVs are already per-eye, no sub-region
+		} else {
+			fsr3Params.motionVectors = mvTex;
+			fsr3Params.mvSourceRegion = &mvRegion;
+		}
 		fsr3Params.depth = depthTex;
 		// Depth is stereo-combined (same layout as color): extract per-eye region
 		D3D11_BOX depthRegion = {};
@@ -1333,6 +2225,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			}
 		}
 		fsr3Params.depthSourceRegion = depthRegionPtr;
+		fsr3Params.reactiveMask = reactiveMaskTex;
+		fsr3Params.reactiveSourceRegion = depthRegionPtr; // Same stereo layout as depth
 		fsr3Params.jitterX = s_fsr3RenderJitterX; // Use the jitter that was applied to rendering
 		fsr3Params.jitterY = s_fsr3RenderJitterY;
 		fsr3Params.deltaTimeMs = deltaMs;
@@ -1340,7 +2234,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		fsr3Params.renderHeight = perEyeRenderH;
 		float fsr3InvScale = 1.0f / std::max(0.5f, oovr_global_configuration.FsrRenderScale());
 		uint32_t perEyeDisplayW = (uint32_t)(perEyeRenderW * fsr3InvScale);
-		uint32_t perEyeDisplayH = perEyeRenderH; // Capped: display height would exceed swapchain
+		uint32_t perEyeDisplayH = (uint32_t)(perEyeRenderH * fsr3InvScale);
 		perEyeDisplayW = std::min(perEyeDisplayW, (uint32_t)createInfo.width);
 		perEyeDisplayH = std::min(perEyeDisplayH, (uint32_t)createInfo.height);
 		fsr3Params.outputWidth = perEyeDisplayW;
@@ -1353,6 +2247,152 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		fsr3Params.jitterCancellation = oovr_global_configuration.Fsr3JitterCancellation();
 		fsr3Params.viewToMeters = oovr_global_configuration.Fsr3ViewToMeters();
 		fsr3Params.mvScale = oovr_global_configuration.MotionVectorScale();
+		int fsr3DbgMode = oovr_global_configuration.Fsr3DebugMode();
+		fsr3Params.debugMode = fsr3DbgMode;
+
+		// Mode 2: Bypass FSR3 — copy raw game render to swapchain (no upscaling)
+		if (fsr3DbgMode == 2) {
+			float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+			context->ClearRenderTargetView(swapchain_rtvs[currentIndex], black);
+			if (colorRegionPtr) {
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, fsrSrc, 0, colorRegionPtr);
+			} else {
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, fsrSrc, 0, nullptr);
+			}
+			{ static bool s = false; if (!s) { s = true;
+				OOVR_LOG("FSR3-DEBUG: Mode 2 — bypass, raw game render to swapchain"); } }
+			goto fsr3_end;
+		}
+
+		// Mode 3: Depth visualization — render depth as grayscale via shader
+		// Mode 4: MV visualization — render motion vectors as RG color via shader
+		// When camera MVs are available, show those (what FSR3 actually uses);
+		// otherwise fall back to the game's bridge MV texture.
+		// (CopySubresourceRegion from R32F/R16G16F → R8G8B8A8 silently fails)
+		if ((fsr3DbgMode == 3 && depthTex) || fsr3DbgMode == 4) {
+			EnsureDebugShaders(device);
+			ID3D11PixelShader* vizPS = (fsr3DbgMode == 3) ? s_debugDepthPS : s_debugMvPS;
+			ID3D11Texture2D* vizTex = (fsr3DbgMode == 3) ? depthTex
+			    : (cameraMVTex ? cameraMVTex : mvTex);
+
+			if (vizPS && vizTex) {
+				// Compute sub-region UVs for the per-eye portion
+				// Camera MVs are already per-eye (no sub-region needed)
+				D3D11_TEXTURE2D_DESC vizDesc;
+				vizTex->GetDesc(&vizDesc);
+				float uvMin[2] = {0.0f, 0.0f};
+				float uvMax[2] = {1.0f, 1.0f};
+				D3D11_BOX* regionPtr = (fsr3DbgMode == 3) ? depthRegionPtr
+				    : (cameraMVTex ? nullptr : &mvRegion);
+				if (regionPtr) {
+					uvMin[0] = (float)regionPtr->left / vizDesc.Width;
+					uvMin[1] = (float)regionPtr->top / vizDesc.Height;
+					uvMax[0] = (float)regionPtr->right / vizDesc.Width;
+					uvMax[1] = (float)regionPtr->bottom / vizDesc.Height;
+				}
+
+				// Update debug constant buffer
+				// NOTE: The full-screen VS does tex.y = 1.0f - tex.y (D3D bottom-up convention).
+				// This means input.tex.y=0 is at the BOTTOM of the screen (= top of texture).
+				// To correctly map screen → texture sub-region, swap uvMin.y and uvMax.y.
+				if (s_debugCB) {
+					D3D11_MAPPED_SUBRESOURCE mapped;
+					if (SUCCEEDED(context->Map(s_debugCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+						float* cb = (float*)mapped.pData;
+						cb[0] = uvMin[0]; cb[1] = uvMax[1]; // uvMin: x normal, y swapped
+						cb[2] = uvMax[0]; cb[3] = uvMin[1]; // uvMax: x normal, y swapped
+						context->Unmap(s_debugCB, 0);
+					}
+				}
+
+				// Create SRV with explicit format (handles typeless textures)
+				ID3D11ShaderResourceView* vizSRV = nullptr;
+				D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+				srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				srvDesc.Texture2D.MipLevels = 1;
+				// Use known format based on mode
+				if (fsr3DbgMode == 3) {
+					srvDesc.Format = DXGI_FORMAT_R32_FLOAT; // depthTex is always R32F after extraction
+				} else {
+					srvDesc.Format = DXGI_FORMAT_R16G16_FLOAT; // MV texture from bridge
+				}
+				HRESULT srvHr = device->CreateShaderResourceView(vizTex, &srvDesc, &vizSRV);
+				if (FAILED(srvHr)) {
+					// Fallback: try with default format
+					srvHr = device->CreateShaderResourceView(vizTex, nullptr, &vizSRV);
+				}
+				if (FAILED(srvHr) || !vizSRV) {
+					{ static int errCnt = 0; if (errCnt++ < 10)
+						OOVR_LOGF("FSR3-DEBUG: CreateSRV for mode %d failed (hr=0x%08X fmt=%u texFmt=%u)",
+						    fsr3DbgMode, srvHr, srvDesc.Format, vizDesc.Format); }
+				}
+				if (vizSRV) {
+					// Set up viewport to fill swapchain
+					D3D11_TEXTURE2D_DESC swapDesc;
+					imagesHandles[currentIndex].texture->GetDesc(&swapDesc);
+					D3D11_VIEWPORT vp = {};
+					vp.Width = (float)swapDesc.Width;
+					vp.Height = (float)swapDesc.Height;
+					vp.MaxDepth = 1.0f;
+
+					float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+					context->ClearRenderTargetView(swapchain_rtvs[currentIndex], black);
+
+					// Save state
+					D3D11_PRIMITIVE_TOPOLOGY savedTopo;
+					context->IAGetPrimitiveTopology(&savedTopo);
+					UINT numVP = 0;
+					context->RSGetViewports(&numVP, nullptr);
+					D3D11_VIEWPORT savedVP[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+					if (numVP) context->RSGetViewports(&numVP, savedVP);
+					UINT numSR = 0;
+					context->RSGetScissorRects(&numSR, nullptr);
+					D3D11_RECT savedSR[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+					if (numSR) context->RSGetScissorRects(&numSR, savedSR);
+					ID3D11RasterizerState* savedRS = nullptr;
+					context->RSGetState(&savedRS);
+
+					// Render full-screen quad
+					// Reset rasterizer state: game may leave ScissorEnable=true with a
+					// small scissor rect that clips our quad to nothing (causes black).
+					context->RSSetState(nullptr);
+					D3D11_RECT sr = { 0, 0, (LONG)swapDesc.Width, (LONG)swapDesc.Height };
+					context->RSSetScissorRects(1, &sr);
+					context->RSSetViewports(1, &vp);
+					context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+					context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+					context->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
+					context->VSSetShader(fs_vshader, nullptr, 0);
+					context->PSSetShader(vizPS, nullptr, 0);
+					context->PSSetShaderResources(0, 1, &vizSRV);
+					context->PSSetConstantBuffers(0, 1, &s_debugCB);
+					context->PSSetSamplers(0, 1, &quad_sampleState);
+					context->Draw(4, 0);
+
+					// Unbind and restore
+					ID3D11ShaderResourceView* nullSRV = nullptr;
+					context->PSSetShaderResources(0, 1, &nullSRV);
+					ID3D11RenderTargetView* nullRTV = nullptr;
+					context->OMSetRenderTargets(1, &nullRTV, nullptr);
+					context->IASetPrimitiveTopology(savedTopo);
+					if (numVP) context->RSSetViewports(numVP, savedVP);
+					if (numSR) context->RSSetScissorRects(numSR, savedSR);
+					context->RSSetState(savedRS);
+					if (savedRS) savedRS->Release();
+
+					vizSRV->Release();
+
+					{ static int vizLog = 0; if (vizLog++ < 3)
+						OOVR_LOGF("FSR3-DEBUG: Mode %d — %s viz OK (region=%.2f,%.2f → %.2f,%.2f texFmt=%u %ux%u)",
+						    fsr3DbgMode, fsr3DbgMode == 3 ? "depth" : "MV",
+						    uvMin[0], uvMin[1], uvMax[0], uvMax[1],
+						    vizDesc.Format, vizDesc.Width, vizDesc.Height); }
+				}
+			}
+			goto fsr3_end;
+		}
 
 		bool fsr3Ok = s_fsr3Upscaler->Dispatch(s_currentEyeIdx, context, fsr3Params);
 		s_fsr3FirstDispatch = false;
@@ -1799,6 +2839,12 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 	// Set current eye index for FSR radius matching (inner Invoke reads this)
 	s_currentEyeIdx = (eye == XruEyeLeft) ? 0 : 1;
+
+#ifdef OC_HAS_FSR3
+	// Capture per-eye pose and FOV for camera MV computation (inner Invoke reads these)
+	s_fsr3EyePose[s_currentEyeIdx] = layer.pose;
+	s_fsr3EyeFov[s_currentEyeIdx] = layer.fov;
+#endif
 
 #ifdef OC_HAS_FSR3
 	// ── FSR 3: lazy-init upscaler and update per-frame jitter ──

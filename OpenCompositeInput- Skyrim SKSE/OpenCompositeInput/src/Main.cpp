@@ -20,6 +20,9 @@ namespace RE { class GASGlobalContext; } // Forward decl needed by GFxMovieRoot.
 #include <RE/I/IMenu.h>             // Still needed: MenuWatcher accesses IMenu for OC_MENU_ACTIVE
 // #include <RE/M/MenuCursor.h>     // Was: SetCursorVisibility, cursorPosX/Y
 #include <RE/M/MenuOpenCloseEvent.h>
+#include <RE/N/NiCamera.h>
+#include <RE/N/NiRTTI.h>
+#include <RE/P/PlayerCamera.h>
 #include <RE/R/Renderer.h>
 #include <RE/U/UI.h>
 #include <SKSE/SKSE.h>
@@ -88,7 +91,11 @@ struct OCRenderTargetBridge {
 	uint64_t d3dDevice;     // ID3D11Device*
 	uint64_t d3dContext;    // ID3D11DeviceContext*
 
-	uint8_t reserved[64];
+	// Camera data for locomotion-aware motion vectors (added v1.1)
+	uint64_t worldToCamPtr;   // float* → NiCamera::worldToCam[0][0] (row-major 4x4, 64 bytes)
+	uint64_t playerPosPtr;    // float* → PlayerCamera::pos.x (3 floats: x, y, z)
+	uint64_t playerYawPtr;    // float* → PlayerCamera::yaw (1 float, radians)
+	uint8_t  reserved2[40];   // Future use (64 - 24 = 40 bytes)
 };
 #pragma pack(pop)
 
@@ -221,6 +228,55 @@ namespace
 		g_pBridge->status = 1;
 		SKSE::log::info("RT Bridge: Ready — shared memory Local\\OpenCompositeRenderTargets ({} bytes)",
 			sizeof(OCRenderTargetBridge));
+	}
+
+	// =========================================================================
+	// NiCamera lookup — deferred until scene graph is available
+	// =========================================================================
+	bool g_niCameraFound = false;
+
+	void FindAndStoreNiCamera()
+	{
+		if (g_niCameraFound || !g_pBridge) return;
+
+		auto* playerCamera = RE::PlayerCamera::GetSingleton();
+		if (!playerCamera) {
+			SKSE::log::warn("RT Bridge: PlayerCamera singleton not available yet");
+			return;
+		}
+
+		// Store PlayerCamera pos/yaw pointers (always available once singleton exists)
+		g_pBridge->playerPosPtr = reinterpret_cast<uint64_t>(&playerCamera->pos.x);
+		g_pBridge->playerYawPtr = reinterpret_cast<uint64_t>(&playerCamera->yaw);
+		SKSE::log::info("RT Bridge: PlayerCamera pos={:p} yaw={:p}",
+			reinterpret_cast<void*>(g_pBridge->playerPosPtr),
+			reinterpret_cast<void*>(g_pBridge->playerYawPtr));
+
+		// Find NiCamera in scene graph via cameraRoot
+		auto* cameraRoot = playerCamera->cameraRoot.get();
+		if (!cameraRoot) {
+			SKSE::log::warn("RT Bridge: cameraRoot is null (scene not loaded yet, will retry)");
+			return;
+		}
+
+		for (uint32_t i = 0; i < cameraRoot->children.size(); i++) {
+			auto* child = cameraRoot->children[i].get();
+			if (!child) continue;
+			auto* rtti = child->GetRTTI();
+			if (rtti && std::string_view(rtti->name) == "NiCamera") {
+				auto* niCam = static_cast<RE::NiCamera*>(child);
+				auto& rtData = niCam->GetRuntimeData();
+				g_pBridge->worldToCamPtr = reinterpret_cast<uint64_t>(&rtData.worldToCam[0][0]);
+				SKSE::log::info("RT Bridge: NiCamera found at {:p}, worldToCam at {:p}",
+					reinterpret_cast<void*>(niCam),
+					reinterpret_cast<void*>(g_pBridge->worldToCamPtr));
+				g_niCameraFound = true;
+				return;
+			}
+		}
+
+		SKSE::log::warn("RT Bridge: NiCamera not found in cameraRoot ({} children, will retry)",
+			cameraRoot->children.size());
 	}
 
 	// Forward declaration — defined after g_activeTrackedMenus
@@ -397,6 +453,11 @@ namespace
 			if (name == "Console")
 				g_consoleOpen = a_event->opening;
 
+			// Retry NiCamera lookup when a loading screen finishes
+			// (kDataLoaded/kNewGame fire too early — scene graph isn't ready yet)
+			if (name == "Loading Menu" && !a_event->opening)
+				FindAndStoreNiCamera();
+
 			// Set OC_MENU_ACTIVE for ALL menus (for WASD blocking in OpenComposite)
 			// IsShowingMenus() returns false in SkyrimVR — use tracked menus + GameIsPaused instead
 			auto ui = RE::UI::GetSingleton();
@@ -455,10 +516,10 @@ namespace
 			auto err = overlay->ShowKeyboard(
 				vr::k_EGamepadTextInputModeNormal,
 				vr::k_EGamepadTextInputLineModeSingleLine,
-				0,                                                         // flags
 				"Enter text",                                              // description
 				charLimit,                                                 // max chars (hard-capped at 31)
 				a_info->startingText ? a_info->startingText : "",          // existing text
+				false,                                                     // bUseMinimalMode
 				0);                                                        // user value
 
 			if (err != vr::VROverlayError_None) {
@@ -839,12 +900,18 @@ namespace
 			InstallVirtualKeyboardHook();
 			CreateSharedMemory();
 			CreateRenderTargetBridge();
+			FindAndStoreNiCamera();  // Try immediately (may need retry after save/new game)
 
 			// Register menu state watcher for MCM laser pointer system
 			if (auto ui = RE::UI::GetSingleton()) {
 				ui->AddEventSink<RE::MenuOpenCloseEvent>(new MenuWatcher());
 				SKSE::log::info("MenuOpenCloseEvent sink registered");
 			}
+			break;
+
+		case SKSE::MessagingInterface::kPostLoadGame:
+		case SKSE::MessagingInterface::kNewGame:
+			FindAndStoreNiCamera();  // Retry after scene graph is fully loaded
 			break;
 
 		case SKSE::MessagingInterface::kInputLoaded:

@@ -34,6 +34,8 @@ public:
 		const D3D11_BOX* mvSourceRegion;     ///< Per-eye sub-region of MV texture (nullptr = full)
 		ID3D11Texture2D* depth;              ///< Depth texture (D32_FLOAT or R32_FLOAT)
 		const D3D11_BOX* depthSourceRegion;  ///< Per-eye sub-region of depth (nullptr = full)
+		ID3D11Texture2D* reactiveMask;       ///< Reactive mask (R8_UNORM, 0=stable 1=reactive), nullptr to skip
+		const D3D11_BOX* reactiveSourceRegion; ///< Per-eye sub-region of reactive mask (nullptr = full)
 		float jitterX, jitterY;              ///< Sub-pixel jitter offset applied to camera
 		float deltaTimeMs;                   ///< Frame time in milliseconds
 		uint32_t renderWidth, renderHeight;  ///< Input (game) resolution per eye
@@ -45,6 +47,7 @@ public:
 		bool jitterCancellation;             ///< MVs already include jitter — FSR3 should compensate
 		float viewToMeters;                  ///< View-space to meters factor (Skyrim: 0.01428)
 		float mvScale;                       ///< MV magnitude multiplier (1.0 = raw engine data)
+		int debugMode;                       ///< 0=off, 1=FSR3 debug overlay, 2=bypass, 3=depth viz
 	};
 
 	/// Dispatch FSR 3 temporal upscaling for one eye (0=left, 1=right).
@@ -66,7 +69,7 @@ private:
 	bool EnsureSharedTextures(uint32_t renderW, uint32_t renderH,
 	    uint32_t outputW, uint32_t outputH, DXGI_FORMAT colorFormat);
 	bool EnsureFsrContexts(uint32_t renderW, uint32_t renderH,
-	    uint32_t outputW, uint32_t outputH);
+	    uint32_t outputW, uint32_t outputH, bool jitterCancellation);
 	void DestroySharedTextures();
 	void DestroyFsrContexts();
 
@@ -112,16 +115,19 @@ private:
 		ID3D12Resource*  colorDX12 = nullptr;
 		ID3D12Resource*  mvDX12 = nullptr;
 		ID3D12Resource*  depthDX12 = nullptr;
+		ID3D12Resource*  reactiveDX12 = nullptr;
 		ID3D12Resource*  outputDX12[2] = {};    // double-buffered for async pipeline
 
 		ID3D11Texture2D* colorDX11 = nullptr;
 		ID3D11Texture2D* mvDX11 = nullptr;
 		ID3D11Texture2D* depthDX11 = nullptr;
+		ID3D11Texture2D* reactiveDX11 = nullptr;
 		ID3D11Texture2D* outputDX11[2] = {};    // double-buffered for async pipeline
 
 		HANDLE colorHandle = nullptr;
 		HANDLE mvHandle = nullptr;
 		HANDLE depthHandle = nullptr;
+		HANDLE reactiveHandle = nullptr;
 		HANDLE outputHandle[2] = {};             // double-buffered for async pipeline
 	};
 	SharedEyeTextures m_eye[2];
@@ -129,6 +135,7 @@ private:
 	// FSR 3 upscaler contexts (opaque handles from high-level API)
 	ffxContext m_fsrContext[2] = {};
 	bool m_fsrContextsCreated = false;
+	bool m_fsrConfigApplied = false;
 
 	// Async pipeline state: double-buffered output with 1-frame delay
 	int m_outputWrite[2] = {0, 0};         // per eye: which output buffer DX12 writes to next

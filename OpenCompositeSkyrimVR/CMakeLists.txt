@@ -419,6 +419,7 @@ if (WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/fidelityfx/api/include/ff
 		libs/fidelityfx/upscalers/include)
 	target_link_libraries(OCCore d3d12.lib dxgi.lib)
 	target_compile_definitions(OCCore PRIVATE OC_HAS_FSR3)
+	target_compile_definitions(DrvOpenXR PRIVATE OC_HAS_FSR3)
 	message(STATUS "FidelityFX SDK found — FSR 3 temporal upscaling enabled")
 else()
 	message(STATUS "FidelityFX SDK not found — FSR 3 disabled (FSR 1 spatial still available)")
