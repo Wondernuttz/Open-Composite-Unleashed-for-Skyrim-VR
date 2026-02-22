@@ -51,6 +51,8 @@
 #endif
 
 #include <chrono>
+#include <cinttypes>
+#include <mutex>
 #include <ranges>
 #include <type_traits>
 
@@ -76,7 +78,7 @@ static BOOL CALLBACK FindGameWindowCB(HWND hwnd, LPARAM lParam) {
 	return TRUE;
 }
 
-static bool testOnlyOne = false;
+std::mutex inputRestartMutex;
 
 std::unique_ptr<TemporaryGraphics> XrBackend::temporaryGraphics = nullptr;
 XrBackend::XrBackend(bool useVulkanTmpGfx, bool useD3D11TmpGfx)
@@ -694,6 +696,9 @@ void XrBackend::StoreEyeTexture(
 
 void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 {
+	static std::mutex submitMutex;
+	std::lock_guard<std::mutex> lock(submitMutex);
+
 	// Always pump events, even if the session isn't active - this is what makes the session active
 	// in the first place.
 	PumpEvents();
@@ -1293,9 +1298,10 @@ bool XrBackend::IsInputAvailable()
 void XrBackend::PumpEvents()
 {
 	BaseInput* input = GetUnsafeBaseInput();
-	if (!testOnlyOne && input && !input->AreActionsLoaded() && sessionState == XR_SESSION_STATE_FOCUSED && !hand_left && !hand_right) {
-		QueryForInteractionProfile();
-		testOnlyOne = true;
+	if (input && sessionState == XR_SESSION_STATE_FOCUSED && !hand_left && !hand_right) {
+		if (input->AreActionsLoaded()) {
+			UpdateInteractionProfile();
+		}
 	}
 	// Poll for OpenXR events
 	// TODO filter by session?
@@ -1583,6 +1589,9 @@ void XrBackend::BindInfoSet()
 			    [&path_name](std::string s) -> bool {
 				    return s.find("/click") != s.npos && s.find(path_name) != s.npos;
 			    });
+			if (click_path == profile->GetValidInputPaths().end()) {
+				continue;
+			}
 			XrPath path;
 			OOVR_FAILED_XR_ABORT(xrStringToPath(xr_instance, click_path->c_str(), &path));
 			bindings.push_back({ .action = infoAction, .binding = path });

@@ -343,7 +343,7 @@ public: // INTERNAL FUNCTIONS
 	 *
 	 * Used for games that don't use the input system.
 	 */
-	void LoadEmptyManifestIfRequired();
+	void LoadEmptyManifestIfRequired(bool allowSessionRestart = true);
 
 	/**
 	 * Update the input stuff, called by BaseSystem.
@@ -369,6 +369,7 @@ public: // INTERNAL FUNCTIONS
 	void GetHandSpace(ITrackedDevice::HandType hand, XrSpace& space, bool aimPose);
 
 	bool AreActionsLoaded();
+	bool IsRestartingSession();
 
 	/**
 	 * Get a number that increments each time xrSyncActions is called. Can be used to check if a cached input value

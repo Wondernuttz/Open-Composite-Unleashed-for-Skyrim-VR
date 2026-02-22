@@ -381,7 +381,6 @@ EVRInputError BaseInput::SetActionManifestPath(const char* pchActionManifestPath
 
 	restartingSession = true;
 	XrBackend::MaybeRestartForInputs();
-	restartingSession = false;
 
 	hasLoadedActions = true;
 	loadedActionsPath = pchActionManifestPath;
@@ -645,18 +644,20 @@ EVRInputError BaseInput::SetActionManifestPath(const char* pchActionManifestPath
 	}
 
 	// Attach everything to the current session
+	restartingSession = false;
 	BindInputsForSession();
 	return vr::VRInputError_None;
 }
 
-void BaseInput::LoadEmptyManifestIfRequired()
+void BaseInput::LoadEmptyManifestIfRequired(bool allowSessionRestart)
 {
 	if (hasLoadedActions)
 		return;
 
 	restartingSession = true;
-	XrBackend::MaybeRestartForInputs();
-	restartingSession = false;
+	if (allowSessionRestart) {
+		XrBackend::MaybeRestartForInputs();
+	}
 
 	OOVR_LOG("Loading virtual empty manifest");
 
@@ -684,6 +685,7 @@ void BaseInput::LoadEmptyManifestIfRequired()
 	}
 
 	// Attach everything to the current session
+	restartingSession = false;
 	BindInputsForSession();
 }
 
@@ -729,7 +731,19 @@ void BaseInput::BindInputsForSession()
 	XrSessionActionSetsAttachInfo attachInfo = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
 	attachInfo.actionSets = sets.data();
 	attachInfo.countActionSets = sets.size();
-	OOVR_FAILED_XR_ABORT(xrAttachSessionActionSets(xr_session.get(), &attachInfo));
+	XrResult attachRes = xrAttachSessionActionSets(xr_session.get(), &attachInfo);
+	if (attachRes == XR_ERROR_ACTIONSETS_ALREADY_ATTACHED) {
+		if (restartingSession) {
+			OOVR_ABORT("Action sets were already attached while restarting session; cannot recover");
+		}
+		OOVR_LOG("Action sets already attached for this session, restarting session to rebind inputs");
+		restartingSession = true;
+		XrBackend::MaybeRestartForInputs();
+		restartingSession = false;
+		BindInputsForSession();
+		return;
+	}
+	OOVR_FAILED_XR_ABORT(attachRes);
 
 	// Setup hand tracking if supported
 	if (xr_gbl->handTrackingProperties.supportsHandTracking) {
@@ -2616,6 +2630,11 @@ void BaseInput::GetHandSpace(ITrackedDevice::HandType hand, XrSpace& space, bool
 bool BaseInput::AreActionsLoaded()
 {
 	return hasLoadedActions;
+}
+
+bool BaseInput::IsRestartingSession()
+{
+	return restartingSession;
 }
 
 ITrackedDevice::HandType BaseInput::ParseAndRemoveHandPrefix(std::string& toModify)
