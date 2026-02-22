@@ -192,13 +192,6 @@ void XrHMD::GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, flo
 	*pfRight = tanf(fov.angleRight);
 
 #ifdef OC_HAS_FSR3
-	// Unconditional call counter — verify Skyrim calls GetProjectionRaw per frame
-	{ static int rawCallCount = 0; rawCallCount++;
-	  if (rawCallCount <= 3 || rawCallCount % 500 == 0)
-		OOVR_LOGF("FSR3-DIAG: GetProjectionRaw call#%d eye=%d jitterEnabled=%d jitter=%.4f,%.4f",
-		    rawCallCount, (int)eEye, (int)g_fsr3JitterEnabled, g_fsr3JitterX, g_fsr3JitterY);
-	}
-
 	// FSR 3 jitter: shift the raw FOV tangent values by a sub-pixel offset.
 	// Skyrim VR calls GetProjectionRaw per frame (NOT GetProjectionMatrix) and
 	// builds its own projection. Shifting both left/right (or top/bottom) by the

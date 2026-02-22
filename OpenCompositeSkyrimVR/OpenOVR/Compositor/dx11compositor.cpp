@@ -2092,34 +2092,6 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			}
 		}
 
-		// Diagnostic: readback center depth value from extracted R32F to verify values
-		// Sample first 5 frames + every 200th frame up to 2000 to catch gameplay values
-		{ static int depthDiag = 0; static int depthFrame = 0; depthFrame++;
-		  bool doSample = (depthDiag < 5) || (depthFrame % 200 == 0 && depthDiag < 20);
-		  if (depthTex && doSample) { depthDiag++;
-			static ID3D11Texture2D* depthStaging = nullptr;
-			if (!depthStaging) {
-				D3D11_TEXTURE2D_DESC stg = {};
-				stg.Width = 1; stg.Height = 1; stg.MipLevels = 1; stg.ArraySize = 1;
-				stg.Format = DXGI_FORMAT_R32_FLOAT; stg.SampleDesc.Count = 1;
-				stg.Usage = D3D11_USAGE_STAGING; stg.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-				device->CreateTexture2D(&stg, nullptr, &depthStaging);
-			}
-			if (depthStaging) {
-				D3D11_TEXTURE2D_DESC dd; depthTex->GetDesc(&dd);
-				uint32_t cx = dd.Width / 2, cy = dd.Height / 2;
-				D3D11_BOX box = { cx, cy, 0, cx + 1, cy + 1, 1 };
-				context->CopySubresourceRegion(depthStaging, 0, 0, 0, 0, depthTex, 0, &box);
-				D3D11_MAPPED_SUBRESOURCE mapped;
-				if (SUCCEEDED(context->Map(depthStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
-					float depthVal = *(float*)mapped.pData;
-					context->Unmap(depthStaging, 0);
-					OOVR_LOGF("FSR3-DEPTH-VALUE: center=%.6f (reversed-Z: 1=near, 0=far) texDims=%ux%u near=%.1f far=%.0f",
-					    depthVal, dd.Width, dd.Height, g_fsr3CameraNear, g_fsr3CameraFar);
-				}
-			}
-		}}
-
 		// ── Camera MV generation ──
 		// Compute per-pixel motion vectors from depth + view-projection matrix deltas.
 		// PRIMARY: Use game's NiCamera::worldToCam (captures HMD tracking + locomotion).
@@ -2954,22 +2926,6 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				OOVR_LOG("FSR3: Initialization failed — falling back to FSR 1");
 				delete s_fsr3Upscaler;
 				s_fsr3Upscaler = nullptr;
-			}
-		}
-
-		// Diagnostic: log bridge state periodically (left eye only)
-		if (eye == XruEyeLeft) {
-			static int s_diagFrame = 0;
-			if (s_diagFrame++ % 200 == 0) {
-				OOVR_LOGF("FSR3-DIAG frame=%d bridge=%p status=%d mainMenu=%d "
-				    "worldToCam=%llX upscaler=%s jitter=%s",
-				    s_diagFrame,
-				    (void*)s_pBridge,
-				    s_pBridge ? (int)s_pBridge->status : -1,
-				    s_pBridge ? (int)s_pBridge->isMainMenu : -1,
-				    s_pBridge ? s_pBridge->worldToCamPtr : 0ULL,
-				    s_fsr3Upscaler ? "ready" : "null",
-				    g_fsr3JitterEnabled ? "on" : "off");
 			}
 		}
 
