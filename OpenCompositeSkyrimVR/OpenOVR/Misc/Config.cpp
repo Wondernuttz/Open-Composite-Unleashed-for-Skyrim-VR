@@ -239,6 +239,9 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(bool, fsr3CameraMV);
 		CFGOPT(float, fsr3ViewToMeters);
 		CFGOPT(int, fsr3DebugMode);
+		CFGOPT(float, fsr3LocoReactiveBase);
+		CFGOPT(float, fsr3LocoSmoothUp);
+		CFGOPT(float, fsr3LocoSmoothDown);
 		CFGOPT(bool, motionVectorsEnabled);
 		CFGOPT(float, motionVectorScale);
 		CFGOPT(bool, aswEnabled);

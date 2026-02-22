@@ -52,7 +52,9 @@ struct OCRenderTargetBridge {
 	uint64_t worldToCamPtr;   // float* → NiCamera::worldToCam[0][0] (row-major 4x4, 64 bytes)
 	uint64_t playerPosPtr;    // float* → PlayerCamera::pos.x (3 floats: x, y, z)
 	uint64_t playerYawPtr;    // float* → PlayerCamera::yaw (1 float, radians)
-	uint8_t  reserved2[40];   // Future use (64 - 24 = 40 bytes)
+	uint8_t  isMainMenu;       // 1 = main menu active, 0 = gameplay
+	uint8_t  isLoadingScreen;  // 1 = loading screen active, 0 = gameplay
+	uint8_t  reserved2[38];   // Future use (40 - 2 = 38 bytes)
 };
 #pragma pack(pop)
 
@@ -1806,6 +1808,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	// Takes priority over FSR 1 when the SKSE bridge provides motion vectors + depth.
 	else if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
 	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
+	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen  // Skip FSR3 on menu/loading
 	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
 	    && oovr_global_configuration.MotionVectorsEnabled()
 	    && oovr_global_configuration.FsrEnabled()
@@ -2001,19 +2004,84 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			}
 		}
 
+		// ── Locomotion detection ──
+		// Detect game camera movement (locomotion) by tracking NiCamera::worldToCam
+		// translation deltas. The game only updates worldToCam during locomotion —
+		// HMD tracking is handled separately by the VR runtime, so gameDelta=0
+		// perfectly indicates "standing still" and gameDelta>0 means locomotion.
+		// We use this to dynamically boost the reactive mask base during movement,
+		// giving maximum temporal quality when still and ghosting protection when moving.
+		static float s_locoBlend = 0.0f; // 0.0 = standing still, 1.0 = full locomotion
+		{
+			static float s_prevGameCamT[3] = {0, 0, 0};
+			static bool  s_hasPrevGameCamT = false;
+
+			// Only update on left eye to avoid double-counting
+			if (s_currentEyeIdx == 0 && s_pBridge && s_pBridge->worldToCamPtr) {
+				const float* g = reinterpret_cast<const float*>(s_pBridge->worldToCamPtr);
+				float gameCamT[3] = { g[3], g[7], g[11] };
+
+				if (s_hasPrevGameCamT) {
+					float gdx = gameCamT[0] - s_prevGameCamT[0];
+					float gdy = gameCamT[1] - s_prevGameCamT[1];
+					float gdz = gameCamT[2] - s_prevGameCamT[2];
+					float gameDelta = sqrtf(gdx*gdx + gdy*gdy + gdz*gdz);
+
+					// Binary detection: any game camera movement = locomotion
+					bool isMoving = (gameDelta > 0.001f);
+
+					// EMA smoothing with separate up/down rates
+					float alpha = isMoving
+					    ? oovr_global_configuration.Fsr3LocoSmoothUp()
+					    : oovr_global_configuration.Fsr3LocoSmoothDown();
+					float target = isMoving ? 1.0f : 0.0f;
+					s_locoBlend = s_locoBlend + alpha * (target - s_locoBlend);
+
+					// Clamp to [0, 1]
+					if (s_locoBlend < 0.001f) s_locoBlend = 0.0f;
+					if (s_locoBlend > 0.999f) s_locoBlend = 1.0f;
+				}
+				s_prevGameCamT[0] = gameCamT[0];
+				s_prevGameCamT[1] = gameCamT[1];
+				s_prevGameCamT[2] = gameCamT[2];
+				s_hasPrevGameCamT = true;
+			}
+
+			// Log locomotion state changes (first 5 + periodic)
+			{ static int s_locoLogN = 0; static float s_lastLoggedBlend = -1.0f;
+			  bool blendChanged = fabsf(s_locoBlend - s_lastLoggedBlend) > 0.05f;
+			  if (s_currentEyeIdx == 0 && blendChanged && s_locoLogN < 100) {
+				s_locoLogN++;
+				s_lastLoggedBlend = s_locoBlend;
+				OOVR_LOGF("LOCO: blend=%.3f (base: %.3f → %.3f)",
+				    s_locoBlend,
+				    oovr_global_configuration.Fsr3ReactiveBase(),
+				    oovr_global_configuration.Fsr3ReactiveBase() +
+				    s_locoBlend * (oovr_global_configuration.Fsr3LocoReactiveBase() -
+				                   oovr_global_configuration.Fsr3ReactiveBase()));
+			  }
+			}
+		}
+
 		// ── Reactive mask generation (depth-edge detection) ──
 		// After depth is available as R32F, generate a per-pixel reactiveness map
 		// from depth discontinuities. This tells FSR3 to use more current-frame data
 		// for depth edges (tree branches against sky), reducing temporal ghosting.
+		// The base reactiveness is dynamically adjusted by locomotion detection:
+		// standing still → low base (max temporal quality), moving → boosted base (anti-ghosting).
 		ID3D11Texture2D* reactiveMaskTex = nullptr;
 		if (depthTex) {
+			float staticBase = oovr_global_configuration.Fsr3ReactiveBase();
+			float locoBase = oovr_global_configuration.Fsr3LocoReactiveBase();
+			float dynamicBase = staticBase + s_locoBlend * (locoBase - staticBase);
+
 			D3D11_TEXTURE2D_DESC dDesc;
 			depthTex->GetDesc(&dDesc);
 			if (EnsureReactiveMaskResources(device, dDesc.Width, dDesc.Height)) {
 				auto* rmDepthSRV = GetOrCreateReactiveMaskDepthSRV(device, depthTex);
 				if (rmDepthSRV) {
 					GenerateReactiveMask(context, rmDepthSRV, dDesc.Width, dDesc.Height,
-					    oovr_global_configuration.Fsr3ReactiveBase(),
+					    dynamicBase,
 					    oovr_global_configuration.Fsr3ReactiveEdgeBoost(),
 					    0.005f,  // edge threshold (depth diff below which edge = 0)
 					    30.0f);  // edge scale (ramp speed)
@@ -2397,6 +2465,17 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		bool fsr3Ok = s_fsr3Upscaler->Dispatch(s_currentEyeIdx, context, fsr3Params);
 		s_fsr3FirstDispatch = false;
 
+		// Sync both eyes: if left eye wasn't ready (warmup), force right eye to use
+		// fallback too, so both eyes transition to FSR3 output on the same stereo frame.
+		{
+			static bool s_fsr3LeftEyeReady = false;
+			if (s_currentEyeIdx == 0) {
+				s_fsr3LeftEyeReady = fsr3Ok;
+			} else if (fsr3Ok && !s_fsr3LeftEyeReady) {
+				fsr3Ok = false;
+			}
+		}
+
 		if (fsr3Ok) {
 			ID3D11Texture2D* fsr3Output = s_fsr3Upscaler->GetOutputDX11(s_currentEyeIdx);
 
@@ -2503,8 +2582,11 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			} }
 		} else {
 			// Async pipeline warmup: no output yet. Copy render-res game content
-			// as fallback into the display-res swapchain. Viewport stays at 0
-			// (reset at frame start) so the fallback path uses source dimensions.
+			// as fallback into the display-res swapchain.
+			// Set viewport to render resolution so the render-res content fills the
+			// viewport correctly. Without this, PostSubmit would use createInfo
+			// (display res), causing a mismatch where the render-res image only fills
+			// part of the viewport — visible as one eye at lower res on the first frame.
 			if (colorRegionPtr) {
 				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
 				    0, 0, 0, fsrSrc, 0, colorRegionPtr);
@@ -2513,7 +2595,10 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
 				    0, 0, 0, fsrSrc, 0, &srcBox);
 			}
-			{ static bool s = false; if (!s) { s = true; OOVR_LOG("FSR3: Dispatch warmup — fallback render-res copy to display-res swapchain"); } }
+			s_fsr3ViewportW = perEyeRenderW;
+			s_fsr3ViewportH = perEyeRenderH;
+			{ static bool s = false; if (!s) { s = true;
+				OOVR_LOGF("FSR3: Dispatch warmup — fallback render-res copy (%ux%u) to display-res swapchain", perEyeRenderW, perEyeRenderH); } }
 		}
 		} // end scoped block (goto fsr3_fallback_copy jumps past here)
 		goto fsr3_end;
@@ -2530,6 +2615,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
 				    0, 0, 0, fsrSrc, 0, &srcBox);
 			}
+			s_fsr3ViewportW = perEyeRenderW;
+			s_fsr3ViewportH = perEyeRenderH;
 			{ static bool s = false; if (!s) { s = true; OOVR_LOG("FSR3: Stale bridge texture — fallback render-res copy"); } }
 		}
 		fsr3_end:;
@@ -2758,6 +2845,14 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		} else {
 			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0, 0, 0, 0, src, 0, &sourceRegion);
 		}
+#ifdef OC_HAS_FSR3
+		// When swapchain is display-res but content is render-res, set viewport to match
+		// actual content size so PostSubmit doesn't stretch the small image across the full viewport
+		if (createInfo.width != (sourceRegion.right - sourceRegion.left)) {
+			s_fsr3ViewportW = sourceRegion.right - sourceRegion.left;
+			s_fsr3ViewportH = sourceRegion.bottom - sourceRegion.top;
+		}
+#endif
 	}
 
 	// Release the swapchain - OpenXR will use the last-released image in a swapchain
@@ -2862,10 +2957,30 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			}
 		}
 
+		// Diagnostic: log bridge state periodically (left eye only)
+		if (eye == XruEyeLeft) {
+			static int s_diagFrame = 0;
+			if (s_diagFrame++ % 200 == 0) {
+				OOVR_LOGF("FSR3-DIAG frame=%d bridge=%p status=%d mainMenu=%d "
+				    "worldToCam=%llX upscaler=%s jitter=%s",
+				    s_diagFrame,
+				    (void*)s_pBridge,
+				    s_pBridge ? (int)s_pBridge->status : -1,
+				    s_pBridge ? (int)s_pBridge->isMainMenu : -1,
+				    s_pBridge ? s_pBridge->worldToCamPtr : 0ULL,
+				    s_fsr3Upscaler ? "ready" : "null",
+				    g_fsr3JitterEnabled ? "on" : "off");
+			}
+		}
+
 		// Save jitter and camera FOV on left eye (once per stereo frame).
 		// IMPORTANT: Do NOT compute next-frame jitter here — right eye's GetProjectionRaw
 		// hasn't been called yet and would pick up the wrong (next) jitter value.
 		if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady() && eye == XruEyeLeft) {
+			// No jitter on main menu / loading screen — FSR3 won't run
+			if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
+				g_fsr3JitterEnabled = false;
+			} else {
 			// Save the jitter that was applied to THIS frame's rendering
 			// (g_fsr3JitterX/Y were set after the PREVIOUS frame's right eye submit)
 			s_fsr3RenderJitterX = g_fsr3JitterX;
@@ -2878,6 +2993,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 			// Capture vertical FOV from OpenXR view
 			s_fsr3CameraFovY = fabsf(layer.fov.angleUp) + fabsf(layer.fov.angleDown);
+			}
 		}
 	} else {
 		g_fsr3JitterEnabled = false;

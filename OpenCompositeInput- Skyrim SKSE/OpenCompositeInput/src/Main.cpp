@@ -95,7 +95,9 @@ struct OCRenderTargetBridge {
 	uint64_t worldToCamPtr;   // float* → NiCamera::worldToCam[0][0] (row-major 4x4, 64 bytes)
 	uint64_t playerPosPtr;    // float* → PlayerCamera::pos.x (3 floats: x, y, z)
 	uint64_t playerYawPtr;    // float* → PlayerCamera::yaw (1 float, radians)
-	uint8_t  reserved2[40];   // Future use (64 - 24 = 40 bytes)
+	uint8_t  isMainMenu;       // 1 = main menu active, 0 = gameplay
+	uint8_t  isLoadingScreen;  // 1 = loading screen active, 0 = gameplay
+	uint8_t  reserved2[38];   // Future use (40 - 2 = 38 bytes)
 };
 #pragma pack(pop)
 
@@ -453,10 +455,19 @@ namespace
 			if (name == "Console")
 				g_consoleOpen = a_event->opening;
 
-			// Retry NiCamera lookup when a loading screen finishes
-			// (kDataLoaded/kNewGame fire too early — scene graph isn't ready yet)
-			if (name == "Loading Menu" && !a_event->opening)
-				FindAndStoreNiCamera();
+			// Track main menu state for FSR3 (disable temporal upscaling on main menu)
+			if (name == "Main Menu" && g_pBridge) {
+				g_pBridge->isMainMenu = a_event->opening ? 1 : 0;
+				SKSE::log::info("RT Bridge: isMainMenu = {}", (int)g_pBridge->isMainMenu);
+			}
+
+			// Track loading screen state for FSR3 + retry NiCamera lookup on close
+			if (name == "Loading Menu" && g_pBridge) {
+				g_pBridge->isLoadingScreen = a_event->opening ? 1 : 0;
+				SKSE::log::info("RT Bridge: isLoadingScreen = {}", (int)g_pBridge->isLoadingScreen);
+				if (!a_event->opening)
+					FindAndStoreNiCamera();
+			}
 
 			// Set OC_MENU_ACTIVE for ALL menus (for WASD blocking in OpenComposite)
 			// IsShowingMenus() returns false in SkyrimVR — use tracked menus + GameIsPaused instead
