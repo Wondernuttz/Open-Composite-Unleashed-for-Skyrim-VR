@@ -3079,12 +3079,45 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				}
 			}
 
-			g_aswProvider->CacheFrame(eyeIdx, context,
-			    colorSrc, &colorRegion,
-			    mvTex, &mvRegion,
-			    depthTex, depthTex ? &depthRegion : nullptr,
-			    layer.pose, layer.fov,
-			    g_fsr3CameraNear, g_fsr3CameraFar);
+		g_aswProvider->CacheFrame(eyeIdx, context,
+		    colorSrc, &colorRegion,
+		    mvTex, &mvRegion,
+		    depthTex, depthTex ? &depthRegion : nullptr,
+		    layer.pose, layer.fov,
+		    g_fsr3CameraNear, g_fsr3CameraFar);
+
+			// Stick locomotion correction: compute once per real frame (right eye)
+			// Reads game-world pos delta and projects onto camera forward/right axes.
+			// Clamp rejects teleport/loading-screen jumps (> 20 game units per frame).
+			if (eyeIdx == 1 && s_pBridge->playerPosPtr && s_pBridge->playerYawPtr) {
+				static float s_prevPos[2] = {};
+				static float s_prevYaw = 0.0f;
+				static bool  s_hasPrevPos = false;
+				const float* pos = reinterpret_cast<const float*>(s_pBridge->playerPosPtr);
+				float yaw = *reinterpret_cast<const float*>(s_pBridge->playerYawPtr);
+				if (s_hasPrevPos) {
+					float dx = s_prevPos[0] - pos[0];
+					float dy = s_prevPos[1] - pos[1];
+					// Clamp: reject teleport/load frames (sprint max ~13 units/frame)
+					if (dx * dx + dy * dy < 400.0f) {  // 20 units radius
+						float locoForward = dx * sinf(yaw) + dy * cosf(yaw);
+						float locoStrafe  = dx * cosf(yaw) - dy * sinf(yaw);
+						g_aswProvider->SetLocomotionTranslation(locoForward, locoStrafe);
+					} else {
+						g_aswProvider->SetLocomotionTranslation(0.0f, 0.0f);
+					}
+					// Yaw delta for stick turn correction
+					float yawDelta = s_prevYaw - yaw;
+					if (yawDelta >  3.14159f) yawDelta -= 6.28318f;
+					if (yawDelta < -3.14159f) yawDelta += 6.28318f;
+					if (fabsf(yawDelta) > 0.5f) yawDelta = 0.0f; // clamp: reject loading screen jumps
+					g_aswProvider->SetLocomotionYaw(yawDelta);
+				}
+				s_prevPos[0] = pos[0];
+				s_prevPos[1] = pos[1];
+				s_prevYaw = yaw;
+				s_hasPrevPos = true;
+			}
 		}
 	}
 

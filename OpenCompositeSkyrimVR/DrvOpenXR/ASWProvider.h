@@ -53,6 +53,15 @@ public:
 
 	bool HasCachedFrame() const { return m_hasCachedFrame; }
 
+	/// Set camera-space locomotion delta (old − new, Skyrim units) for stick locomotion correction.
+	/// fwd: positive = player moved toward camera forward. strafe: positive = moved right.
+	void SetLocomotionTranslation(float fwd, float strafe) {
+		m_locoForward = fwd; m_locoStrafe = strafe;
+	}
+
+	/// Set stick yaw delta (old − new, radians) for stick turn correction.
+	void SetLocomotionYaw(float yawDelta) { m_locoYaw = yawDelta; }
+
 	/// Cached pose/FOV for building projection views during injection
 	XrPosef GetCachedPose(int eye) const { return m_cachedPose[eye]; }
 	XrFovf GetCachedFov(int eye) const { return m_cachedFov[eye]; }
@@ -76,6 +85,11 @@ private:
 	static void QuatRotateVec(const XrQuaternionf& q, const XrVector3f& v, XrVector3f& out);
 	static void BuildPoseDeltaMatrix(const XrPosef& oldPose, const XrPosef& newPose,
 	    float* outMatrix4x4);
+
+	// Stick locomotion delta: camera-space (old − new, Skyrim units), set each real frame
+	float m_locoForward = 0.0f;  // toward camera forward
+	float m_locoStrafe  = 0.0f;  // rightward in camera space
+	float m_locoYaw     = 0.0f;  // stick yaw delta (old − new, radians)
 
 	bool m_ready = false;
 	uint32_t m_eyeWidth = 0, m_eyeHeight = 0;
@@ -113,13 +127,17 @@ private:
 	float m_cachedFar = 10000.0f;
 	bool m_hasCachedFrame = false;
 
-	// Constant buffer layout (must match HLSL, 16-byte aligned = 112 bytes)
+	// Constant buffer layout (must match HLSL, 16-byte aligned = 128 bytes)
 	struct WarpConstants {
 		float poseDeltaMatrix[16]; // 4x4 row-major
 		float resolution[2];
 		float nearZ, farZ;
 		float fovTanLeft, fovTanRight, fovTanUp, fovTanDown;
 		float depthScale;          // multiplier on linearized depth
-		float _pad[3];             // pad to 16-byte boundary
+		float edgeFadeWidth;       // depth-edge fade threshold (depth ratio units)
+		float nearFadeDepth;       // parallax fades to 0 below this depth; 0 = disabled
+		float mvConfidence;        // 0=pure parallax, 1=full MV correction
+		float mvPixelScale;        // overall MV magnitude multiplier
+		float _pad[3];             // 12-byte alignment padding
 	};
 };

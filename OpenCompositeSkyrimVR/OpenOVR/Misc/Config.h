@@ -114,6 +114,11 @@ public:
 	inline float ASWRotationScale() const { return aswRotationScale; }
 	inline float ASWTranslationScale() const { return aswTranslationScale; }
 	inline float ASWDepthScale() const { return aswDepthScale; }
+	inline float ASWEdgeFadeWidth() const { return aswEdgeFadeWidth; }
+	inline float ASWLocoScale() const { return aswLocoScale; }
+	inline float ASWNearFadeDepth() const { return aswNearFadeDepth; }
+	inline float ASWMVConfidence() const { return aswMVConfidence; }
+	inline float ASWMVPixelScale() const { return aswMVPixelScale; }
 
 	// CAS sharpening (RCAS) — independent of FSR
 	inline bool CasEnabled() const { return casEnabled; }
@@ -138,6 +143,11 @@ public:
 	float aswRotationScale = 1.0f; // 0.0 = no rotation correction, 1.0 = full
 	float aswTranslationScale = 1.0f; // 0.0 = no translation correction, 1.0 = full
 	float aswDepthScale = 1.0f;    // multiplier on linearized depth (parallax intensity)
+	float aswEdgeFadeWidth = 3.0f;   // depth-edge fade threshold (depth ratio units)
+	float aswLocoScale = 0.5f;       // stick locomotion parallax correction (0=off, 0.5=half-frame)
+	float aswNearFadeDepth = 0.0f;   // parallax fades to 0 below this depth (meters); 0 = disabled
+	float aswMVConfidence = 0.0f;    // 0=pure parallax (default off), 1=full MV object correction
+	float aswMVPixelScale = 1.0f;    // overall MV magnitude multiplier (1.0 = identity)
 
 private:
 	static int ini_handler(
