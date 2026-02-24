@@ -2037,65 +2037,6 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			}
 		}
 
-		// ── Locomotion detection ──
-		// Detect game camera movement (locomotion) by tracking NiCamera::worldToCam
-		// translation deltas. The game only updates worldToCam during locomotion —
-		// HMD tracking is handled separately by the VR runtime, so gameDelta=0
-		// perfectly indicates "standing still" and gameDelta>0 means locomotion.
-		// We use this to dynamically boost the reactive mask base during movement,
-		// giving maximum temporal quality when still and ghosting protection when moving.
-		static float s_locoBlend = 0.0f; // 0.0 = standing still, 1.0 = full locomotion
-		{
-			static float s_prevGameCamT[3] = {0, 0, 0};
-			static bool  s_hasPrevGameCamT = false;
-
-			// Only update on left eye to avoid double-counting
-			if (s_currentEyeIdx == 0 && s_pBridge && s_pBridge->worldToCamPtr) {
-				const float* g = reinterpret_cast<const float*>(s_pBridge->worldToCamPtr);
-				float gameCamT[3] = { g[3], g[7], g[11] };
-
-				if (s_hasPrevGameCamT) {
-					float gdx = gameCamT[0] - s_prevGameCamT[0];
-					float gdy = gameCamT[1] - s_prevGameCamT[1];
-					float gdz = gameCamT[2] - s_prevGameCamT[2];
-					float gameDelta = sqrtf(gdx*gdx + gdy*gdy + gdz*gdz);
-
-					// Binary detection: any game camera movement = locomotion
-					bool isMoving = (gameDelta > 0.001f);
-
-					// EMA smoothing with separate up/down rates
-					float alpha = isMoving
-					    ? oovr_global_configuration.Fsr3LocoSmoothUp()
-					    : oovr_global_configuration.Fsr3LocoSmoothDown();
-					float target = isMoving ? 1.0f : 0.0f;
-					s_locoBlend = s_locoBlend + alpha * (target - s_locoBlend);
-
-					// Clamp to [0, 1]
-					if (s_locoBlend < 0.001f) s_locoBlend = 0.0f;
-					if (s_locoBlend > 0.999f) s_locoBlend = 1.0f;
-				}
-				s_prevGameCamT[0] = gameCamT[0];
-				s_prevGameCamT[1] = gameCamT[1];
-				s_prevGameCamT[2] = gameCamT[2];
-				s_hasPrevGameCamT = true;
-			}
-
-			// Log locomotion state changes (first 5 + periodic)
-			{ static int s_locoLogN = 0; static float s_lastLoggedBlend = -1.0f;
-			  bool blendChanged = fabsf(s_locoBlend - s_lastLoggedBlend) > 0.05f;
-			  if (s_currentEyeIdx == 0 && blendChanged && s_locoLogN < 100) {
-				s_locoLogN++;
-				s_lastLoggedBlend = s_locoBlend;
-				OOVR_LOGF("LOCO: blend=%.3f (base: %.3f → %.3f)",
-				    s_locoBlend,
-				    oovr_global_configuration.Fsr3ReactiveBase(),
-				    oovr_global_configuration.Fsr3ReactiveBase() +
-				    s_locoBlend * (oovr_global_configuration.Fsr3LocoReactiveBase() -
-				                   oovr_global_configuration.Fsr3ReactiveBase()));
-			  }
-			}
-		}
-
 		// ── Reactive mask generation (depth-edge detection) ──
 		// Generates per-pixel reactiveness from depth discontinuities. This tells
 		// FSR3 to favor current-frame data at depth edges (tree branches against sky),
