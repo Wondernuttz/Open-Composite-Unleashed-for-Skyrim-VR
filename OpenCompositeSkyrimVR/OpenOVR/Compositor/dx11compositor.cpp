@@ -3110,8 +3110,12 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		// Save jitter and camera FOV on left eye (once per stereo frame).
 		// IMPORTANT: Do NOT compute next-frame jitter here — right eye's GetProjectionRaw
 		// hasn't been called yet and would pick up the wrong (next) jitter value.
-		if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady() && eye == XruEyeLeft) {
-			// No jitter on main menu / loading screen — FSR3 won't run
+		if ((s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
+#ifdef OC_HAS_DLSS
+		    || (s_dlssUpscaler && s_dlssUpscaler->IsReady())
+#endif
+		    ) && eye == XruEyeLeft) {
+			// No jitter on main menu / loading screen — upscaler won't run
 			if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
 				g_fsr3JitterEnabled = false;
 			} else {
