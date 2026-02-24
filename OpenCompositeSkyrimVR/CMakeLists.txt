@@ -261,6 +261,8 @@ add_library(OCCore STATIC
 	OpenOVR/Compositor/dx11compositor.cpp
 	OpenOVR/Compositor/Fsr3Upscaler.cpp
 	OpenOVR/Compositor/Fsr3Upscaler.h
+	OpenOVR/Compositor/DlssUpscaler.cpp
+	OpenOVR/Compositor/DlssUpscaler.h
 	OpenOVR/Compositor/VRSManager.cpp
 	OpenOVR/Compositor/VRSManager.h
 	OpenOVR/Compositor/dx10compositor.cpp
@@ -423,6 +425,18 @@ if (WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/fidelityfx/api/include/ff
 	message(STATUS "FidelityFX SDK found — FSR 3 temporal upscaling enabled")
 else()
 	message(STATUS "FidelityFX SDK not found — FSR 3 disabled (FSR 1 spatial still available)")
+endif()
+
+# NVIDIA DLSS 4 Super Resolution (optional, native DX11 NGX API)
+if (WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/dlss/include/nvsdk_ngx.h")
+	target_include_directories(OCCore PRIVATE libs/dlss/include)
+	target_link_libraries(OCCore
+		"${CMAKE_CURRENT_SOURCE_DIR}/libs/dlss/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+	target_compile_definitions(OCCore PRIVATE OC_HAS_DLSS)
+	target_compile_definitions(DrvOpenXR PRIVATE OC_HAS_DLSS)
+	message(STATUS "DLSS SDK found — DLSS 4 Super Resolution enabled")
+else()
+	message(STATUS "DLSS SDK not found — DLSS disabled")
 endif()
 
 target_link_libraries(OCCore OpenVR Vulkan ${XrLib} ${glmLib})

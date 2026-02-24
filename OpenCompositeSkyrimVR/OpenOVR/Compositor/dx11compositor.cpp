@@ -24,6 +24,10 @@
 #include "Fsr3Upscaler.h"
 #endif
 
+#ifdef OC_HAS_DLSS
+#include "DlssUpscaler.h"
+#endif
+
 #include "../../DrvOpenXR/ASWProvider.h"
 
 // ============================================================================
@@ -839,6 +843,21 @@ float g_fsr3CameraNear = 5.0f;
 float g_fsr3CameraFar = 100000.0f;
 #endif
 
+#ifdef OC_HAS_DLSS
+static DlssUpscaler* s_dlssUpscaler = nullptr;
+// Fallback jitter/camera state for DLSS-only builds (no FSR3 SDK).
+// When OC_HAS_FSR3 is also defined, the FSR3 versions take precedence.
+#ifndef OC_HAS_FSR3
+static float  s_fsr3RenderJitterX = 0.0f;
+static float  s_fsr3RenderJitterY = 0.0f;
+static float  g_fsr3CameraNear    = 5.0f;
+static float  g_fsr3CameraFar     = 100000.0f;
+static bool   s_fsr3FirstDispatch = true;
+static uint32_t s_fsr3ViewportW   = 0;
+static uint32_t s_fsr3ViewportH   = 0;
+#endif
+#endif
+
 // Shader HLSL headers are embedded as Win32 resources (avoids MSVC string literal size limits)
 #include "../resources.h"
 
@@ -1393,6 +1412,18 @@ DX11Compositor::~DX11Compositor()
 		s_hasPrevVP[0] = s_hasPrevVP[1] = false;
 	}
 #endif
+#ifdef OC_HAS_DLSS
+	if (iAmDxcomp && s_dlssUpscaler) {
+		OOVR_LOG("DLSS: Shutting down upscaler (dxcomp destroyed — VR session restart)");
+		delete s_dlssUpscaler;
+		s_dlssUpscaler = nullptr;
+		s_fsr3ViewportW = 0;
+		s_fsr3ViewportH = 0;
+#	ifdef OC_HAS_FSR3
+		s_fsr3FirstDispatch = true;
+#	endif
+	}
+#endif
 
 	// OCU ASW cleanup: compute shader + XR swapchains tied to this session
 	if (iAmDxcomp && g_aswProvider) {
@@ -1513,6 +1544,17 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 			s_fsr3ViewportW = 0;
 			s_fsr3ViewportH = 0;
 			s_hasPrevVP[0] = s_hasPrevVP[1] = false;
+		}
+#endif
+#ifdef OC_HAS_DLSS
+		if (s_dlssUpscaler && s_dlssUpscaler->IsReady()) {
+			delete s_dlssUpscaler;
+			s_dlssUpscaler = nullptr;
+			s_fsr3ViewportW = 0;
+			s_fsr3ViewportH = 0;
+#		ifdef OC_HAS_FSR3
+			s_fsr3FirstDispatch = true;
+#		endif
 		}
 #endif
 
@@ -1992,6 +2034,65 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 					}
 				}
 				// else: R32_FLOAT/D32_FLOAT/R32_TYPELESS → copy-compatible with R32F, no extraction needed
+			}
+		}
+
+		// ── Locomotion detection ──
+		// Detect game camera movement (locomotion) by tracking NiCamera::worldToCam
+		// translation deltas. The game only updates worldToCam during locomotion —
+		// HMD tracking is handled separately by the VR runtime, so gameDelta=0
+		// perfectly indicates "standing still" and gameDelta>0 means locomotion.
+		// We use this to dynamically boost the reactive mask base during movement,
+		// giving maximum temporal quality when still and ghosting protection when moving.
+		static float s_locoBlend = 0.0f; // 0.0 = standing still, 1.0 = full locomotion
+		{
+			static float s_prevGameCamT[3] = {0, 0, 0};
+			static bool  s_hasPrevGameCamT = false;
+
+			// Only update on left eye to avoid double-counting
+			if (s_currentEyeIdx == 0 && s_pBridge && s_pBridge->worldToCamPtr) {
+				const float* g = reinterpret_cast<const float*>(s_pBridge->worldToCamPtr);
+				float gameCamT[3] = { g[3], g[7], g[11] };
+
+				if (s_hasPrevGameCamT) {
+					float gdx = gameCamT[0] - s_prevGameCamT[0];
+					float gdy = gameCamT[1] - s_prevGameCamT[1];
+					float gdz = gameCamT[2] - s_prevGameCamT[2];
+					float gameDelta = sqrtf(gdx*gdx + gdy*gdy + gdz*gdz);
+
+					// Binary detection: any game camera movement = locomotion
+					bool isMoving = (gameDelta > 0.001f);
+
+					// EMA smoothing with separate up/down rates
+					float alpha = isMoving
+					    ? oovr_global_configuration.Fsr3LocoSmoothUp()
+					    : oovr_global_configuration.Fsr3LocoSmoothDown();
+					float target = isMoving ? 1.0f : 0.0f;
+					s_locoBlend = s_locoBlend + alpha * (target - s_locoBlend);
+
+					// Clamp to [0, 1]
+					if (s_locoBlend < 0.001f) s_locoBlend = 0.0f;
+					if (s_locoBlend > 0.999f) s_locoBlend = 1.0f;
+				}
+				s_prevGameCamT[0] = gameCamT[0];
+				s_prevGameCamT[1] = gameCamT[1];
+				s_prevGameCamT[2] = gameCamT[2];
+				s_hasPrevGameCamT = true;
+			}
+
+			// Log locomotion state changes (first 5 + periodic)
+			{ static int s_locoLogN = 0; static float s_lastLoggedBlend = -1.0f;
+			  bool blendChanged = fabsf(s_locoBlend - s_lastLoggedBlend) > 0.05f;
+			  if (s_currentEyeIdx == 0 && blendChanged && s_locoLogN < 100) {
+				s_locoLogN++;
+				s_lastLoggedBlend = s_locoBlend;
+				OOVR_LOGF("LOCO: blend=%.3f (base: %.3f → %.3f)",
+				    s_locoBlend,
+				    oovr_global_configuration.Fsr3ReactiveBase(),
+				    oovr_global_configuration.Fsr3ReactiveBase() +
+				    s_locoBlend * (oovr_global_configuration.Fsr3LocoReactiveBase() -
+				                   oovr_global_configuration.Fsr3ReactiveBase()));
+			  }
 			}
 		}
 
@@ -2488,6 +2589,175 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		#endif // FSR3_BYPASS_FOR_DIAG
 	}
 #endif
+#ifdef OC_HAS_DLSS
+	// ── DLSS 4 Super Resolution path (native DX11 NGX, no DX12 interop) ──
+	else if (s_dlssUpscaler && s_dlssUpscaler->IsReady()
+	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
+	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen
+	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
+	    && oovr_global_configuration.DlssEnabled()
+	    && oovr_global_configuration.FsrRenderScale() < 0.99f
+	    && !isOverlay && !swapchain_rtvs.empty()) {
+
+		{ static int s_dlssHits = 0; s_dlssHits++;
+		  if (s_dlssHits <= 4 || s_dlssHits % 200 == 0)
+		    OOVR_LOGF("DLSS: dispatch path #%d eye=%d", s_dlssHits, s_currentEyeIdx);
+		}
+
+		ID3D11Texture2D* dlssSrc = src;
+		// Resolve MSAA first if needed
+		if (srcDesc.SampleDesc.Count > 1 && !resolvedMSAATextures.empty()) {
+			context->ResolveSubresource(resolvedMSAATextures[currentIndex], 0, src, 0, srcDesc.Format);
+			dlssSrc = resolvedMSAATextures[currentIndex];
+		}
+		D3D11_TEXTURE2D_DESC dlssSrcDesc;
+		dlssSrc->GetDesc(&dlssSrcDesc);
+
+		// Per-eye color sub-region
+		D3D11_BOX dlssColorRegion = {};
+		D3D11_BOX* dlssColorRegionPtr = nullptr;
+		uint32_t dlssRenderW = dlssSrcDesc.Width;
+		uint32_t dlssRenderH = dlssSrcDesc.Height;
+		if (bounds) {
+			dlssColorRegion.left   = (uint32_t)(bounds->uMin * dlssSrcDesc.Width);
+			dlssColorRegion.right  = (uint32_t)(bounds->uMax * dlssSrcDesc.Width);
+			if (bounds->vMin <= bounds->vMax) {
+				dlssColorRegion.top    = (uint32_t)(bounds->vMin * dlssSrcDesc.Height);
+				dlssColorRegion.bottom = (uint32_t)(bounds->vMax * dlssSrcDesc.Height);
+			} else {
+				dlssColorRegion.top    = (uint32_t)(bounds->vMax * dlssSrcDesc.Height);
+				dlssColorRegion.bottom = (uint32_t)(bounds->vMin * dlssSrcDesc.Height);
+			}
+			dlssColorRegion.front = 0; dlssColorRegion.back = 1;
+			dlssColorRegionPtr = &dlssColorRegion;
+			dlssRenderW = dlssColorRegion.right  - dlssColorRegion.left;
+			dlssRenderH = dlssColorRegion.bottom - dlssColorRegion.top;
+		}
+
+		// MV + depth from SKSE bridge
+		auto* dlssMVTex = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->mvTexture);
+		auto* dlssDepthTex = s_pBridge->depthTexture
+		    ? reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture) : nullptr;
+		if (dlssDepthTex && !ValidateBridgeTexture(dlssDepthTex, "Depth"))
+			dlssDepthTex = nullptr;
+
+		D3D11_TEXTURE2D_DESC dlssMVDesc;
+		bool dlssBridgeOk = SafeGetTextureDesc(dlssMVTex, &dlssMVDesc);
+
+		if (dlssBridgeOk) {
+		// MV stereo-combined sub-region
+		bool dlssMVStereo = (dlssMVDesc.Width >= dlssRenderW * 2 - 4);
+		D3D11_BOX dlssMVRegion = {};
+		if (dlssMVStereo) {
+			uint32_t mvEyeW = dlssMVDesc.Width / 2;
+			dlssMVRegion.left  = (s_currentEyeIdx == 0) ? 0 : mvEyeW;
+			dlssMVRegion.right = dlssMVRegion.left + mvEyeW;
+		} else {
+			dlssMVRegion.left = 0; dlssMVRegion.right = dlssMVDesc.Width;
+		}
+		dlssMVRegion.top = 0; dlssMVRegion.bottom = dlssMVDesc.Height;
+		dlssMVRegion.front = 0; dlssMVRegion.back = 1;
+
+		// Depth sub-region
+		D3D11_BOX dlssDepthRegion = {};
+		D3D11_BOX* dlssDepthRegionPtr = nullptr;
+		if (dlssDepthTex) {
+			D3D11_TEXTURE2D_DESC dlssDepthDesc;
+			if (SafeGetTextureDesc(dlssDepthTex, &dlssDepthDesc)) {
+				bool depthStereo = (dlssDepthDesc.Width >= dlssRenderW * 2 - 4);
+				dlssDepthRegion.left   = (depthStereo && s_currentEyeIdx == 1) ? dlssDepthDesc.Width / 2 : 0;
+				dlssDepthRegion.right  = dlssDepthRegion.left + (depthStereo ? dlssDepthDesc.Width / 2 : dlssDepthDesc.Width);
+				dlssDepthRegion.top    = 0; dlssDepthRegion.bottom = dlssDepthDesc.Height;
+				dlssDepthRegion.front  = 0; dlssDepthRegion.back   = 1;
+				dlssDepthRegionPtr = &dlssDepthRegion;
+			} else {
+				dlssDepthTex = nullptr;
+			}
+		}
+
+		// Per-eye display resolution (same render-scale logic as FSR3)
+		float dlssInvScale = 1.0f / std::max(0.5f, oovr_global_configuration.FsrRenderScale());
+		uint32_t dlssDisplayW = std::min((uint32_t)(dlssRenderW * dlssInvScale), (uint32_t)createInfo.width);
+		uint32_t dlssDisplayH = std::min((uint32_t)(dlssRenderH * dlssInvScale), (uint32_t)createInfo.height);
+
+		// Frame delta time (left eye measurement, shared across stereo pair)
+		static std::chrono::steady_clock::time_point s_dlssLastFrameTime;
+		static float s_dlssFrameDeltaMs = 11.1f;
+		{
+			auto now = std::chrono::steady_clock::now();
+			if (s_currentEyeIdx == 0) {
+				if (s_dlssLastFrameTime.time_since_epoch().count() > 0) {
+					auto delta = std::chrono::duration_cast<std::chrono::microseconds>(now - s_dlssLastFrameTime);
+					s_dlssFrameDeltaMs = std::max(1.0f, std::min(100.0f, delta.count() / 1000.0f));
+				}
+				s_dlssLastFrameTime = now;
+			}
+		}
+
+		// Build and dispatch
+		DlssUpscaler::DispatchParams dlssParams = {};
+		dlssParams.color             = dlssSrc;
+		dlssParams.colorSourceRegion = dlssColorRegionPtr;
+		dlssParams.motionVectors     = dlssMVTex;
+		dlssParams.mvSourceRegion    = dlssMVStereo ? &dlssMVRegion : nullptr;
+		dlssParams.depth             = dlssDepthTex;
+		dlssParams.depthSourceRegion = dlssDepthRegionPtr;
+		dlssParams.jitterX           = s_fsr3RenderJitterX;  // shared jitter
+		dlssParams.jitterY           = s_fsr3RenderJitterY;
+		dlssParams.deltaTimeMs       = s_dlssFrameDeltaMs;
+		dlssParams.renderWidth       = dlssRenderW;
+		dlssParams.renderHeight      = dlssRenderH;
+		dlssParams.outputWidth       = dlssDisplayW;
+		dlssParams.outputHeight      = dlssDisplayH;
+		dlssParams.cameraNear        = g_fsr3CameraNear;
+		dlssParams.cameraFar         = g_fsr3CameraFar;
+		dlssParams.sharpness         = oovr_global_configuration.DlssSharpness();
+		dlssParams.reset             = s_fsr3FirstDispatch;
+		dlssParams.mvScale           = oovr_global_configuration.MotionVectorScale();
+		dlssParams.debugMode         = 0;
+		s_fsr3FirstDispatch = false;
+
+		bool dlssOk = s_dlssUpscaler->Dispatch(s_currentEyeIdx, context, dlssParams);
+		if (dlssOk) {
+			ID3D11Texture2D* dlssOutput = s_dlssUpscaler->GetOutputDX11(s_currentEyeIdx);
+			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+			    0, 0, 0, dlssOutput, 0, nullptr);
+			s_fsr3ViewportW = dlssDisplayW;
+			s_fsr3ViewportH = dlssDisplayH;
+			{ static bool s = false; if (!s) { s = true;
+			    OOVR_LOGF("DLSS: First output %ux%u→%ux%u swapchain %ux%u",
+			        dlssRenderW, dlssRenderH, dlssDisplayW, dlssDisplayH,
+			        createInfo.width, createInfo.height);
+			}}
+		} else {
+			// Dispatch failed — copy render-res content as fallback
+			if (dlssColorRegionPtr) {
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, dlssSrc, 0, dlssColorRegionPtr);
+			} else {
+				D3D11_BOX srcBox = { 0, 0, 0, dlssRenderW, dlssRenderH, 1 };
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, dlssSrc, 0, &srcBox);
+			}
+			s_fsr3ViewportW = dlssRenderW;
+			s_fsr3ViewportH = dlssRenderH;
+		}
+		} else {
+			// Stale bridge texture — copy render-res content as fallback
+			{ static bool s = false; if (!s) { s = true; OOVR_LOG("DLSS: Stale bridge texture — fallback copy"); }}
+			if (dlssColorRegionPtr) {
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, dlssSrc, 0, dlssColorRegionPtr);
+			} else {
+				D3D11_BOX srcBox = { 0, 0, 0, dlssRenderW, dlssRenderH, 1 };
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, dlssSrc, 0, &srcBox);
+			}
+			s_fsr3ViewportW = dlssRenderW;
+			s_fsr3ViewportH = dlssRenderH;
+		}
+	}
+#endif
 	else if (fsrReady && oovr_global_configuration.CasEnabled() && !isOverlay
 	    && oovr_global_configuration.CasSharpness() > 0.0f
 	    && !bounds && !swapchain_rtvs.empty()) {
@@ -2821,6 +3091,22 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			}
 		}
 
+		// Diagnostic: log bridge state periodically (left eye only)
+		if (eye == XruEyeLeft) {
+			static int s_diagFrame = 0;
+			if (s_diagFrame++ % 200 == 0) {
+				OOVR_LOGF("FSR3-DIAG frame=%d bridge=%p status=%d mainMenu=%d "
+				    "worldToCam=%llX upscaler=%s jitter=%s",
+				    s_diagFrame,
+				    (void*)s_pBridge,
+				    s_pBridge ? (int)s_pBridge->status : -1,
+				    s_pBridge ? (int)s_pBridge->isMainMenu : -1,
+				    s_pBridge ? s_pBridge->worldToCamPtr : 0ULL,
+				    s_fsr3Upscaler ? "ready" : "null",
+				    g_fsr3JitterEnabled ? "on" : "off");
+			}
+		}
+
 		// Save jitter and camera FOV on left eye (once per stereo frame).
 		// IMPORTANT: Do NOT compute next-frame jitter here — right eye's GetProjectionRaw
 		// hasn't been called yet and would pick up the wrong (next) jitter value.
@@ -2845,6 +3131,22 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		}
 	} else {
 		g_fsr3JitterEnabled = false;
+	}
+#endif
+
+#ifdef OC_HAS_DLSS
+	// ── DLSS 4: lazy-init upscaler ──
+	// DLSS is mutually exclusive with FSR3 — only one activates at a time.
+	if (oovr_global_configuration.DlssEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+		OpenRenderTargetBridge();
+		if (!s_dlssUpscaler && s_pBridge && s_pBridge->status == 1) {
+			s_dlssUpscaler = new DlssUpscaler();
+			if (!s_dlssUpscaler->Initialize(device)) {
+				OOVR_LOG("DLSS: Initialization failed (no NVIDIA GPU or driver too old) — falling back to FSR 1");
+				delete s_dlssUpscaler;
+				s_dlssUpscaler = nullptr;
+			}
+		}
 	}
 #endif
 

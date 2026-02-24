@@ -263,6 +263,9 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, vrsMidRadius);
 		CFGOPT(float, vrsOuterRadius);
 		CFGOPT(bool, vrsFavorHorizontal);
+		CFGOPT(bool, dlssEnabled);
+		CFGOPT(int, dlssPreset);
+		CFGOPT(float, dlssSharpness);
 	}
 
 	// Combos are parsed separately by BaseOverlay; just skip them here

@@ -103,6 +103,10 @@ public:
 	inline float Fsr3ViewToMeters() const { return fsr3ViewToMeters; }
 	inline int Fsr3DebugMode() const { return fsr3DebugMode; }
 
+	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
+	inline bool  DlssEnabled()   const { return dlssEnabled; }
+	inline int   DlssPreset()    const { return dlssPreset; }    // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
+	inline float DlssSharpness() const { return dlssSharpness; }
 
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	inline bool MotionVectorsEnabled() const { return motionVectorsEnabled; }
@@ -271,6 +275,10 @@ private:
 	float vrsOuterRadius = 1.00f;
 	bool vrsFavorHorizontal = true;
 
+	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
+	bool  dlssEnabled   = false;
+	int   dlssPreset    = 0;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
+	float dlssSharpness = 0.0f;
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;
