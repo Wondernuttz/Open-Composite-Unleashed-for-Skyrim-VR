@@ -237,6 +237,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, fsr3ReactiveBase);
 		CFGOPT(float, fsr3ReactiveEdgeBoost);
 		CFGOPT(bool, fsr3CameraMV);
+		CFGOPT(int, fsr3CamMVSource);
 		CFGOPT(float, fsr3ViewToMeters);
 		CFGOPT(int, fsr3DebugMode);
 		CFGOPT(float, fsr3LocoReactiveBase);

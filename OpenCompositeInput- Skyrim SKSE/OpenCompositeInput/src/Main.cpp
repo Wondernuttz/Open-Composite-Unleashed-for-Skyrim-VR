@@ -97,7 +97,12 @@ struct OCRenderTargetBridge {
 	uint64_t playerYawPtr;    // float* → PlayerCamera::yaw (1 float, radians)
 	uint8_t  isMainMenu;       // 1 = main menu active, 0 = gameplay
 	uint8_t  isLoadingScreen;  // 1 = loading screen active, 0 = gameplay
-	uint8_t  reserved2[38];   // Future use (40 - 2 = 38 bytes)
+	uint8_t  _pad1[6];        // padding to align next uint64_t
+	uint64_t viewFrustumPtr;  // float* → NiFrustum (7 members: L,R,T,B,Near,Far + bool ortho)
+
+	// RendererShadowState base address — compositor reads VP matrices at known offsets
+	uint64_t rssBasePtr;      // uintptr_t → BSGraphics::RendererShadowState singleton
+	uint8_t  reserved2[16];   // Future use (24 - 8 = 16 bytes)
 };
 #pragma pack(pop)
 
@@ -233,6 +238,75 @@ namespace
 	}
 
 	// =========================================================================
+	// RendererShadowState diagnostic — verify game VP matrices are accessible
+	// =========================================================================
+	// We avoid including RendererShadowState.h due to transitive TESFile.h
+	// MAX_PATH macro conflict with Windows.h. Use REL::ID + raw offsets instead.
+	// All offsets verified by static_assert in RendererShadowState.h (VR layout):
+	//   posAdjust:     0x3A4  (EYE_POSITION<NiPoint3, 2>)
+	//   prevPosAdjust: 0x3BC
+	//   cameraData:    0x3E0  (EYE_POSITION<ViewData, 2>, each ViewData = 0x250)
+	//     ViewData.viewMat:                          +0x30  (pure view 4x4)
+	//     ViewData.projMatrixUnjittered:              +0x1B0
+	//     ViewData.viewProjMatrixUnjittered:          +0x130
+	//     ViewData.previousViewProjMatrixUnjittered:  +0x170
+	void TestRendererShadowState()
+	{
+		// RELOCATION_ID(524773, 388819) = address of RendererShadowState singleton
+		uintptr_t rssAddr = RELOCATION_ID(524773, 388819).address();
+		if (!rssAddr) {
+			SKSE::log::error("RSS Test: RELOCATION_ID returned 0!");
+			return;
+		}
+		SKSE::log::info("RSS Test: Singleton at {:p}", (void*)rssAddr);
+
+		uint8_t* base = reinterpret_cast<uint8_t*>(rssAddr);
+
+		// posAdjust: offset 0x3A4, EYE_POSITION<NiPoint3, 2> = 2 × 12 bytes
+		float* posAdj = reinterpret_cast<float*>(base + 0x3A4);
+		SKSE::log::info("RSS Test: posAdjust L=({:.1f}, {:.1f}, {:.1f}) R=({:.1f}, {:.1f}, {:.1f})",
+			posAdj[0], posAdj[1], posAdj[2], posAdj[3], posAdj[4], posAdj[5]);
+
+		// previousPosAdjust: offset 0x3BC
+		float* prevPosAdj = reinterpret_cast<float*>(base + 0x3BC);
+		SKSE::log::info("RSS Test: prevPosAdjust L=({:.1f}, {:.1f}, {:.1f}) R=({:.1f}, {:.1f}, {:.1f})",
+			prevPosAdj[0], prevPosAdj[1], prevPosAdj[2], prevPosAdj[3], prevPosAdj[4], prevPosAdj[5]);
+
+		// Left eye ViewData starts at offset 0x3E0 (each ViewData is 0x250)
+		// viewMat (pure view, no projection): ViewData + 0x30
+		float* viewMatL = reinterpret_cast<float*>(base + 0x3E0 + 0x30);
+		SKSE::log::info("RSS Test: Left viewMat (pure view, 4x4):");
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", viewMatL[0], viewMatL[1], viewMatL[2], viewMatL[3]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", viewMatL[4], viewMatL[5], viewMatL[6], viewMatL[7]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", viewMatL[8], viewMatL[9], viewMatL[10], viewMatL[11]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", viewMatL[12], viewMatL[13], viewMatL[14], viewMatL[15]);
+
+		// projMatrixUnjittered: ViewData + 0x1B0
+		float* projUnjitL = reinterpret_cast<float*>(base + 0x3E0 + 0x1B0);
+		SKSE::log::info("RSS Test: Left projMatrixUnjittered:");
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", projUnjitL[0], projUnjitL[1], projUnjitL[2], projUnjitL[3]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", projUnjitL[4], projUnjitL[5], projUnjitL[6], projUnjitL[7]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", projUnjitL[8], projUnjitL[9], projUnjitL[10], projUnjitL[11]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", projUnjitL[12], projUnjitL[13], projUnjitL[14], projUnjitL[15]);
+
+		// viewProjMatrixUnjittered: ViewData + 0x130
+		float* vpUnjitL = reinterpret_cast<float*>(base + 0x3E0 + 0x130);
+		SKSE::log::info("RSS Test: Left viewProjMatrixUnjittered:");
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", vpUnjitL[0], vpUnjitL[1], vpUnjitL[2], vpUnjitL[3]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", vpUnjitL[4], vpUnjitL[5], vpUnjitL[6], vpUnjitL[7]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", vpUnjitL[8], vpUnjitL[9], vpUnjitL[10], vpUnjitL[11]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", vpUnjitL[12], vpUnjitL[13], vpUnjitL[14], vpUnjitL[15]);
+
+		// previousViewProjMatrixUnjittered: ViewData + 0x170
+		float* prevVPL = reinterpret_cast<float*>(base + 0x3E0 + 0x170);
+		SKSE::log::info("RSS Test: Left previousViewProjMatrixUnjittered:");
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", prevVPL[0], prevVPL[1], prevVPL[2], prevVPL[3]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", prevVPL[4], prevVPL[5], prevVPL[6], prevVPL[7]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", prevVPL[8], prevVPL[9], prevVPL[10], prevVPL[11]);
+		SKSE::log::info("  [{:.6f} {:.6f} {:.6f} {:.6f}]", prevVPL[12], prevVPL[13], prevVPL[14], prevVPL[15]);
+	}
+
+	// =========================================================================
 	// NiCamera lookup — deferred until scene graph is available
 	// =========================================================================
 	bool g_niCameraFound = false;
@@ -269,10 +343,44 @@ namespace
 				auto* niCam = static_cast<RE::NiCamera*>(child);
 				auto& rtData = niCam->GetRuntimeData();
 				g_pBridge->worldToCamPtr = reinterpret_cast<uint64_t>(&rtData.worldToCam[0][0]);
-				SKSE::log::info("RT Bridge: NiCamera found at {:p}, worldToCam at {:p}",
+				// Store viewFrustum pointer (inline frustum from RUNTIME_DATA2)
+				auto& rtData2 = niCam->GetRuntimeData2();
+				g_pBridge->viewFrustumPtr = reinterpret_cast<uint64_t>(&rtData2.viewFrustum);
+				SKSE::log::info("RT Bridge: NiCamera found at {:p}, worldToCam at {:p}, viewFrustum at {:p}",
 					reinterpret_cast<void*>(niCam),
-					reinterpret_cast<void*>(g_pBridge->worldToCamPtr));
+					reinterpret_cast<void*>(g_pBridge->worldToCamPtr),
+					reinterpret_cast<void*>(g_pBridge->viewFrustumPtr));
+
+				// Log NiCamera world transform (pure rotation + position, no projection)
+				auto& w = niCam->world;
+				SKSE::log::info("RT Bridge: NiCamera world.translate=({:.2f}, {:.2f}, {:.2f}) scale={:.4f}",
+					w.translate.x, w.translate.y, w.translate.z, w.scale);
+				SKSE::log::info("RT Bridge: NiCamera world.rotate row0=({:.6f}, {:.6f}, {:.6f})",
+					w.rotate.entry[0][0], w.rotate.entry[0][1], w.rotate.entry[0][2]);
+				SKSE::log::info("RT Bridge: NiCamera world.rotate row1=({:.6f}, {:.6f}, {:.6f})",
+					w.rotate.entry[1][0], w.rotate.entry[1][1], w.rotate.entry[1][2]);
+				SKSE::log::info("RT Bridge: NiCamera world.rotate row2=({:.6f}, {:.6f}, {:.6f})",
+					w.rotate.entry[2][0], w.rotate.entry[2][1], w.rotate.entry[2][2]);
+
+				auto& pw = niCam->previousWorld;
+				SKSE::log::info("RT Bridge: NiCamera previousWorld.translate=({:.2f}, {:.2f}, {:.2f})",
+					pw.translate.x, pw.translate.y, pw.translate.z);
+
 				g_niCameraFound = true;
+
+				// Store RendererShadowState base address for compositor to read VP matrices
+				{
+					uintptr_t rssAddr = RELOCATION_ID(524773, 388819).address();
+					if (rssAddr) {
+						g_pBridge->rssBasePtr = static_cast<uint64_t>(rssAddr);
+						SKSE::log::info("RT Bridge: RSS base at {:p}", (void*)rssAddr);
+					} else {
+						SKSE::log::warn("RT Bridge: RSS RELOCATION_ID returned 0");
+					}
+				}
+
+				// Run RSS diagnostic now that we know the scene is loaded
+				TestRendererShadowState();
 				return;
 			}
 		}
@@ -923,6 +1031,7 @@ namespace
 		case SKSE::MessagingInterface::kPostLoadGame:
 		case SKSE::MessagingInterface::kNewGame:
 			FindAndStoreNiCamera();  // Retry after scene graph is fully loaded
+			TestRendererShadowState();  // Diagnostic: verify game VP matrices
 			break;
 
 		case SKSE::MessagingInterface::kInputLoaded:

@@ -54,7 +54,12 @@ struct OCRenderTargetBridge {
 	uint64_t playerYawPtr;    // float* → PlayerCamera::yaw (1 float, radians)
 	uint8_t  isMainMenu;       // 1 = main menu active, 0 = gameplay
 	uint8_t  isLoadingScreen;  // 1 = loading screen active, 0 = gameplay
-	uint8_t  reserved2[38];   // Future use (40 - 2 = 38 bytes)
+	uint8_t  _pad1[6];        // padding to align next uint64_t
+	uint64_t viewFrustumPtr;  // float* → NiFrustum (L,R,T,B,Near,Far + bool ortho)
+
+	// RendererShadowState base address — compositor reads VP matrices at known offsets
+	uint64_t rssBasePtr;      // uintptr_t → BSGraphics::RendererShadowState singleton
+	uint8_t  reserved2[16];   // Future use
 };
 #pragma pack(pop)
 
@@ -196,6 +201,11 @@ static uint32_t                   s_cameraMVW = 0, s_cameraMVH = 0;
 static float s_prevVP[2][16] = {};
 static bool  s_hasPrevVP[2] = {false, false};
 
+// Per-eye previous jitter (pixel-space, for computing jitter delta in camera MVs)
+static float s_prevJitterX[2] = {0.0f, 0.0f};
+static float s_prevJitterY[2] = {0.0f, 0.0f};
+
+
 // Per-eye pose/fov captured in outer Invoke, consumed by camera MV in inner Invoke
 static XrPosef s_fsr3EyePose[2] = {};
 static XrFovf  s_fsr3EyeFov[2] = {};
@@ -205,10 +215,11 @@ Texture2D<float>       DepthIn  : register(t0);
 RWTexture2D<float2>    MVOut    : register(u0);
 
 cbuffer CameraMVCB : register(b0) {
-    column_major float4x4 invCurrentVP;  // inverse of current view-projection
-    column_major float4x4 prevVP;         // previous frame's view-projection
-    float2 renderSize;                     // per-eye render resolution
-    int2 depthOffset;                      // offset into stereo-combined depth texture
+    column_major float4x4 clipToClip;  // prevVP * inv(curVP), computed in double on CPU
+    float2 renderSize;                  // per-eye render resolution
+    int2 depthOffset;                   // offset into stereo-combined depth texture
+    float2 jitterDeltaUV;               // (curJitter - prevJitter) / renderSize
+    float2 _pad0;
 };
 
 [numthreads(8, 8, 1)]
@@ -230,19 +241,24 @@ void CS_CameraMV(uint3 id : SV_DispatchThreadID)
     float2 uv = (float2(id.xy) + 0.5) / renderSize;
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
-    // Unproject from NDC+depth to world space using inverse current VP
+    // Directly map current clip space to previous clip space via clipToClip matrix.
+    // This is equivalent to: worldPos = inv(curVP) * clipPos; prevClip = prevVP * worldPos;
+    // but avoids float32 catastrophic cancellation from large game-unit world positions.
+    // The clipToClip matrix ≈ Identity for small frame-to-frame changes, keeping all
+    // intermediate values in the shader at manageable magnitudes.
     float4 clipPos = float4(ndc, depth, 1.0);
-    float4 worldPos = mul(invCurrentVP, clipPos);
-    worldPos /= worldPos.w;
-
-    // Reproject to previous frame's screen space
-    float4 prevClip = mul(prevVP, worldPos);
+    float4 prevClip = mul(clipToClip, clipPos);
     float2 prevNDC = prevClip.xy / prevClip.w;
     float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
 
-    // MV in UV space: points from current frame to previous frame
-    // FSR3 convention: MV = prevPos - currentPos (where to find previous data)
-    MVOut[id.xy] = prevUV - uv;
+    // MV in UV space with jitter compensation for FSR3.
+    // The jittered VPs cause phantom MV: mv.x = -jitterDeltaUV.x, mv.y = +jitterDeltaUV.y.
+    // (Y sign differs from X because UV.y = 0.5 - NDC.y * 0.5, flipping the jitter direction.)
+    float2 mv = prevUV - uv;
+    mv.x += jitterDeltaUV.x;
+    mv.y -= jitterDeltaUV.y;
+
+    MVOut[id.xy] = mv;
 }
 )HLSL";
 
@@ -541,11 +557,13 @@ static void BuildViewMatrix(const XrPosef& pose, float out[16]) {
 	out[12]=vx;  out[13]=vy;  out[14]=vz;  out[15]=1;
 }
 
-// Build reversed-Z off-axis projection from XrFovf tangent angles
+// Build RIGHT-HANDED reversed-Z off-axis projection from XrFovf tangent angles
 // Reversed-Z: near plane → ndcZ=1, far plane → ndcZ=0
-static void BuildReversedZProjection(const XrFovf& fov, float nearZ, float farZ, float out[16]) {
-	float tanL = tanf(fov.angleLeft),  tanR = tanf(fov.angleRight);
-	float tanU = tanf(fov.angleUp),    tanD = tanf(fov.angleDown);
+// Used with OpenXR pose fallback (camera looks at -Z)
+static void BuildReversedZProjection(const XrFovf& fov, float nearZ, float farZ, float out[16],
+    float jitterX = 0.0f, float jitterY = 0.0f) {
+	float tanL = tanf(fov.angleLeft)  + jitterX, tanR = tanf(fov.angleRight) + jitterX;
+	float tanU = tanf(fov.angleUp)    + jitterY, tanD = tanf(fov.angleDown)  + jitterY;
 	float w = tanR - tanL, h = tanU - tanD;
 	memset(out, 0, 16 * sizeof(float));
 	out[ 0] = 2.0f / w;                          // col0.row0
@@ -553,8 +571,27 @@ static void BuildReversedZProjection(const XrFovf& fov, float nearZ, float farZ,
 	out[ 8] = (tanR + tanL) / w;                 // col2.row0
 	out[ 9] = (tanU + tanD) / h;                 // col2.row1
 	out[10] = nearZ / (farZ - nearZ);            // col2.row2 (reversed-Z)
-	out[11] = -1.0f;                             // col2.row3
+	out[11] = -1.0f;                             // col2.row3 (RH: w = -z)
 	out[14] = nearZ * farZ / (farZ - nearZ);     // col3.row2 (reversed-Z)
+}
+
+// Build LEFT-HANDED reversed-Z off-axis projection (column-major)
+// Matches Skyrim/Creation Engine's D3D rendering convention (camera looks at +Z)
+// Used with game's NiCamera::worldToCam for camera MV generation
+// jitterX/jitterY: sub-pixel jitter in tangent space (added to all edges, same as GetProjectionRaw)
+static void BuildLHReversedZProjection(const XrFovf& fov, float nearZ, float farZ, float out[16],
+    float jitterX = 0.0f, float jitterY = 0.0f) {
+	float tanL = tanf(fov.angleLeft)  + jitterX, tanR = tanf(fov.angleRight) + jitterX;
+	float tanU = tanf(fov.angleUp)    + jitterY, tanD = tanf(fov.angleDown)  + jitterY;
+	float w = tanR - tanL, h = tanU - tanD;
+	memset(out, 0, 16 * sizeof(float));
+	out[ 0] = 2.0f / w;                          // col0.row0
+	out[ 5] = 2.0f / h;                          // col1.row1
+	out[ 8] = -(tanR + tanL) / w;                // col2.row0 (negated vs RH)
+	out[ 9] = -(tanU + tanD) / h;                // col2.row1 (negated vs RH)
+	out[10] = -nearZ / (farZ - nearZ);           // col2.row2 (negated vs RH)
+	out[11] = 1.0f;                              // col2.row3 (LH: w = +z)
+	out[14] = nearZ * farZ / (farZ - nearZ);     // col3.row2 (same as RH)
 }
 
 // Multiply two column-major 4x4 matrices: out = A * B
@@ -588,6 +625,56 @@ static bool Mat4Inv(const float m[16], float out[16]) {
 	out[10]=( a30*b04-a31*b02+a33*b00)*id; out[11]=(-a20*b04+a21*b02-a23*b00)*id;
 	out[12]=(-a10*b09+a11*b07-a12*b06)*id; out[13]=( a00*b09-a01*b07+a02*b06)*id;
 	out[14]=(-a30*b03+a31*b01-a32*b00)*id; out[15]=( a20*b03-a21*b01+a22*b00)*id;
+	return true;
+}
+
+// Double-precision 4x4 matrix multiply: out = A * B (column-major)
+// Used on the CPU to compute clip-to-clip reprojection matrix without float32 cancellation.
+static void Mat4Mul_d(const double A[16], const double B[16], double out[16]) {
+	for (int c = 0; c < 4; c++)
+		for (int r = 0; r < 4; r++) {
+			double s = 0;
+			for (int k = 0; k < 4; k++) s += A[k*4+r] * B[c*4+k];
+			out[c*4+r] = s;
+		}
+}
+
+// Double-precision 4x4 matrix inverse (column-major, cofactor method)
+static bool Mat4Inv_d(const double m[16], double out[16]) {
+	double a00=m[0],a01=m[1],a02=m[2],a03=m[3];
+	double a10=m[4],a11=m[5],a12=m[6],a13=m[7];
+	double a20=m[8],a21=m[9],a22=m[10],a23=m[11];
+	double a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+	double b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10;
+	double b03=a01*a12-a02*a11, b04=a01*a13-a03*a11, b05=a02*a13-a03*a12;
+	double b06=a20*a31-a21*a30, b07=a20*a32-a22*a30, b08=a20*a33-a23*a30;
+	double b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+	double det = b00*b11 - b01*b10 + b02*b09 + b03*b08 - b04*b07 + b05*b06;
+	if (fabs(det) < 1e-20) return false;
+	double id = 1.0 / det;
+	out[ 0]=( a11*b11-a12*b10+a13*b09)*id; out[ 1]=(-a01*b11+a02*b10-a03*b09)*id;
+	out[ 2]=( a31*b05-a32*b04+a33*b03)*id; out[ 3]=(-a21*b05+a22*b04-a23*b03)*id;
+	out[ 4]=(-a10*b11+a12*b08-a13*b07)*id; out[ 5]=( a00*b11-a02*b08+a03*b07)*id;
+	out[ 6]=(-a30*b05+a32*b02-a33*b01)*id; out[ 7]=( a20*b05-a22*b02+a23*b01)*id;
+	out[ 8]=( a10*b10-a11*b08+a13*b06)*id; out[ 9]=(-a00*b10+a01*b08-a03*b06)*id;
+	out[10]=( a30*b04-a31*b02+a33*b00)*id; out[11]=(-a20*b04+a21*b02-a23*b00)*id;
+	out[12]=(-a10*b09+a11*b07-a12*b06)*id; out[13]=( a00*b09-a01*b07+a02*b06)*id;
+	out[14]=(-a30*b03+a31*b01-a32*b00)*id; out[15]=( a20*b03-a21*b01+a22*b00)*id;
+	return true;
+}
+
+// Compute clip-to-clip reprojection matrix M = prevVP * inv(curVP) in double precision.
+// The resulting float32 matrix M ≈ Identity (for small frame-to-frame changes), so the
+// shader's float32 multiply M * clipPos has no catastrophic cancellation.
+static bool ComputeClipToClip(const float curVP[16], const float prevVP[16], float out[16]) {
+	double curVP_d[16], invCurVP_d[16], prevVP_d[16], M_d[16];
+	for (int i = 0; i < 16; i++) {
+		curVP_d[i] = (double)curVP[i];
+		prevVP_d[i] = (double)prevVP[i];
+	}
+	if (!Mat4Inv_d(curVP_d, invCurVP_d)) return false;
+	Mat4Mul_d(prevVP_d, invCurVP_d, M_d);
+	for (int i = 0; i < 16; i++) out[i] = (float)M_d[i];
 	return true;
 }
 
@@ -636,10 +723,10 @@ static bool EnsureCameraMVResources(ID3D11Device* device, uint32_t w, uint32_t h
 		OOVR_LOGF("CameraMV: R16G16_FLOAT output %ux%u created", w, h);
 	}
 
-	// Create constant buffer once (2x mat4x4 + float2 renderSize + int2 depthOffset = 144 bytes)
+	// Create constant buffer once (160 bytes = 10 * 16)
 	if (!s_cameraMVCB) {
 		D3D11_BUFFER_DESC bd = {};
-		bd.ByteWidth = 144; // 9 * 16 bytes
+		bd.ByteWidth = 160; // 10 * 16 bytes
 		bd.Usage = D3D11_USAGE_DYNAMIC;
 		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -664,22 +751,25 @@ static ID3D11ShaderResourceView* GetOrCreateCameraMVDepthSRV(ID3D11Device* devic
 	return s_cameraMVDepthSRV;
 }
 
-// Generate camera-derived motion vectors from depth + VP matrix deltas
+// Generate camera-derived motion vectors from depth + clip-to-clip reprojection matrix
 static bool GenerateCameraMVs(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
-    uint32_t outputW, uint32_t outputH, const float invCurrentVP[16], const float prevVP[16],
-    int depthOffsetX, int depthOffsetY)
+    uint32_t outputW, uint32_t outputH, const float clipToClip[16],
+    int depthOffsetX, int depthOffsetY, float jitterDeltaUVx, float jitterDeltaUVy)
 {
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	if (SUCCEEDED(context->Map(s_cameraMVCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 		float* cb = (float*)mapped.pData;
-		memcpy(cb, invCurrentVP, 64);       // offset 0: invCurrentVP (16 floats = 64 bytes)
-		memcpy(cb + 16, prevVP, 64);         // offset 64: prevVP (16 floats = 64 bytes)
-		cb[32] = (float)outputW;             // offset 128: renderSize.x
-		cb[33] = (float)outputH;             // offset 132: renderSize.y
+		memcpy(cb, clipToClip, 64);          // offset 0: clipToClip (16 floats = 64 bytes)
+		cb[16] = (float)outputW;             // offset 64: renderSize.x
+		cb[17] = (float)outputH;             // offset 68: renderSize.y
 		int32_t* cbi = (int32_t*)mapped.pData;
-		cbi[34] = depthOffsetX;              // offset 136: depthOffset.x
-		cbi[35] = depthOffsetY;              // offset 140: depthOffset.y
+		cbi[18] = depthOffsetX;              // offset 72: depthOffset.x
+		cbi[19] = depthOffsetY;              // offset 76: depthOffset.y
+		cb[20] = jitterDeltaUVx;             // offset 80: jitterDeltaUV.x
+		cb[21] = jitterDeltaUVy;             // offset 84: jitterDeltaUV.y
+		cb[22] = 0.0f;                       // offset 88: _pad0.x
+		cb[23] = 0.0f;                       // offset 92: _pad0.y
 		context->Unmap(s_cameraMVCB, 0);
 	}
 
@@ -750,10 +840,13 @@ float4 PS_DebugMV(VsOut input) : SV_TARGET
     uint w, h;
     MVTex.GetDimensions(w, h);
     float2 mv = MVTex.Load(int3(sampleUV * float2(w, h), 0));
-    // Scale for visibility: UV-space values ~0.001-0.025 → amplify 20x
-    float r = saturate(abs(mv.x) * 20.0);
-    float g = saturate(abs(mv.y) * 20.0);
-    return float4(r, g, 0.0, 1.0);
+    // Signed display: 0.5=zero, >0.5=positive (bright), <0.5=negative (dark)
+    // Scale: UV-space values ~0.001-0.025 → amplify 20x around 0.5 midpoint
+    float r = saturate(0.5 + mv.x * 20.0);
+    float g = saturate(0.5 + mv.y * 20.0);
+    // Blue channel: magnitude (helps see any non-zero MVs when standing still)
+    float b = saturate(length(mv) * 100.0);
+    return float4(r, g, b, 1.0);
 }
 )HLSL";
 
@@ -2095,74 +2188,359 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		// ── Camera MV generation ──
 		// Compute per-pixel motion vectors from depth + view-projection matrix deltas.
 		// PRIMARY: Use game's NiCamera::worldToCam (captures HMD tracking + locomotion).
+		//   Uses LH reversed-Z projection to match game's D3D rendering conventions.
 		// FALLBACK: Use OpenXR layer.pose (HMD tracking only, no locomotion).
+		//   Uses RH reversed-Z projection to match OpenXR conventions.
 		ID3D11Texture2D* cameraMVTex = nullptr;
 		if (depthTex && oovr_global_configuration.Fsr3CameraMV()) {
 			int eye = s_currentEyeIdx;
-			// Build current VP matrix for this eye
-			float viewMat[16], projMat[16], vpMat[16], invVP[16];
+			float viewMat[16], projMat[16];
+
+			// Read game's actual near/far from NiFrustum (shared across all modes)
+			bool haveGameView = false;
+			float gameNear = g_fsr3CameraNear, gameFar = g_fsr3CameraFar;
+			if (s_pBridge && s_pBridge->viewFrustumPtr) {
+				const float* f = reinterpret_cast<const float*>(s_pBridge->viewFrustumPtr);
+				float nf = f[4], ff = f[5];
+				// Tightened check: startup reads near=1.0/far=2.0 before real values
+				if (nf > 5.0f && ff > nf * 10.0f) { gameNear = nf; gameFar = ff; }
+			}
 
 			// Try game's actual worldToCam first (includes locomotion + HMD tracking)
-			bool haveGameView = false;
-			if (s_pBridge && s_pBridge->worldToCamPtr) {
+			// fsr3CamMVSource: 0=worldToCam, 1=OpenXR pose only, 2=hybrid, 3=RSS viewMat
+			int camMVSource = oovr_global_configuration.Fsr3CamMVSource();
+			if (camMVSource == 0 && s_pBridge && s_pBridge->worldToCamPtr
+			    && s_pBridge->viewFrustumPtr) {
 				const float* g = reinterpret_cast<const float*>(s_pBridge->worldToCamPtr);
-				// g is row-major 4x4 from NiCamera::worldToCam (Gamebryo/Creation Engine).
-				// Rows 0-2 are rotation*scale + translation. Row 3 is auxiliary (not affine).
-				//
-				// Game WORLD space: X-right, Y-forward, Z-up
-				// OpenXR WORLD space: X-right, Y-up, Z-backward
-				// World axis remap: OXR_X = game_X, OXR_Y = game_Z, OXR_Z = -game_Y
-				//
-				// Rotation columns represent world-axis contributions to camera axes.
-				// Remap columns for world axis conversion + negate row 2 for cam Z flip:
-				//   Col 0 (world X): game col 0
-				//   Col 1 (world Y_oxr = game Z): game col 2
-				//   Col 2 (world Z_oxr = -game Y): -game col 1
-				//   Row 2 negated throughout (LH forward → RH backward).
-				// Translation (col 3) is in CAMERA space — only row 2 negate, NO col swap.
-				float s = sqrtf(g[0]*g[0] + g[1]*g[1] + g[2]*g[2]);
-				if (s < 0.001f) s = 1.0f;
-				float invS = 1.0f / s;
+				const float* nf = reinterpret_cast<const float*>(s_pBridge->viewFrustumPtr);
 
-				// Col 0 (OXR world X = game world X)
-				viewMat[0]  =  g[0]  * invS;   // row0: cam X
-				viewMat[1]  =  g[4]  * invS;   // row1: cam Y
-				viewMat[2]  = -g[8]  * invS;   // row2: cam Z (negated)
-				viewMat[3]  = 0.0f;
-				// Col 1 (OXR world Y = game world Z): game col 2
-				viewMat[4]  =  g[2]  * invS;   // row0
-				viewMat[5]  =  g[6]  * invS;   // row1
-				viewMat[6]  = -g[10] * invS;   // row2 (negated)
-				viewMat[7]  = 0.0f;
-				// Col 2 (OXR world Z = -game world Y): -game col 1
-				viewMat[8]  = -g[1]  * invS;   // row0
-				viewMat[9]  = -g[5]  * invS;   // row1
-				viewMat[10] =  g[9]  * invS;   // row2 (double negate)
-				viewMat[11] = 0.0f;
-				// Col 3: translation is in CAMERA space, not world space.
-				// Only row 2 negate applies — NO world-axis column swap.
-				viewMat[12] =  g[3]  * invS;   // cam X translation
-				viewMat[13] =  g[7]  * invS;   // cam Y translation
-				viewMat[14] = -g[11] * invS;   // cam Z translation (negated)
-				viewMat[15] = 1.0f;
+				// worldToCam = P_culling × V_game where P_culling bakes in NiFrustum XY
+				// scaling + perspective. To recover the orthonormal V_game, multiply by
+				// inv(P_culling) using NiFrustum L,R,T,B,Near values.
+				//
+				// P_culling structure (row-major):
+				//   row0: [2/(R-L),  0,        (R+L)/(R-L),  0  ]
+				//   row1: [0,        2/(T-B),  (T+B)/(T-B),  0  ]
+				//   row2: [0,        0,        1,            -N ]
+				//   row3: [0,        0,        1,             0 ]
+				//
+				// inv(P_culling) × worldToCam gives:
+				//   V_row0 = (R-L)/2 * wTC_row0 - (R+L)/2 * wTC_row3
+				//   V_row1 = (T-B)/2 * wTC_row1 - (T+B)/2 * wTC_row3
+				//   V_row2 = wTC_row3
+				//   V_row3 = (wTC_row3 - wTC_row2) / N  → should be [0,0,0,1]
 
-				haveGameView = true;
+				float nfL = nf[0], nfR = nf[1], nfT = nf[2], nfB = nf[3], nfNear = nf[4];
+
+				// Validate NiFrustum is initialized (startup reads 1.0/2.0 before real values)
+				bool validFrustum = (nfNear > 5.0f && nf[5] > nfNear * 10.0f
+				    && (nfR - nfL) > 0.5f && (nfT - nfB) > 0.5f);
+
+				if (validFrustum) {
+					float halfW  = (nfR - nfL) * 0.5f;   // (R-L)/2
+					float halfH  = (nfT - nfB) * 0.5f;   // (T-B)/2
+					float halfCX = (nfR + nfL) * 0.5f;   // (R+L)/2
+					float halfCY = (nfT + nfB) * 0.5f;   // (T+B)/2
+					float invN   = 1.0f / nfNear;
+
+					// Extract V_game rows (row-major)
+					float V0[4], V1[4], V2[4], V3[4];
+					for (int i = 0; i < 4; i++) {
+						V0[i] = halfW * g[0+i]  - halfCX * g[12+i];
+						V1[i] = halfH * g[4+i]  - halfCY * g[12+i];
+						V2[i] = g[12+i];
+						V3[i] = (g[12+i] - g[8+i]) * invN;
+					}
+
+					// Transpose V_game (row-major) → viewMat (column-major)
+					viewMat[0]  = V0[0]; viewMat[4]  = V0[1]; viewMat[8]  = V0[2]; viewMat[12] = V0[3];
+					viewMat[1]  = V1[0]; viewMat[5]  = V1[1]; viewMat[9]  = V1[2]; viewMat[13] = V1[3];
+					viewMat[2]  = V2[0]; viewMat[6]  = V2[1]; viewMat[10] = V2[2]; viewMat[14] = V2[3];
+					viewMat[3]  = V3[0]; viewMat[7]  = V3[1]; viewMat[11] = V3[2]; viewMat[15] = V3[3];
+
+					haveGameView = true;
+
+					// DIAG: verify V_game is orthonormal
+					{ static int diagCount = 0;
+					  if (eye == 0 && (diagCount < 5 || diagCount % 200 == 0)) {
+						float r0s = sqrtf(V0[0]*V0[0]+V0[1]*V0[1]+V0[2]*V0[2]);
+						float r1s = sqrtf(V1[0]*V1[0]+V1[1]*V1[1]+V1[2]*V1[2]);
+						float r2s = sqrtf(V2[0]*V2[0]+V2[1]*V2[1]+V2[2]*V2[2]);
+						OOVR_LOGF("CAMDIAG[%d] V_game row scales: %.6f %.6f %.6f (expect ~1.0)",
+						    diagCount, r0s, r1s, r2s);
+						OOVR_LOGF("CAMDIAG[%d] V_game row3: [%.6f %.6f %.6f %.6f] (expect ~[0,0,0,1])",
+						    diagCount, V3[0], V3[1], V3[2], V3[3]);
+						OOVR_LOGF("CAMDIAG[%d] NiFrustum: L=%.4f R=%.4f T=%.4f B=%.4f Near=%.2f Far=%.1f",
+						    diagCount, nfL, nfR, nfT, nfB, nfNear, nf[5]);
+						OOVR_LOGF("CAMDIAG[%d] GPR: L=%.4f R=%.4f U=%.4f D=%.4f near=%.2f far=%.1f jit=%.4f,%.4f",
+						    diagCount, s_fsr3EyeFov[eye].angleLeft, s_fsr3EyeFov[eye].angleRight,
+						    s_fsr3EyeFov[eye].angleUp, s_fsr3EyeFov[eye].angleDown,
+						    gameNear, gameFar,
+						    s_fsr3RenderJitterX, s_fsr3RenderJitterY);
+					  }
+					  diagCount++;
+					}
+				}
 			}
-			// Fallback: OpenXR pose (head rotation only)
+			// Mode 3: RSS viewProjMatrix with double-precision clip-to-clip reprojection.
+			//
+			// The game's RSS VP captures ALL camera movement (rotation + tracking +
+			// locomotion) and matches the depth buffer exactly. However, the shader's
+			// two-step unproject-reproject (invVP * clip → worldPos → prevVP * worldPos)
+			// suffers from float32 catastrophic cancellation: large game-unit world
+			// positions (~10000) cause VP*worldPos products (~14000) to cancel against
+			// VP translation (~-14000), losing ~2-3 digits of precision.
+			//
+			// Fix: Compute M = prevVP * inv(curVP) on the CPU in DOUBLE PRECISION,
+			// then pass M to the shader as a single clip-to-clip matrix. The shader
+			// does prevClip = M * clipPos (ONE matrix multiply). Since M ≈ Identity
+			// for small frame-to-frame changes, all intermediate values are well-
+			// conditioned and there is no catastrophic cancellation.
+			//
+			// This is why mode 2 (OpenXR pose) had perfect rotation: its meter-scale
+			// coordinates kept intermediate values small. Now mode 3 gets the same
+			// precision by pre-computing the reprojection in double.
+			//
+			// RendererShadowState layout (VR, verified by static_assert):
+			//   +0x3E0: cameraData (EYE_POSITION<ViewData, 2>), each ViewData = 0x250
+			//     ViewData+0x130: viewProjMatrixUnjittered (4x4 row-major)
+			if (camMVSource == 3 && s_pBridge && s_pBridge->rssBasePtr) {
+				const uint8_t* rssBase = reinterpret_cast<const uint8_t*>(
+				    static_cast<uintptr_t>(s_pBridge->rssBasePtr));
+
+				// Build 26m: Similarity transform rotation correction.
+				// RSS VP at +0x130 has correct locomotion but stale rotation.
+				// We read the game's viewMat (+0x30) and projection (+0x1B0) to
+				// compute a rotation correction matrix. The math:
+				//   C2C_final = RotCorr_prev * C2C_rss * inv(RotCorr_cur)
+				//   RotCorr = P * (R_openxr_lh * R_stale^T) * P^-1
+				// R_stale cancels in the product, giving the exact correct C2C.
+
+				// Build 26t: Fix incorrect RSS matrix transpose.
+				// Game stores matrices in DirectX row-major (row-vector convention:
+				// clip = v * M). Our code uses column-major column-vector convention
+				// (clip = M' * v), where M' = M^T. Row-major raw bytes reinterpreted
+				// as column-major ARE the transpose, so just memcpy — no swapping.
+				// The previous element-swapping "transpose" was WRONG: it stored
+				// M_game (not M_game^T), corrupting Z/W → systematic drift.
+
+				// Read VP at +0x130: just memcpy (row-major bytes = column-major transpose)
+				const float* rssVPRM = reinterpret_cast<const float*>(
+				    rssBase + 0x3E0 + eye * 0x250 + 0x130);
+				float curVP[16];
+				memcpy(curVP, rssVPRM, sizeof(curVP));
+
+				// First-frame guard: need a stored prevVP from the previous frame.
+				if (!s_hasPrevVP[eye]) {
+					memcpy(s_prevVP[eye], curVP, sizeof(curVP));
+					s_prevJitterX[eye] = s_fsr3RenderJitterX;
+					s_prevJitterY[eye] = s_fsr3RenderJitterY;
+					s_hasPrevVP[eye] = true;
+					goto rss_done;
+				}
+
+				// Compute clip-to-clip matrix M = prevVP * inv(curVP) in double precision.
+				// This avoids float32 cancellation from large game-unit world coordinates.
+				float clipToClipMat[16];
+				if (ComputeClipToClip(curVP, s_prevVP[eye], clipToClipMat)) {
+					D3D11_TEXTURE2D_DESC dDesc;
+					depthTex->GetDesc(&dDesc);
+					int depthOffX = 0, depthOffY = 0;
+					bool depthIsStereo = (dDesc.Width >= perEyeRenderW * 2 - 4);
+					if (depthIsStereo && eye == 1)
+						depthOffX = (int)(dDesc.Width / 2);
+
+					// Jitter delta compensation: the game's projection includes our FSR3
+					// jitter (from GetProjectionRaw), so MVs contain a jitter component.
+					float curJitterX = s_fsr3RenderJitterX;
+					float curJitterY = s_fsr3RenderJitterY;
+					float jdUVx = (curJitterX - s_prevJitterX[eye]) / (float)perEyeRenderW;
+					float jdUVy = (curJitterY - s_prevJitterY[eye]) / (float)perEyeRenderH;
+
+					// DIAG: log clip-to-clip matrix properties and MV diagnostics
+					if (eye == 0) {
+						static int diagFrame = 0;
+						static float s_diagPrevPos[3] = {0,0,0};
+						static bool  s_diagHasPrev = false;
+						float locoSpeed = 0;
+						if (s_pBridge && s_pBridge->playerPosPtr) {
+							const float* pp = reinterpret_cast<const float*>(s_pBridge->playerPosPtr);
+							if (s_diagHasPrev) {
+								float dd[3] = {pp[0]-s_diagPrevPos[0], pp[1]-s_diagPrevPos[1], pp[2]-s_diagPrevPos[2]};
+								locoSpeed = sqrtf(dd[0]*dd[0]+dd[1]*dd[1]+dd[2]*dd[2]);
+							}
+							s_diagPrevPos[0]=pp[0]; s_diagPrevPos[1]=pp[1]; s_diagPrevPos[2]=pp[2];
+							s_diagHasPrev = true;
+						}
+
+						bool shouldLog = diagFrame < 5 || diagFrame % 60 == 0;
+						if (shouldLog) {
+							// How far is M from identity? Large deviation = fast motion.
+							float maxOffDiag = 0, maxDiagDev = 0;
+							for (int r = 0; r < 4; r++)
+								for (int c = 0; c < 4; c++) {
+									float v = clipToClipMat[c*4+r];
+									float expected = (r == c) ? 1.0f : 0.0f;
+									float dev = fabsf(v - expected);
+									if (r == c) { if (dev > maxDiagDev) maxDiagDev = dev; }
+									else { if (dev > maxOffDiag) maxOffDiag = dev; }
+								}
+
+							// CPU-side MV test at screen center (depth=0.5) for verification.
+							// Uses the clip-to-clip matrix directly (same as shader will).
+							float testClip[4] = {0.0f, 0.0f, 0.5f, 1.0f};
+							float testPrev[4];
+							for (int r = 0; r < 4; r++)
+								testPrev[r] = clipToClipMat[r]*testClip[0] + clipToClipMat[4+r]*testClip[1]
+								    + clipToClipMat[8+r]*testClip[2] + clipToClipMat[12+r]*testClip[3];
+							float testPrevU = (testPrev[0]/testPrev[3]) * 0.5f + 0.5f;
+							float testPrevV = 0.5f - (testPrev[1]/testPrev[3]) * 0.5f;
+							float testMvPx = sqrtf((testPrevU-0.5f)*(testPrevU-0.5f)
+							    + (testPrevV-0.5f)*(testPrevV-0.5f)) * (float)perEyeRenderW;
+
+							OOVR_LOGF("C2C[%d] diagDev=%.8f offDiag=%.8f mvCenterPx=%.3f locoSpd=%.2f jdUV=%.6f,%.6f",
+							    diagFrame, maxDiagDev, maxOffDiag, testMvPx, locoSpeed, jdUVx, jdUVy);
+						}
+						diagFrame++;
+					}
+
+					// Build 26s: No similarity transform needed — reversed-Z VP
+					// already matches depth buffer. Stale HMD rotation cancels
+					// between consecutive frames in the C2C delta.
+					if (EnsureCameraMVResources(device, perEyeRenderW, perEyeRenderH)) {
+						auto* cmvDepthSRV = GetOrCreateCameraMVDepthSRV(device, depthTex);
+						if (cmvDepthSRV) {
+							GenerateCameraMVs(context, cmvDepthSRV,
+							    perEyeRenderW, perEyeRenderH,
+							    clipToClipMat,
+							    depthOffX, depthOffY,
+							    jdUVx, jdUVy);
+							cameraMVTex = s_cameraMVTex;
+							{ static bool s = false; if (!s) { s = true;
+								OOVR_LOGF("CameraMV: Build 26t (memcpy VP, no transpose) -- %ux%u eye=%d",
+								    perEyeRenderW, perEyeRenderH, eye); } }
+						}
+					}
+
+					// Store curVP as prevVP for next frame & track jitter
+					memcpy(s_prevVP[eye], curVP, sizeof(curVP));
+					s_prevJitterX[eye] = curJitterX;
+					s_prevJitterY[eye] = curJitterY;
+				}
+
+				s_hasPrevVP[eye] = true;
+				goto rss_done;
+			}
+
+			// Fallback / Hybrid: OpenXR pose (optionally augmented with game position)
 			if (!haveGameView) {
 				BuildViewMatrix(s_fsr3EyePose[eye], viewMat);
+
+				// Mode 2: Hybrid — combine OpenXR rotation with game-world locomotion position.
+				// V_hybrid = V_openxr * M_gameToStage
+				//
+				// V_openxr: meter-scale HMD translation (~1.5m).
+				// M_gameToStage: unit rotation + v2m-scaled translation (meters).
+				// Projection: game-unit near/far (5, 100000).
+				//
+				// PlayerCamera::pos is locomotion-only (does NOT include HMD tracking).
+				if (camMVSource == 2 && s_pBridge &&
+				    s_pBridge->playerPosPtr && s_pBridge->playerYawPtr) {
+					const float* pPos = reinterpret_cast<const float*>(s_pBridge->playerPosPtr);
+					const float* pYaw = reinterpret_cast<const float*>(s_pBridge->playerYawPtr);
+
+					// Use position relative to a reference point to maintain float32 precision.
+					// Reference is reset when |relPos| > 200 game units (handles fast travel,
+					// loading, and extended walking).
+					static float s_refPos[3] = {0, 0, 0};
+					static bool  s_hasRefPos = false;
+
+					float rpx = pPos[0] - s_refPos[0];
+					float rpy = pPos[1] - s_refPos[1];
+					float rpz = pPos[2] - s_refPos[2];
+					float relDist = sqrtf(rpx*rpx + rpy*rpy + rpz*rpz);
+
+					// Reset reference when relPos gets too large (>200 game units)
+					// or on first frame. This keeps VP translation bounded for float32 precision.
+					if (!s_hasRefPos || relDist > 200.0f) {
+						bool wasReset = s_hasRefPos; // distinguish first capture from reset
+						s_refPos[0] = pPos[0]; s_refPos[1] = pPos[1]; s_refPos[2] = pPos[2];
+						s_hasRefPos = true;
+						rpx = rpy = rpz = 0.0f;
+						relDist = 0.0f;
+						// Invalidate prevVP to prevent one-frame VP discontinuity.
+						s_hasPrevVP[0] = s_hasPrevVP[1] = false;
+						OOVR_LOGF("CameraMV: %s reference position (%.1f, %.1f, %.1f) relDist was %.1f",
+						    wasReset ? "Reset" : "Captured",
+						    s_refPos[0], s_refPos[1], s_refPos[2], relDist);
+					}
+
+					float px = rpx, py = rpy, pz = rpz;
+					float yaw = *pYaw;
+					float cy = cosf(yaw), sy = sinf(yaw);
+
+					// M_gameToStage (column-major): unit rotation + v2m-scaled translation.
+					float v2m = oovr_global_configuration.Fsr3ViewToMeters();
+					float g2s[16];
+					g2s[0]  = cy;    g2s[1]  = 0.0f;  g2s[2]  = -sy;   g2s[3]  = 0.0f;
+					g2s[4]  = -sy;   g2s[5]  = 0.0f;  g2s[6]  = -cy;   g2s[7]  = 0.0f;
+					g2s[8]  = 0.0f;  g2s[9]  = 1.0f;  g2s[10] = 0.0f;  g2s[11] = 0.0f;
+					g2s[12] = v2m*(-cy*px + sy*py);
+					g2s[13] = v2m*(-pz);
+					g2s[14] = v2m*(sy*px + cy*py);
+					g2s[15] = 1.0f;
+
+					float viewMat_oxr[16];
+					memcpy(viewMat_oxr, viewMat, sizeof(viewMat_oxr));
+					Mat4Mul(viewMat_oxr, g2s, viewMat);
+
+					// DIAG: log player position and relative position
+					{ static int diagCount = 0;
+					  if (eye == 0 && (diagCount < 5 || diagCount % 200 == 0)) {
+						OOVR_LOGF("CAMHYBRID[%d] absPos=(%.1f,%.1f,%.1f) relPos=(%.1f,%.1f,%.1f) relDist=%.1f yaw=%.4f v2m=%.5f",
+						    diagCount, pPos[0], pPos[1], pPos[2], px, py, pz, relDist, yaw, v2m);
+					  }
+					  diagCount++;
+					}
+				}
+
+				{ static bool s = false; if (!s) { s = true;
+					OOVR_LOGF("CameraMV: Using %s (camMVSource=%d, bridge=%p)",
+					    camMVSource == 2 ? "hybrid (OpenXR rot + game pos)" : "OpenXR pose only",
+					    camMVSource, (void*)s_pBridge); } }
 			}
 
-			BuildReversedZProjection(s_fsr3EyeFov[eye], g_fsr3CameraNear, g_fsr3CameraFar, projMat);
-
-			// Build current and previous VP matrices for camera MV generation.
-			// Uses file-scope s_prevVP/s_hasPrevVP (reset on teleport/session restart).
-			// No translation shifting — float32 precision is adequate for typical
-			// game-world translations (~100s of units). Previous camera-space shifting
-			// was mathematically wrong: subtracting translations in different rotated
-			// coordinate systems introduces errors proportional to ||t|| * delta_rotation.
+			// Build current VP matrix for camera MV generation.
+			// JITTERED projection: matches the game's actual rendering projection (GetProjectionRaw
+			// includes sub-pixel jitter). This gives exact depth unprojection → correct world positions.
+			// The jitter component is subtracted in the shader (jitterDeltaUV), giving clean zero MVs
+			// for static scenes and pure camera motion for head rotation — no reliance on FSR3's
+			// jitter cancellation (which operates as a black box and may introduce residual error).
 			{
 			float curVP[16], curInvVP[16];
+			float curJitterX = s_fsr3RenderJitterX; // pixel-space jitter for this frame
+			float curJitterY = s_fsr3RenderJitterY;
+			if (haveGameView) {
+				// Game path: LH reversed-Z with GetProjectionRaw tangent FOV + NiFrustum near/far.
+				// worldToCam was NORMALIZED (rows /= scale), so projection uses full XY scale from GPR.
+				// Near/far from NiFrustum (13/353840) instead of our defaults (5/100000) for correct Z.
+				float tanL = tanf(s_fsr3EyeFov[eye].angleLeft);
+				float tanR = tanf(s_fsr3EyeFov[eye].angleRight);
+				float tanU = tanf(s_fsr3EyeFov[eye].angleUp);
+				float tanD = tanf(s_fsr3EyeFov[eye].angleDown);
+				float jTanX = curJitterX * (tanR - tanL) / (float)perEyeRenderW;
+				float jTanY = curJitterY * (tanU - tanD) / (float)perEyeRenderH;
+				BuildLHReversedZProjection(s_fsr3EyeFov[eye], gameNear, gameFar, projMat, jTanX, jTanY);
+			} else {
+				// Fallback/Hybrid: RH reversed-Z with jitter (OpenXR pose path)
+				float tanL = tanf(s_fsr3EyeFov[eye].angleLeft);
+				float tanR = tanf(s_fsr3EyeFov[eye].angleRight);
+				float tanU = tanf(s_fsr3EyeFov[eye].angleUp);
+				float tanD = tanf(s_fsr3EyeFov[eye].angleDown);
+				float jTanX = curJitterX * (tanR - tanL) / (float)perEyeRenderW;
+				float jTanY = curJitterY * (tanU - tanD) / (float)perEyeRenderH;
+				BuildReversedZProjection(s_fsr3EyeFov[eye], g_fsr3CameraNear, g_fsr3CameraFar, projMat, jTanX, jTanY);
+			}
 			Mat4Mul(projMat, viewMat, curVP);
 
 			if (s_hasPrevVP[eye]) {
@@ -2174,25 +2552,103 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 					if (depthIsStereo && eye == 1)
 						depthOffX = (int)(dDesc.Width / 2);
 
-					if (EnsureCameraMVResources(device, perEyeRenderW, perEyeRenderH)) {
+					// Compute jitter delta in UV space: (curJitter - prevJitter) / renderSize
+					// This is subtracted in the shader to cancel the jitter component from MVs.
+					float jdUVx = (curJitterX - s_prevJitterX[eye]) / (float)perEyeRenderW;
+					float jdUVy = (curJitterY - s_prevJitterY[eye]) / (float)perEyeRenderH;
+
+					// ── LOCOMOTION MV DIAGNOSTIC ──
+					// Compute camera MVs at screen center for several depths.
+					// Logs magnitude during locomotion vs standing still.
+					if (eye == 0) {
+						static float s_diagPrevPos[3] = {0,0,0};
+						static bool  s_diagHasPrev = false;
+						static int   s_diagFrame = 0;
+
+						float diagDelta[3] = {0,0,0};
+						float locoSpeed = 0;
+						if (s_pBridge && s_pBridge->playerPosPtr) {
+							const float* pp = reinterpret_cast<const float*>(s_pBridge->playerPosPtr);
+							if (s_diagHasPrev) {
+								diagDelta[0] = pp[0] - s_diagPrevPos[0];
+								diagDelta[1] = pp[1] - s_diagPrevPos[1];
+								diagDelta[2] = pp[2] - s_diagPrevPos[2];
+							}
+							s_diagPrevPos[0] = pp[0]; s_diagPrevPos[1] = pp[1]; s_diagPrevPos[2] = pp[2];
+							s_diagHasPrev = true;
+							locoSpeed = sqrtf(diagDelta[0]*diagDelta[0] + diagDelta[1]*diagDelta[1] + diagDelta[2]*diagDelta[2]);
+						}
+
+						bool isMoving = locoSpeed > 1.0f;
+						bool shouldLog = (isMoving && s_diagFrame % 30 == 0)
+						    || (!isMoving && s_diagFrame % 500 == 0 && s_diagFrame > 0);
+
+						if (shouldLog) {
+							float testDepths[] = {0.999f, 0.99f, 0.5f, 0.1f, 0.01f, 0.001f};
+							const char* depthLabels[] = {"0.999", "0.990", "0.500", "0.100", "0.010", "0.001"};
+
+							OOVR_LOGF("LOCDIAG[%d] locoSpeed=%.2f delta=(%.2f,%.2f,%.2f)",
+							    s_diagFrame, locoSpeed, diagDelta[0], diagDelta[1], diagDelta[2]);
+
+							for (int t = 0; t < 6; t++) {
+								float d = testDepths[t];
+								float clip[4] = {0.0f, 0.0f, d, 1.0f}; // screen center
+
+								// Unproject with current invVP
+								float wp[4];
+								for (int r = 0; r < 4; r++)
+									wp[r] = curInvVP[r]*clip[0] + curInvVP[4+r]*clip[1]
+									    + curInvVP[8+r]*clip[2] + curInvVP[12+r]*clip[3];
+								if (fabsf(wp[3]) > 1e-10f) { wp[0]/=wp[3]; wp[1]/=wp[3]; wp[2]/=wp[3]; wp[3]=1.0f; }
+
+								// Reproject with prevVP
+								float pc[4];
+								for (int r = 0; r < 4; r++)
+									pc[r] = s_prevVP[0][r]*wp[0] + s_prevVP[0][4+r]*wp[1]
+									    + s_prevVP[0][8+r]*wp[2] + s_prevVP[0][12+r]*wp[3];
+								float prevU = pc[0]/pc[3] * 0.5f + 0.5f;
+								float prevV = 0.5f - pc[1]/pc[3] * 0.5f;
+
+								float mvU = prevU - 0.5f;
+								float mvV = prevV - 0.5f;
+								float mvPx = sqrtf(mvU*mvU + mvV*mvV) * (float)perEyeRenderW;
+
+								OOVR_LOGF("LOCDIAG[%d] depth=%s: raw=%.2fpx linZ=%.1f",
+								    s_diagFrame, depthLabels[t], mvPx,
+								    (gameNear * gameFar)
+								    / (d * (gameFar - gameNear) + gameNear));
+							}
+						}
+						s_diagFrame++;
+					}
+					// ── END LOCOMOTION MV DIAGNOSTIC ──
+
+					// Compute clip-to-clip in double precision for shader
+					float c2cMat[16];
+					if (EnsureCameraMVResources(device, perEyeRenderW, perEyeRenderH)
+					    && ComputeClipToClip(curVP, s_prevVP[eye], c2cMat)) {
 						auto* cmvDepthSRV = GetOrCreateCameraMVDepthSRV(device, depthTex);
 						if (cmvDepthSRV) {
 							GenerateCameraMVs(context, cmvDepthSRV,
 							    perEyeRenderW, perEyeRenderH,
-							    curInvVP, s_prevVP[eye],
-							    depthOffX, depthOffY);
+							    c2cMat,
+							    depthOffX, depthOffY,
+							    jdUVx, jdUVy);
 							cameraMVTex = s_cameraMVTex;
 							{ static bool s = false; if (!s) { s = true;
-								OOVR_LOGF("CameraMV: Generated %ux%u eye=%d depthOff=%d,%d",
-								    perEyeRenderW, perEyeRenderH, eye, depthOffX, depthOffY); } }
+								OOVR_LOGF("CameraMV: Generated %ux%u eye=%d depthOff=%d,%d jitterDelta=%.6f,%.6f",
+								    perEyeRenderW, perEyeRenderH, eye, depthOffX, depthOffY, jdUVx, jdUVy); } }
 						}
 					}
 				}
 			}
 
 			memcpy(s_prevVP[eye], curVP, sizeof(curVP));
+			s_prevJitterX[eye] = curJitterX;
+			s_prevJitterY[eye] = curJitterY;
 			s_hasPrevVP[eye] = true;
 			}
+		rss_done:;  // Mode 3 (RSS full VP) jumps here after generating MVs directly
 		}
 
 		// MV region: detect if stereo-combined (double width) or per-eye
@@ -2284,7 +2740,12 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		fsr3Params.cameraFovY = s_fsr3CameraFovY;
 		fsr3Params.sharpness = oovr_global_configuration.Fsr3Sharpness();
 		fsr3Params.reset = s_fsr3FirstDispatch;
-		fsr3Params.jitterCancellation = oovr_global_configuration.Fsr3JitterCancellation();
+		// Jitter cancellation: when camera MVs are active, our shader compensates for
+		// the jitter delta and FSR3's context-level jitter cancellation also subtracts
+		// jitter. This is technically double-compensation, but the error is sub-pixel
+		// (~0.15px max) and invisible. Empirically, having jitter cancellation ON when
+		// camera MVs are active produces stable results, while OFF causes shaking.
+		fsr3Params.jitterCancellation = oovr_global_configuration.Fsr3CameraMV();
 		fsr3Params.viewToMeters = oovr_global_configuration.Fsr3ViewToMeters();
 		fsr3Params.mvScale = oovr_global_configuration.MotionVectorScale();
 		int fsr3DbgMode = oovr_global_configuration.Fsr3DebugMode();
