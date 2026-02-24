@@ -61,6 +61,10 @@ namespace OpenCompositeConfigurator
         private NumericUpDown _nudCasSharpness = null!;
         private Label _lblFsrRenderScale = null!;
         private Label _lblCasSharpness = null!;
+        private CheckBox _chkDlssEnabled = null!;
+        private ComboBox _cmbDlssPreset = null!;
+        private NumericUpDown _nudDlssSharpness = null!;
+        private Label _lblDlssSharpness = null!;
 
         // VRS controls
         private CheckBox _chkVrsEnabled = null!;
@@ -446,6 +450,13 @@ namespace OpenCompositeConfigurator
             _btnBrowse = MakeButton("Browse...", leftMargin + 845, y - 1, 110, 27);
             _btnBrowse.Click += BtnBrowse_Click;
             Controls.Add(_btnBrowse);
+
+            var btnMasterReset = MakeButton("Master Reset", leftMargin + 965, y - 1, 120, 27);
+            btnMasterReset.BackColor = Color.FromArgb(120, 60, 40);
+            btnMasterReset.ForeColor = Color.White;
+            btnMasterReset.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            btnMasterReset.Click += BtnMasterReset_Click;
+            Controls.Add(btnMasterReset);
 
             y += 40;
 
@@ -2954,6 +2965,131 @@ namespace OpenCompositeConfigurator
             int halfWidth = (rightEdge - leftMargin) / 2;
             int col2 = leftMargin + halfWidth + 10;
 
+            // ── DLSS 4 SUPER RESOLUTION ──
+            Panel dlssAdv = null!;
+            var lblDlssSection = MakeSectionLabel("DLSS 4 Super Resolution", leftMargin, y);
+            container.Controls.Add(lblDlssSection);
+            var btnDlssAdv = MakeButton("\u25bc Advanced", rightEdge - 100, y + 2, 94, 22);
+            btnDlssAdv.Font = new Font("Segoe UI", 7.5f);
+            btnDlssAdv.BackColor = Color.FromArgb(45, 48, 62);
+            btnDlssAdv.Click += (s, e) =>
+            {
+                bool show = !dlssAdv.Visible; dlssAdv.Visible = show;
+                if (show) dlssAdv.BringToFront();
+                btnDlssAdv.Text = show ? "\u25b2 Advanced" : "\u25bc Advanced";
+            };
+            container.Controls.Add(btnDlssAdv);
+            y += 26;
+
+            _chkDlssEnabled = MakeCheckBox("Enable DLSS 4 SR (NVIDIA only)", leftMargin, y);
+            _chkDlssEnabled.CheckedChanged += (s, e) =>
+            {
+                bool en = _chkDlssEnabled.Checked;
+                _nudDlssSharpness.Enabled = en;
+                _cmbDlssPreset.Enabled = en;
+                if (en) {
+                    _chkFsrEnabled.Checked = false; // mutually exclusive
+                    _chkMotionVectorsEnabled.Checked = true;
+                    _chkFsr3JitterCancellation.Checked = true;
+                }
+                CheckPotatoMode();
+            };
+            container.Controls.Add(_chkDlssEnabled);
+
+            var lblDlssDesc = MakeLabel("NVIDIA AI upscaling (RTX / GTX 16xx). Mutually exclusive with FSR.",
+                leftMargin + 230, y + 3, rightEdge - leftMargin - 250);
+            lblDlssDesc.ForeColor = Color.FromArgb(130, 130, 130);
+            lblDlssDesc.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            container.Controls.Add(lblDlssDesc);
+            y += 30;
+
+            var lblDlssWarn = MakeLabel("\u26a0  Do not run a second upscaler mod alongside this one \u2014 two upscalers conflict and cause visual corruption.",
+                leftMargin, y, rightEdge - leftMargin - 10);
+            lblDlssWarn.ForeColor = Color.FromArgb(255, 185, 35);
+            lblDlssWarn.Font = new Font("Segoe UI", 8f, FontStyle.Bold);
+            container.Controls.Add(lblDlssWarn);
+            y += 20;
+
+            // Preset ComboBox
+            var lblDlssPresetLabel = MakeLabel("DLSS Preset:", leftMargin, y + 3, 85);
+            container.Controls.Add(lblDlssPresetLabel);
+            _cmbDlssPreset = new ComboBox
+            {
+                Location = new Point(leftMargin + 90, y), Size = new Size(168, 24),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(35, 37, 50), ForeColor = Color.White,
+                Enabled = false,
+            };
+            _cmbDlssPreset.Items.AddRange(new object[] {
+                "Quality (67%)", "Balanced (58%)", "Performance (50%)", "Ultra Perf (33%)" });
+            _cmbDlssPreset.SelectedIndex = 0;
+            _cmbDlssPreset.SelectedIndexChanged += (s, e) =>
+            {
+                if (_chkDlssEnabled.Checked && _cmbDlssPreset.SelectedIndex >= 0) {
+                    decimal[] scales = { 0.67m, 0.58m, 0.50m, 0.33m };
+                    _nudFsrRenderScale.Value = scales[_cmbDlssPreset.SelectedIndex];
+                }
+            };
+            container.Controls.Add(_cmbDlssPreset);
+
+            // Sharpness
+            _lblDlssSharpness = MakeLabel("Sharpness:", leftMargin + 270, y + 3, 72);
+            container.Controls.Add(_lblDlssSharpness);
+            _nudDlssSharpness = new NumericUpDown
+            {
+                Location = new Point(leftMargin + 346, y), Width = 60,
+                DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.00m, Maximum = 1.00m, Value = 0.00m,
+                BackColor = Color.FromArgb(35, 37, 50), ForeColor = Color.White,
+                Enabled = false,
+            };
+            container.Controls.Add(_nudDlssSharpness);
+            y += 30;
+
+            // Quick preset buttons
+            var lblDlssPresets = MakeLabel("Quick Presets:", leftMargin, y + 5, 90);
+            container.Controls.Add(lblDlssPresets);
+            int dlssPx = leftMargin + 94;
+            var btnDlssQuality = MakeButton("Quality", dlssPx, y, 75, 26);
+            btnDlssQuality.Click += (s, e) => { _chkDlssEnabled.Checked = true; _nudFsrRenderScale.Value = 0.67m; _cmbDlssPreset.SelectedIndex = 0; };
+            container.Controls.Add(btnDlssQuality); dlssPx += 79;
+            var btnDlssBalanced = MakeButton("Balanced", dlssPx, y, 80, 26);
+            btnDlssBalanced.Click += (s, e) => { _chkDlssEnabled.Checked = true; _nudFsrRenderScale.Value = 0.58m; _cmbDlssPreset.SelectedIndex = 1; };
+            container.Controls.Add(btnDlssBalanced); dlssPx += 84;
+            var btnDlssPerf = MakeButton("Performance", dlssPx, y, 95, 26);
+            btnDlssPerf.Click += (s, e) => { _chkDlssEnabled.Checked = true; _nudFsrRenderScale.Value = 0.50m; _cmbDlssPreset.SelectedIndex = 2; };
+            container.Controls.Add(btnDlssPerf); dlssPx += 99;
+            var btnDlssOff = MakeButton("Off", dlssPx, y, 55, 26);
+            btnDlssOff.BackColor = Color.FromArgb(120, 60, 40);
+            btnDlssOff.Click += (s, e) => { _chkDlssEnabled.Checked = false; };
+            container.Controls.Add(btnDlssOff);
+            y += 34;
+
+            // ── DLSS ADVANCED OVERLAY PANEL ──
+            {
+                int advW = rightEdge - leftMargin;
+                dlssAdv = new Panel
+                {
+                    Location = new Point(leftMargin, y), Size = new Size(advW, 44),
+                    BackColor = Color.FromArgb(26, 28, 40), BorderStyle = BorderStyle.FixedSingle, Visible = false,
+                };
+                int ap = 4;
+                var lblDlssAdvHdr = new Label
+                {
+                    Text = "\u26a0  Expert settings \u2014 normally not needed",
+                    ForeColor = Color.FromArgb(255, 185, 35), Font = new Font("Segoe UI", 8f, FontStyle.Bold),
+                    Location = new Point(ap, ap), AutoSize = true,
+                };
+                dlssAdv.Controls.Add(lblDlssAdvHdr);
+                var btnDlssClose = MakeButton("\u00d7", advW - 50, ap - 2, 42, 22);
+                btnDlssClose.BackColor = Color.FromArgb(90, 40, 40);
+                btnDlssClose.Click += (s, e) => { dlssAdv.Visible = false; btnDlssAdv.Text = "\u25bc Advanced"; };
+                dlssAdv.Controls.Add(btnDlssClose);
+                container.Controls.Add(dlssAdv);
+            }
+
+            container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
+            y += 10;
+
             // ── FSR SUPER RESOLUTION ──
             Panel fsrAdv = null!;
             var lblFsrSection = MakeSectionLabel("FSR Super Resolution", leftMargin, y);
@@ -2976,7 +3112,8 @@ namespace OpenCompositeConfigurator
             {
                 bool en = _chkFsrEnabled.Checked;
                 _nudFsrRenderScale.Enabled = en;
-                if (en) { _chkMotionVectorsEnabled.Checked = true; _chkFsr3JitterCancellation.Checked = true; }
+                if (en) { _chkMotionVectorsEnabled.Checked = true; _chkFsr3JitterCancellation.Checked = true;
+                    if (_chkDlssEnabled != null) _chkDlssEnabled.Checked = false; } // mutually exclusive
                 else { _chkMotionVectorsEnabled.Checked = false; _chkFsr3JitterCancellation.Checked = false; }
                 UpdateFsrStatus();
                 CheckPotatoMode();
@@ -3160,12 +3297,10 @@ namespace OpenCompositeConfigurator
             container.Controls.Add(btnOff);
             y += 34;
 
-            container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
-            y += 10;
 
             // ── OCU ASW ──
             Panel aswAdv = null!;
-            var lblSwSection = MakeSectionLabel("OCU ASW (Experimental)", leftMargin, y);
+            var lblSwSection = MakeSectionLabel("OCU ASW", leftMargin, y);
             container.Controls.Add(lblSwSection);
             var btnAswAdv = MakeButton("\u25bc Advanced", rightEdge - 100, y + 2, 94, 22);
             btnAswAdv.Font = new Font("Segoe UI", 7.5f);
@@ -3184,11 +3319,12 @@ namespace OpenCompositeConfigurator
             _chkAswEnabled.CheckedChanged += (s, e) => { };
             container.Controls.Add(_chkAswEnabled);
 
-            var lblSwDesc = MakeLabel("PC-side frame doubling using depth parallax. Higher quality than VD's SSW with slightly lower framerate. Works well with FSR 3 or VRS. Disable SSW in Virtual Desktop when using this — combining both causes stuttering.", leftMargin + 230, y + 3, rightEdge - leftMargin - 250);
+            var lblSwDesc = MakeLabel("Doubles frame rate with superior image quality to VD's SSW. All reprojection may cause slight parallax separation. VD's SSW tends to ghost and smear at close range, OCU ASW is cleaner but may show parallax separation on nearby objects. Mitigate with DLSS 4 or FSR 3. Disable SSW in Virtual Desktop when using this, as combining both causes stuttering.", leftMargin + 230, y + 3, rightEdge - leftMargin - 250);
             lblSwDesc.ForeColor = Color.FromArgb(130, 130, 130);
             lblSwDesc.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
+            lblSwDesc.Height = 60;
             container.Controls.Add(lblSwDesc);
-            y += 30;
+            y += 68;
 
             // ── ASW ADVANCED OVERLAY PANEL (does not advance y — floats over content below) ──
             {
@@ -3442,7 +3578,7 @@ namespace OpenCompositeConfigurator
             container.Controls.Add(btnVrsAdv);
             y += 26;
 
-            var lblVrsInfo = MakeLabel("Requires NVIDIA RTX or GTX 16xx series GPU. Reduces shading rate in peripheral vision for better performance. May cause pixel flashes if used with FSR 3.", leftMargin + 20, y, rightEdge - leftMargin - 20);
+            var lblVrsInfo = MakeLabel("Requires NVIDIA RTX or GTX 16xx series GPU. Reduces shading rate in peripheral vision for better performance. May cause pixel flashes if used with FSR 3 or DLSS 4.", leftMargin + 20, y, rightEdge - leftMargin - 20);
             lblVrsInfo.ForeColor = Color.White;
             lblVrsInfo.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
             container.Controls.Add(lblVrsInfo);
@@ -3701,6 +3837,57 @@ namespace OpenCompositeConfigurator
             }
         }
 
+        private void BtnMasterReset_Click(object? sender, EventArgs e)
+        {
+            var result = MessageBox.Show(
+                "This will reset all settings and key bindings back to defaults.\n\nAre you sure?",
+                "Master Reset",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+
+            if (result != DialogResult.Yes) return;
+
+            // Reset ini: clear all lines so ReadFromIni() falls back to every hardcoded default
+            _ini.Load("__reset__"); // file doesn't exist — Load() just clears _lines and returns
+            _isLoading = true;
+            ReadFromIni();
+            _isLoading = false;
+
+            // Write defaults to both ini locations
+            WriteToIni();
+            if (!string.IsNullOrEmpty(_gameDir))
+            {
+                string path = Path.Combine(_gameDir, "opencomposite.ini");
+                _ini.Save(path);
+            }
+            if (!string.IsNullOrEmpty(_mo2ModDir))
+            {
+                try { _ini.Save(Path.Combine(_mo2ModDir, "opencomposite.ini")); } catch { }
+            }
+
+            // Reset controlmapvr.txt to embedded default template
+            if (_gameType == "skyrim")
+            {
+                string filePath = GetControlmapSavePath();
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                using var stream = asm.GetManifestResourceStream("OpenCompositeConfigurator.controlmapvr_template.txt");
+                if (stream != null)
+                {
+                    using var reader = new StreamReader(stream);
+                    File.WriteAllText(filePath, reader.ReadToEnd());
+                    _keyBindings.Clear();
+                    LoadDefaultKeyBindings();
+                    TryLoadControlmapVR();
+                }
+            }
+
+            string time = DateTime.Now.ToString("h:mm:ss tt");
+            _lblStatus.Text = $"Reset to defaults at {time}";
+            _lblStatus.ForeColor = Color.FromArgb(255, 185, 35);
+            MessageBox.Show("All settings and bindings have been reset to defaults.", "Master Reset",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
         private void BtnSave_Click(object? sender, EventArgs e)
         {
             if (string.IsNullOrEmpty(_gameDir))
@@ -3879,7 +4066,7 @@ namespace OpenCompositeConfigurator
                 _lblRotCutoff.Enabled = en;
                 _lblRotBeta.Enabled = en;
             }
-            _chkDisableTriggerTouch.Checked = ParseBool(_ini.Get("", "disableTriggerTouch", "false"));
+            _chkDisableTriggerTouch.Checked = ParseBool(_ini.Get("", "disableTriggerTouch", "true"));
             _chkDisableTrackpad.Checked = ParseBool(_ini.Get("", "disableTrackPad", "false"));
             _chkVRIKKnuckles.Checked = ParseBool(_ini.Get("", "enableVRIKKnucklesTrackPadSupport", "false"));
             _chkGpuTiming.Checked = ParseBool(_ini.Get("", "enableGpuTiming", "true"));
@@ -3958,6 +4145,14 @@ namespace OpenCompositeConfigurator
                 bool en = _chkFsrEnabled.Checked;
                 _nudFsrRenderScale.Enabled = en;
             }
+            // DLSS settings
+            _chkDlssEnabled.Checked = ParseBool(_ini.Get("", "dlssEnabled", "false"));
+            if (int.TryParse(_ini.Get("", "dlssPreset", "0"), out int dlssPreset))
+                _cmbDlssPreset.SelectedIndex = Math.Clamp(dlssPreset, 0, 3);
+            if (float.TryParse(_ini.Get("", "dlssSharpness", "0.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float dlssSh))
+                _nudDlssSharpness.Value = (decimal)Math.Clamp(dlssSh, 0f, 1f);
+            { bool en = _chkDlssEnabled.Checked; _nudDlssSharpness.Enabled = en; _cmbDlssPreset.Enabled = en; }
+
             _chkMotionVectorsEnabled.Checked = ParseBool(_ini.Get("", "motionVectorsEnabled", "true"));
             if (float.TryParse(_ini.Get("", "motionVectorScale", "1.0"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float mvs))
                 _nudMotionVectorScale.Value = (decimal)Math.Clamp(mvs, 0.1f, 2.0f);
@@ -4106,6 +4301,9 @@ namespace OpenCompositeConfigurator
             // FSR settings
             _ini.Set("", "fsrEnabled", _chkFsrEnabled.Checked ? "true" : "false");
             _ini.Set("", "fsrRenderScale", _nudFsrRenderScale.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+            _ini.Set("", "dlssEnabled", _chkDlssEnabled.Checked ? "true" : "false");
+            _ini.Set("", "dlssPreset", _cmbDlssPreset.SelectedIndex.ToString());
+            _ini.Set("", "dlssSharpness", _nudDlssSharpness.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
             _ini.Set("", "motionVectorsEnabled", _chkMotionVectorsEnabled.Checked ? "true" : "false");
             _ini.Set("", "motionVectorScale", _nudMotionVectorScale.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
             _ini.Set("", "aswEnabled", _chkAswEnabled.Checked ? "true" : "false");
