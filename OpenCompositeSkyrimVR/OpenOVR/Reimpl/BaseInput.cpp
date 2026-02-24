@@ -1361,6 +1361,14 @@ EVRInputError BaseInput::GetAnalogActionData(VRActionHandle_t action, InputAnalo
 			XrActionStateFloat state = { XR_TYPE_ACTION_STATE_FLOAT };
 			OOVR_FAILED_XR_ABORT(xrGetActionStateFloat(xr_session.get(), &getInfo, &state));
 
+			// Trigger range remap: allows worn/stiff triggers to reach full 1.0
+			{
+				float tdz = oovr_global_configuration.TriggerDeadzone();
+				float tmax = oovr_global_configuration.TriggerMax();
+				if (tmax > tdz + 0.001f)
+					state.currentState = std::clamp((state.currentState - tdz) / (tmax - tdz), 0.0f, 1.0f);
+			}
+
 			float lengthSq = state.currentState * state.currentState;
 			if (lengthSq < maxLengthSq || !state.isActive)
 				continue;
@@ -1864,6 +1872,14 @@ EVRInputError BaseInput::getEstimatedSkeletalSummary(ITrackedDevice::HandType ha
 		if (state_triggerClick.currentState) {
 			triggerValue = 1.0f; // Binary fallback - loses analog but at least works
 		}
+	}
+
+	// Trigger range remap: allows worn/stiff triggers to reach full 1.0
+	{
+		float tdz = oovr_global_configuration.TriggerDeadzone();
+		float tmax = oovr_global_configuration.TriggerMax();
+		if (tmax > tdz + 0.001f)
+			triggerValue = std::clamp((triggerValue - tdz) / (tmax - tdz), 0.0f, 1.0f);
 	}
 
 	if (state_grip.currentState) {

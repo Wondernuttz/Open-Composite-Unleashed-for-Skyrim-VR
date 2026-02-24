@@ -97,16 +97,15 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     // 4b. MV-based warp.
     //    kMOTION_VECTOR: forward UV convention (currentUV - prevUV), range ~[-0.5, +0.5].
-    //    To find where a pixel was 0.5 frames ago: subtract half the per-frame velocity.
-    //    MVs encode everything: camera rotation, stick locomotion, NPCs, foliage, etc.
-    //    mvConfidence=0: pure parallax. mvConfidence=1: pure MV (replaces parallax).
+    //    mvConfidence = direct scale on MV. 0 = no MV (pure parallax). 0.5 = half frame.
+    //    Tune up from 0.5 until doubling disappears; back off if smearing appears.
     float2 finalParallaxUV = parallaxUV;
     if (mvConfidence > 0.0) {
-        float2 mv = mvTex[tid.xy] * mvPixelScale;  // forward UV (current - prev), scale=1
-        float2 mvSourceUV = uv - 0.5 * mv;         // go back half a frame
+        float2 mv = mvTex[tid.xy] * mvPixelScale;   // forward UV (current - prev)
+        float2 mvSourceUV = uv - mvConfidence * mv; // direct scale: go back mvConfidence frames
         if (any(mvSourceUV < -0.01) || any(mvSourceUV > 1.01))
             mvSourceUV = parallaxUV;
-        finalParallaxUV = lerp(parallaxUV, mvSourceUV, mvConfidence);
+        finalParallaxUV = mvSourceUV;
     }
 
     // 5. Apply combined fade (edge + near-field) to parallax

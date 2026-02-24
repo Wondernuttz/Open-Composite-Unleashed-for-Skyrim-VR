@@ -211,6 +211,8 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, rightDeadZoneXSize);
 		CFGOPT(float, rightDeadZoneYSize);
 		CFGOPT(bool, disableTriggerTouch);
+		CFGOPT(float, triggerDeadzone);
+		CFGOPT(float, triggerMax);
 		CFGOPT(float, hapticStrength);
 		CFGOPT(bool, disableTrackPad);
 		CFGOPT(bool, enableControllerSmoothing);

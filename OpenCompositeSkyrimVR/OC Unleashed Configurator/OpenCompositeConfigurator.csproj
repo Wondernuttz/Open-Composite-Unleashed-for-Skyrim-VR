@@ -4,10 +4,10 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net9.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
-    <ApplicationIcon>Resources\icon.ico</ApplicationIcon>
+    <ApplicationIcon>Resources\Bluefox.ico</ApplicationIcon>
     <RootNamespace>OpenCompositeConfigurator</RootNamespace>
     <Nullable>enable</Nullable>
-    <AssemblyName>OC Unleashed Configurator</AssemblyName>
+    <AssemblyName>OC Unleashed Configurator for Skyrim VR</AssemblyName>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -19,6 +19,12 @@
   <ItemGroup>
     <EmbeddedResource Include="Resources\controllers.png" />
     <EmbeddedResource Include="Resources\kofi.png" />
+    <EmbeddedResource Include="Resources\Bluefox.png" />
+    <EmbeddedResource Include="Resources\FO4Fox.png" />
+    <EmbeddedResource Include="controlmapvr_template.txt" />
+    <EmbeddedResource Include="controlmapvr_vrsafe.txt" />
+    <EmbeddedResource Include="controlmapvr_vrik.txt" />
+    <EmbeddedResource Include="PotatoMode.wav" />
   </ItemGroup>
 
 </Project>

@@ -527,10 +527,10 @@ namespace
 			auto err = overlay->ShowKeyboard(
 				vr::k_EGamepadTextInputModeNormal,
 				vr::k_EGamepadTextInputLineModeSingleLine,
+				0,                                                         // flags
 				"Enter text",                                              // description
 				charLimit,                                                 // max chars (hard-capped at 31)
 				a_info->startingText ? a_info->startingText : "",          // existing text
-				false,                                                     // bUseMinimalMode
 				0);                                                        // user value
 
 			if (err != vr::VROverlayError_None) {

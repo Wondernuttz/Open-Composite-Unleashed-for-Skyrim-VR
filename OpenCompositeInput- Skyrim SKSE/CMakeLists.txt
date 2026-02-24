@@ -10,7 +10,7 @@ project(
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Strip absolute source paths from PDBs so crash logs don't expose local user paths
+# Strip absolute source paths from PDBs so crash logs don't expose C:\Users\borja\...
 if(MSVC)
     string(APPEND CMAKE_CXX_FLAGS " /d1trimfile:\"${CMAKE_SOURCE_DIR}/\"")
     set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /PDBALTPATH:%_PDB%")
@@ -25,13 +25,13 @@ set(ENABLE_SKYRIM_VR ON CACHE BOOL "" FORCE)
 
 # Add CommonLibVR as a subdirectory
 add_subdirectory(
-    "${CMAKE_CURRENT_SOURCE_DIR}/../CommonLibVR-4.1.3"
+    "C:/Users/borja/Desktop/CommonLibVR-4.1.3"
     CommonLibSSE
     EXCLUDE_FROM_ALL
 )
 
 # Include the plugin helper macro from CommonLibVR
-include("${CMAKE_CURRENT_SOURCE_DIR}/../CommonLibVR-4.1.3/cmake/CommonLibSSE.cmake")
+include("C:/Users/borja/Desktop/CommonLibVR-4.1.3/cmake/CommonLibSSE.cmake")
 
 # Plugin source files
 set(SOURCES
@@ -42,7 +42,7 @@ set(SOURCES
 add_commonlibsse_plugin(${PROJECT_NAME}
     SOURCES ${SOURCES}
     NAME "OpenCompositeInput"
-    AUTHOR "Wondertnuttz"
+    AUTHOR "borja"
     VERSION ${PROJECT_VERSION}
     USE_ADDRESS_LIBRARY
 )

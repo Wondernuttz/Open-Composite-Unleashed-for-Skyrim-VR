@@ -51,6 +51,8 @@ public:
 	float RightDeadZoneXSize() const { return rightDeadZoneXSize; }
 	float RightDeadZoneYSize() const { return rightDeadZoneYSize; }
 	inline bool DisableTriggerTouch() { return disableTriggerTouch; }
+	inline float TriggerDeadzone() const { return triggerDeadzone; }
+	inline float TriggerMax() const { return triggerMax; }
 	float HapticStrength() { return hapticStrength; }
 	inline bool DisableTrackPad() { return disableTrackPad; }
 	inline bool EnableControllerSmoothing() { return enableControllerSmoothing; }
@@ -210,6 +212,8 @@ private:
 	float rightDeadZoneXSize = 0.0f;
 	float rightDeadZoneYSize = 0.0f;
 	bool disableTriggerTouch = false;
+	float triggerDeadzone = 0.0f;   // raw trigger value below which output = 0
+	float triggerMax = 1.0f;        // raw trigger value at which output = 1.0 (for worn controllers)
 	float hapticStrength = 0.1f;
 	bool disableTrackPad = false;
 	bool enableControllerSmoothing = false;

@@ -136,6 +136,35 @@ namespace OpenCompositeConfigurator
             }
         }
 
+        public List<(string key, string value)> GetAllInSection(string section)
+        {
+            section = section.ToLowerInvariant();
+            var result = new List<(string key, string value)>();
+            foreach (var line in _lines)
+            {
+                if (line.Type == IniLineType.KeyValue && line.Section == section)
+                    result.Add((line.Key, line.Value));
+            }
+            return result;
+        }
+
+        public void Remove(string section, string key)
+        {
+            section = section.ToLowerInvariant();
+            _lines.RemoveAll(l =>
+                l.Type == IniLineType.KeyValue &&
+                l.Section == section &&
+                string.Equals(l.Key, key, StringComparison.OrdinalIgnoreCase));
+        }
+
+        public void ClearSection(string section)
+        {
+            section = section.ToLowerInvariant();
+            _lines.RemoveAll(l =>
+                l.Section == section &&
+                (l.Type == IniLineType.KeyValue || l.Type == IniLineType.Section));
+        }
+
         public void Save()
         {
             Save(_filePath);

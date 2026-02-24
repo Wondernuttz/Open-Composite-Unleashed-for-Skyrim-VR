@@ -18,13 +18,13 @@ set(ENABLE_SKYRIM_VR ON CACHE BOOL "" FORCE)
 
 # Add CommonLibVR as a subdirectory
 add_subdirectory(
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../CommonLibVR-4.1.3"
+    "C:/Users/borja/Desktop/CommonLibVR-4.1.3"
     CommonLibSSE
     EXCLUDE_FROM_ALL
 )
 
 # Include the plugin helper macro from CommonLibVR
-include("${CMAKE_CURRENT_SOURCE_DIR}/../../CommonLibVR-4.1.3/cmake/CommonLibSSE.cmake")
+include("C:/Users/borja/Desktop/CommonLibVR-4.1.3/cmake/CommonLibSSE.cmake")
 
 # Plugin source files
 set(SOURCES
@@ -35,7 +35,7 @@ set(SOURCES
 add_commonlibsse_plugin(${PROJECT_NAME}
     SOURCES ${SOURCES}
     NAME "OpenCompositeInput"
-    AUTHOR "Wondertnuttz"
+    AUTHOR "borja"
     VERSION ${PROJECT_VERSION}
     USE_ADDRESS_LIBRARY
 )
