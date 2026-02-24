@@ -546,10 +546,25 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 	// so we can find where each output pixel maps to in the cached frame
 	BuildPoseDeltaMatrix(newPose, m_cachedPose[eye], cb.poseDeltaMatrix);
 
+	// Save raw OpenXR pose delta translation for diagnostics (before zeroing rotation)
+	float rawTransX = cb.poseDeltaMatrix[3];
+	float rawTransY = cb.poseDeltaMatrix[7];
+	float rawTransZ = cb.poseDeltaMatrix[11];
+
 	// HMD rotation is handled by VD's ATW — zero the OpenXR-derived rotation, identity only.
 	for (int r = 0; r < 3; r++)
 		for (int c = 0; c < 3; c++)
 			cb.poseDeltaMatrix[r * 4 + c] = (r == c) ? 1.0f : 0.0f;
+
+	// ── Coordinate system fix ──
+	// BuildPoseDeltaMatrix computes translation in OpenXR view space: +X right, +Y up, -Z forward.
+	// The shader reconstructs positions as (tanX*depth, tanY*depth, +depth) — i.e. +Z forward.
+	// We must negate Z to convert from OpenXR convention to the shader's convention.
+	// Without this, forward HMD movement (negative Z in OpenXR) would reduce the shader's
+	// positive Z depth, making everything appear to shrink/grow — the "ghost scaling" bug.
+	cb.poseDeltaMatrix[3]  = rawTransX;   // X: +right in both conventions — unchanged
+	cb.poseDeltaMatrix[7]  = rawTransY;   // Y: +up in both conventions — unchanged
+	cb.poseDeltaMatrix[11] = -rawTransZ;  // Z: negate to convert -Z forward → +Z forward
 
 	// Stick turn correction: camera-space Y-axis rotation from playerYaw delta.
 	// Built directly in camera/depth-buffer space — no OpenXR coordinate mismatch.
@@ -575,11 +590,35 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 		cb.poseDeltaMatrix[11] *= transS;
 	}
 
-	// Stick locomotion correction: inject camera-space movement delta (game units, same space as linearDepth)
+	// Stick locomotion correction: apply camera-view-space deltas from dx11compositor.
+	//
+	// The world delta is transformed to camera view space using NiCamera::worldToCam
+	// in dx11compositor.cpp. This correctly handles HMD rotation because worldToCam
+	// is the actual game camera matrix (includes HMD physical rotation).
+	//
+	// NiCamera view space: +X right, +Y up, +Z forward (into screen).
+	// This matches the shader's convention (positions reconstructed as +Z forward).
+	// No coordinate conversion needed — add directly.
 	float locoS = oovr_global_configuration.ASWLocoScale();
-	if (locoS != 0.0f && (m_locoForward != 0.0f || m_locoStrafe != 0.0f)) {
-		cb.poseDeltaMatrix[3]  -=  m_locoStrafe  * locoS;  // camera-right  → view X (negated: old−new convention gives -velocity, so negate to get +correction)
-		cb.poseDeltaMatrix[11] += -m_locoForward * locoS;  // camera-forward → view Z (negated: old−new is negative when moved fwd)
+	if (locoS != 0.0f && (m_locoViewX != 0.0f || m_locoViewY != 0.0f || m_locoViewZ != 0.0f)) {
+		cb.poseDeltaMatrix[3]  += m_locoViewX * locoS;  // camera right
+		cb.poseDeltaMatrix[7]  += m_locoViewY * locoS;  // camera up
+		cb.poseDeltaMatrix[11] += m_locoViewZ * locoS;  // camera forward (+Z)
+	}
+
+	// ── ASW diagnostics: log pose delta every N frames (left eye only to avoid spam) ──
+	if (eye == 0) {
+		static int s_diagCount = 0;
+		if (s_diagCount < 120 || (s_diagCount % 300 == 0)) {
+			OOVR_LOGF("ASW diag [%d]: rawTrans(%.4f, %.4f, %.4f) → shaderTrans(%.4f, %.4f, %.4f) "
+			    "locoView(X=%.4f Y=%.4f Z=%.4f) yaw=%.4f scales(trans=%.2f loco=%.2f rot=%.2f)",
+			    s_diagCount,
+			    rawTransX, rawTransY, rawTransZ,
+			    cb.poseDeltaMatrix[3], cb.poseDeltaMatrix[7], cb.poseDeltaMatrix[11],
+			    m_locoViewX, m_locoViewY, m_locoViewZ,
+			    m_locoYaw, transS, locoS, rotS);
+		}
+		s_diagCount++;
 	}
 
 	cb.resolution[0] = (float)m_eyeWidth;
@@ -596,6 +635,20 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 	cb.nearFadeDepth = oovr_global_configuration.ASWNearFadeDepth() * 72.0f;  // meters → game units (depth buffer is in game units)
 	cb.mvConfidence  = oovr_global_configuration.ASWMVConfidence();
 	cb.mvPixelScale  = oovr_global_configuration.ASWMVPixelScale();
+
+	// ── Additional diagnostics: FOV and depth params (log once at startup) ──
+	if (eye == 0) {
+		static int s_fovLogCount = 0;
+		if (s_fovLogCount < 5) {
+			OOVR_LOGF("ASW fov: tanL=%.4f tanR=%.4f tanU=%.4f tanD=%.4f  near=%.2f far=%.1f  depthScale=%.3f",
+			    cb.fovTanLeft, cb.fovTanRight, cb.fovTanUp, cb.fovTanDown,
+			    cb.nearZ, cb.farZ, cb.depthScale);
+			OOVR_LOGF("ASW poses: cached=(%.3f,%.3f,%.3f) new=(%.3f,%.3f,%.3f)",
+			    m_cachedPose[eye].position.x, m_cachedPose[eye].position.y, m_cachedPose[eye].position.z,
+			    newPose.position.x, newPose.position.y, newPose.position.z);
+			s_fovLogCount++;
+		}
+	}
 
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;

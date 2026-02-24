@@ -2934,37 +2934,91 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		    layer.pose, layer.fov,
 		    g_fsr3CameraNear, g_fsr3CameraFar);
 
-			// Stick locomotion correction: compute once per real frame (right eye)
-			// Reads game-world pos delta and projects onto camera forward/right axes.
-			// Clamp rejects teleport/loading-screen jumps (> 20 game units per frame).
-			if (eyeIdx == 1 && s_pBridge->playerPosPtr && s_pBridge->playerYawPtr) {
-				static float s_prevPos[2] = {};
+			// Stick locomotion correction: compute once per real frame (right eye).
+			//
+			// Uses the RSS VP matrix (same source as FSR3 camera MVs) to extract
+			// camera world position each frame. The inter-frame delta captures ALL
+			// camera movement: HMD tracking + stick locomotion + anything else.
+			// Transform this world delta to current view space using the view matrix
+			// rotation, then pass to ASWProvider.
+			//
+			// PlayerCamera::pos is broken in Skyrim VR (only moves along one axis,
+			// PlayerCamera::yaw stuck at 0). RSS matrices are reliable — they're
+			// the actual matrices the game uses for rendering.
+			if (eyeIdx == 1 && s_pBridge->rssBasePtr) {
+				static float s_prevCamWorld[3] = {};
 				static float s_prevYaw = 0.0f;
-				static bool  s_hasPrevPos = false;
-				const float* pos = reinterpret_cast<const float*>(s_pBridge->playerPosPtr);
-				float yaw = *reinterpret_cast<const float*>(s_pBridge->playerYawPtr);
-				if (s_hasPrevPos) {
-					float dx = s_prevPos[0] - pos[0];
-					float dy = s_prevPos[1] - pos[1];
-					// Clamp: reject teleport/load frames (sprint max ~13 units/frame)
-					if (dx * dx + dy * dy < 400.0f) {  // 20 units radius
-						float locoForward = dx * sinf(yaw) + dy * cosf(yaw);
-						float locoStrafe  = dx * cosf(yaw) - dy * sinf(yaw);
-						g_aswProvider->SetLocomotionTranslation(locoForward, locoStrafe);
+				static bool  s_hasPrevCam = false;
+
+				const uint8_t* rssBase = reinterpret_cast<const uint8_t*>(
+				    static_cast<uintptr_t>(s_pBridge->rssBasePtr));
+
+				// Read RSS VP matrix for right eye (same offset as FSR3 camera MV)
+				// Layout: rssBase + 0x3E0 + eye*0x250 + 0x130
+				const float* vp = reinterpret_cast<const float*>(
+				    rssBase + 0x3E0 + 1 * 0x250 + 0x130);
+
+				// Read RSS view matrix for right eye (rotation + translation, at +0x30)
+				const float* vm = reinterpret_cast<const float*>(
+				    rssBase + 0x3E0 + 1 * 0x250 + 0x30);
+
+				// Extract camera world position from view matrix.
+				// Row-major, row-vector convention: v_view = v_world * V
+				// V layout (row-major flat array):
+				//   rows 0-2: 3x3 rotation R (columns are right/up/forward basis)
+				//   row 3: translation t = (vm[12], vm[13], vm[14])
+				// Camera world pos = -R^T * t:
+				//   cam.x = -(vm[0]*vm[12] + vm[1]*vm[13] + vm[2]*vm[14])
+				//   cam.y = -(vm[4]*vm[12] + vm[5]*vm[13] + vm[6]*vm[14])
+				//   cam.z = -(vm[8]*vm[12] + vm[9]*vm[13] + vm[10]*vm[14])
+				float camX = -(vm[0]*vm[12] + vm[1]*vm[13] + vm[2]*vm[14]);
+				float camY = -(vm[4]*vm[12] + vm[5]*vm[13] + vm[6]*vm[14]);
+				float camZ = -(vm[8]*vm[12] + vm[9]*vm[13] + vm[10]*vm[14]);
+
+				if (s_hasPrevCam) {
+					// World-space delta (old - new)
+					float dwx = s_prevCamWorld[0] - camX;
+					float dwy = s_prevCamWorld[1] - camY;
+					float dwz = s_prevCamWorld[2] - camZ;
+
+					float dist2 = dwx*dwx + dwy*dwy + dwz*dwz;
+					if (dist2 < 400.0f) {  // 20-unit clamp: reject teleport/loading
+						// Transform world delta to current view space using view matrix rotation.
+						// v_view = v_world * R (row-vector, rotation part of V):
+						float viewX = dwx*vm[0] + dwy*vm[4] + dwz*vm[8];
+						float viewY = dwx*vm[1] + dwy*vm[5] + dwz*vm[9];
+						float viewZ = dwx*vm[2] + dwy*vm[6] + dwz*vm[10];
+						g_aswProvider->SetLocomotionViewDelta(viewX, viewY, viewZ);
+
+						// Diagnostic
+						static int s_locoLogCount = 0;
+						if ((s_locoLogCount < 60 || s_locoLogCount % 300 == 0)
+						    && dist2 > 0.0001f) {
+							OOVR_LOGF("ASW loco [%d]: camWorld(%.1f,%.1f,%.1f) delta(%.3f,%.3f,%.3f) "
+							    "→ viewDelta(%.4f,%.4f,%.4f)",
+							    s_locoLogCount, camX, camY, camZ,
+							    dwx, dwy, dwz, viewX, viewY, viewZ);
+						}
+						s_locoLogCount++;
 					} else {
-						g_aswProvider->SetLocomotionTranslation(0.0f, 0.0f);
+						g_aswProvider->SetLocomotionViewDelta(0.0f, 0.0f, 0.0f);
 					}
-					// Yaw delta for stick turn correction
+
+					// Yaw delta for stick turn correction (still use PlayerCamera::yaw for this)
+					float yaw = s_pBridge->playerYawPtr
+					    ? *reinterpret_cast<const float*>(s_pBridge->playerYawPtr) : 0.0f;
 					float yawDelta = s_prevYaw - yaw;
 					if (yawDelta >  3.14159f) yawDelta -= 6.28318f;
 					if (yawDelta < -3.14159f) yawDelta += 6.28318f;
-					if (fabsf(yawDelta) > 0.5f) yawDelta = 0.0f; // clamp: reject loading screen jumps
+					if (fabsf(yawDelta) > 0.5f) yawDelta = 0.0f;
 					g_aswProvider->SetLocomotionYaw(yawDelta);
+					s_prevYaw = yaw;
 				}
-				s_prevPos[0] = pos[0];
-				s_prevPos[1] = pos[1];
-				s_prevYaw = yaw;
-				s_hasPrevPos = true;
+
+				s_prevCamWorld[0] = camX;
+				s_prevCamWorld[1] = camY;
+				s_prevCamWorld[2] = camZ;
+				s_hasPrevCam = true;
 			}
 		}
 	}

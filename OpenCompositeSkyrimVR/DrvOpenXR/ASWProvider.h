@@ -53,10 +53,12 @@ public:
 
 	bool HasCachedFrame() const { return m_hasCachedFrame; }
 
-	/// Set camera-space locomotion delta (old − new, Skyrim units) for stick locomotion correction.
-	/// fwd: positive = player moved toward camera forward. strafe: positive = moved right.
-	void SetLocomotionTranslation(float fwd, float strafe) {
-		m_locoForward = fwd; m_locoStrafe = strafe;
+	/// Set camera-view-space locomotion delta for stick locomotion correction.
+	/// Values are already transformed from Skyrim world space to camera view space
+	/// using NiCamera::worldToCam rotation. Units are Skyrim game units.
+	/// viewX: +right, viewY: +up, viewZ: +forward (into screen).
+	void SetLocomotionViewDelta(float viewX, float viewY, float viewZ) {
+		m_locoViewX = viewX; m_locoViewY = viewY; m_locoViewZ = viewZ;
 	}
 
 	/// Set stick yaw delta (old − new, radians) for stick turn correction.
@@ -86,10 +88,12 @@ private:
 	static void BuildPoseDeltaMatrix(const XrPosef& oldPose, const XrPosef& newPose,
 	    float* outMatrix4x4);
 
-	// Stick locomotion delta: camera-space (old − new, Skyrim units), set each real frame
-	float m_locoForward = 0.0f;  // toward camera forward
-	float m_locoStrafe  = 0.0f;  // rightward in camera space
-	float m_locoYaw     = 0.0f;  // stick yaw delta (old − new, radians)
+	// Stick locomotion delta in camera view space (Skyrim game units), set each real frame
+	// Computed in dx11compositor by transforming Skyrim world delta through NiCamera::worldToCam
+	float m_locoViewX = 0.0f;  // camera +X (right)
+	float m_locoViewY = 0.0f;  // camera +Y (up)
+	float m_locoViewZ = 0.0f;  // camera +Z (into screen / forward)
+	float m_locoYaw   = 0.0f;  // stick yaw delta (old − new, radians)
 
 	bool m_ready = false;
 	uint32_t m_eyeWidth = 0, m_eyeHeight = 0;
