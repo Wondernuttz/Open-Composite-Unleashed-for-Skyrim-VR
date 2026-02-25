@@ -214,11 +214,11 @@ void XrHMD::GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, flo
 			*pfTop    += shiftY;
 			*pfBottom += shiftY;
 
-			static int jitterCallCount = 0; jitterCallCount++;
-			if (jitterCallCount <= 5 || jitterCallCount % 400 == 0) {
-				OOVR_LOGF("FSR3-JITTER: GetProjectionRaw eye=%d call#%d jitter=%.4f,%.4f shift=%.6f,%.6f",
-				    (int)eEye, jitterCallCount, g_fsr3JitterX, g_fsr3JitterY, shiftX, shiftY);
-			}
+			{ static bool s_jitterLogged = false; if (!s_jitterLogged) {
+				s_jitterLogged = true;
+				OOVR_LOGF("FSR3-JITTER: GetProjectionRaw active, eye=%d jitter=%.4f,%.4f shift=%.6f,%.6f",
+				    (int)eEye, g_fsr3JitterX, g_fsr3JitterY, shiftX, shiftY);
+			}}
 		}
 	}
 #endif
