@@ -105,16 +105,19 @@ static void OpenRenderTargetBridge()
 
 // OCU ASW — PC-side Asynchronous SpaceWarp (global g_aswProvider in ASWProvider.h)
 
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 #ifdef OC_HAS_FSR3
 static Fsr3Upscaler* s_fsr3Upscaler = nullptr;
 static std::chrono::steady_clock::time_point s_fsr3LastFrameTime;
 static float s_fsr3CameraFovY = 1.57f; // Radians, updated from XR view each frame
+#endif
 static bool s_fsr3FirstDispatch = true;
 static float s_fsr3RenderJitterX = 0.0f; // Jitter that was applied to current frame's rendering
 static float s_fsr3RenderJitterY = 0.0f;
 static uint32_t s_fsr3ViewportW = 0; // FSR3 output viewport (for crop when swapchain > output)
 static uint32_t s_fsr3ViewportH = 0;
 
+#ifdef OC_HAS_FSR3
 // ── Reactive mask resources (depth-edge detection for FSR3 ghosting reduction) ──
 static ID3D11ComputeShader*        s_reactiveMaskCS = nullptr;
 static ID3D11Texture2D*            s_reactiveMaskTex = nullptr;
@@ -123,6 +126,7 @@ static ID3D11ShaderResourceView*   s_reactiveMaskDepthSRV = nullptr;
 static ID3D11Texture2D*            s_reactiveMaskDepthSRVTex = nullptr;
 static uint32_t                    s_reactiveMaskW = 0;
 static uint32_t                    s_reactiveMaskH = 0;
+#endif
 
 // ── Depth extraction resources ──
 // Skyrim VR's main depth-stencil is R24G8_TYPELESS (24-bit depth + 8-bit stencil).
@@ -150,6 +154,7 @@ void CS_DepthExtract(uint3 id : SV_DispatchThreadID)
 }
 )HLSL";
 
+#ifdef OC_HAS_FSR3
 // ── Reactive mask compute shader ──
 // Depth-edge detection: adds reactiveness at object silhouettes (tree branches
 // against sky) to reduce FSR3 temporal ghosting on thin geometry.
@@ -187,6 +192,7 @@ void CS_ReactiveMask(uint3 id : SV_DispatchThreadID)
 }
 )HLSL";
 static ID3D11Buffer* s_reactiveMaskCB = nullptr;
+#endif // OC_HAS_FSR3 (reactive mask)
 
 
 // ── Camera MV resources (compute per-pixel camera motion from depth + pose deltas) ──
@@ -703,6 +709,7 @@ static bool GenerateCameraMVs(ID3D11DeviceContext* context, ID3D11ShaderResource
 	return true;
 }
 
+#ifdef OC_HAS_FSR3
 // ── Debug visualization shaders ──
 // Mode 3: Depth → grayscale (reversed-Z: near=1=white, far=0=black)
 // Mode 4: Motion vectors → RG color (red=horizontal, green=vertical, abs scaled)
@@ -780,6 +787,7 @@ static void EnsureDebugShaders(ID3D11Device* device) {
 		device->CreateBuffer(&cbd, nullptr, &s_debugCB);
 	}
 }
+#endif // OC_HAS_FSR3 (debug viz)
 
 // Validate a raw texture pointer from the SKSE shared-memory bridge.
 // The bridge stores void* pointers to game render targets WITHOUT AddRef —
@@ -841,21 +849,10 @@ int g_fsr3JitterPhaseCount = 0;
 // Camera near/far — captured from game's GetProjectionMatrix in XrHMD.cpp
 float g_fsr3CameraNear = 5.0f;
 float g_fsr3CameraFar = 100000.0f;
-#endif
+#endif // defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 
 #ifdef OC_HAS_DLSS
 static DlssUpscaler* s_dlssUpscaler = nullptr;
-// Fallback jitter/camera state for DLSS-only builds (no FSR3 SDK).
-// When OC_HAS_FSR3 is also defined, the FSR3 versions take precedence.
-#ifndef OC_HAS_FSR3
-static float  s_fsr3RenderJitterX = 0.0f;
-static float  s_fsr3RenderJitterY = 0.0f;
-static float  g_fsr3CameraNear    = 5.0f;
-static float  g_fsr3CameraFar     = 100000.0f;
-static bool   s_fsr3FirstDispatch = true;
-static uint32_t s_fsr3ViewportW   = 0;
-static uint32_t s_fsr3ViewportH   = 0;
-#endif
 #endif
 
 // Shader HLSL headers are embedded as Win32 resources (avoids MSVC string literal size limits)
@@ -1417,11 +1414,10 @@ DX11Compositor::~DX11Compositor()
 		OOVR_LOG("DLSS: Shutting down upscaler (dxcomp destroyed — VR session restart)");
 		delete s_dlssUpscaler;
 		s_dlssUpscaler = nullptr;
+		s_fsr3FirstDispatch = true;
 		s_fsr3ViewportW = 0;
 		s_fsr3ViewportH = 0;
-#	ifdef OC_HAS_FSR3
-		s_fsr3FirstDispatch = true;
-#	endif
+		s_hasPrevVP[0] = s_hasPrevVP[1] = false;
 	}
 #endif
 
@@ -1487,16 +1483,26 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 #else
 	if (bounds) fsrActive = false;
 #endif
+	// DLSS also needs swapchain inflation (same logic as FSR)
+#ifdef OC_HAS_DLSS
+	bool dlssNeedsInflation = !fsrActive && s_dlssUpscaler && s_dlssUpscaler->IsReady()
+	    && oovr_global_configuration.DlssEnabled()
+	    && oovr_global_configuration.FsrRenderScale() < 0.99f
+	    && !cube && !isOverlay;
+#else
+	bool dlssNeedsInflation = false;
+#endif
+
 	uint32_t outWidth = srcDesc.Width;
 	uint32_t outHeight = srcDesc.Height;
-	if (fsrActive) {
-		// FSR 1 (non-stereo) or FSR 3 (stereo-combined): inflate swapchain to display
-		// resolution so the upscaler has room to write the full-res output.
+	if (fsrActive || dlssNeedsInflation) {
+		// FSR / DLSS: inflate swapchain to display resolution so the
+		// upscaler has room to write the full-res output.
 		float invScale = 1.0f / std::max(0.5f, oovr_global_configuration.FsrRenderScale());
 		outWidth = (uint32_t)(srcDesc.Width * invScale);
 		outHeight = (uint32_t)(srcDesc.Height * invScale);
 	}
-	bool fsrConfigured = fsrActive;
+	bool fsrConfigured = fsrActive || dlssNeedsInflation;
 
 	// Check if existing chain is compatible (compare against OUTPUT dimensions)
 	bool usable = false;
@@ -1522,9 +1528,9 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 		OOVR_LOGF("Texture desc Usage: %d", srcDesc.Usage);
 		OOVR_LOGF("Texture desc width: %d", srcDesc.Width);
 		OOVR_LOGF("Texture desc height: %d", srcDesc.Height);
-		if (fsrActive)
-			OOVR_LOGF("FSR output: %dx%d (scale %.2f)", outWidth, outHeight,
-			    oovr_global_configuration.FsrRenderScale());
+		if (fsrActive || dlssNeedsInflation)
+			OOVR_LOGF("%s output: %dx%d (scale %.2f)", dlssNeedsInflation ? "DLSS" : "FSR",
+			    outWidth, outHeight, oovr_global_configuration.FsrRenderScale());
 
 		// ClearState unbinds all SRVs/RTVs/UAVs from the pipeline, releasing the
 		// NVIDIA driver's internal tracking references to our textures. Without
@@ -1550,11 +1556,10 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 		if (s_dlssUpscaler && s_dlssUpscaler->IsReady()) {
 			delete s_dlssUpscaler;
 			s_dlssUpscaler = nullptr;
+			s_fsr3FirstDispatch = true;
 			s_fsr3ViewportW = 0;
 			s_fsr3ViewportH = 0;
-#		ifdef OC_HAS_FSR3
-			s_fsr3FirstDispatch = true;
-#		endif
+			s_hasPrevVP[0] = s_hasPrevVP[1] = false;
 		}
 #endif
 
@@ -2616,6 +2621,84 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			}
 		}
 
+		// ── Depth format conversion for DLSS ──
+		// Skyrim's depth-stencil is R24G8_TYPELESS (D24_UNORM_S8_UINT).
+		// CopySubresourceRegion to R32F silently fails. Extract via compute shader.
+		if (dlssDepthTex) {
+			D3D11_TEXTURE2D_DESC dlssDepthFmtDesc;
+			if (SafeGetTextureDesc(dlssDepthTex, &dlssDepthFmtDesc)) {
+				bool needsExtract = (dlssDepthFmtDesc.Format != DXGI_FORMAT_R32_FLOAT
+				    && dlssDepthFmtDesc.Format != DXGI_FORMAT_D32_FLOAT
+				    && dlssDepthFmtDesc.Format != DXGI_FORMAT_R32_TYPELESS);
+				if (needsExtract) {
+					if (EnsureDepthExtractResources(device, dlssDepthFmtDesc.Width, dlssDepthFmtDesc.Height)) {
+						auto* depthSRV = GetOrCreateDepthSRV(device, dlssDepthTex,
+						    dlssDepthFmtDesc.Format, dlssDepthFmtDesc.Width, dlssDepthFmtDesc.Height);
+						if (depthSRV) {
+							ExtractDepthToR32F(context, depthSRV, dlssDepthFmtDesc.Width, dlssDepthFmtDesc.Height);
+							dlssDepthTex = s_depthR32F;
+							{ static bool s = false; if (!s) { s = true;
+							    OOVR_LOGF("DLSS DepthExtract: Converted depth fmt=%u → R32F (%ux%u)",
+							        dlssDepthFmtDesc.Format, dlssDepthFmtDesc.Width, dlssDepthFmtDesc.Height); } }
+						}
+					}
+				}
+			}
+		}
+
+		// ── Camera MV generation for DLSS ──
+		// Generates per-pixel camera motion from depth + VP matrix deltas.
+		// Without this, static geometry has zero motion during head rotation/locomotion.
+		ID3D11Texture2D* dlssCameraMVTex = nullptr;
+		if (dlssDepthTex && oovr_global_configuration.Fsr3CameraMV()
+		    && s_pBridge && s_pBridge->rssBasePtr) {
+			int eye = s_currentEyeIdx;
+			const uint8_t* rssBase = reinterpret_cast<const uint8_t*>(
+			    static_cast<uintptr_t>(s_pBridge->rssBasePtr));
+
+			const float* rssVPRM = reinterpret_cast<const float*>(
+			    rssBase + 0x3E0 + eye * 0x250 + 0x130);
+			float curVP[16];
+			memcpy(curVP, rssVPRM, sizeof(curVP));
+
+			if (s_hasPrevVP[eye]) {
+				float clipToClipMat[16];
+				if (ComputeClipToClip(curVP, s_prevVP[eye], clipToClipMat)) {
+					D3D11_TEXTURE2D_DESC dDesc;
+					dlssDepthTex->GetDesc(&dDesc);
+					int depthOffX = 0, depthOffY = 0;
+					bool depthIsStereo = (dDesc.Width >= dlssRenderW * 2 - 4);
+					if (depthIsStereo && eye == 1)
+						depthOffX = (int)(dDesc.Width / 2);
+
+					float curJitterX = s_fsr3RenderJitterX;
+					float curJitterY = s_fsr3RenderJitterY;
+					float jdUVx = (curJitterX - s_prevJitterX[eye]) / (float)dlssRenderW;
+					float jdUVy = (curJitterY - s_prevJitterY[eye]) / (float)dlssRenderH;
+
+					if (EnsureCameraMVResources(device, dlssRenderW, dlssRenderH)) {
+						auto* cmvDepthSRV = GetOrCreateCameraMVDepthSRV(device, dlssDepthTex);
+						if (cmvDepthSRV) {
+							GenerateCameraMVs(context, cmvDepthSRV,
+							    dlssRenderW, dlssRenderH,
+							    clipToClipMat,
+							    depthOffX, depthOffY,
+							    jdUVx, jdUVy);
+							dlssCameraMVTex = s_cameraMVTex;
+							{ static bool s = false; if (!s) { s = true;
+							    OOVR_LOGF("DLSS CameraMV: RSS VP -- %ux%u eye=%d",
+							        dlssRenderW, dlssRenderH, eye); } }
+						}
+					}
+				}
+			}
+
+			memcpy(s_prevVP[eye], curVP, sizeof(curVP));
+			s_prevJitterX[eye] = s_fsr3RenderJitterX;
+			s_prevJitterY[eye] = s_fsr3RenderJitterY;
+			s_hasPrevVP[eye] = true;
+		}
+
 		// Per-eye display resolution (same render-scale logic as FSR3)
 		float dlssInvScale = 1.0f / std::max(0.5f, oovr_global_configuration.FsrRenderScale());
 		uint32_t dlssDisplayW = std::min((uint32_t)(dlssRenderW * dlssInvScale), (uint32_t)createInfo.width);
@@ -2639,8 +2722,13 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		DlssUpscaler::DispatchParams dlssParams = {};
 		dlssParams.color             = dlssSrc;
 		dlssParams.colorSourceRegion = dlssColorRegionPtr;
-		dlssParams.motionVectors     = dlssMVTex;
-		dlssParams.mvSourceRegion    = dlssMVStereo ? &dlssMVRegion : nullptr;
+		if (dlssCameraMVTex) {
+			dlssParams.motionVectors = dlssCameraMVTex;
+			dlssParams.mvSourceRegion = nullptr;  // Camera MVs are already per-eye
+		} else {
+			dlssParams.motionVectors = dlssMVTex;
+			dlssParams.mvSourceRegion = dlssMVStereo ? &dlssMVRegion : nullptr;
+		}
 		dlssParams.depth             = dlssDepthTex;
 		dlssParams.depthSourceRegion = dlssDepthRegionPtr;
 		dlssParams.jitterX           = s_fsr3RenderJitterX;  // shared jitter
@@ -2659,6 +2747,17 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		s_fsr3FirstDispatch = false;
 
 		bool dlssOk = s_dlssUpscaler->Dispatch(s_currentEyeIdx, context, dlssParams);
+
+		// Eye sync: ensure both eyes transition to DLSS output on the same stereo frame
+		{
+			static bool s_dlssLeftEyeReady = false;
+			if (s_currentEyeIdx == 0) {
+				s_dlssLeftEyeReady = dlssOk;
+			} else if (dlssOk && !s_dlssLeftEyeReady) {
+				dlssOk = false;  // Force right eye fallback if left eye failed
+			}
+		}
+
 		if (dlssOk) {
 			ID3D11Texture2D* dlssOutput = s_dlssUpscaler->GetOutputDX11(s_currentEyeIdx);
 			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
@@ -2920,7 +3019,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		} else {
 			context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0, 0, 0, 0, src, 0, &sourceRegion);
 		}
-#ifdef OC_HAS_FSR3
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 		// When swapchain is display-res but content is render-res, set viewport to match
 		// actual content size so PostSubmit doesn't stretch the small image across the full viewport
 		if (createInfo.width != (sourceRegion.right - sourceRegion.left)) {
@@ -2982,8 +3081,8 @@ void DX11Compositor::InvokeCubemap(const vr::Texture_t* textures)
 void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::VRTextureBounds_t* ptrBounds,
     vr::EVRSubmitFlags submitFlags, XrCompositionLayerProjectionView& layer)
 {
-#ifdef OC_HAS_FSR3
-	// Reset FSR3 viewport crop — set by FSR3 dispatch if it runs this frame
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
+	// Reset upscaler viewport crop — set by FSR3/DLSS dispatch if it runs this frame
 	s_fsr3ViewportW = 0;
 	s_fsr3ViewportH = 0;
 #endif
@@ -3083,13 +3182,15 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	// ── DLSS 4: lazy-init upscaler ──
 	// DLSS is mutually exclusive with FSR3 — only one activates at a time.
 	if (oovr_global_configuration.DlssEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+		static bool s_dlssInitFailed = false;  // Prevent retrying every frame (~300ms per attempt)
 		OpenRenderTargetBridge();
-		if (!s_dlssUpscaler && s_pBridge && s_pBridge->status == 1) {
+		if (!s_dlssUpscaler && !s_dlssInitFailed && s_pBridge && s_pBridge->status == 1) {
 			s_dlssUpscaler = new DlssUpscaler();
 			if (!s_dlssUpscaler->Initialize(device)) {
-				OOVR_LOG("DLSS: Initialization failed (no NVIDIA GPU or driver too old) — falling back to FSR 1");
+				OOVR_LOG("DLSS: Initialization failed — falling back to FSR 1. Check log for details.");
 				delete s_dlssUpscaler;
 				s_dlssUpscaler = nullptr;
+				s_dlssInitFailed = true;
 			}
 		}
 	}
@@ -3270,7 +3371,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		}
 	}
 
-#ifdef OC_HAS_FSR3
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 	// After right eye: compute NEXT frame's jitter and increment frame counter.
 	// This must happen AFTER both eyes have rendered and dispatched with the current jitter.
 	// Previously this was in the left-eye block, which caused the right eye to pick up
@@ -3282,9 +3383,16 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		uint32_t renderW = ptrBounds ? srcDesc.Width / 2 : srcDesc.Width;
 		uint32_t displayW = xr_main_view(XruEyeLeft).recommendedImageRectWidth;
 
+#ifdef OC_HAS_FSR3
 		g_fsr3JitterPhaseCount = Fsr3Upscaler::GetJitterPhaseCount(renderW, displayW);
 		Fsr3Upscaler::GetJitterOffset(&g_fsr3JitterX, &g_fsr3JitterY,
 		    g_fsr3FrameIndex, g_fsr3JitterPhaseCount);
+#else
+		// DLSS-only build: use DlssUpscaler's jitter helpers
+		g_fsr3JitterPhaseCount = DlssUpscaler::GetJitterPhaseCount(renderW, displayW);
+		DlssUpscaler::GetJitterOffset(&g_fsr3JitterX, &g_fsr3JitterY,
+		    g_fsr3FrameIndex, g_fsr3JitterPhaseCount);
+#endif
 		// Apply jitter scale — lower values reduce temporal instability in VR
 		float jScale = oovr_global_configuration.Fsr3JitterScale();
 		g_fsr3JitterX *= jScale;
@@ -3351,8 +3459,8 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 		viewport.offset.x = 0;
 		viewport.offset.y = 0;
-#ifdef OC_HAS_FSR3
-		// When FSR3 has produced output, use FSR3's display-res viewport
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
+		// When upscaler has produced output, use display-res viewport
 		if (s_fsr3ViewportW > 0 && s_fsr3ViewportH > 0) {
 			viewport.extent.width = s_fsr3ViewportW;
 			viewport.extent.height = s_fsr3ViewportH;
