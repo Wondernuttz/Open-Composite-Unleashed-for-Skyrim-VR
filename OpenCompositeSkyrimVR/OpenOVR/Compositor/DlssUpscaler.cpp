@@ -42,14 +42,51 @@ int DlssUpscaler::GetJitterPhaseCount(uint32_t renderWidth, uint32_t displayWidt
 // Lifecycle
 // ============================================================================
 
+// Get the directory containing our DLL (openvr_api.dll / vrclient_x64.dll).
+// NGX needs this to find nvngx_dlss.dll when deployed alongside our DLL
+// rather than alongside the game executable.
+static std::wstring GetOurDllDirectory()
+{
+	HMODULE hMod = nullptr;
+	// Get handle to THIS DLL (not the exe) using the address of this function
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	    reinterpret_cast<LPCWSTR>(&GetOurDllDirectory), &hMod);
+	if (!hMod) return L".";
+	wchar_t path[MAX_PATH] = {};
+	GetModuleFileNameW(hMod, path, MAX_PATH);
+	// Strip filename, keep directory
+	std::wstring dir(path);
+	auto pos = dir.find_last_of(L"\\/");
+	if (pos != std::wstring::npos) dir.resize(pos);
+	return dir;
+}
+
 bool DlssUpscaler::Initialize(ID3D11Device* d3d11Device)
 {
 	m_device = d3d11Device;
 
-	// Initialize NGX on this DX11 device.
-	// appId = 0 is acceptable for development; ship with a registered project ID for release.
-	// The log path "." writes nvngx.log next to the executable.
-	NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init(0ULL, L".", d3d11Device);
+	// Resolve directory containing our DLL — nvngx_dlss.dll should be deployed here.
+	std::wstring dllDir = GetOurDllDirectory();
+
+	// Tell NGX to also search our DLL directory for feature DLLs (nvngx_dlss.dll).
+	// Without this, NGX only checks the game executable's directory and system paths.
+	const wchar_t* featurePaths[] = { dllDir.c_str() };
+	NVSDK_NGX_FeatureCommonInfo featureInfo = {};
+	featureInfo.PathListInfo.Path = featurePaths;
+	featureInfo.PathListInfo.Length = 1;
+
+	OOVR_LOGF("DLSS: Initializing NGX — DLL dir: %ls", dllDir.c_str());
+
+	// Use Init_with_ProjectID for custom engine integration. A valid GUID-format
+	// project ID is required — the NGX core validates the format. AppId=0 with plain
+	// Init only works for NVIDIA-registered titles.
+	NVSDK_NGX_Result result = NVSDK_NGX_D3D11_Init_with_ProjectID(
+	    "a0f57b54-1daf-4934-90ae-c4035c19df04",  // Open Composite Unleashed project GUID
+	    NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+	    "1.0.0",
+	    dllDir.c_str(),
+	    d3d11Device,
+	    &featureInfo);
 	if (NVSDK_NGX_FAILED(result)) {
 		OOVR_LOGF("DLSS: NGX Init failed (0x%08X) — no NVIDIA GPU or driver too old", (unsigned)result);
 		return false;
@@ -63,11 +100,24 @@ bool DlssUpscaler::Initialize(ID3D11Device* d3d11Device)
 		return false;
 	}
 
+	// Log additional diagnostic info
+	unsigned int needsUpdatedDriver = 0;
+	m_params->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needsUpdatedDriver);
+	unsigned int minDriverMajor = 0, minDriverMinor = 0;
+	m_params->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &minDriverMajor);
+	m_params->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &minDriverMinor);
+	OOVR_LOGF("DLSS: NeedsUpdatedDriver=%u MinDriver=%u.%u", needsUpdatedDriver, minDriverMajor, minDriverMinor);
+
 	// Confirm DLSS Super Sampling is supported on this GPU/driver.
 	int dlssAvailable = 0;
 	result = m_params->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &dlssAvailable);
 	if (NVSDK_NGX_FAILED(result) || !dlssAvailable) {
-		OOVR_LOGF("DLSS: SuperSampling not available (result=0x%08X available=%d)", (unsigned)result, dlssAvailable);
+		// Log feature discovery failure details to help diagnose missing nvngx_dlss.dll
+		unsigned int featureSupported = 0;
+		m_params->Get(NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &featureSupported);
+		OOVR_LOGF("DLSS: SuperSampling not available (result=0x%08X available=%d featureInit=0x%08X)",
+		    (unsigned)result, dlssAvailable, featureSupported);
+		OOVR_LOGF("DLSS: Ensure nvngx_dlss.dll is deployed alongside openvr_api.dll at: %ls", dllDir.c_str());
 		NVSDK_NGX_D3D11_DestroyParameters(m_params);
 		m_params = nullptr;
 		NVSDK_NGX_D3D11_Shutdown1(m_device);

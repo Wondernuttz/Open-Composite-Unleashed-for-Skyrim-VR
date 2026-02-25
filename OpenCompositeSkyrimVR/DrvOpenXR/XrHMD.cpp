@@ -12,7 +12,7 @@
 #include <chrono>
 #include <thread>
 
-#ifdef OC_HAS_FSR3
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 // Global jitter state — set by dx11compositor.cpp, consumed here
 extern int g_fsr3FrameIndex;
 extern float g_fsr3JitterX;
@@ -28,8 +28,12 @@ void XrHMD::GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* height)
 {
 	float scale = oovr_global_configuration.SupersampleRatio();
 
-	// FSR: tell the game to render at a lower resolution — we upscale in the compositor
-	if (oovr_global_configuration.FsrEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+	// FSR / DLSS: tell the game to render at a lower resolution — we upscale in the compositor
+	bool needsDownscale = oovr_global_configuration.FsrEnabled();
+#ifdef OC_HAS_DLSS
+	needsDownscale = needsDownscale || oovr_global_configuration.DlssEnabled();
+#endif
+	if (needsDownscale && oovr_global_configuration.FsrRenderScale() < 0.99f) {
 		scale *= std::max(0.5f, oovr_global_configuration.FsrRenderScale());
 	}
 
@@ -69,7 +73,7 @@ vr::HmdMatrix44_t XrHMD::GetProjectionMatrix(vr::EVREye eEye, float fNearZ, floa
 	// Build the projection matrix
 	XrFovf& fov = views[eEye].fov;
 
-#ifdef OC_HAS_FSR3
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 	// Capture the game's actual near/far planes (left eye only, both eyes use the same values)
 	if (eEye == vr::Eye_Left) {
 		g_fsr3CameraNear = fNearZ;
@@ -191,8 +195,8 @@ void XrHMD::GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, flo
 	*pfLeft = tanf(fov.angleLeft);
 	*pfRight = tanf(fov.angleRight);
 
-#ifdef OC_HAS_FSR3
-	// FSR 3 jitter: shift the raw FOV tangent values by a sub-pixel offset.
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
+	// Temporal upscaler jitter: shift the raw FOV tangent values by a sub-pixel offset.
 	// Skyrim VR calls GetProjectionRaw per frame (NOT GetProjectionMatrix) and
 	// builds its own projection. Shifting both left/right (or top/bottom) by the
 	// same amount changes the projection center without altering FOV extent:
