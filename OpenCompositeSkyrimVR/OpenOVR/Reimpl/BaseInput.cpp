@@ -2540,32 +2540,13 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 	// Now we fall back to trigger-based estimation when real hand tracking fails.
 	VRSkeletalSummaryData_t skeletonData = { 0 };
 
-	// DEBUG: Log every call to trace finger curl issue
-	static int traceCounter[2] = {0, 0};
-	bool shouldLog = (++traceCounter[hand] % 90 == 1);
-
 	if (xr_gbl->handTrackingProperties.supportsHandTracking) {
 		EVRInputError err = getRealSkeletalSummary((ITrackedDevice::HandType)hand, &skeletonData);
 		if (err != vr::VRInputError_None) {
-			// Hand tracking failed (hand not visible to cameras) - fall back to trigger-based estimation
-			if (shouldLog) {
-				OOVR_LOGF("Hand %d: Real tracking failed (err=%d), using trigger-based fallback", hand, err);
-			}
 			getEstimatedSkeletalSummary((ITrackedDevice::HandType)hand, &skeletonData);
-		} else if (shouldLog) {
-			OOVR_LOGF("Hand %d: Real tracking succeeded, index curl=%.3f", hand, skeletonData.flFingerCurl[1]);
 		}
 	} else {
-		// No hand tracking support - use trigger-based estimation
-		if (shouldLog) {
-			OOVR_LOGF("Hand %d: No hand tracking, using trigger-based estimation", hand);
-		}
 		getEstimatedSkeletalSummary((ITrackedDevice::HandType)hand, &skeletonData);
-	}
-
-	if (shouldLog) {
-		OOVR_LOGF("Hand %d: Final finger curl - index=%.3f middle=%.3f",
-		    hand, skeletonData.flFingerCurl[1], skeletonData.flFingerCurl[2]);
 	}
 
 	VRControllerAxis_t& fingers = state->rAxis[3];

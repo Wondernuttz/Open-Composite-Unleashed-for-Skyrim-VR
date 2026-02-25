@@ -304,9 +304,9 @@ bool DlssUpscaler::EnsureFeature(int eyeIdx, ID3D11DeviceContext* ctx,
 	createParams.Feature.InTargetHeight = outputH;
 	createParams.Feature.InPerfQualityValue = perfQuality;
 	createParams.InFeatureCreateFlags =
-		NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
-		NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |   // MVs at render res (not display res)
-		NVSDK_NGX_DLSS_Feature_Flags_DepthInverted; // Skyrim uses reversed-Z depth
+		NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |     // MVs at render res (not display res)
+		NVSDK_NGX_DLSS_Feature_Flags_DepthInverted | // Skyrim uses reversed-Z depth (1=near, 0=far)
+		NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;   // Let DLSS compute exposure internally
 
 	NVSDK_NGX_Result result = NGX_D3D11_CREATE_DLSS_EXT(ctx, &m_handle[eyeIdx], m_params, &createParams);
 	if (NVSDK_NGX_FAILED(result)) {
@@ -377,24 +377,49 @@ bool DlssUpscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* ctx, const Dispatch
 	NVSDK_NGX_D3D11_DLSS_Eval_Params evalParams = {};
 	evalParams.Feature.pInColor         = colorIn;
 	evalParams.Feature.pInOutput        = m_output[eyeIdx];
+	evalParams.pInDepth                 = depthIn;
+	evalParams.pInMotionVectors         = mvIn;
 	evalParams.InJitterOffsetX          = params.jitterX;
 	evalParams.InJitterOffsetY          = params.jitterY;
 	evalParams.InReset                  = params.reset ? 1 : 0;
-	evalParams.pInDepth                 = depthIn;
-	evalParams.pInMotionVectors         = mvIn;
 	evalParams.InFrameTimeDeltaInMsec   = std::max(1.0f, params.deltaTimeMs);
-	evalParams.InMVScaleX               = params.mvScale;
-	evalParams.InMVScaleY               = params.mvScale;
+	evalParams.InMVScaleX               = params.mvScaleX;
+	evalParams.InMVScaleY               = params.mvScaleY;
 	evalParams.InPreExposure            = 1.0f;
 	evalParams.InExposureScale          = 1.0f;
-	// Sharpness: DLSS 3.1+ uses a separate RCAS pass; 0.0 = no sharpening
 	evalParams.Feature.InSharpness      = params.sharpness;
+
+	// CRITICAL: InRenderSubrectDimensions tells DLSS the actual render area within the
+	// input textures. Without this (0x0), DLSS sees an invalid empty region → 0xBAD00005.
+	evalParams.InRenderSubrectDimensions.Width  = params.renderWidth;
+	evalParams.InRenderSubrectDimensions.Height = params.renderHeight;
+
+	{ static int s_logCount = 0; if (s_logCount++ < 3) {
+		D3D11_TEXTURE2D_DESC cDesc = {}, mDesc = {}, dDesc = {};
+		if (colorIn) colorIn->GetDesc(&cDesc);
+		if (mvIn) mvIn->GetDesc(&mDesc);
+		if (depthIn) depthIn->GetDesc(&dDesc);
+		OOVR_LOGF("DLSS Eval #%d eye=%d: color=%ux%u(fmt%u) mv=%ux%u(fmt%u) depth=%ux%u(fmt%u) "
+		    "render=%ux%u output=%ux%u jitter=%.4f,%.4f mvScale=%.1f,%.1f",
+		    s_logCount, eyeIdx,
+		    cDesc.Width, cDesc.Height, cDesc.Format,
+		    mDesc.Width, mDesc.Height, mDesc.Format,
+		    dDesc.Width, dDesc.Height, dDesc.Format,
+		    params.renderWidth, params.renderHeight,
+		    params.outputWidth, params.outputHeight,
+		    params.jitterX, params.jitterY, params.mvScaleX, params.mvScaleY);
+	}}
 
 	NVSDK_NGX_Result result = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, m_handle[eyeIdx], m_params, &evalParams);
 	if (NVSDK_NGX_FAILED(result)) {
 		static int failCount = 0;
-		if (failCount++ < 5)
-			OOVR_LOGF("DLSS: EvaluateFeature failed eye=%d (0x%08X)", eyeIdx, (unsigned)result);
+		if (failCount++ < 10)
+			OOVR_LOGF("DLSS: EvaluateFeature failed eye=%d (0x%08X) render=%ux%u output=%ux%u "
+			    "color=%p mv=%p depth=%p output=%p",
+			    eyeIdx, (unsigned)result,
+			    params.renderWidth, params.renderHeight,
+			    params.outputWidth, params.outputHeight,
+			    colorIn, mvIn, depthIn, m_output[eyeIdx]);
 		return false;
 	}
 

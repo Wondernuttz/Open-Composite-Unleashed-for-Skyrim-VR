@@ -228,7 +228,8 @@ cbuffer CameraMVCB : register(b0) {
     column_major float4x4 clipToClip;  // prevVP * inv(curVP), computed in double on CPU
     float2 renderSize;                  // per-eye render resolution
     int2 depthOffset;                   // offset into stereo-combined depth texture
-    float2 jitterDeltaUV;               // (curJitter - prevJitter) / renderSize
+    float2 jitterDeltaUV;               // (curJitter - prevJitter) / renderSize (FSR3 only)
+    float2 currJitterUV;                // current jitter in UV space (DLSS: unjitters clip coords)
     float2 _pad0;
 };
 
@@ -249,22 +250,25 @@ void CS_CameraMV(uint3 id : SV_DispatchThreadID)
 
     // Pixel center -> UV -> NDC
     float2 uv = (float2(id.xy) + 0.5) / renderSize;
-    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
-    // Directly map current clip space to previous clip space via clipToClip matrix.
-    // This is equivalent to: worldPos = inv(curVP) * clipPos; prevClip = prevVP * worldPos;
-    // but avoids float32 catastrophic cancellation from large game-unit world positions.
-    // The clipToClip matrix ≈ Identity for small frame-to-frame changes, keeping all
-    // intermediate values in the shader at manageable magnitudes.
+    // Remove current frame's jitter from UV before converting to NDC.
+    // The game renders with our jittered projection (from GetProjectionRaw), so pixels
+    // are displaced by sub-pixel jitter. But clipToClip uses unjittered VP matrices.
+    // Without this correction, inv(curVP_unjittered) receives jittered clip coords,
+    // causing a depth-dependent MV error through the perspective divide (close objects
+    // get larger error than far objects). For FSR3: currJitterUV=(0,0) — FSR3 handles
+    // jitter via its own cancellation framework. For DLSS: removes the mismatch.
+    float2 uvUnjittered = uv - currJitterUV;
+    float2 ndc = float2(uvUnjittered.x * 2.0 - 1.0, 1.0 - uvUnjittered.y * 2.0);
+
+    // Map current clip space to previous clip space via clipToClip matrix.
+    // clipToClip = prevVP * inv(curVP), computed in double precision on CPU.
     float4 clipPos = float4(ndc, depth, 1.0);
     float4 prevClip = mul(clipToClip, clipPos);
     float2 prevNDC = prevClip.xy / prevClip.w;
     float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
 
-    // MV in UV space with jitter compensation for FSR3.
-    // The jittered VPs cause phantom MV: mv.x = -jitterDeltaUV.x, mv.y = +jitterDeltaUV.y.
-    // (Y sign differs from X because UV.y = 0.5 - NDC.y * 0.5, flipping the jitter direction.)
-    float2 mv = prevUV - uv;
+    float2 mv = prevUV - uvUnjittered;
     mv.x += jitterDeltaUV.x;
     mv.y -= jitterDeltaUV.y;
 
@@ -659,10 +663,13 @@ static ID3D11ShaderResourceView* GetOrCreateCameraMVDepthSRV(ID3D11Device* devic
 	return s_cameraMVDepthSRV;
 }
 
-// Generate camera-derived motion vectors from depth + clip-to-clip reprojection matrix
+// Generate camera-derived motion vectors from depth + clip-to-clip reprojection matrix.
+// currJitterUVx/y: current frame's jitter in UV space. For DLSS, this unjitters the clip-space
+// position to match the unjittered VP matrix. For FSR3, pass (0,0).
 static bool GenerateCameraMVs(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
     uint32_t outputW, uint32_t outputH, const float clipToClip[16],
-    int depthOffsetX, int depthOffsetY, float jitterDeltaUVx, float jitterDeltaUVy)
+    int depthOffsetX, int depthOffsetY, float jitterDeltaUVx, float jitterDeltaUVy,
+    float currJitterUVx = 0.0f, float currJitterUVy = 0.0f)
 {
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
@@ -676,8 +683,10 @@ static bool GenerateCameraMVs(ID3D11DeviceContext* context, ID3D11ShaderResource
 		cbi[19] = depthOffsetY;              // offset 76: depthOffset.y
 		cb[20] = jitterDeltaUVx;             // offset 80: jitterDeltaUV.x
 		cb[21] = jitterDeltaUVy;             // offset 84: jitterDeltaUV.y
-		cb[22] = 0.0f;                       // offset 88: _pad0.x
-		cb[23] = 0.0f;                       // offset 92: _pad0.y
+		cb[22] = currJitterUVx;              // offset 88: currJitterUV.x
+		cb[23] = currJitterUVy;              // offset 92: currJitterUV.y
+		cb[24] = 0.0f;                       // offset 96: _pad0.x
+		cb[25] = 0.0f;                       // offset 100: _pad0.y
 		context->Unmap(s_cameraMVCB, 0);
 	}
 
@@ -2545,10 +2554,10 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	    && oovr_global_configuration.FsrRenderScale() < 0.99f
 	    && !isOverlay && !swapchain_rtvs.empty()) {
 
-		{ static int s_dlssHits = 0; s_dlssHits++;
-		  if (s_dlssHits <= 4 || s_dlssHits % 200 == 0)
-		    OOVR_LOGF("DLSS: dispatch path #%d eye=%d", s_dlssHits, s_currentEyeIdx);
-		}
+		{ static bool s_dlssFirstLog = false; if (!s_dlssFirstLog) {
+		    s_dlssFirstLog = true;
+		    OOVR_LOGF("DLSS: dispatch path active, eye=%d", s_currentEyeIdx);
+		}}
 
 		ID3D11Texture2D* dlssSrc = src;
 		// Resolve MSAA first if needed
@@ -2671,10 +2680,12 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 					if (depthIsStereo && eye == 1)
 						depthOffX = (int)(dDesc.Width / 2);
 
-					float curJitterX = s_fsr3RenderJitterX;
-					float curJitterY = s_fsr3RenderJitterY;
-					float jdUVx = (curJitterX - s_prevJitterX[eye]) / (float)dlssRenderW;
-					float jdUVy = (curJitterY - s_prevJitterY[eye]) / (float)dlssRenderH;
+					// No jitter delta — MVs are from unjittered RSS VP matrices.
+					// currJitterUV unjitters pixel coords before clipToClip transform.
+					float jdUVx = 0.0f;
+					float jdUVy = 0.0f;
+					float currJUVx = s_fsr3RenderJitterX / (float)dlssRenderW;
+					float currJUVy = s_fsr3RenderJitterY / (float)dlssRenderH;
 
 					if (EnsureCameraMVResources(device, dlssRenderW, dlssRenderH)) {
 						auto* cmvDepthSRV = GetOrCreateCameraMVDepthSRV(device, dlssDepthTex);
@@ -2683,7 +2694,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 							    dlssRenderW, dlssRenderH,
 							    clipToClipMat,
 							    depthOffX, depthOffY,
-							    jdUVx, jdUVy);
+							    jdUVx, jdUVy,
+							    currJUVx, currJUVy);
 							dlssCameraMVTex = s_cameraMVTex;
 							{ static bool s = false; if (!s) { s = true;
 							    OOVR_LOGF("DLSS CameraMV: RSS VP -- %ux%u eye=%d",
@@ -2725,9 +2737,16 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		if (dlssCameraMVTex) {
 			dlssParams.motionVectors = dlssCameraMVTex;
 			dlssParams.mvSourceRegion = nullptr;  // Camera MVs are already per-eye
+			// Camera MVs are UV-space (0-1). DLSS InMVScale converts to pixel space.
+			float dlssMvScale = oovr_global_configuration.DlssMvScale();
+			dlssParams.mvScaleX = (float)dlssRenderW * dlssMvScale;
+			dlssParams.mvScaleY = (float)dlssRenderH * dlssMvScale;
 		} else {
 			dlssParams.motionVectors = dlssMVTex;
 			dlssParams.mvSourceRegion = dlssMVStereo ? &dlssMVRegion : nullptr;
+			float s = oovr_global_configuration.MotionVectorScale();
+			dlssParams.mvScaleX = s;
+			dlssParams.mvScaleY = s;
 		}
 		dlssParams.depth             = dlssDepthTex;
 		dlssParams.depthSourceRegion = dlssDepthRegionPtr;
@@ -2742,7 +2761,6 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		dlssParams.cameraFar         = g_fsr3CameraFar;
 		dlssParams.sharpness         = oovr_global_configuration.DlssSharpness();
 		dlssParams.reset             = s_fsr3FirstDispatch;
-		dlssParams.mvScale           = oovr_global_configuration.MotionVectorScale();
 		dlssParams.debugMode         = 0;
 		s_fsr3FirstDispatch = false;
 
@@ -3150,11 +3168,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		// Save jitter and camera FOV on left eye (once per stereo frame).
 		// IMPORTANT: Do NOT compute next-frame jitter here — right eye's GetProjectionRaw
 		// hasn't been called yet and would pick up the wrong (next) jitter value.
-		if ((s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
-#ifdef OC_HAS_DLSS
-		    || (s_dlssUpscaler && s_dlssUpscaler->IsReady())
-#endif
-		    ) && eye == XruEyeLeft) {
+		if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady() && eye == XruEyeLeft) {
 			// No jitter on main menu / loading screen — upscaler won't run
 			if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
 				g_fsr3JitterEnabled = false;
@@ -3173,12 +3187,28 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			s_fsr3CameraFovY = fabsf(layer.fov.angleUp) + fabsf(layer.fov.angleDown);
 			}
 		}
-	} else {
+	} else if (!oovr_global_configuration.DlssEnabled()) {
+		// Only disable jitter if DLSS isn't handling it either
 		g_fsr3JitterEnabled = false;
 	}
 #endif
 
 #ifdef OC_HAS_DLSS
+	// ── DLSS: save jitter and enable on left eye ──
+	if (oovr_global_configuration.DlssEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f
+	    && s_dlssUpscaler && s_dlssUpscaler->IsReady() && eye == XruEyeLeft) {
+		if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
+			g_fsr3JitterEnabled = false;
+		} else {
+			s_fsr3RenderJitterX = g_fsr3JitterX;
+			s_fsr3RenderJitterY = g_fsr3JitterY;
+			g_fsr3JitterEnabled = true;
+		}
+	} else if (!oovr_global_configuration.FsrEnabled() && eye == XruEyeLeft
+	    && !(s_dlssUpscaler && s_dlssUpscaler->IsReady())) {
+		g_fsr3JitterEnabled = false;
+	}
+
 	// ── DLSS 4: lazy-init upscaler ──
 	// DLSS is mutually exclusive with FSR3 — only one activates at a time.
 	if (oovr_global_configuration.DlssEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f) {
@@ -3393,7 +3423,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		DlssUpscaler::GetJitterOffset(&g_fsr3JitterX, &g_fsr3JitterY,
 		    g_fsr3FrameIndex, g_fsr3JitterPhaseCount);
 #endif
-		// Apply jitter scale — lower values reduce temporal instability in VR
+		// Apply jitter scale — lower values reduce temporal instability in VR.
 		float jScale = oovr_global_configuration.Fsr3JitterScale();
 		g_fsr3JitterX *= jScale;
 		g_fsr3JitterY *= jScale;
