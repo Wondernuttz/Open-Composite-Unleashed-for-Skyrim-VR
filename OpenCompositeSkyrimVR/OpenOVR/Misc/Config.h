@@ -107,6 +107,7 @@ public:
 	inline bool  DlssEnabled()   const { return dlssEnabled; }
 	inline int   DlssPreset()    const { return dlssPreset; }    // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
 	inline float DlssSharpness() const { return dlssSharpness; }
+	inline float DlssMvScale()   const { return dlssMvScale; }
 
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	inline bool MotionVectorsEnabled() const { return motionVectorsEnabled; }
@@ -279,6 +280,7 @@ private:
 	bool  dlssEnabled   = false;
 	int   dlssPreset    = 0;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
 	float dlssSharpness = 0.0f;
+	float dlssMvScale   = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;

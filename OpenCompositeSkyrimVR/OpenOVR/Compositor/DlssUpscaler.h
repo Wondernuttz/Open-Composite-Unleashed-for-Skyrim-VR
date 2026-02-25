@@ -40,7 +40,7 @@ public:
 		float cameraNear, cameraFar;         ///< Camera planes
 		float sharpness;                     ///< Post-upscale sharpness (0.0-1.0)
 		bool reset;                          ///< True on camera teleport / scene change
-		float mvScale;                       ///< MV magnitude multiplier (1.0 = raw engine data)
+		float mvScaleX, mvScaleY;            ///< UV-to-pixel conversion (renderW/H for UV-space MVs, 1.0 for pixel-space)
 		int debugMode;                       ///< 0=off, 2=bypass (raw game image)
 	};
 
