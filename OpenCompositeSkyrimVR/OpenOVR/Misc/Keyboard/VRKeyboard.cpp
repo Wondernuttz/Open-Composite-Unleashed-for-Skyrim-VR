@@ -244,33 +244,56 @@ static bool ReloadKeyboardSettings()
 	int newPressVol = s_pressVolume;
 	int newHaptic = s_hapticStrength;
 	bool inKeyboardSection = false;
+	bool inDefaultSection = true;  // starts in default section (before any [header])
 	char line[256];
 
 	while (fgets(line, sizeof(line), f)) {
 		if (line[0] == '[') {
 			inKeyboardSection = (strstr(line, "[keyboard]") != nullptr);
+			inDefaultSection = false;
 			continue;
 		}
-		if (!inKeyboardSection)
-			continue;
 
 		float val;
 		int ival;
 		char sval[32];
-		if (sscanf(line, "displayTilt=%f", &val) == 1)
-			newTilt = val;
-		if (sscanf(line, "displayOpacity=%d", &ival) == 1)
-			newOpacity = ival;
-		if (sscanf(line, "displayScale=%d", &ival) == 1)
-			newScale = ival;
-		if (sscanf(line, "soundsEnabled=%31s", sval) == 1)
-			newSounds = (strcmp(sval, "true") == 0 || strcmp(sval, "1") == 0);
-		if (sscanf(line, "hoverVolume=%d", &ival) == 1)
-			newHoverVol = ival;
-		if (sscanf(line, "pressVolume=%d", &ival) == 1)
-			newPressVol = ival;
-		if (sscanf(line, "hapticStrength=%d", &ival) == 1)
-			newHaptic = ival;
+
+		if (inKeyboardSection) {
+			if (sscanf(line, "displayTilt=%f", &val) == 1)
+				newTilt = val;
+			if (sscanf(line, "displayOpacity=%d", &ival) == 1)
+				newOpacity = ival;
+			if (sscanf(line, "displayScale=%d", &ival) == 1)
+				newScale = ival;
+			if (sscanf(line, "soundsEnabled=%31s", sval) == 1)
+				newSounds = (strcmp(sval, "true") == 0 || strcmp(sval, "1") == 0);
+			if (sscanf(line, "hoverVolume=%d", &ival) == 1)
+				newHoverVol = ival;
+			if (sscanf(line, "pressVolume=%d", &ival) == 1)
+				newPressVol = ival;
+			if (sscanf(line, "hapticStrength=%d", &ival) == 1)
+				newHaptic = ival;
+		}
+
+		// Hot-reload ASW tuning values (in default section of ini)
+		if (inDefaultSection) {
+			if (sscanf(line, "aswWarpStrength=%f", &val) == 1)
+				oovr_global_configuration.aswWarpStrength = val;
+			if (sscanf(line, "aswRotationScale=%f", &val) == 1)
+				oovr_global_configuration.aswRotationScale = val;
+			if (sscanf(line, "aswTranslationScale=%f", &val) == 1)
+				oovr_global_configuration.aswTranslationScale = val;
+			if (sscanf(line, "aswDepthScale=%f", &val) == 1)
+				oovr_global_configuration.aswDepthScale = val;
+			if (sscanf(line, "aswEdgeFadeWidth=%f", &val) == 1)
+				oovr_global_configuration.aswEdgeFadeWidth = val;
+			if (sscanf(line, "aswNearFadeDepth=%f", &val) == 1)
+				oovr_global_configuration.aswNearFadeDepth = val;
+			if (sscanf(line, "aswMVConfidence=%f", &val) == 1)
+				oovr_global_configuration.aswMVConfidence = val;
+			if (sscanf(line, "aswMVPixelScale=%f", &val) == 1)
+				oovr_global_configuration.aswMVPixelScale = val;
+		}
 	}
 	fclose(f);
 

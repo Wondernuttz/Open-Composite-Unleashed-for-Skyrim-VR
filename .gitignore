@@ -13,6 +13,8 @@ Release/
 *.pdb
 *.ilk
 *.exp
+libs/
+scripts/
 
 # Published executables
 *.exe

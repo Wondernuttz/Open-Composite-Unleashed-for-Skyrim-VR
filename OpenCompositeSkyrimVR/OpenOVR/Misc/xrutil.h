@@ -139,6 +139,8 @@ void rotate_vector_by_quaternion(const XrVector3f& v, const XrQuaternionf& q, Xr
 
 extern XrInstance xr_instance;
 extern SessionWrapper xr_session;
+// Serialize OpenXR calls that touch a live XrSession when worker/frame-thread paths are active.
+extern std::mutex xr_session_call_mutex;
 extern XrSystemId xr_system;
 XrViewConfigurationView& xr_main_view(XruEye view_id);
 extern XrSessionGlobals* xr_gbl;

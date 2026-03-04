@@ -120,10 +120,13 @@ public:
 	inline float ASWTranslationScale() const { return aswTranslationScale; }
 	inline float ASWDepthScale() const { return aswDepthScale; }
 	inline float ASWEdgeFadeWidth() const { return aswEdgeFadeWidth; }
-	inline float ASWLocoScale() const { return aswLocoScale; }
 	inline float ASWNearFadeDepth() const { return aswNearFadeDepth; }
 	inline float ASWMVConfidence() const { return aswMVConfidence; }
 	inline float ASWMVPixelScale() const { return aswMVPixelScale; }
+	inline int ASWDebugMode() const { return aswDebugMode; }
+	inline bool ASWConcurrentFrameThread() const { return aswConcurrentFrameThread; }
+	inline bool ASWSpeculativeTrackingLead() const { return aswSpeculativeTrackingLead; }
+	inline bool ASWBufferEnabled() const { return aswBufferEnabled; }
 
 	// CAS sharpening (RCAS) — independent of FSR
 	inline bool CasEnabled() const { return casEnabled; }
@@ -149,10 +152,10 @@ public:
 	float aswTranslationScale = 1.0f; // 0.0 = no translation correction, 1.0 = full
 	float aswDepthScale = 1.0f;    // multiplier on linearized depth (parallax intensity)
 	float aswEdgeFadeWidth = 3.0f;   // depth-edge fade threshold (depth ratio units)
-	float aswLocoScale = 0.5f;       // stick locomotion parallax correction (0=off, 0.5=half-frame)
 	float aswNearFadeDepth = 0.0f;   // parallax fades to 0 below this depth (meters); 0 = disabled
-	float aswMVConfidence = 0.0f;    // 0=pure parallax (default off), 1=full MV object correction
+	float aswMVConfidence = -0.5f;   // MV warp strength: -0.5 = half-frame extrapolation (midpoint inject). 0 = off.
 	float aswMVPixelScale = 1.0f;    // overall MV magnitude multiplier (1.0 = identity)
+	int aswDebugMode = 0;            // 0=normal, 1=depth viz, 2=linearized depth, 3=MV magnitude, 50=black warp frame
 
 private:
 	static int ini_handler(
@@ -255,6 +258,9 @@ private:
 
 	// OCU ASW — PC-side Asynchronous SpaceWarp (experimental)
 	bool aswEnabled = false;
+	bool aswConcurrentFrameThread = false; // If true, dedicated XR thread owns wait/begin/end in buffered mode
+	bool aswSpeculativeTrackingLead = false; // Diagnostic default: prefer begun-slot sync over speculative +1 period lead
+	bool aswBufferEnabled = true;            // true = async warp worker thread (clean GPU queue), false = inline warp on game thread
 	// NOTE: aswWarpStrength, aswRotationScale, aswTranslationScale, aswDepthScale
 	// are declared in the public section above for hot-reload access
 

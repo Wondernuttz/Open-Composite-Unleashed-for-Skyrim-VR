@@ -249,10 +249,13 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, aswTranslationScale);
 		CFGOPT(float, aswDepthScale);
 		CFGOPT(float, aswEdgeFadeWidth);
-		CFGOPT(float, aswLocoScale);
 		CFGOPT(float, aswNearFadeDepth);
 		CFGOPT(float, aswMVConfidence);
 		CFGOPT(float, aswMVPixelScale);
+		CFGOPT(int, aswDebugMode);
+		CFGOPT(bool, aswConcurrentFrameThread);
+		CFGOPT(bool, aswSpeculativeTrackingLead);
+		CFGOPT(bool, aswBufferEnabled);
 		CFGOPT(bool, casEnabled);
 		CFGOPT(float, fsrSharpness);
 		CFGOPT(bool, fsrRadiusEnabled);

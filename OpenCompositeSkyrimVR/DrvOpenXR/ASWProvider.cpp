@@ -1,19 +1,39 @@
 #include "ASWProvider.h"
 
-#include "../OpenOVR/Misc/xr_ext.h"
 #include "../OpenOVR/Misc/Config.h"
+#include "../OpenOVR/Misc/xr_ext.h"
 #include "../OpenOVR/logging.h"
 
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
-#include <d3d11.h>
-#include <d3dcompiler.h>
 #include <cmath>
 #include <cstring>
+#include <d3d11.h>
+#include <d3d11_4.h>
+#include <d3d12.h>
+#include <d3dcompiler.h>
+#include <dxgi1_4.h>
 
 // Global instance — accessed from XrBackend for frame injection
+
+// ── ASW frame buffering: staging textures for decoupled game/submit pipeline ──
+bool g_aswStagingActive = false;
+ID3D11Texture2D* g_aswStagingTex[2][kAswStagingSlotCount] = {};
+ID3D11Query* g_aswStagingDoneQuery[2][kAswStagingSlotCount] = {};
+std::atomic<uint64_t> g_aswStagingSlotSeq[2][kAswStagingSlotCount] = {};
+std::atomic<int64_t> g_aswStagingPublishNs[2][kAswStagingSlotCount] = {};
+std::atomic<uint32_t> g_aswStagingWriteCursor[2] = { 0, 0 };
+std::atomic<int> g_aswStagingPublishedSlot[2] = { -1, -1 };
+std::atomic<int> g_aswStagingLastReadySlot[2] = { -1, -1 };
+std::atomic<uint64_t> g_aswStagingPublishSeq[2] = { 0, 0 };
+XrSwapchain g_aswStagingSwapchain[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
+std::vector<XrSwapchainImageD3D11KHR> g_aswStagingSwapImages[2];
+
 ASWProvider* g_aswProvider = nullptr;
+
+// Loading/menu state — set by dx11compositor, read by ASW submit thread
+std::atomic<bool> g_aswSkipWarp{ false };
 
 // ============================================================================
 // Embedded HLSL compute shader for frame warping
@@ -36,13 +56,43 @@ cbuffer WarpParams : register(b0) {
     float nearFadeDepth;        // parallax fades to 0 below this depth; 0 = disabled
     float mvConfidence;         // 0=pure parallax, 1=full MV correction
     float mvPixelScale;         // overall MV magnitude multiplier
-    float3 _pad;                // 12-byte alignment padding
+    float2 depthResolution;     // actual depth data dimensions (may differ from resolution when upscaler active)
+    float _pad0;                // alignment padding
+    float2 mvResolution;        // actual MV data dimensions (render-res when camera MVs + upscaler)
+    float2 _pad1;               // alignment padding
+    int debugMode;              // 0=normal, 1=depth viz, 2=MV magnitude viz
+    float3 _pad2;               // alignment to 16 bytes
+    row_major float4x4 headRotMatrix;  // head rotation delta between prev/cur cached poses
+                                       // used to subtract head rot from camera MVs
+    column_major float4x4 clipToClipNoLoco;  // prevVP * inv(curVP_original): head rot+trans, no loco
+                                              // matches camera MV source exactly
+    int hasClipToClipNoLoco;           // 1 = use clipToClipNoLoco, 0 = fallback to headRotMatrix
+    float3 _pad3;
 };
 
-// Helper: linearize depth from reversed-Z buffer value
+// LinearizeDepth: used by the parallax warp, depth-edge detection, nearFadeDepth.
+// This formula was calibrated with the rest of the ASW parallax system; do NOT change
+// without re-tuning depthScale and related parameters.
 float LinearizeDepth(float d, float zNear, float zFar) {
-    float denom = zFar - d * (zFar - zNear);
+    float denom = zNear + d * (zFar - zNear);
     return (abs(denom) > 0.0001) ? (zNear * zFar / denom) : zFar;
+}
+
+// Helper: map output pixel coordinate to MV pixel coordinate
+// When camera MVs + upscaler, MVs are render-res but output is display-res.
+int2 ToMVCoord(int2 colorPixel) {
+    float2 uv = (float2(colorPixel) + 0.5) / resolution;
+    int2 mp = int2(uv * mvResolution);
+    return clamp(mp, int2(0,0), int2(mvResolution) - 1);
+}
+
+// Helper: map output pixel coordinate to depth pixel coordinate
+// When an upscaler is active, color is display-res but depth is render-res.
+// Depth data fills the top-left corner of the staging texture.
+int2 ToDepthCoord(int2 colorPixel) {
+    float2 uv = (float2(colorPixel) + 0.5) / resolution;
+    int2 dp = int2(uv * depthResolution);
+    return clamp(dp, int2(0,0), int2(depthResolution) - 1);
 }
 
 [numthreads(8, 8, 1)]
@@ -52,8 +102,9 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     float2 uv = ((float2)tid.xy + 0.5) / resolution;
 
-    // 1. Read and linearize depth
-    float d = depthTex[tid.xy];
+    // 1. Read and linearize depth (using scaled coordinates for render-res depth)
+    int2 depthPixel = ToDepthCoord((int2)tid.xy);
+    float d = depthTex[depthPixel];
     float linearDepth = LinearizeDepth(d, nearZ, farZ);
 
     // 2. Depth-edge detection: sample 4 cardinal neighbours
@@ -63,8 +114,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     int2 pixel = (int2)tid.xy;
     int2 offsets[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };
     [unroll] for (int i = 0; i < 4; i++) {
-        int2 np = pixel + offsets[i];
-        np = clamp(np, int2(0,0), int2((int)resolution.x-1, (int)resolution.y-1));
+        int2 np = ToDepthCoord(pixel + offsets[i]);
         float nd = LinearizeDepth(depthTex[np], nearZ, farZ);
         minD = min(minD, nd);
         maxD = max(maxD, nd);
@@ -78,12 +128,11 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
     float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
     float3 newViewPos = float3(tanX * scaledDepth, tanY * scaledDepth, scaledDepth);
-
     float4 transformed = mul(poseDeltaMatrix, float4(newViewPos, 1.0));
     float3 oldViewPos = transformed.xyz;
 
     float2 parallaxUV = uv;
-    if (oldViewPos.z > 0.001) {
+    if (scaledDepth > 0.001 && oldViewPos.z > 0.001) {
         float oldTanX = oldViewPos.x / oldViewPos.z;
         float oldTanY = oldViewPos.y / oldViewPos.z;
         parallaxUV.x = (oldTanX - fovTanLeft) / (fovTanRight - fovTanLeft);
@@ -95,30 +144,99 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     //    Prevents "frame split" on hands, nearby NPCs, walls you're next to.
     float depthFade = (nearFadeDepth > 0.0) ? saturate((linearDepth - nearFadeDepth) / nearFadeDepth) : 1.0;
 
-    // 4b. MV-based warp.
-    //    kMOTION_VECTOR: forward UV convention (currentUV - prevUV), range ~[-0.5, +0.5].
-    //    mvConfidence = direct scale on MV. 0 = no MV (pure parallax). 0.5 = half frame.
-    //    Tune up from 0.5 until doubling disappears; back off if smearing appears.
-    float2 finalParallaxUV = parallaxUV;
-    if (mvConfidence > 0.0) {
-        float2 mv = mvTex[tid.xy] * mvPixelScale;   // forward UV (current - prev)
-        float2 mvSourceUV = uv - mvConfidence * mv; // direct scale: go back mvConfidence frames
-        if (any(mvSourceUV < -0.01) || any(mvSourceUV > 1.01))
-            mvSourceUV = parallaxUV;
-        finalParallaxUV = mvSourceUV;
+    // 4b. Combine depth parallax + MV correction additively.
+    //    Depth parallax (parallaxUV - uv): head translation + locomotion (depth-dependent).
+    //    MV correction: stick rotation + head trans residual from camera MVs minus head rot.
+    //    Camera MVs from RSS VP capture rotation + head tracking but NOT locomotion.
+    //    Both offsets use uv as common base to avoid double-counting.
+    float2 parallaxOffset = parallaxUV - uv;  // depth-dependent translation correction
+    float2 mvOffset = float2(0, 0);           // rotation correction from MVs
+    if (abs(mvConfidence) > 0.001) {
+        // Compute head MV (head rotation + head translation, no locomotion)
+        // to subtract from total camera MV, isolating locomotion for the warp.
+        float2 headMV = float2(0, 0);
+
+        if (hasClipToClipNoLoco) {
+            // PRIMARY PATH: Use clipToClipNoLoco from the same VP source as camera MVs.
+            // clipToClipNoLoco = prevVP * inv(curVP_original) — captures head rotation +
+            // head translation but NOT locomotion. Using the same VP matrices that
+            // generated the camera MVs ensures exact cancellation of head motion,
+            // eliminating the mismatch between OpenXR poses and game VP matrices.
+            float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+            float4 clipPos = float4(ndc, d, 1.0);
+            float4 prevClip = mul(clipToClipNoLoco, clipPos);
+            if (abs(prevClip.w) > 0.0001) {
+                float2 prevNDC = prevClip.xy / prevClip.w;
+                float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
+                headMV = prevUV - uv;
+            }
+        } else {
+            // FALLBACK: Use OpenXR-pose-derived headRotMatrix (rotation only).
+            float tanX_here = lerp(fovTanLeft, fovTanRight, uv.x);
+            float tanY_here = lerp(fovTanUp, fovTanDown, uv.y);
+            float3 viewDir = float3(tanX_here, tanY_here, 1.0);
+            float3 rotDir = mul((float3x3)headRotMatrix, viewDir);
+            float2 headPrevUV = uv;
+            if (rotDir.z > 0.001) {
+                headPrevUV.x = (rotDir.x / rotDir.z - fovTanLeft) / (fovTanRight - fovTanLeft);
+                headPrevUV.y = (rotDir.y / rotDir.z - fovTanUp) / (fovTanDown - fovTanUp);
+            }
+            headMV = headPrevUV - uv;
+        }
+
+        // Read total camera MV and subtract head motion component
+        int2 mvPixel = ToMVCoord((int2)tid.xy);
+        float2 totalMV = mvTex[mvPixel] * mvPixelScale;
+
+        // Reject MV outliers: clamp to ±0.15 UV (~540px at 3560).
+        // Game MV buffer can contain garbage values >1.0 from skybox vertices,
+        // objects entering/leaving frustum, or particle shaders.
+        totalMV = clamp(totalMV, float2(-0.15, -0.15), float2(0.15, 0.15));
+
+        float2 locoMV = totalMV - headMV;
+
+        // Apply locomotion MV to displacement.
+        // mvConfidence evaluates negatively (`-m_mvTimingRatio * scale`).
+        // To sample backwards along the MV direction (gather warp), we add the negative MV 
+        // to the read coordinate instead of subtracting it.
+        mvOffset = mvConfidence * locoMV;
     }
 
-    // 5. Apply combined fade (edge + near-field) to parallax
-    float2 sourceUV = lerp(uv, finalParallaxUV, edgeFade * depthFade);
+    // 5. Combine corrections with fading:
+    //    Depth parallax (translation): faded at depth edges and near-field.
+    //    MV locomotion (mvOffset): full strength everywhere.
+    float2 fadedParallax = parallaxOffset * edgeFade * depthFade;
+    float2 sourceUV = uv + fadedParallax + mvOffset;
 
-    // OOB safety: if warped UV is outside frame, fall back to identity
+    // OOB safety: if warped UV is outside frame, try without parallax, then identity
     if (any(sourceUV < -0.01) || any(sourceUV > 1.01)) {
-        sourceUV = uv;
+        sourceUV = uv + mvOffset;  // drop parallax, keep loco
+        if (any(sourceUV < -0.01) || any(sourceUV > 1.01))
+            sourceUV = uv;  // identity fallback
     }
     sourceUV = saturate(sourceUV);
 
     // Sample cached frame
     float4 color = prevColor.SampleLevel(linearClamp, sourceUV, 0);
+
+    // Debug visualization modes (set via aswDebugMode in INI, hot-reloadable)
+    if (debugMode == 1) {
+        // RAW depth viz: shows the raw depth buffer value (0-1 reversed-Z) as grayscale
+        // d=1 (near) → white, d=0 (far/sky) → black
+        color = float4(d, d, d, 1.0);
+    } else if (debugMode == 2) {
+        // Linearized depth viz: blue=near(<500gu), green=mid(500-5000gu), red=far(>5000gu)
+        float normDepth = saturate(linearDepth / 50000.0);
+        color = float4(normDepth, saturate(linearDepth / 5000.0) * (1.0 - normDepth),
+                       saturate(1.0 - linearDepth / 500.0), 1.0);
+    } else if (debugMode == 3) {
+        // MV magnitude viz: green = small motion, red = large motion
+        int2 mvPixel = ToMVCoord((int2)tid.xy);
+        float2 mv = mvTex[mvPixel];
+        float mvMag = length(mv) * 100.0;  // scale for visibility
+        color = float4(saturate(mvMag), saturate(1.0 - mvMag), 0.0, 1.0);
+    }
+
     output[tid.xy] = color;
 }
 )";
@@ -197,10 +315,22 @@ void ASWProvider::BuildPoseDeltaMatrix(const XrPosef& oldPose, const XrPosef& ne
 	float wx = qw * qx, wy = qw * qy, wz = qw * qz;
 
 	// Row-major 4x4 matrix
-	m[0]  = 1.0f - 2.0f * (yy + zz);  m[1]  = 2.0f * (xy - wz);          m[2]  = 2.0f * (xz + wy);          m[3]  = deltaTrans.x;
-	m[4]  = 2.0f * (xy + wz);          m[5]  = 1.0f - 2.0f * (xx + zz);   m[6]  = 2.0f * (yz - wx);          m[7]  = deltaTrans.y;
-	m[8]  = 2.0f * (xz - wy);          m[9]  = 2.0f * (yz + wx);          m[10] = 1.0f - 2.0f * (xx + yy);   m[11] = deltaTrans.z;
-	m[12] = 0.0f;                       m[13] = 0.0f;                       m[14] = 0.0f;                       m[15] = 1.0f;
+	m[0] = 1.0f - 2.0f * (yy + zz);
+	m[1] = 2.0f * (xy - wz);
+	m[2] = 2.0f * (xz + wy);
+	m[3] = deltaTrans.x;
+	m[4] = 2.0f * (xy + wz);
+	m[5] = 1.0f - 2.0f * (xx + zz);
+	m[6] = 2.0f * (yz - wx);
+	m[7] = deltaTrans.y;
+	m[8] = 2.0f * (xz - wy);
+	m[9] = 2.0f * (yz + wx);
+	m[10] = 1.0f - 2.0f * (xx + yy);
+	m[11] = deltaTrans.z;
+	m[12] = 0.0f;
+	m[13] = 0.0f;
+	m[14] = 0.0f;
+	m[15] = 1.0f;
 }
 
 // ============================================================================
@@ -214,8 +344,10 @@ ASWProvider::~ASWProvider()
 
 bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight)
 {
-	if (m_ready) return true;
-	if (!device || eyeWidth == 0 || eyeHeight == 0) return false;
+	if (m_ready)
+		return true;
+	if (!device || eyeWidth == 0 || eyeHeight == 0)
+		return false;
 
 	OOVR_LOGF("ASW: Initializing — per-eye %ux%u", eyeWidth, eyeHeight);
 
@@ -228,6 +360,36 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 		OOVR_LOG("ASW: Failed to create compute shader");
 		Shutdown();
 		return false;
+	}
+
+	// Set up D3D12 warp pipeline (separate GPU queue to avoid D3D11 contention)
+	{
+		HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&m_d3d11Device5));
+		if (FAILED(hr)) {
+			OOVR_LOG("ASW D3D12: ID3D11Device5 not available — D3D12 warp disabled");
+		} else {
+			IDXGIDevice* dxgiDevice = nullptr;
+			hr = device->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
+			if (SUCCEEDED(hr)) {
+				IDXGIAdapter* adapter = nullptr;
+				hr = dxgiDevice->GetAdapter(&adapter);
+				dxgiDevice->Release();
+				if (SUCCEEDED(hr)) {
+					if (CreateDX12Device(adapter)) {
+						if (CreateSharedFence()) {
+							if (CreateDX12ComputePipeline()) {
+								m_d3d12Ready = true;
+								OOVR_LOG("ASW D3D12: Warp pipeline fully initialized");
+							}
+						}
+					}
+					adapter->Release();
+				}
+			}
+			if (!m_d3d12Ready) {
+				OOVR_LOG("ASW D3D12: Setup failed — falling back to D3D11 warp");
+			}
+		}
 	}
 
 	if (!CreateStagingTextures(device)) {
@@ -248,7 +410,14 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 	}
 
 	m_ready = true;
-	m_hasCachedFrame = false;
+	m_publishedSlot.store(-1, std::memory_order_relaxed);
+	m_previousPublishedSlot.store(-1, std::memory_order_relaxed);
+	m_warpReadSlot.store(-1, std::memory_order_relaxed);
+	m_buildSlot = 0;
+	m_buildEyeReady[0] = false;
+	m_buildEyeReady[1] = false;
+	m_hasLastPublishedPose = false;
+	m_frameCounter = 0;
 	OOVR_LOGF("ASW: Initialized — %ux%u per eye, compute shader ready", eyeWidth, eyeHeight);
 	return true;
 }
@@ -274,7 +443,8 @@ bool ASWProvider::CreateComputeShader(ID3D11Device* device)
 		}
 		return false;
 	}
-	if (errors) errors->Release();
+	if (errors)
+		errors->Release();
 
 	hr = device->CreateComputeShader(compiled->GetBufferPointer(),
 	    compiled->GetBufferSize(), nullptr, &m_warpCS);
@@ -316,60 +486,150 @@ bool ASWProvider::CreateComputeShader(ID3D11Device* device)
 
 bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 {
+	// When D3D12 warp is active, textures need SHARED flags for cross-API access
+	UINT sharedFlags = 0;
+	if (m_d3d12Ready)
+		sharedFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = m_eyeWidth;
+	desc.Height = m_eyeHeight;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+
+	// D3D12 descriptor heap CPU handle (for creating SRV/UAV descriptors)
+	D3D12_CPU_DESCRIPTOR_HANDLE heapCpuStart = {};
+	if (m_d3d12Ready && m_d3d12SrvUavHeap)
+		heapCpuStart = m_d3d12SrvUavHeap->GetCPUDescriptorHandleForHeapStart();
+
+	for (uint32_t slot = 0; slot < kAswCacheSlotCount; ++slot) {
+		for (int eye = 0; eye < 2; ++eye) {
+			uint32_t descBaseIndex = (slot * 2 + eye) * 3; // 3 SRVs per slot/eye
+
+			// Cached color (RGBA)
+			desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			desc.MiscFlags = sharedFlags;
+			HRESULT hr = device->CreateTexture2D(&desc, nullptr, &m_cachedColor[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateTexture2D color[%u][%d] failed hr=0x%08X", slot, eye, hr);
+				return false;
+			}
+			srvDesc.Format = desc.Format;
+			hr = device->CreateShaderResourceView(m_cachedColor[slot][eye], &srvDesc, &m_srvColor[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateSRV color[%u][%d] failed", slot, eye);
+				return false;
+			}
+
+			// Cached MV (R16G16_FLOAT)
+			desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+			hr = device->CreateTexture2D(&desc, nullptr, &m_cachedMV[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateTexture2D MV[%u][%d] failed hr=0x%08X", slot, eye, hr);
+				return false;
+			}
+			srvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+			hr = device->CreateShaderResourceView(m_cachedMV[slot][eye], &srvDesc, &m_srvMV[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateSRV MV[%u][%d] failed", slot, eye);
+				return false;
+			}
+
+			// Cached depth (R32_FLOAT)
+			desc.Format = DXGI_FORMAT_R32_FLOAT;
+			hr = device->CreateTexture2D(&desc, nullptr, &m_cachedDepth[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateTexture2D depth[%u][%d] failed hr=0x%08X", slot, eye, hr);
+				return false;
+			}
+			srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+			hr = device->CreateShaderResourceView(m_cachedDepth[slot][eye], &srvDesc, &m_srvDepth[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateSRV depth[%u][%d] failed", slot, eye);
+				return false;
+			}
+
+			// Share to D3D12 and create SRV descriptors
+			if (m_d3d12Ready) {
+				ShareTextureD3D11ToD3D12(m_cachedColor[slot][eye], &m_d3d12CachedColor[slot][eye]);
+				ShareTextureD3D11ToD3D12(m_cachedMV[slot][eye], &m_d3d12CachedMV[slot][eye]);
+				ShareTextureD3D11ToD3D12(m_cachedDepth[slot][eye], &m_d3d12CachedDepth[slot][eye]);
+
+				if (m_d3d12CachedColor[slot][eye] && m_d3d12CachedMV[slot][eye] && m_d3d12CachedDepth[slot][eye]) {
+					// Color SRV (t0)
+					D3D12_SHADER_RESOURCE_VIEW_DESC d3d12SrvDesc = {};
+					d3d12SrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+					d3d12SrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+					d3d12SrvDesc.Texture2D.MipLevels = 1;
+
+					D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+					cpuHandle.ptr = heapCpuStart.ptr + (SIZE_T)(descBaseIndex + 0) * m_d3d12HeapDescriptorSize;
+					d3d12SrvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+					m_d3d12Device->CreateShaderResourceView(m_d3d12CachedColor[slot][eye], &d3d12SrvDesc, cpuHandle);
+
+					// MV SRV (t1)
+					cpuHandle.ptr = heapCpuStart.ptr + (SIZE_T)(descBaseIndex + 1) * m_d3d12HeapDescriptorSize;
+					d3d12SrvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+					m_d3d12Device->CreateShaderResourceView(m_d3d12CachedMV[slot][eye], &d3d12SrvDesc, cpuHandle);
+
+					// Depth SRV (t2)
+					cpuHandle.ptr = heapCpuStart.ptr + (SIZE_T)(descBaseIndex + 2) * m_d3d12HeapDescriptorSize;
+					d3d12SrvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+					m_d3d12Device->CreateShaderResourceView(m_d3d12CachedDepth[slot][eye], &d3d12SrvDesc, cpuHandle);
+				} else {
+					OOVR_LOGF("ASW D3D12: Failed to share cache textures slot=%u eye=%d", slot, eye);
+					m_d3d12Ready = false;
+				}
+			}
+		}
+	}
+
 	for (int eye = 0; eye < 2; eye++) {
-		// Cached color (RGBA)
-		D3D11_TEXTURE2D_DESC desc = {};
-		desc.Width = m_eyeWidth;
-		desc.Height = m_eyeHeight;
-		desc.MipLevels = 1;
-		desc.ArraySize = 1;
-		desc.SampleDesc.Count = 1;
-		desc.Usage = D3D11_USAGE_DEFAULT;
-
-		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		HRESULT hr = device->CreateTexture2D(&desc, nullptr, &m_cachedColor[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateTexture2D color[%d] failed", eye); return false; }
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-		srvDesc.Format = desc.Format;
-		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		srvDesc.Texture2D.MipLevels = 1;
-		hr = device->CreateShaderResourceView(m_cachedColor[eye], &srvDesc, &m_srvColor[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateSRV color[%d] failed", eye); return false; }
-
-		// Cached MV (R16G16_FLOAT)
-		desc.Format = DXGI_FORMAT_R16G16_FLOAT;
-		hr = device->CreateTexture2D(&desc, nullptr, &m_cachedMV[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateTexture2D MV[%d] failed", eye); return false; }
-
-		srvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
-		hr = device->CreateShaderResourceView(m_cachedMV[eye], &srvDesc, &m_srvMV[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateSRV MV[%d] failed", eye); return false; }
-
-		// Cached depth (R32_FLOAT)
-		desc.Format = DXGI_FORMAT_R32_FLOAT;
-		hr = device->CreateTexture2D(&desc, nullptr, &m_cachedDepth[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateTexture2D depth[%d] failed", eye); return false; }
-
-		srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
-		hr = device->CreateShaderResourceView(m_cachedDepth[eye], &srvDesc, &m_srvDepth[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateSRV depth[%d] failed", eye); return false; }
-
 		// Warped output (RGBA, UAV for compute shader)
 		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-		hr = device->CreateTexture2D(&desc, nullptr, &m_warpedOutput[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateTexture2D output[%d] failed", eye); return false; }
+		desc.MiscFlags = sharedFlags;
+		HRESULT hr = device->CreateTexture2D(&desc, nullptr, &m_warpedOutput[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateTexture2D output[%d] failed hr=0x%08X", eye, hr);
+			return false;
+		}
 
 		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
 		uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
 		hr = device->CreateUnorderedAccessView(m_warpedOutput[eye], &uavDesc, &m_uavOutput[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateUAV output[%d] failed", eye); return false; }
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateUAV output[%d] failed", eye);
+			return false;
+		}
+
+		// Share warped output to D3D12 and create UAV descriptor
+		if (m_d3d12Ready) {
+			ShareTextureD3D11ToD3D12(m_warpedOutput[eye], &m_d3d12WarpedOutput[eye]);
+			if (m_d3d12WarpedOutput[eye]) {
+				uint32_t uavIndex = 3 * kAswCacheSlotCount * 2 + eye;
+				D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+				cpuHandle.ptr = heapCpuStart.ptr + (SIZE_T)uavIndex * m_d3d12HeapDescriptorSize;
+				D3D12_UNORDERED_ACCESS_VIEW_DESC d3d12UavDesc = {};
+				d3d12UavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				d3d12UavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+				m_d3d12Device->CreateUnorderedAccessView(m_d3d12WarpedOutput[eye], nullptr, &d3d12UavDesc, cpuHandle);
+			} else {
+				OOVR_LOGF("ASW D3D12: Failed to share warped output eye=%d", eye);
+				m_d3d12Ready = false;
+			}
+		}
 	}
 
-	OOVR_LOG("ASW: Staging textures created (2 eyes × 4 textures)");
+	OOVR_LOGF("ASW: Cache textures created (%u slots x 2 eyes, d3d12=%d)", kAswCacheSlotCount, m_d3d12Ready ? 1 : 0);
 	return true;
 }
 
@@ -410,7 +670,81 @@ bool ASWProvider::CreateOutputSwapchain(uint32_t width, uint32_t height)
 	for (uint32_t i = 0; i < imageCount; i++)
 		m_outputSwapchainImages[i] = images[i].texture;
 
-	OOVR_LOGF("ASW: Output swapchain created %ux%u (%u images)", width, height, imageCount);
+	// Try to share swapchain images to D3D12 for direct copy (bypasses D3D11 GPU queue)
+	m_d3d12DirectCopy = false;
+	if (m_d3d12Ready && imageCount <= kMaxSwapchainImages) {
+		// Log swapchain image flags for diagnostics
+		{
+			D3D11_TEXTURE2D_DESC desc;
+			m_outputSwapchainImages[0]->GetDesc(&desc);
+			OOVR_LOGF("ASW D3D12: Swapchain image[0] Format=%u BindFlags=0x%X MiscFlags=0x%X Usage=%d",
+			    desc.Format, desc.BindFlags, desc.MiscFlags, desc.Usage);
+		}
+
+		bool allShared = true;
+		for (uint32_t i = 0; i < imageCount; i++) {
+			HANDLE handle = nullptr;
+			HRESULT hr;
+
+			// Try 1: NT handle sharing (IDXGIResource1::CreateSharedHandle)
+			IDXGIResource1* dxgiRes1 = nullptr;
+			hr = m_outputSwapchainImages[i]->QueryInterface(IID_PPV_ARGS(&dxgiRes1));
+			if (SUCCEEDED(hr)) {
+				hr = dxgiRes1->CreateSharedHandle(nullptr,
+				    DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle);
+				dxgiRes1->Release();
+				if (SUCCEEDED(hr) && handle) {
+					hr = m_d3d12Device->OpenSharedHandle(handle, IID_PPV_ARGS(&m_d3d12SwapchainImages[i]));
+					CloseHandle(handle);
+					if (SUCCEEDED(hr)) {
+						if (i == 0)
+							OOVR_LOG("ASW D3D12: Swapchain sharing via NT handle succeeded");
+						continue;
+					}
+					OOVR_LOGF("ASW D3D12: Swapchain image[%u] NT handle OpenSharedHandle failed (hr=0x%08X)", i, hr);
+				}
+			}
+
+			// Try 2: Legacy sharing (IDXGIResource::GetSharedHandle)
+			IDXGIResource* dxgiRes = nullptr;
+			hr = m_outputSwapchainImages[i]->QueryInterface(IID_PPV_ARGS(&dxgiRes));
+			if (SUCCEEDED(hr)) {
+				handle = nullptr;
+				hr = dxgiRes->GetSharedHandle(&handle);
+				dxgiRes->Release();
+				if (SUCCEEDED(hr) && handle) {
+					hr = m_d3d12Device->OpenSharedHandle(handle, IID_PPV_ARGS(&m_d3d12SwapchainImages[i]));
+					// Legacy handles are global — don't CloseHandle
+					if (SUCCEEDED(hr)) {
+						if (i == 0)
+							OOVR_LOG("ASW D3D12: Swapchain sharing via legacy handle succeeded");
+						continue;
+					}
+					OOVR_LOGF("ASW D3D12: Swapchain image[%u] legacy OpenSharedHandle failed (hr=0x%08X)", i, hr);
+				} else {
+					OOVR_LOGF("ASW D3D12: Swapchain image[%u] GetSharedHandle failed (hr=0x%08X)", i, hr);
+				}
+			}
+
+			allShared = false;
+			break;
+		}
+		if (allShared) {
+			m_d3d12DirectCopy = true;
+			OOVR_LOGF("ASW D3D12: Swapchain images shared to D3D12 (%u images) — direct copy enabled", imageCount);
+		} else {
+			// Clean up any partially shared images
+			for (uint32_t i = 0; i < kMaxSwapchainImages; i++) {
+				if (m_d3d12SwapchainImages[i]) {
+					m_d3d12SwapchainImages[i]->Release();
+					m_d3d12SwapchainImages[i] = nullptr;
+				}
+			}
+			OOVR_LOG("ASW D3D12: Swapchain sharing failed — falling back to D3D11 copy");
+		}
+	}
+
+	OOVR_LOGF("ASW: Output swapchain created %ux%u (%u images, d3d12DirectCopy=%d)", width, height, imageCount, m_d3d12DirectCopy ? 1 : 0);
 	return true;
 }
 
@@ -464,6 +798,432 @@ bool ASWProvider::CreateDepthSwapchain(uint32_t width, uint32_t height)
 }
 
 // ============================================================================
+// D3D12 warp pipeline setup
+// ============================================================================
+
+bool ASWProvider::CreateDX12Device(IDXGIAdapter* adapter)
+{
+	HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_d3d12Device));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: D3D12CreateDevice failed (hr=0x%08X)", hr);
+		return false;
+	}
+
+	// DIRECT command queue — COMPUTE type crashes some drivers (see Fsr3Upscaler)
+	// COMPUTE queue: runs on async compute hardware, physically separate from the
+	// graphics pipe. D3D11 game draws run on the graphics pipe; warp compute runs
+	// on the async compute pipe concurrently with ZERO contention.
+	// Dispatch + CopyTextureRegion are both supported on COMPUTE queues.
+	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+	queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+	hr = m_d3d12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_d3d12CmdQueue));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateCommandQueue(COMPUTE) failed (hr=0x%08X)", hr);
+		return false;
+	}
+
+	hr = m_d3d12Device->CreateCommandAllocator(
+	    D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&m_d3d12CmdAlloc));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateCommandAllocator(COMPUTE) failed (hr=0x%08X)", hr);
+		return false;
+	}
+
+	hr = m_d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+	    m_d3d12CmdAlloc, nullptr, IID_PPV_ARGS(&m_d3d12CmdList));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateCommandList failed (hr=0x%08X)", hr);
+		return false;
+	}
+	// Command list starts recording; close until first use
+	m_d3d12CmdList->Close();
+
+	// Second allocator + list for game staging→swapchain copies (step G2)
+	hr = m_d3d12Device->CreateCommandAllocator(
+	    D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_d3d12GameCopyCmdAlloc));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateCommandAllocator(gameCopy) failed (hr=0x%08X)", hr);
+		return false;
+	}
+	hr = m_d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+	    m_d3d12GameCopyCmdAlloc, nullptr, IID_PPV_ARGS(&m_d3d12GameCopyCmdList));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateCommandList(gameCopy) failed (hr=0x%08X)", hr);
+		return false;
+	}
+	m_d3d12GameCopyCmdList->Close();
+	m_gameCopyFenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+	OOVR_LOG("ASW D3D12: Device + DIRECT queue created on same adapter");
+	return true;
+}
+
+bool ASWProvider::CreateSharedFence()
+{
+	HRESULT hr = m_d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&m_d3d12Fence));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateFence(SHARED) failed (hr=0x%08X)", hr);
+		return false;
+	}
+
+	hr = m_d3d12Device->CreateSharedHandle(m_d3d12Fence, nullptr, GENERIC_ALL, nullptr, &m_fenceSharedHandle);
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateSharedHandle(fence) failed (hr=0x%08X)", hr);
+		return false;
+	}
+
+	hr = m_d3d11Device5->OpenSharedFence(m_fenceSharedHandle, IID_PPV_ARGS(&m_d3d11Fence));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: OpenSharedFence failed (hr=0x%08X)", hr);
+		return false;
+	}
+
+	m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+	m_fenceValue = 0;
+	m_cacheFenceValue.store(0, std::memory_order_relaxed);
+
+	// ── Gap fence: separate shared fence for GPU-side stall (D3D12→D3D11) ──
+	hr = m_d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&m_d3d12GapFence));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateFence(gap,SHARED) failed (hr=0x%08X)", hr);
+		return false;
+	}
+	hr = m_d3d12Device->CreateSharedHandle(m_d3d12GapFence, nullptr, GENERIC_ALL, nullptr, &m_gapFenceSharedHandle);
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateSharedHandle(gap) failed (hr=0x%08X)", hr);
+		return false;
+	}
+	hr = m_d3d11Device5->OpenSharedFence(m_gapFenceSharedHandle, IID_PPV_ARGS(&m_d3d11GapFence));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: OpenSharedFence(gap) failed (hr=0x%08X)", hr);
+		return false;
+	}
+	m_gapFenceValue.store(0, std::memory_order_relaxed);
+	m_gapTargetValue.store(0, std::memory_order_relaxed);
+
+	OOVR_LOG("ASW D3D12: Cross-API shared fence + gap fence created");
+	return true;
+}
+
+void ASWProvider::ShareTextureD3D11ToD3D12(ID3D11Texture2D* d3d11Tex, ID3D12Resource** outD3d12)
+{
+	*outD3d12 = nullptr;
+	IDXGIResource1* dxgiRes = nullptr;
+	HRESULT hr = d3d11Tex->QueryInterface(IID_PPV_ARGS(&dxgiRes));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: QI for IDXGIResource1 failed (hr=0x%08X)", hr);
+		return;
+	}
+
+	HANDLE handle = nullptr;
+	hr = dxgiRes->CreateSharedHandle(nullptr,
+	    DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle);
+	dxgiRes->Release();
+	if (FAILED(hr) || !handle) {
+		OOVR_LOGF("ASW D3D12: CreateSharedHandle failed (hr=0x%08X)", hr);
+		return;
+	}
+
+	hr = m_d3d12Device->OpenSharedHandle(handle, IID_PPV_ARGS(outD3d12));
+	CloseHandle(handle);
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: OpenSharedHandle failed (hr=0x%08X)", hr);
+		*outD3d12 = nullptr;
+	}
+}
+
+bool ASWProvider::CreateDX12ComputePipeline()
+{
+	// 1. Compile HLSL to cs_5_1 (D3D12 requires SM 5.1+ for root signature binding)
+	DWORD flags = D3DCOMPILE_PACK_MATRIX_ROW_MAJOR | D3DCOMPILE_ENABLE_STRICTNESS;
+#ifdef _DEBUG
+	flags |= D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_DEBUG;
+#else
+	flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#endif
+
+	ID3DBlob* compiled = nullptr;
+	ID3DBlob* errors = nullptr;
+	HRESULT hr = D3DCompile(s_warpShaderHLSL, strlen(s_warpShaderHLSL),
+	    "ASWWarp_DX12", nullptr, nullptr, "CSMain", "cs_5_1", flags, 0, &compiled, &errors);
+	if (FAILED(hr)) {
+		if (errors) {
+			OOVR_LOGF("ASW D3D12: Shader compile error: %s", (char*)errors->GetBufferPointer());
+			errors->Release();
+		}
+		return false;
+	}
+	if (errors)
+		errors->Release();
+
+	// 2. Root signature: CBV(b0) + SRV table(t0-t2) + UAV table(u0) + static sampler(s0)
+	D3D12_DESCRIPTOR_RANGE1 srvRange = {};
+	srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	srvRange.NumDescriptors = 3;
+	srvRange.BaseShaderRegister = 0;
+	srvRange.RegisterSpace = 0;
+	srvRange.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+	srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+	D3D12_DESCRIPTOR_RANGE1 uavRange = {};
+	uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+	uavRange.NumDescriptors = 1;
+	uavRange.BaseShaderRegister = 0;
+	uavRange.RegisterSpace = 0;
+	uavRange.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+	uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+	D3D12_ROOT_PARAMETER1 rootParams[3] = {};
+	// Param 0: Root CBV (b0)
+	rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	rootParams[0].Descriptor.ShaderRegister = 0;
+	rootParams[0].Descriptor.RegisterSpace = 0;
+	rootParams[0].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
+	rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+	// Param 1: SRV descriptor table (t0-t2)
+	rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	rootParams[1].DescriptorTable.NumDescriptorRanges = 1;
+	rootParams[1].DescriptorTable.pDescriptorRanges = &srvRange;
+	rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+	// Param 2: UAV descriptor table (u0)
+	rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	rootParams[2].DescriptorTable.NumDescriptorRanges = 1;
+	rootParams[2].DescriptorTable.pDescriptorRanges = &uavRange;
+	rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	D3D12_STATIC_SAMPLER_DESC staticSampler = {};
+	staticSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+	staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	staticSampler.ShaderRegister = 0;
+	staticSampler.RegisterSpace = 0;
+	staticSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+	staticSampler.MaxLOD = D3D12_FLOAT32_MAX;
+
+	D3D12_VERSIONED_ROOT_SIGNATURE_DESC rsDesc = {};
+	rsDesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+	rsDesc.Desc_1_1.NumParameters = 3;
+	rsDesc.Desc_1_1.pParameters = rootParams;
+	rsDesc.Desc_1_1.NumStaticSamplers = 1;
+	rsDesc.Desc_1_1.pStaticSamplers = &staticSampler;
+
+	ID3DBlob* serialized = nullptr;
+	ID3DBlob* rsErrors = nullptr;
+	hr = D3D12SerializeVersionedRootSignature(&rsDesc, &serialized, &rsErrors);
+	if (FAILED(hr)) {
+		if (rsErrors) {
+			OOVR_LOGF("ASW D3D12: Root signature serialize error: %s", (char*)rsErrors->GetBufferPointer());
+			rsErrors->Release();
+		}
+		compiled->Release();
+		return false;
+	}
+	if (rsErrors)
+		rsErrors->Release();
+
+	hr = m_d3d12Device->CreateRootSignature(0, serialized->GetBufferPointer(),
+	    serialized->GetBufferSize(), IID_PPV_ARGS(&m_d3d12RootSig));
+	serialized->Release();
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateRootSignature failed (hr=0x%08X)", hr);
+		compiled->Release();
+		return false;
+	}
+
+	// 3. Compute PSO
+	D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+	psoDesc.pRootSignature = m_d3d12RootSig;
+	psoDesc.CS.pShaderBytecode = compiled->GetBufferPointer();
+	psoDesc.CS.BytecodeLength = compiled->GetBufferSize();
+	hr = m_d3d12Device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_d3d12PipelineState));
+	compiled->Release();
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateComputePipelineState failed (hr=0x%08X)", hr);
+		return false;
+	}
+
+	// 4. Descriptor heap: 3 SRVs per slot/eye + 2 UAVs for warped output
+	// Layout: [slot0_eye0: colorSRV, mvSRV, depthSRV] [slot0_eye1: ...] ... [uav_eye0] [uav_eye1]
+	uint32_t totalDescriptors = 3 * kAswCacheSlotCount * 2 + 2;
+	D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	heapDesc.NumDescriptors = totalDescriptors;
+	heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	hr = m_d3d12Device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_d3d12SrvUavHeap));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateDescriptorHeap failed (hr=0x%08X)", hr);
+		return false;
+	}
+	m_d3d12HeapDescriptorSize = m_d3d12Device->GetDescriptorHandleIncrementSize(
+	    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	// 5. Upload-heap constant buffer: 2 x 256-byte-aligned regions (one per eye).
+	// Eye 0 and eye 1 dispatches are recorded into the same command list before
+	// execution, so each eye needs its own CB region to avoid eye 1 overwriting eye 0.
+	m_d3d12CbEyeStride = (sizeof(WarpConstants) + 255) & ~255;
+	uint32_t cbSize = m_d3d12CbEyeStride * 2;
+	D3D12_HEAP_PROPERTIES uploadHeap = {};
+	uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+	D3D12_RESOURCE_DESC cbResDesc = {};
+	cbResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	cbResDesc.Alignment = 0;
+	cbResDesc.Width = cbSize;
+	cbResDesc.Height = 1;
+	cbResDesc.DepthOrArraySize = 1;
+	cbResDesc.MipLevels = 1;
+	cbResDesc.Format = DXGI_FORMAT_UNKNOWN;
+	cbResDesc.SampleDesc.Count = 1;
+	cbResDesc.SampleDesc.Quality = 0;
+	cbResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	cbResDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+	hr = m_d3d12Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE,
+	    &cbResDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_d3d12ConstantBuffer));
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CreateCommittedResource(CB) failed (hr=0x%08X)", hr);
+		return false;
+	}
+
+	// Persistent map
+	D3D12_RANGE readRange = { 0, 0 }; // We won't read from CPU
+	hr = m_d3d12ConstantBuffer->Map(0, &readRange, &m_d3d12CbMappedPtr);
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW D3D12: CB Map failed (hr=0x%08X)", hr);
+		return false;
+	}
+
+	OOVR_LOGF("ASW D3D12: Compute pipeline ready (%u descriptors, CB %u bytes)", totalDescriptors, cbSize);
+	return true;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE ASWProvider::GetSrvGpuHandle(int slot, int eye) const
+{
+	// Layout: [slot0_eye0: 3 SRVs] [slot0_eye1: 3 SRVs] [slot1_eye0: ...] ... [UAVs]
+	uint32_t index = (slot * 2 + eye) * 3;
+	D3D12_GPU_DESCRIPTOR_HANDLE handle = m_d3d12SrvUavHeap->GetGPUDescriptorHandleForHeapStart();
+	handle.ptr += (SIZE_T)index * m_d3d12HeapDescriptorSize;
+	return handle;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE ASWProvider::GetUavGpuHandle(int eye) const
+{
+	// UAVs are after all SRVs
+	uint32_t index = 3 * kAswCacheSlotCount * 2 + eye;
+	D3D12_GPU_DESCRIPTOR_HANDLE handle = m_d3d12SrvUavHeap->GetGPUDescriptorHandleForHeapStart();
+	handle.ptr += (SIZE_T)index * m_d3d12HeapDescriptorSize;
+	return handle;
+}
+
+void ASWProvider::SignalCacheDone(ID3D11DeviceContext* ctx)
+{
+	if (!m_d3d12Ready || !m_d3d11Fence)
+		return;
+
+	ID3D11DeviceContext4* ctx4 = nullptr;
+	ctx->QueryInterface(IID_PPV_ARGS(&ctx4));
+	if (ctx4) {
+		uint64_t val = ++m_fenceValue;
+		ctx4->Signal(m_d3d11Fence, val);
+		m_cacheFenceValue.store(val, std::memory_order_release);
+		// Store per-slot fence value for the just-published slot
+		int pub = m_publishedSlot.load(std::memory_order_acquire);
+		if (pub >= 0 && pub < (int)kAswCacheSlotCount)
+			m_slotCacheFenceValue[pub] = val;
+		ctx4->Release();
+	}
+}
+
+bool ASWProvider::InsertGpuGap(ID3D11DeviceContext* ctx)
+{
+	if (!m_gpuGapEnabled.load(std::memory_order_acquire))
+		return false;
+	if (!m_d3d12Ready || !m_d3d11GapFence)
+		return false;
+
+	ID3D11DeviceContext4* ctx4 = nullptr;
+	ctx->QueryInterface(IID_PPV_ARGS(&ctx4));
+	if (!ctx4)
+		return false;
+
+	uint64_t target = m_gapFenceValue.fetch_add(1, std::memory_order_relaxed) + 1;
+	m_gapTargetValue.store(target, std::memory_order_release);
+
+	// GPU-side wait: D3D11 command stream stalls until gap fence reaches target.
+	// CPU returns immediately — no blocking. Right eye draws queue behind this.
+	ctx4->Wait(m_d3d11GapFence, target);
+	ctx4->Release();
+
+	{
+		static int s = 0;
+		if (s++ < 30 || (s % 300 == 0))
+			OOVR_LOGF("ASW InsertGpuGap: target=%llu (GPU stall inserted after left eye)", (unsigned long long)target);
+	}
+	return true;
+}
+
+void ASWProvider::ReleaseGpuGap()
+{
+	if (!m_d3d12Ready || !m_d3d12GapFence || !m_d3d12CmdQueue)
+		return;
+
+	uint64_t target = m_gapTargetValue.load(std::memory_order_acquire);
+	if (target == 0)
+		return; // no gap pending
+
+	// Signal the gap fence from the D3D12 queue.
+	// At this point (~13ms), the D3D12 queue is idle (no pending warp work).
+	// The signal fires immediately, releasing the D3D11 GPU stall.
+	m_d3d12CmdQueue->Signal(m_d3d12GapFence, target);
+
+	{
+		static int s = 0;
+		if (s++ < 30 || (s % 300 == 0))
+			OOVR_LOGF("ASW ReleaseGpuGap: signaled target=%llu (GPU resumes right eye)", (unsigned long long)target);
+	}
+}
+
+int ASWProvider::GetLatestReadySlot(int preferredSlot) const
+{
+	if (!m_d3d12Ready || !m_d3d12Fence)
+		return preferredSlot;
+
+	uint64_t completed = m_d3d12Fence->GetCompletedValue();
+
+	// Check preferred slot first (current published slot)
+	if (preferredSlot >= 0 && preferredSlot < (int)kAswCacheSlotCount) {
+		if (m_slotCacheFenceValue[preferredSlot] > 0 && completed >= m_slotCacheFenceValue[preferredSlot])
+			return preferredSlot;
+	}
+
+	// Preferred slot's fence hasn't completed — find the most recent ready alternative.
+	// "Most recent" = highest fence value that's completed (higher fence = newer frame).
+	int bestSlot = -1;
+	uint64_t bestFence = 0;
+	for (int i = 0; i < (int)kAswCacheSlotCount; i++) {
+		if (m_slotCacheFenceValue[i] > 0 && completed >= m_slotCacheFenceValue[i]) {
+			if (m_slotCacheFenceValue[i] > bestFence) {
+				bestFence = m_slotCacheFenceValue[i];
+				bestSlot = i;
+			}
+		}
+	}
+	return bestSlot;
+}
+
+bool ASWProvider::WaitForFenceValue(uint64_t value, DWORD timeoutMs)
+{
+	if (!m_d3d12Fence || !m_fenceEvent)
+		return false;
+	if (m_d3d12Fence->GetCompletedValue() >= value)
+		return true;
+	HRESULT hr = m_d3d12Fence->SetEventOnCompletion(value, m_fenceEvent);
+	if (FAILED(hr))
+		return false;
+	return (WaitForSingleObject(m_fenceEvent, timeoutMs) == WAIT_OBJECT_0);
+}
+
+// ============================================================================
 // Per-frame operations
 // ============================================================================
 
@@ -472,12 +1232,14 @@ bool ASWProvider::CreateDepthSwapchain(uint32_t width, uint32_t height)
 // Must be a standalone function: __try/__except can't coexist with C++ destructors.
 static bool SafeBridgeCopy(ID3D11DeviceContext* ctx,
     ID3D11Resource* dst, UINT dstSub, UINT dstX, UINT dstY, UINT dstZ,
-    ID3D11Resource* src, UINT srcSub, const D3D11_BOX* srcBox) {
+    ID3D11Resource* src, UINT srcSub, const D3D11_BOX* srcBox)
+{
 	__try {
 		ctx->CopySubresourceRegion(dst, dstSub, dstX, dstY, dstZ, src, srcSub, srcBox);
 		return true;
 	} __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
-	    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+	        ? EXCEPTION_EXECUTE_HANDLER
+	        : EXCEPTION_CONTINUE_SEARCH) {
 		return false;
 	}
 }
@@ -489,182 +1251,439 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
     const XrPosef& eyePose, const XrFovf& eyeFov,
     float nearZ, float farZ)
 {
-	if (!m_ready || eye < 0 || eye > 1) return;
+	if (!m_ready || eye < 0 || eye > 1)
+		return;
+	const bool enableReadbackDiag = (oovr_global_configuration.ASWDebugMode() >= 10);
+	const int slot = m_buildSlot;
 
-	// Copy color (game eye texture → cached)
+	if (eye == 0) {
+		// Default dimensions when optional MV/depth copies are unavailable.
+		m_slotMVDataW[slot] = m_eyeWidth;
+		m_slotMVDataH[slot] = m_eyeHeight;
+		m_slotDepthDataW[slot] = m_eyeWidth;
+		m_slotDepthDataH[slot] = m_eyeHeight;
+	}
+
+	// Copy color (game eye texture -> cached slot)
 	if (colorTex && colorRegion) {
-		if (!SafeBridgeCopy(ctx, m_cachedColor[eye], 0, 0, 0, 0,
-		    colorTex, 0, colorRegion)) {
-			OOVR_LOG("ASW: TOCTOU — color texture freed during copy");
+		if (!SafeBridgeCopy(ctx, m_cachedColor[slot][eye], 0, 0, 0, 0,
+		        colorTex, 0, colorRegion)) {
+			OOVR_LOG("ASW: TOCTOU - color texture freed during copy");
 			return;
 		}
 	}
 
-	// Copy motion vectors (bridge MV → cached)
-	// Only copy when MV correction is active — the copy creates a write→read GPU hazard
-	// (CopySubresourceRegion write → shader SRV read) that forces a pipeline barrier and
-	// serializes the warp with the game renderer. Skip when mvConfidence=0 to avoid cost.
-	if (mvTex && mvRegion && oovr_global_configuration.ASWMVConfidence() > 0.0f) {
-		if (!SafeBridgeCopy(ctx, m_cachedMV[eye], 0, 0, 0, 0,
-		    mvTex, 0, mvRegion)) {
-			OOVR_LOG("ASW: TOCTOU — MV texture freed during copy");
+	// Copy motion vectors (bridge MV -> cached slot)
+	if (mvTex && mvRegion && fabsf(oovr_global_configuration.ASWMVConfidence()) > 0.001f) {
+		if (!SafeBridgeCopy(ctx, m_cachedMV[slot][eye], 0, 0, 0, 0,
+		        mvTex, 0, mvRegion)) {
+			OOVR_LOG("ASW: TOCTOU - MV texture freed during copy");
 			return;
+		}
+		m_slotMVDataW[slot] = mvRegion->right - mvRegion->left;
+		m_slotMVDataH[slot] = mvRegion->bottom - mvRegion->top;
+
+		// Optional readback diagnostics (left eye only)
+		{
+			static int s_mvReadbackFrame = 0;
+			s_mvReadbackFrame++;
+			if (enableReadbackDiag && s_mvReadbackFrame > 90 && (s_mvReadbackFrame % 30) == 0 && eye == 0) {
+				static int s_mvSampleCount = 0;
+				if (s_mvSampleCount < 60) {
+					s_mvSampleCount++;
+					ID3D11Device* dev = nullptr;
+					ctx->GetDevice(&dev);
+					if (dev) {
+						D3D11_TEXTURE2D_DESC readDesc;
+						m_cachedMV[slot][eye]->GetDesc(&readDesc);
+						readDesc.Usage = D3D11_USAGE_STAGING;
+						readDesc.BindFlags = 0;
+						readDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+						ID3D11Texture2D* readback = nullptr;
+						if (SUCCEEDED(dev->CreateTexture2D(&readDesc, nullptr, &readback))) {
+							ctx->CopyResource(readback, m_cachedMV[slot][eye]);
+							D3D11_MAPPED_SUBRESOURCE mapped;
+							if (SUCCEEDED(ctx->Map(readback, 0, D3D11_MAP_READ, 0, &mapped))) {
+								uint32_t mw = m_slotMVDataW[slot] > 0 ? m_slotMVDataW[slot] : readDesc.Width;
+								uint32_t mh = m_slotMVDataH[slot] > 0 ? m_slotMVDataH[slot] : readDesc.Height;
+								uint32_t bytesPerRow = mapped.RowPitch;
+								auto readMV = [&](uint32_t px, uint32_t py, float& outX, float& outY) {
+									const uint16_t* row = (const uint16_t*)((const uint8_t*)mapped.pData + py * bytesPerRow);
+									uint16_t hx = row[px * 2 + 0];
+									uint16_t hy = row[px * 2 + 1];
+									auto h2f = [](uint16_t h) -> float {
+										uint32_t sign = (h >> 15) & 1;
+										uint32_t exp = (h >> 10) & 0x1F;
+										uint32_t mant = h & 0x3FF;
+										if (exp == 0)
+											return sign ? -0.0f : 0.0f;
+										if (exp == 31)
+											return sign ? -1e30f : 1e30f;
+										float f = ldexpf((float)(mant + 1024) / 1024.0f, (int)exp - 15);
+										return sign ? -f : f;
+									};
+									outX = h2f(hx);
+									outY = h2f(hy);
+								};
+								float cx, cy, lx, ly, rx, ry, tx, ty, bx, by;
+								readMV(mw / 2, mh / 2, cx, cy);
+								readMV(mw / 8, mh / 2, lx, ly);
+								readMV(mw * 7 / 8, mh / 2, rx, ry);
+								readMV(mw / 2, mh / 8, tx, ty);
+								readMV(mw / 2, mh * 7 / 8, bx, by);
+								float headYawDeg = 0.0f;
+								if (m_slotHasPrevPose[slot]) {
+									XrQuaternionf pInv;
+									QuatInverse(m_slotPrevPose[slot][eye].orientation, pInv);
+									XrQuaternionf dq;
+									QuatMultiply(pInv, m_slotPose[slot][eye].orientation, dq);
+									headYawDeg = atan2f(2.0f * (dq.w * dq.y + dq.x * dq.z),
+									                 1.0f - 2.0f * (dq.x * dq.x + dq.y * dq.y))
+									    * 57.2958f;
+								}
+								OOVR_LOGF("ASW MV[%d]: center=(%.5f,%.5f) left=(%.5f,%.5f) right=(%.5f,%.5f) top=(%.5f,%.5f) bot=(%.5f,%.5f) headYaw=%.2fdeg (data %ux%u)",
+								    s_mvSampleCount, cx, cy, lx, ly, rx, ry, tx, ty, bx, by, headYawDeg, mw, mh);
+								ctx->Unmap(readback, 0);
+							}
+							readback->Release();
+						}
+						dev->Release();
+					}
+				}
+			}
 		}
 	}
 
-	// Copy depth (bridge depth → cached)
+	// Copy depth (extracted R32F -> cached slot)
 	if (depthTex && depthRegion) {
-		if (!SafeBridgeCopy(ctx, m_cachedDepth[eye], 0, 0, 0, 0,
-		    depthTex, 0, depthRegion)) {
-			OOVR_LOG("ASW: TOCTOU — depth texture freed during copy");
+		if (!SafeBridgeCopy(ctx, m_cachedDepth[slot][eye], 0, 0, 0, 0,
+		        depthTex, 0, depthRegion)) {
+			OOVR_LOG("ASW: TOCTOU - depth texture freed during copy");
 			return;
+		}
+		m_slotDepthDataW[slot] = depthRegion->right - depthRegion->left;
+		m_slotDepthDataH[slot] = depthRegion->bottom - depthRegion->top;
+
+		// Optional readback diagnostics (left eye only)
+		{
+			static int s_readbackFrame = 0;
+			static int s_readbackCount = 0;
+			static float s_lastLoggedNear = 0, s_lastLoggedFar = 0;
+			s_readbackFrame++;
+			bool areaChanged = (fabsf(nearZ - s_lastLoggedNear) > 0.5f || fabsf(farZ - s_lastLoggedFar) > 1000.0f);
+			if (enableReadbackDiag && areaChanged && s_readbackFrame > 90) {
+				OOVR_LOGF("ASW area change: near %.1f->%.1f far %.0f->%.0f - resetting depth sampling",
+				    s_lastLoggedNear, nearZ, s_lastLoggedFar, farZ);
+				s_readbackCount = 0;
+				s_readbackFrame = 0;
+				s_lastLoggedNear = nearZ;
+				s_lastLoggedFar = farZ;
+			}
+			if (enableReadbackDiag && s_readbackFrame > 225 && s_readbackCount < 20
+			    && (s_readbackFrame % 45) == 0 && eye == 0) {
+				s_readbackCount++;
+				s_lastLoggedNear = nearZ;
+				s_lastLoggedFar = farZ;
+				ID3D11Device* dev = nullptr;
+				ctx->GetDevice(&dev);
+				if (dev) {
+					D3D11_TEXTURE2D_DESC readDesc;
+					m_cachedDepth[slot][eye]->GetDesc(&readDesc);
+					readDesc.Usage = D3D11_USAGE_STAGING;
+					readDesc.BindFlags = 0;
+					readDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+					ID3D11Texture2D* readback = nullptr;
+					if (SUCCEEDED(dev->CreateTexture2D(&readDesc, nullptr, &readback))) {
+						ctx->CopyResource(readback, m_cachedDepth[slot][eye]);
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(ctx->Map(readback, 0, D3D11_MAP_READ, 0, &mapped))) {
+							const float* pixels = (const float*)mapped.pData;
+							uint32_t stride = mapped.RowPitch / sizeof(float);
+							uint32_t dw = m_slotDepthDataW[slot] > 0 ? m_slotDepthDataW[slot] : readDesc.Width;
+							uint32_t dh = m_slotDepthDataH[slot] > 0 ? m_slotDepthDataH[slot] : readDesc.Height;
+							float center = pixels[(dh / 2) * stride + (dw / 2)];
+							float topCtr = pixels[(dh / 8) * stride + (dw / 2)];
+							float botCtr = pixels[(dh * 7 / 8) * stride + (dw / 2)];
+							float leftCtr = pixels[(dh / 2) * stride + (dw / 8)];
+							float rightCtr = pixels[(dh / 2) * stride + (dw * 7 / 8)];
+							OOVR_LOGF("ASW depth[%d]: center=%.5f top=%.5f bot=%.5f left=%.5f right=%.5f near=%.1f far=%.0f (data %ux%u)",
+							    s_readbackCount, center, topCtr, botCtr, leftCtr, rightCtr, nearZ, farZ, dw, dh);
+							ctx->Unmap(readback, 0);
+						}
+						readback->Release();
+					}
+					dev->Release();
+				}
+			}
 		}
 	}
 
-	m_cachedPose[eye] = eyePose;
-	m_cachedFov[eye] = eyeFov;
-	m_cachedNear = nearZ;
-	m_cachedFar = farZ;
+	m_slotPose[slot][eye] = eyePose;
+	m_slotFov[slot][eye] = eyeFov;
+	m_slotNear[slot] = nearZ;
+	m_slotFar[slot] = farZ;
 
-	// Both eyes cached → ready for warping
-	if (eye == 1) {
-		m_hasCachedFrame = true;
+	if (eye == 0)
+		m_slotFrameId[slot] = ++m_frameCounter;
+
+	m_buildEyeReady[eye] = true;
+	if (eye == 1 && m_buildEyeReady[0]) {
+		if (m_hasLastPublishedPose) {
+			m_slotHasPrevPose[slot] = true;
+			m_slotPrevPose[slot][0] = m_lastPublishedPose[0];
+			m_slotPrevPose[slot][1] = m_lastPublishedPose[1];
+		} else {
+			m_slotHasPrevPose[slot] = false;
+		}
+
+		m_lastPublishedPose[0] = m_slotPose[slot][0];
+		m_lastPublishedPose[1] = m_slotPose[slot][1];
+		m_hasLastPublishedPose = true;
+
+		m_slotTimestamp[slot] = std::chrono::steady_clock::now();
+		m_previousPublishedSlot.store(m_publishedSlot.load(std::memory_order_relaxed), std::memory_order_release);
+		m_publishedSlot.store(slot, std::memory_order_release);
+
+		int next = (slot + 1) % (int)kAswCacheSlotCount;
+		int protectedSlot = m_warpReadSlot.load(std::memory_order_acquire);
+		if (next == protectedSlot)
+			next = (next + 1) % (int)kAswCacheSlotCount;
+		m_buildSlot = next;
+		m_buildEyeReady[0] = false;
+		m_buildEyeReady[1] = false;
+
 		static int s = 0;
-		if (s++ < 3)
-			OOVR_LOGF("ASW: Frame cached — near=%.2f far=%.1f", nearZ, farZ);
+		if (s++ < 6 || (s % 600 == 0))
+			OOVR_LOGF("ASW: Frame cached - slot=%d near=%.2f far=%.1f fid=%llu", slot, nearZ, farZ, m_slotFrameId[slot]);
 	}
 }
 
-bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
-    const XrPosef& newPose)
+void ASWProvider::WaitForCacheFence()
 {
-	if (!m_ready || !m_hasCachedFrame || eye < 0 || eye > 1) return false;
+	// N-1 warping: use the previous slot's fence (signaled ~27ms ago).
+	// This should be instant — the fence was signaled last cycle.
+	if (!m_d3d12Ready || !m_d3d12Fence)
+		return;
+	int slot = m_previousPublishedSlot.load(std::memory_order_acquire);
+	if (slot < 0 || slot >= (int)kAswCacheSlotCount)
+		return;
+	uint64_t cacheVal = m_slotCacheFenceValue[slot];
+	if (cacheVal == 0)
+		return;
 
-	// Build pose delta matrix
-	WarpConstants cb = {};
-	// Backward warping: matrix transforms NEW view → OLD view
-	// so we can find where each output pixel maps to in the cached frame
-	BuildPoseDeltaMatrix(newPose, m_cachedPose[eye], cb.poseDeltaMatrix);
-
-	// Save raw OpenXR pose delta translation for diagnostics (before zeroing rotation)
-	float rawTransX = cb.poseDeltaMatrix[3];
-	float rawTransY = cb.poseDeltaMatrix[7];
-	float rawTransZ = cb.poseDeltaMatrix[11];
-
-	// HMD rotation is handled by VD's ATW — zero the OpenXR-derived rotation, identity only.
-	for (int r = 0; r < 3; r++)
-		for (int c = 0; c < 3; c++)
-			cb.poseDeltaMatrix[r * 4 + c] = (r == c) ? 1.0f : 0.0f;
-
-	// ── Coordinate system fix ──
-	// BuildPoseDeltaMatrix computes translation in OpenXR view space: +X right, +Y up, -Z forward.
-	// The shader reconstructs positions as (tanX*depth, tanY*depth, +depth) — i.e. +Z forward.
-	// We must negate Z to convert from OpenXR convention to the shader's convention.
-	// Without this, forward HMD movement (negative Z in OpenXR) would reduce the shader's
-	// positive Z depth, making everything appear to shrink/grow — the "ghost scaling" bug.
-	cb.poseDeltaMatrix[3]  = rawTransX;   // X: +right in both conventions — unchanged
-	cb.poseDeltaMatrix[7]  = rawTransY;   // Y: +up in both conventions — unchanged
-	cb.poseDeltaMatrix[11] = -rawTransZ;  // Z: negate to convert -Z forward → +Z forward
-
-	// Stick turn correction: camera-space Y-axis rotation from playerYaw delta.
-	// Built directly in camera/depth-buffer space — no OpenXR coordinate mismatch.
-	// aswRotationScale tunes magnitude; set to -1 in ini if rotation direction is backwards.
-	float rotS = oovr_global_configuration.ASWRotationScale();
-	if (rotS != 0.0f && m_locoYaw != 0.0f) {
-		float theta = m_locoYaw * rotS;
-		float c = cosf(theta), s = sinf(theta);
-		// R_y(theta) row-major into the 3x3 block (Y row/col unchanged = identity)
-		cb.poseDeltaMatrix[0]  = c;   // [0][0]
-		cb.poseDeltaMatrix[2]  = s;   // [0][2]
-		cb.poseDeltaMatrix[8]  = -s;  // [2][0]
-		cb.poseDeltaMatrix[10] = c;   // [2][2]
+	if (m_d3d12Fence->GetCompletedValue() < cacheVal) {
+		m_d3d12Fence->SetEventOnCompletion(cacheVal, m_fenceEvent);
+		WaitForSingleObject(m_fenceEvent, 5000);
+		OOVR_LOGF("ASW: N-1 cache fence unexpectedly not ready (val=%llu)", cacheVal);
 	}
+	m_cacheFenceWaitedEarly = true;
+}
 
-	// Scale translation part by master strength × translation scale
-	float master = oovr_global_configuration.ASWWarpStrength();
-	float transS = master * oovr_global_configuration.ASWTranslationScale();
-	transS = (transS < 0.0f) ? 0.0f : transS;
-	if (transS != 1.0f) {
-		cb.poseDeltaMatrix[3] *= transS;
-		cb.poseDeltaMatrix[7] *= transS;
-		cb.poseDeltaMatrix[11] *= transS;
-	}
+bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
+{
+	if (!m_ready || eye < 0 || eye > 1)
+		return false;
 
-	// Stick locomotion correction: apply camera-view-space deltas from dx11compositor.
-	//
-	// The world delta is transformed to camera view space using NiCamera::worldToCam
-	// in dx11compositor.cpp. This correctly handles HMD rotation because worldToCam
-	// is the actual game camera matrix (includes HMD physical rotation).
-	//
-	// NiCamera view space: +X right, +Y up, +Z forward (into screen).
-	// This matches the shader's convention (positions reconstructed as +Z forward).
-	// No coordinate conversion needed — add directly.
-	float locoS = oovr_global_configuration.ASWLocoScale();
-	if (locoS != 0.0f && (m_locoViewX != 0.0f || m_locoViewY != 0.0f || m_locoViewZ != 0.0f)) {
-		cb.poseDeltaMatrix[3]  += m_locoViewX * locoS;  // camera right
-		cb.poseDeltaMatrix[7]  += m_locoViewY * locoS;  // camera up
-		cb.poseDeltaMatrix[11] += m_locoViewZ * locoS;  // camera forward (+Z)
-	}
-
-	// ── ASW diagnostics: log pose delta every N frames (left eye only to avoid spam) ──
+	int slot = -1;
 	if (eye == 0) {
-		static int s_diagCount = 0;
-		if (s_diagCount < 120 || (s_diagCount % 300 == 0)) {
-			OOVR_LOGF("ASW diag [%d]: rawTrans(%.4f, %.4f, %.4f) → shaderTrans(%.4f, %.4f, %.4f) "
-			    "locoView(X=%.4f Y=%.4f Z=%.4f) yaw=%.4f scales(trans=%.2f loco=%.2f rot=%.2f)",
-			    s_diagCount,
-			    rawTransX, rawTransY, rawTransZ,
-			    cb.poseDeltaMatrix[3], cb.poseDeltaMatrix[7], cb.poseDeltaMatrix[11],
-			    m_locoViewX, m_locoViewY, m_locoViewZ,
-			    m_locoYaw, transS, locoS, rotS);
+		if (slotOverride >= 0 && slotOverride < (int)kAswCacheSlotCount) {
+			slot = slotOverride;
+		} else {
+			// N-1 warping: use the PREVIOUS frame's cache slot.
+			// Its fence was signaled last cycle (~27ms ago) — zero wait.
+			slot = m_previousPublishedSlot.load(std::memory_order_acquire);
 		}
-		s_diagCount++;
+		if (slot < 0)
+			return false;
+		m_warpReadSlot.store(slot, std::memory_order_release);
+	} else {
+		slot = m_warpReadSlot.load(std::memory_order_acquire);
+		if (slot < 0)
+			slot = m_publishedSlot.load(std::memory_order_acquire);
+		if (slot < 0)
+			return false;
+	}
+
+	WarpConstants cb = {};
+	// poseDeltaMatrix: depth-aware rotation from warp target orientation (newPose)
+	// back to cached game orientation (m_slotPose). This rotates the warp output
+	// to match the warp display time's predicted pose. Combined with declaring
+	// newPose (GetPrecompPose) in the composition layer, ATW correction ≈ 0
+	// for the warp slot — eliminating the parallax alternation between game/warp.
+	BuildPoseDeltaMatrix(m_slotPose[slot][eye], newPose, cb.poseDeltaMatrix);
+	m_precompPose[eye] = newPose;
+
+	cb.debugMode = oovr_global_configuration.ASWDebugMode();
+
+	if (m_slotHasPrevPose[slot]) {
+		XrQuaternionf prevInv;
+		QuatInverse(m_slotPrevPose[slot][eye].orientation, prevInv);
+		XrQuaternionf dq;
+		QuatMultiply(prevInv, m_slotPose[slot][eye].orientation, dq);
+		dq.x = -dq.x;
+		dq.y = -dq.y;
+		float qx = dq.x, qy = dq.y, qz = dq.z, qw = dq.w;
+		float xx = qx * qx, yy = qy * qy, zz = qz * qz;
+		float xy = qx * qy, xz = qx * qz, yz = qy * qz;
+		float wx = qw * qx, wy = qw * qy, wz = qw * qz;
+		float* m = cb.headRotMatrix;
+		m[0] = 1 - 2 * (yy + zz);
+		m[1] = 2 * (xy - wz);
+		m[2] = 2 * (xz + wy);
+		m[3] = 0;
+		m[4] = 2 * (xy + wz);
+		m[5] = 1 - 2 * (xx + zz);
+		m[6] = 2 * (yz - wx);
+		m[7] = 0;
+		m[8] = 2 * (xz - wy);
+		m[9] = 2 * (yz + wx);
+		m[10] = 1 - 2 * (xx + yy);
+		m[11] = 0;
+		m[12] = 0;
+		m[13] = 0;
+		m[14] = 0;
+		m[15] = 1;
+	} else {
+		for (int i = 0; i < 16; i++)
+			cb.headRotMatrix[i] = 0;
+		cb.headRotMatrix[0] = cb.headRotMatrix[5] = cb.headRotMatrix[10] = cb.headRotMatrix[15] = 1;
+	}
+
+	// clipToClipNoLoco: prevVP * inv(curVP_original) — head rotation + head translation,
+	// no locomotion injection. Matches the exact VP matrices used to generate camera MVs,
+	// ensuring perfect cancellation of head motion in locoMV = totalMV - headMV.
+	// Read from the SAME cache slot as color/MV/depth to avoid race with game thread.
+	if (m_slotHasClipToClipNoLoco[slot] && eye >= 0 && eye < 2) {
+		memcpy(cb.clipToClipNoLoco, m_slotClipToClipNoLoco[slot][eye], sizeof(cb.clipToClipNoLoco));
+		cb.hasClipToClipNoLoco = 1;
+	} else {
+		// Identity fallback — shader will use headRotMatrix path
+		for (int i = 0; i < 16; i++)
+			cb.clipToClipNoLoco[i] = 0;
+		cb.clipToClipNoLoco[0] = cb.clipToClipNoLoco[5] = cb.clipToClipNoLoco[10] = cb.clipToClipNoLoco[15] = 1.0f;
+		cb.hasClipToClipNoLoco = 0;
 	}
 
 	cb.resolution[0] = (float)m_eyeWidth;
 	cb.resolution[1] = (float)m_eyeHeight;
-	cb.nearZ = m_cachedNear;
-	cb.farZ = m_cachedFar;
-	cb.fovTanLeft = tanf(m_cachedFov[eye].angleLeft);
-	cb.fovTanRight = tanf(m_cachedFov[eye].angleRight);
-	cb.fovTanUp = tanf(m_cachedFov[eye].angleUp);
-	cb.fovTanDown = tanf(m_cachedFov[eye].angleDown);
+	cb.nearZ = m_slotNear[slot];
+	cb.farZ = m_slotFar[slot];
+	cb.fovTanLeft = tanf(m_slotFov[slot][eye].angleLeft);
+	cb.fovTanRight = tanf(m_slotFov[slot][eye].angleRight);
+	cb.fovTanUp = tanf(m_slotFov[slot][eye].angleUp);
+	cb.fovTanDown = tanf(m_slotFov[slot][eye].angleDown);
 	float ds = oovr_global_configuration.ASWDepthScale();
 	cb.depthScale = (ds < 0.0f) ? 0.0f : ds;
 	cb.edgeFadeWidth = oovr_global_configuration.ASWEdgeFadeWidth();
-	cb.nearFadeDepth = oovr_global_configuration.ASWNearFadeDepth() * 72.0f;  // meters → game units (depth buffer is in game units)
-	cb.mvConfidence  = oovr_global_configuration.ASWMVConfidence();
-	cb.mvPixelScale  = oovr_global_configuration.ASWMVPixelScale();
+	cb.nearFadeDepth = oovr_global_configuration.ASWNearFadeDepth() * 72.0f;
+	{
+		float configConf = oovr_global_configuration.ASWMVConfidence();
+		if (fabsf(configConf) > 0.001f) {
+			float scale = configConf / -0.5f;
+			cb.mvConfidence = -m_mvTimingRatio * scale;
+		} else {
+			cb.mvConfidence = 0.0f;
+		}
+	}
+	cb.mvPixelScale = oovr_global_configuration.ASWMVPixelScale();
+	cb.depthResolution[0] = (m_slotDepthDataW[slot] > 0) ? (float)m_slotDepthDataW[slot] : (float)m_eyeWidth;
+	cb.depthResolution[1] = (m_slotDepthDataH[slot] > 0) ? (float)m_slotDepthDataH[slot] : (float)m_eyeHeight;
+	cb.mvResolution[0] = (m_slotMVDataW[slot] > 0) ? (float)m_slotMVDataW[slot] : (float)m_eyeWidth;
+	cb.mvResolution[1] = (m_slotMVDataH[slot] > 0) ? (float)m_slotMVDataH[slot] : (float)m_eyeHeight;
 
-	// ── Additional diagnostics: FOV and depth params (log once at startup) ──
+	if (eye == 0) {
+		static int s_diagCount = 0;
+		if (s_diagCount < 120 || (s_diagCount % 300 == 0)) {
+			OOVR_LOGF("ASW warp [%d]: slot=%d fid=%llu locoTrans(%.4f, %.4f, %.4f) mvConf=%.3f timingR=%.3f c2c=%d d3d12=%d",
+			    s_diagCount, slot, m_slotFrameId[slot],
+			    m_locoTransX, m_locoTransY, m_locoTransZ, cb.mvConfidence, m_mvTimingRatio, cb.hasClipToClipNoLoco, m_d3d12Ready ? 1 : 0);
+		}
+		s_diagCount++;
+	}
+
 	if (eye == 0) {
 		static int s_fovLogCount = 0;
 		if (s_fovLogCount < 5) {
-			OOVR_LOGF("ASW fov: tanL=%.4f tanR=%.4f tanU=%.4f tanD=%.4f  near=%.2f far=%.1f  depthScale=%.3f",
-			    cb.fovTanLeft, cb.fovTanRight, cb.fovTanUp, cb.fovTanDown,
-			    cb.nearZ, cb.farZ, cb.depthScale);
+			OOVR_LOGF("ASW fov: tanL=%.4f tanR=%.4f tanU=%.4f tanD=%.4f near=%.2f far=%.1f depthScale=%.3f",
+			    cb.fovTanLeft, cb.fovTanRight, cb.fovTanUp, cb.fovTanDown, cb.nearZ, cb.farZ, cb.depthScale);
 			OOVR_LOGF("ASW poses: cached=(%.3f,%.3f,%.3f) new=(%.3f,%.3f,%.3f)",
-			    m_cachedPose[eye].position.x, m_cachedPose[eye].position.y, m_cachedPose[eye].position.z,
+			    m_slotPose[slot][eye].position.x, m_slotPose[slot][eye].position.y, m_slotPose[slot][eye].position.z,
 			    newPose.position.x, newPose.position.y, newPose.position.z);
 			s_fovLogCount++;
 		}
 	}
 
-	// Update constant buffer
+	// ── D3D12 warp path ──
+	if (m_d3d12Ready) {
+		// Write constants to per-eye upload heap region (eye 0 at offset 0, eye 1 at offset stride)
+		void* eyeCbPtr = (uint8_t*)m_d3d12CbMappedPtr + eye * m_d3d12CbEyeStride;
+		memcpy(eyeCbPtr, &cb, sizeof(cb));
+
+		if (eye == 0) {
+			// Cache fence: if WaitForCacheFence() was called early (before
+			// xrWaitFrame), skip the wait here — data is already verified ready.
+			if (!m_cacheFenceWaitedEarly) {
+				uint64_t cacheVal = m_slotCacheFenceValue[slot];
+				if (cacheVal > 0 && m_d3d12Fence->GetCompletedValue() < cacheVal) {
+					m_d3d12Fence->SetEventOnCompletion(cacheVal, m_fenceEvent);
+					WaitForSingleObject(m_fenceEvent, 5000);
+				}
+			}
+			m_cacheFenceWaitedEarly = false;
+
+			// Reset command list once per frame (before first eye)
+			m_d3d12CmdAlloc->Reset();
+			m_d3d12CmdList->Reset(m_d3d12CmdAlloc, m_d3d12PipelineState);
+		}
+
+		// Bind compute root signature + per-eye constant buffer region
+		m_d3d12CmdList->SetComputeRootSignature(m_d3d12RootSig);
+		m_d3d12CmdList->SetComputeRootConstantBufferView(0,
+		    m_d3d12ConstantBuffer->GetGPUVirtualAddress() + eye * m_d3d12CbEyeStride);
+
+		ID3D12DescriptorHeap* heaps[] = { m_d3d12SrvUavHeap };
+		m_d3d12CmdList->SetDescriptorHeaps(1, heaps);
+		m_d3d12CmdList->SetComputeRootDescriptorTable(1, GetSrvGpuHandle(slot, eye));
+		m_d3d12CmdList->SetComputeRootDescriptorTable(2, GetUavGpuHandle(eye));
+
+		// Dispatch warp compute (same 8x8 thread groups)
+		uint32_t groupsX = (m_eyeWidth + 7) / 8;
+		uint32_t groupsY = (m_eyeHeight + 7) / 8;
+		m_d3d12CmdList->Dispatch(groupsX, groupsY, 1);
+
+		return true;
+	}
+
+	// ── D3D11 fallback path ──
+	// Get immediate context from device (WarpFrame no longer takes ctx param)
+	ID3D11DeviceContext* ctx = nullptr;
+	m_device->GetImmediateContext(&ctx);
+	if (!ctx)
+		return false;
+
+	if (oovr_global_configuration.ASWDebugMode() == 4) {
+		ctx->CopyResource(m_warpedOutput[eye], m_cachedColor[slot][eye]);
+		ctx->Release();
+		{
+			static int s = 0;
+			if (s++ < 5)
+				OOVR_LOGF("ASW BYPASS[%d]: copied cached->output (no warp), fid=%llu", eye, m_slotFrameId[slot]);
+		}
+		return true;
+	}
+
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = ctx->Map(m_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-	if (FAILED(hr)) return false;
+	if (FAILED(hr)) {
+		ctx->Release();
+		return false;
+	}
 	memcpy(mapped.pData, &cb, sizeof(cb));
 	ctx->Unmap(m_constantBuffer, 0);
 
-	// Dispatch compute shader
-	// Bind NULL at t1 when MVs are off so D3D11 doesn't enforce write→read coherency
-	// on m_cachedMV (which was written by CopySubresourceRegion in CacheFrame).
-	// Even with mvConfidence=0 the shader bytecode references t1, so D3D11 would
-	// otherwise stall to ensure the copy is visible before the dispatch.
 	ctx->CSSetShader(m_warpCS, nullptr, 0);
-	ID3D11ShaderResourceView* mvSRV = (cb.mvConfidence > 0.0f) ? m_srvMV[eye] : nullptr;
-	ID3D11ShaderResourceView* srvs[] = { m_srvColor[eye], mvSRV, m_srvDepth[eye] };
+	ID3D11ShaderResourceView* mvSRV = (fabsf(cb.mvConfidence) > 0.001f) ? m_srvMV[slot][eye] : nullptr;
+	ID3D11ShaderResourceView* srvs[] = { m_srvColor[slot][eye], mvSRV, m_srvDepth[slot][eye] };
 	ctx->CSSetShaderResources(0, 3, srvs);
 	ID3D11UnorderedAccessView* uavs[] = { m_uavOutput[eye] };
 	ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
@@ -675,19 +1694,655 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 	uint32_t groupsY = (m_eyeHeight + 7) / 8;
 	ctx->Dispatch(groupsX, groupsY, 1);
 
-	// Unbind to avoid hazards
 	ID3D11ShaderResourceView* nullSRVs[3] = {};
 	ID3D11UnorderedAccessView* nullUAVs[1] = {};
 	ctx->CSSetShaderResources(0, 3, nullSRVs);
 	ctx->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
 	ctx->CSSetShader(nullptr, nullptr, 0);
 
+	ctx->Release();
+	return true;
+}
+
+bool ASWProvider::FlushWarpCommandList()
+{
+	if (!m_d3d12Ready)
+		return false;
+
+	// Close and execute D3D12 command list (warp compute dispatches from WarpFrame)
+	HRESULT hr = m_d3d12CmdList->Close();
+	if (FAILED(hr)) {
+		static int s = 0;
+		if (s++ < 5)
+			OOVR_LOGF("ASW FlushWarp: Close failed hr=0x%08X", (unsigned)hr);
+		m_precomputedWarpReady = false;
+		return false;
+	}
+	ID3D12CommandList* lists[] = { m_d3d12CmdList };
+	m_d3d12CmdQueue->ExecuteCommandLists(1, lists);
+
+	// EXPERIMENT: no-fence test — skip fence signal, just mark ready immediately.
+	// D3D12 queue will execute in order, copy follows warp on same queue.
+	m_precomputedWarpReady = true;
+	m_warpFenceWaitPending = false;
+	m_warpReadSlot.store(-1, std::memory_order_release);
+	return true;
+}
+
+bool ASWProvider::WaitForWarpCompletion()
+{
+	// EXPERIMENT: no-fence test — return immediately, no CPU-wait.
+	return m_precomputedWarpReady;
+}
+
+// ============================================================================
+// D3D12 game staging copy — bypasses D3D11 GPU queue contention
+// ============================================================================
+
+void ASWProvider::SignalGameStagingDone(ID3D11DeviceContext* ctx)
+{
+	if (!m_d3d11Fence || !ctx)
+		return;
+	ID3D11DeviceContext4* ctx4 = nullptr;
+	ctx->QueryInterface(IID_PPV_ARGS(&ctx4));
+	if (ctx4) {
+		uint64_t val = ++m_fenceValue;
+		ctx4->Signal(m_d3d11Fence, val);
+		m_stagingFenceValue.store(val, std::memory_order_release);
+		ctx4->Release();
+	}
+}
+
+ID3D12Resource* ASWProvider::GetOrShareTextureD3D12(ID3D11Texture2D* d3d11Tex)
+{
+	if (!d3d11Tex || !m_d3d12Device)
+		return nullptr;
+
+	// Check cache first
+	for (uint32_t i = 0; i < m_gameSharedTexCount; i++) {
+		if (m_gameSharedTexCache[i].d3d11Tex == d3d11Tex)
+			return m_gameSharedTexCache[i].d3d12Res;
+	}
+
+	if (m_gameSharedTexCount >= kMaxGameSharedTextures) {
+		OOVR_LOG("ASW D3D12 gameCopy: shared texture cache full");
+		return nullptr;
+	}
+
+	// Try NT handle sharing (IDXGIResource1::CreateSharedHandle)
+	HANDLE handle = nullptr;
+	ID3D12Resource* d3d12Res = nullptr;
+
+	IDXGIResource1* dxgiRes1 = nullptr;
+	HRESULT hr = d3d11Tex->QueryInterface(IID_PPV_ARGS(&dxgiRes1));
+	if (SUCCEEDED(hr)) {
+		hr = dxgiRes1->CreateSharedHandle(nullptr,
+		    DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle);
+		dxgiRes1->Release();
+		if (SUCCEEDED(hr) && handle) {
+			hr = m_d3d12Device->OpenSharedHandle(handle, IID_PPV_ARGS(&d3d12Res));
+			CloseHandle(handle);
+			if (SUCCEEDED(hr) && d3d12Res) {
+				m_gameSharedTexCache[m_gameSharedTexCount].d3d11Tex = d3d11Tex;
+				m_gameSharedTexCache[m_gameSharedTexCount].d3d12Res = d3d12Res;
+				m_gameSharedTexCount++;
+				return d3d12Res;
+			}
+		}
+	}
+
+	// Try legacy sharing (IDXGIResource::GetSharedHandle)
+	IDXGIResource* dxgiRes = nullptr;
+	hr = d3d11Tex->QueryInterface(IID_PPV_ARGS(&dxgiRes));
+	if (SUCCEEDED(hr)) {
+		handle = nullptr;
+		hr = dxgiRes->GetSharedHandle(&handle);
+		dxgiRes->Release();
+		if (SUCCEEDED(hr) && handle) {
+			hr = m_d3d12Device->OpenSharedHandle(handle, IID_PPV_ARGS(&d3d12Res));
+			if (SUCCEEDED(hr) && d3d12Res) {
+				m_gameSharedTexCache[m_gameSharedTexCount].d3d11Tex = d3d11Tex;
+				m_gameSharedTexCache[m_gameSharedTexCount].d3d12Res = d3d12Res;
+				m_gameSharedTexCount++;
+				return d3d12Res;
+			}
+		}
+	}
+
+	OOVR_LOGF("ASW D3D12 gameCopy: failed to share D3D11 texture %p to D3D12", d3d11Tex);
+	return nullptr;
+}
+
+bool ASWProvider::CopyGameStagingToSwapchainD3D12(
+    ID3D11DeviceContext* ctx,
+    int count,
+    ID3D11Texture2D** stagingTexs,
+    ID3D11Texture2D** swapchainImages)
+{
+	if (!m_d3d12Ready || !m_d3d12GameCopyCmdAlloc || !m_d3d12GameCopyCmdList || count <= 0)
+		return false;
+
+	// Wait for previous game copy fence if pending (deferred from last cycle)
+	if (m_gameCopyFenceWaitPending) {
+		WaitForSingleObject(m_gameCopyFenceEvent, 5000);
+		m_gameCopyFenceWaitPending = false;
+	}
+
+	// Share all textures to D3D12 (lazy, cached)
+	ID3D12Resource* d3d12Staging[4] = {};
+	ID3D12Resource* d3d12Swap[4] = {};
+	int validCount = (count > 4) ? 4 : count;
+	for (int i = 0; i < validCount; i++) {
+		d3d12Staging[i] = GetOrShareTextureD3D12(stagingTexs[i]);
+		d3d12Swap[i] = GetOrShareTextureD3D12(swapchainImages[i]);
+		if (!d3d12Staging[i] || !d3d12Swap[i])
+			return false;
+	}
+
+	// Skip staging fence wait — read previous frame's staging data (GPU-complete
+	// from previous cycle's Flush). Build 12 proved that the compositor can't
+	// show the game frame when game draws are pending on the D3D11 GPU queue.
+	// By skipping the fence wait, the D3D12 copy runs immediately with
+	// GPU-complete (stale) data, giving the compositor a clean swapchain image.
+
+	// Record all copy commands in a single command list (both eyes batched)
+	m_d3d12GameCopyCmdAlloc->Reset();
+	m_d3d12GameCopyCmdList->Reset(m_d3d12GameCopyCmdAlloc, nullptr);
+
+	for (int i = 0; i < validCount; i++) {
+		D3D12_TEXTURE_COPY_LOCATION src = {};
+		src.pResource = d3d12Staging[i];
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src.SubresourceIndex = 0;
+		D3D12_TEXTURE_COPY_LOCATION dst = {};
+		dst.pResource = d3d12Swap[i];
+		dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dst.SubresourceIndex = 0;
+
+		m_d3d12GameCopyCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+	}
+
+	m_d3d12GameCopyCmdList->Close();
+
+	// Execute on D3D12 queue (independent of D3D11 game draws)
+	ID3D12CommandList* lists[] = { m_d3d12GameCopyCmdList };
+	m_d3d12CmdQueue->ExecuteCommandLists(1, lists);
+
+	// Signal fence and CPU-wait for D3D12 copy completion.
+	uint64_t fenceVal = ++m_fenceValue;
+	m_d3d12CmdQueue->Signal(m_d3d12Fence, fenceVal);
+	m_d3d12Fence->SetEventOnCompletion(fenceVal, m_gameCopyFenceEvent);
+	WaitForSingleObject(m_gameCopyFenceEvent, 5000);
+	m_gameCopyFenceWaitPending = false;
+
+	// ── D3D11↔D3D12 GPU sync: runtime reads swapchain via D3D11 ──
+	// D3D12 wrote to the shared swapchain resource, but D3D11 (used by the
+	// runtime's compositor) has no visibility of D3D12 writes without a fence
+	// wait. Insert D3D11 Wait so the GPU processes D3D12 writes before any
+	// subsequent D3D11 commands (e.g. xrReleaseSwapchainImage).
+	// NOTE: This runs at Step G2 when the D3D11 GPU queue is CLEAN (game was
+	// signaled at prev cycle's S, ~24ms ago — all draws processed by now).
+	if (m_d3d11Fence) {
+		ID3D11DeviceContext4* ctx4 = nullptr;
+		ctx->QueryInterface(IID_PPV_ARGS(&ctx4));
+		if (ctx4) {
+			ctx4->Wait(m_d3d11Fence, fenceVal);
+			ctx4->Release();
+		}
+	}
+
+	return true;
+}
+
+bool ASWProvider::CopyPrecomputedWarpToSwapchain(ID3D11DeviceContext* ctx, uint32_t* outSwapIdx)
+{
+	if (!m_ready)
+		return false;
+
+	// EXPERIMENT: no-fence test — skip warp fence wait entirely.
+	if (!m_precomputedWarpReady)
+		return false;
+
+	// 1. Acquire output swapchain
+	XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	uint32_t idx = 0;
+	XrResult res = xrAcquireSwapchainImage(m_outputSwapchain, &acquireInfo, &idx);
+	if (XR_FAILED(res)) {
+		static int s = 0;
+		if (s++ < 5)
+			OOVR_LOGF("ASW PrecompCopy: acquire failed result=%d", (int)res);
+		return false;
+	}
+	if (outSwapIdx)
+		*outSwapIdx = idx;
+
+	XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	waitInfo.timeout = XR_INFINITE_DURATION;
+	res = xrWaitSwapchainImage(m_outputSwapchain, &waitInfo);
+	if (XR_FAILED(res)) {
+		OOVR_LOGF("ASW PrecompCopy: wait failed result=%d", (int)res);
+		return false;
+	}
+
+	if (idx >= m_outputSwapchainImages.size()) {
+		XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		xrReleaseSwapchainImage(m_outputSwapchain, &rel);
+		return false;
+	}
+
+	// Debug mode 51: draw cyan center box into warpedOutput BEFORE copy to swapchain.
+	// Written via D3D11 (warp compute already done), so the D3D12 copy includes it.
+	if (oovr_global_configuration.ASWDebugMode() == 51) {
+		for (int eye = 0; eye < 2; eye++) {
+			D3D11_TEXTURE2D_DESC desc;
+			m_warpedOutput[eye]->GetDesc(&desc);
+			UINT boxW = 200, boxH = 200;
+			if (boxW > desc.Width)
+				boxW = desc.Width;
+			if (boxH > desc.Height)
+				boxH = desc.Height;
+			UINT left = (desc.Width - boxW) / 2;
+			UINT top = (desc.Height - boxH) / 2;
+			D3D11_BOX box = { left, top, 0, left + boxW, top + boxH, 1 };
+			std::vector<uint8_t> pixels(boxW * boxH * 4);
+			for (UINT i = 0; i < boxW * boxH; i++) {
+				pixels[i * 4 + 0] = 0; // R
+				pixels[i * 4 + 1] = 255; // G
+				pixels[i * 4 + 2] = 255; // B
+				pixels[i * 4 + 3] = 255; // A
+			}
+			ctx->UpdateSubresource(m_warpedOutput[eye], 0, &box, pixels.data(), boxW * 4, 0);
+		}
+		// EXPERIMENT: no-fence test — skip debug box fence.
+	}
+
+	// 2. Copy warpedOutput → swapchain image
+	if (m_d3d12Ready && m_d3d12DirectCopy && idx < kMaxSwapchainImages && m_d3d12SwapchainImages[idx]) {
+		// ── D3D12 direct copy: bypasses D3D11 GPU queue entirely ──
+		// Reuses warp command allocator/list — WaitForWarpCompletion() already ran,
+		// so the allocator is free.
+		m_d3d12CmdAlloc->Reset();
+		m_d3d12CmdList->Reset(m_d3d12CmdAlloc, nullptr);
+
+		D3D12_TEXTURE_COPY_LOCATION srcLeft = {};
+		srcLeft.pResource = m_d3d12WarpedOutput[0];
+		srcLeft.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		srcLeft.SubresourceIndex = 0;
+		D3D12_TEXTURE_COPY_LOCATION dstLeft = {};
+		dstLeft.pResource = m_d3d12SwapchainImages[idx];
+		dstLeft.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dstLeft.SubresourceIndex = 0;
+		D3D12_BOX srcBox = { 0, 0, 0, m_eyeWidth, m_eyeHeight, 1 };
+		m_d3d12CmdList->CopyTextureRegion(&dstLeft, 0, 0, 0, &srcLeft, &srcBox);
+
+		D3D12_TEXTURE_COPY_LOCATION srcRight = {};
+		srcRight.pResource = m_d3d12WarpedOutput[1];
+		srcRight.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		srcRight.SubresourceIndex = 0;
+		D3D12_TEXTURE_COPY_LOCATION dstRight = {};
+		dstRight.pResource = m_d3d12SwapchainImages[idx];
+		dstRight.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dstRight.SubresourceIndex = 0;
+		m_d3d12CmdList->CopyTextureRegion(&dstRight, (UINT)m_eyeWidth, 0, 0, &srcRight, &srcBox);
+
+		m_d3d12CmdList->Close();
+		ID3D12CommandList* lists[] = { m_d3d12CmdList };
+		m_d3d12CmdQueue->ExecuteCommandLists(1, lists);
+		// EXPERIMENT: no-fence test — skip fence signal + CPU-wait before xrRelease.
+		// D3D12 copy submitted but we don't wait for GPU completion.
+	} else {
+		// ── D3D11 fallback ──
+		// EXPERIMENT: no-fence test — skip D3D11 fence wait.
+		ID3D11Texture2D* target = m_outputSwapchainImages[idx];
+		ctx->CopySubresourceRegion(target, 0,
+		    0, 0, 0, m_warpedOutput[0], 0, nullptr);
+		ctx->CopySubresourceRegion(target, 0,
+		    m_eyeWidth, 0, 0, m_warpedOutput[1], 0, nullptr);
+		ctx->Flush();
+	}
+
+	// 4. Release swapchain
+	XrSwapchainImageReleaseInfo relInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	xrReleaseSwapchainImage(m_outputSwapchain, &relInfo);
+
+	// 5. Depth swapchain (D3D11 — depth is small, not contention-sensitive)
+	int slot = GetActiveCacheSlot();
+	if (m_depthSwapchain != XR_NULL_HANDLE && slot >= 0) {
+		XrSwapchainImageAcquireInfo depthAcquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+		uint32_t depthIdx = 0;
+		XrResult depthRes = xrAcquireSwapchainImage(m_depthSwapchain, &depthAcquire, &depthIdx);
+		if (XR_SUCCEEDED(depthRes)) {
+			XrSwapchainImageWaitInfo depthWait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+			depthWait.timeout = XR_INFINITE_DURATION;
+			depthRes = xrWaitSwapchainImage(m_depthSwapchain, &depthWait);
+			if (XR_SUCCEEDED(depthRes)) {
+				if (depthIdx < m_depthSwapchainImages.size()) {
+					ID3D11Texture2D* depthTarget = m_depthSwapchainImages[depthIdx];
+					D3D11_BOX depthBox = {};
+					depthBox.right = m_eyeWidth;
+					depthBox.bottom = m_eyeHeight;
+					depthBox.front = 0;
+					depthBox.back = 1;
+					ctx->CopySubresourceRegion(depthTarget, 0,
+					    0, 0, 0, m_cachedDepth[slot][0], 0, &depthBox);
+					ctx->CopySubresourceRegion(depthTarget, 0,
+					    m_eyeWidth, 0, 0, m_cachedDepth[slot][1], 0, &depthBox);
+				}
+				XrSwapchainImageReleaseInfo depthRel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+				xrReleaseSwapchainImage(m_depthSwapchain, &depthRel);
+			}
+		}
+	}
+
+	m_precomputedWarpReady = false; // consumed
+	return true;
+}
+
+uint64_t ASWProvider::FlushWarpComputeAsync()
+{
+	if (!m_d3d12Ready)
+		return 0;
+	m_d3d12CmdList->Close();
+	ID3D12CommandList* lists[] = { m_d3d12CmdList };
+	m_d3d12CmdQueue->ExecuteCommandLists(1, lists);
+	uint64_t val = ++m_fenceValue;
+	m_d3d12CmdQueue->Signal(m_d3d12Fence, val);
+	return val;
+}
+
+bool ASWProvider::FinishWarpCopy(uint64_t computeFenceVal)
+{
+	if (!m_d3d12Ready || !m_d3d12DirectCopy)
+		return false;
+
+	auto tStart = std::chrono::high_resolution_clock::now();
+
+	// 1. CPU-wait for compute fence (should be done — GPU ran during xrWaitFrame)
+	float computeWaitMs = 0;
+	if (computeFenceVal > 0 && m_d3d12Fence->GetCompletedValue() < computeFenceVal) {
+		auto tw0 = std::chrono::high_resolution_clock::now();
+		m_d3d12Fence->SetEventOnCompletion(computeFenceVal, m_fenceEvent);
+		WaitForSingleObject(m_fenceEvent, 5000);
+		auto tw1 = std::chrono::high_resolution_clock::now();
+		computeWaitMs = std::chrono::duration<float, std::milli>(tw1 - tw0).count();
+	}
+
+	// 2. Acquire swapchain image
+	XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	uint32_t idx = 0;
+	XrResult res = xrAcquireSwapchainImage(m_outputSwapchain, &acquireInfo, &idx);
+	if (XR_FAILED(res)) {
+		m_warpReadSlot.store(-1, std::memory_order_release);
+		return false;
+	}
+	XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	waitInfo.timeout = XR_INFINITE_DURATION;
+	res = xrWaitSwapchainImage(m_outputSwapchain, &waitInfo);
+	if (XR_FAILED(res)) {
+		m_ready = false;
+		m_warpReadSlot.store(-1, std::memory_order_release);
+		return false;
+	}
+	if (idx >= m_outputSwapchainImages.size() || !m_d3d12SwapchainImages[idx]) {
+		XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		xrReleaseSwapchainImage(m_outputSwapchain, &rel);
+		m_warpReadSlot.store(-1, std::memory_order_release);
+		return false;
+	}
+
+	// 3. Reset allocator (GPU done with compute) and record copy commands
+	m_d3d12CmdAlloc->Reset();
+	m_d3d12CmdList->Reset(m_d3d12CmdAlloc, nullptr);
+
+	D3D12_BOX srcBox = { 0, 0, 0, m_eyeWidth, m_eyeHeight, 1 };
+
+	D3D12_TEXTURE_COPY_LOCATION srcLeft = {};
+	srcLeft.pResource = m_d3d12WarpedOutput[0];
+	srcLeft.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	D3D12_TEXTURE_COPY_LOCATION dstLeft = {};
+	dstLeft.pResource = m_d3d12SwapchainImages[idx];
+	dstLeft.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	m_d3d12CmdList->CopyTextureRegion(&dstLeft, 0, 0, 0, &srcLeft, &srcBox);
+
+	D3D12_TEXTURE_COPY_LOCATION srcRight = {};
+	srcRight.pResource = m_d3d12WarpedOutput[1];
+	srcRight.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	D3D12_TEXTURE_COPY_LOCATION dstRight = {};
+	dstRight.pResource = m_d3d12SwapchainImages[idx];
+	dstRight.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	m_d3d12CmdList->CopyTextureRegion(&dstRight, (UINT)m_eyeWidth, 0, 0, &srcRight, &srcBox);
+
+	// 4. Execute copy + fence wait
+	m_d3d12CmdList->Close();
+	ID3D12CommandList* lists[] = { m_d3d12CmdList };
+	m_d3d12CmdQueue->ExecuteCommandLists(1, lists);
+	uint64_t copyFenceVal = ++m_fenceValue;
+	m_d3d12CmdQueue->Signal(m_d3d12Fence, copyFenceVal);
+	m_d3d12Fence->SetEventOnCompletion(copyFenceVal, m_fenceEvent);
+	WaitForSingleObject(m_fenceEvent, 5000);
+
+	auto tDone = std::chrono::high_resolution_clock::now();
+
+	// 5. Release swapchain
+	XrSwapchainImageReleaseInfo relInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	xrReleaseSwapchainImage(m_outputSwapchain, &relInfo);
+
+	float totalMs = std::chrono::duration<float, std::milli>(tDone - tStart).count();
+	{
+		static int s = 0;
+		if (s++ < 10 || totalMs > 3.0f || computeWaitMs > 0.5f)
+			OOVR_LOGF("ASW FinishWarpCopy: total=%.1fms computeWait=%.1fms copy=%.1fms idx=%u",
+			    totalMs, computeWaitMs, totalMs - computeWaitMs, idx);
+	}
+
+	// 6. Handle depth swapchain
+	if (m_depthSwapchain != XR_NULL_HANDLE) {
+		XrSwapchainImageAcquireInfo depthAcquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+		uint32_t depthIdx = 0;
+		res = xrAcquireSwapchainImage(m_depthSwapchain, &depthAcquire, &depthIdx);
+		if (XR_SUCCEEDED(res)) {
+			XrSwapchainImageWaitInfo depthWait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+			depthWait.timeout = XR_INFINITE_DURATION;
+			res = xrWaitSwapchainImage(m_depthSwapchain, &depthWait);
+			if (XR_SUCCEEDED(res)) {
+				XrSwapchainImageReleaseInfo depthRel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+				xrReleaseSwapchainImage(m_depthSwapchain, &depthRel);
+			}
+		}
+	}
+
+	m_warpReadSlot.store(-1, std::memory_order_release);
 	return true;
 }
 
 bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 {
-	if (!m_ready || !m_hasCachedFrame) return false;
+	if (!m_ready || !HasCachedFrame()) {
+		m_warpReadSlot.store(-1, std::memory_order_release);
+		return false;
+	}
+	int slot = m_warpReadSlot.load(std::memory_order_acquire);
+	if (slot < 0)
+		slot = m_publishedSlot.load(std::memory_order_acquire);
+	if (slot < 0) {
+		m_warpReadSlot.store(-1, std::memory_order_release);
+		return false;
+	}
+
+	auto tStart = std::chrono::high_resolution_clock::now();
+
+	// ── D3D12 path ──
+	if (m_d3d12Ready) {
+		// 1. Acquire OpenXR swapchain FIRST (need idx for D3D12 direct copy)
+		XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+		uint32_t idx = 0;
+		XrResult res = xrAcquireSwapchainImage(m_outputSwapchain, &acquireInfo, &idx);
+		if (XR_FAILED(res)) {
+			static int s = 0;
+			if (s++ < 5)
+				OOVR_LOGF("ASW: Output acquire failed result=%d", (int)res);
+			m_warpReadSlot.store(-1, std::memory_order_release);
+			return false;
+		}
+
+		XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+		waitInfo.timeout = XR_INFINITE_DURATION;
+		res = xrWaitSwapchainImage(m_outputSwapchain, &waitInfo);
+		if (XR_FAILED(res)) {
+			OOVR_LOGF("ASW: Output wait FAILED result=%d — disabling ASW (swapchain stuck)", (int)res);
+			m_ready = false;
+			m_warpReadSlot.store(-1, std::memory_order_release);
+			return false;
+		}
+
+		if (idx >= m_outputSwapchainImages.size()) {
+			static int s = 0;
+			if (s++ < 5)
+				OOVR_LOGF("ASW: Acquired idx %u out of range (have %zu)", idx, m_outputSwapchainImages.size());
+			XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+			xrReleaseSwapchainImage(m_outputSwapchain, &rel);
+			m_warpReadSlot.store(-1, std::memory_order_release);
+			return false;
+		}
+
+		// 2. Add D3D12 copy commands to the command list (warp output → swapchain image)
+		// This runs entirely on the D3D12 queue, independent of D3D11 game draws.
+		if (m_d3d12DirectCopy && idx < kMaxSwapchainImages && m_d3d12SwapchainImages[idx]) {
+			// Copy left eye at x=0
+			D3D12_TEXTURE_COPY_LOCATION srcLeft = {};
+			srcLeft.pResource = m_d3d12WarpedOutput[0];
+			srcLeft.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			srcLeft.SubresourceIndex = 0;
+			D3D12_TEXTURE_COPY_LOCATION dstLeft = {};
+			dstLeft.pResource = m_d3d12SwapchainImages[idx];
+			dstLeft.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dstLeft.SubresourceIndex = 0;
+			D3D12_BOX srcBox = { 0, 0, 0, m_eyeWidth, m_eyeHeight, 1 };
+			m_d3d12CmdList->CopyTextureRegion(&dstLeft, 0, 0, 0, &srcLeft, &srcBox);
+
+			// Copy right eye at x=eyeWidth
+			D3D12_TEXTURE_COPY_LOCATION srcRight = {};
+			srcRight.pResource = m_d3d12WarpedOutput[1];
+			srcRight.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			srcRight.SubresourceIndex = 0;
+			D3D12_TEXTURE_COPY_LOCATION dstRight = {};
+			dstRight.pResource = m_d3d12SwapchainImages[idx];
+			dstRight.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dstRight.SubresourceIndex = 0;
+			m_d3d12CmdList->CopyTextureRegion(&dstRight, (UINT)m_eyeWidth, 0, 0, &srcRight, &srcBox);
+		}
+
+		// 3. Close and execute D3D12 command list (warp compute + copy)
+		m_d3d12CmdList->Close();
+		ID3D12CommandList* lists[] = { m_d3d12CmdList };
+		m_d3d12CmdQueue->ExecuteCommandLists(1, lists);
+
+		// 4. Signal D3D12 fence and CPU-wait for completion
+		uint64_t warpFenceVal = ++m_fenceValue;
+		m_d3d12CmdQueue->Signal(m_d3d12Fence, warpFenceVal);
+		m_d3d12Fence->SetEventOnCompletion(warpFenceVal, m_fenceEvent);
+		WaitForSingleObject(m_fenceEvent, 5000);
+
+		auto tWarpGPU = std::chrono::high_resolution_clock::now();
+
+		if (m_d3d12DirectCopy && idx < kMaxSwapchainImages && m_d3d12SwapchainImages[idx]) {
+			// D3D12 wrote directly to swapchain image. CPU fence wait guarantees
+			// the write is complete. No D3D11 copy needed. No D3D11 Flush needed.
+			// The WDDM ensures D3D12 writes are visible to the compositor.
+		} else if (ctx) {
+			// Fallback: D3D11 copy (may be behind game draws)
+			ID3D11DeviceContext4* ctx4 = nullptr;
+			ctx->QueryInterface(IID_PPV_ARGS(&ctx4));
+			if (ctx4) {
+				ctx4->Wait(m_d3d11Fence, warpFenceVal);
+				ctx4->Release();
+			}
+
+			ID3D11Texture2D* target = m_outputSwapchainImages[idx];
+			ctx->CopySubresourceRegion(target, 0,
+			    0, 0, 0, m_warpedOutput[0], 0, nullptr);
+			ctx->CopySubresourceRegion(target, 0,
+			    m_eyeWidth, 0, 0, m_warpedOutput[1], 0, nullptr);
+			ctx->Flush();
+		}
+
+		// Debug mode 51: magenta stripe (still uses D3D11 UpdateSubresource)
+		if (ctx && oovr_global_configuration.ASWDebugMode() == 51) {
+			ID3D11Texture2D* target = m_outputSwapchainImages[idx];
+			D3D11_TEXTURE2D_DESC desc;
+			target->GetDesc(&desc);
+			UINT stripeH = 64;
+			if (stripeH > desc.Height)
+				stripeH = desc.Height;
+			UINT top = (desc.Height - stripeH) / 2;
+			D3D11_BOX box = { 0, top, 0, desc.Width, top + stripeH, 1 };
+			std::vector<uint8_t> pixels(desc.Width * stripeH * 4);
+			for (UINT i = 0; i < desc.Width * stripeH; i++) {
+				pixels[i * 4 + 0] = 255; // R
+				pixels[i * 4 + 1] = 0; // G
+				pixels[i * 4 + 2] = 255; // B
+				pixels[i * 4 + 3] = 255; // A
+			}
+			ctx->UpdateSubresource(target, 0, &box, pixels.data(), desc.Width * 4, 0);
+			ctx->Flush();
+		}
+
+		XrSwapchainImageReleaseInfo relInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		xrReleaseSwapchainImage(m_outputSwapchain, &relInfo);
+
+		auto tDone = std::chrono::high_resolution_clock::now();
+
+		// Timing diagnostics
+		float warpGpuMs = std::chrono::duration<float, std::milli>(tWarpGPU - tStart).count();
+		float totalMs = std::chrono::duration<float, std::milli>(tDone - tStart).count();
+		if (totalMs > 5.0f) {
+			OOVR_LOGF("ASW WARP TIMING (D3D12%s): total=%.1fms warpGPU=%.1f copy=%.1f idx=%u",
+			    m_d3d12DirectCopy ? "+directCopy" : "+d3d11Copy",
+			    totalMs, warpGpuMs, totalMs - warpGpuMs, idx);
+		}
+
+		// 7. Depth swapchain (requires D3D11 ctx for copy — skip from worker thread)
+		if (ctx && m_depthSwapchain != XR_NULL_HANDLE) {
+			XrSwapchainImageAcquireInfo depthAcquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+			uint32_t depthIdx = 0;
+			XrResult depthRes = xrAcquireSwapchainImage(m_depthSwapchain, &depthAcquire, &depthIdx);
+			if (XR_SUCCEEDED(depthRes)) {
+				XrSwapchainImageWaitInfo depthWait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+				depthWait.timeout = XR_INFINITE_DURATION;
+				depthRes = xrWaitSwapchainImage(m_depthSwapchain, &depthWait);
+				if (XR_SUCCEEDED(depthRes)) {
+					if (depthIdx < m_depthSwapchainImages.size()) {
+						ID3D11Texture2D* depthTarget = m_depthSwapchainImages[depthIdx];
+						D3D11_BOX depthBox = {};
+						depthBox.right = m_eyeWidth;
+						depthBox.bottom = m_eyeHeight;
+						depthBox.front = 0;
+						depthBox.back = 1;
+						ctx->CopySubresourceRegion(depthTarget, 0,
+						    0, 0, 0, m_cachedDepth[slot][0], 0, &depthBox);
+						ctx->CopySubresourceRegion(depthTarget, 0,
+						    m_eyeWidth, 0, 0, m_cachedDepth[slot][1], 0, &depthBox);
+						// NO Flush() — runtime handles GPU sync
+					}
+					XrSwapchainImageReleaseInfo depthRel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+					xrReleaseSwapchainImage(m_depthSwapchain, &depthRel);
+				} else {
+					OOVR_LOGF("ASW: Depth wait failed result=%d — depth layer disabled", (int)depthRes);
+				}
+			}
+		}
+
+		static int s = 0;
+		if (s++ < 3)
+			OOVR_LOGF("ASW: Warped output submitted (D3D12%s) warpGPU=%.1fms total=%.1fms",
+			    m_d3d12DirectCopy ? " directCopy" : " d3d11Copy",
+			    warpGpuMs, totalMs);
+
+		m_warpReadSlot.store(-1, std::memory_order_release);
+		return true;
+	}
+
+	// ── D3D11 fallback path (original code) ──
 
 	// Acquire output swapchain
 	XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -695,38 +2350,59 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 	XrResult res = xrAcquireSwapchainImage(m_outputSwapchain, &acquireInfo, &idx);
 	if (XR_FAILED(res)) {
 		static int s = 0;
-		if (s++ < 5) OOVR_LOGF("ASW: Output acquire failed result=%d", (int)res);
+		if (s++ < 5)
+			OOVR_LOGF("ASW: Output acquire failed result=%d", (int)res);
+		m_warpReadSlot.store(-1, std::memory_order_release);
 		return false;
 	}
 
 	XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-	waitInfo.timeout = XR_INFINITE_DURATION; // our own swapchain — runtime always returns images
+	waitInfo.timeout = XR_INFINITE_DURATION;
 	res = xrWaitSwapchainImage(m_outputSwapchain, &waitInfo);
 	if (XR_FAILED(res)) {
-		// Wait failed on our own swapchain — something is seriously wrong.
-		// Do NOT release: spec says release after failed wait is XR_ERROR_CALL_ORDER_INVALID.
-		// Image stays acquired — swapchain is now stuck. Disable ASW for this session.
 		OOVR_LOGF("ASW: Output wait FAILED result=%d — disabling ASW (swapchain stuck)", (int)res);
 		m_ready = false;
+		m_warpReadSlot.store(-1, std::memory_order_release);
 		return false;
 	}
 
-	// Copy both warped eyes into stereo-combined swapchain (use acquired index!)
 	if (idx >= m_outputSwapchainImages.size()) {
 		static int s = 0;
-		if (s++ < 5) OOVR_LOGF("ASW: Acquired idx %u out of range (have %zu)", idx, m_outputSwapchainImages.size());
+		if (s++ < 5)
+			OOVR_LOGF("ASW: Acquired idx %u out of range (have %zu)", idx, m_outputSwapchainImages.size());
 		XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 		xrReleaseSwapchainImage(m_outputSwapchain, &rel);
+		m_warpReadSlot.store(-1, std::memory_order_release);
 		return false;
 	}
 	ID3D11Texture2D* target = m_outputSwapchainImages[idx];
-	// Copy warped output (translation-corrected) into stereo-combined swapchain
-	ctx->CopySubresourceRegion(target, 0,
-	    0, 0, 0, m_warpedOutput[0], 0, nullptr); // left eye at x=0
-	ctx->CopySubresourceRegion(target, 0,
-	    m_eyeWidth, 0, 0, m_warpedOutput[1], 0, nullptr); // right eye at x=eyeWidth
 
-	// No manual Flush() — xrReleaseSwapchainImage handles GPU synchronization
+	ctx->CopySubresourceRegion(target, 0,
+	    0, 0, 0, m_warpedOutput[0], 0, nullptr);
+	ctx->CopySubresourceRegion(target, 0,
+	    m_eyeWidth, 0, 0, m_warpedOutput[1], 0, nullptr);
+
+	// Debug mode 51: magenta stripe across center of warp frames (D3D11 fallback path)
+	if (oovr_global_configuration.ASWDebugMode() == 51) {
+		D3D11_TEXTURE2D_DESC desc;
+		target->GetDesc(&desc);
+		UINT stripeH = 64;
+		if (stripeH > desc.Height)
+			stripeH = desc.Height;
+		UINT top = (desc.Height - stripeH) / 2;
+		D3D11_BOX box = { 0, top, 0, desc.Width, top + stripeH, 1 };
+		std::vector<uint8_t> pixels(desc.Width * stripeH * 4);
+		for (UINT i = 0; i < desc.Width * stripeH; i++) {
+			pixels[i * 4 + 0] = 255; // R
+			pixels[i * 4 + 1] = 0; // G
+			pixels[i * 4 + 2] = 255; // B
+			pixels[i * 4 + 3] = 255; // A
+		}
+		ctx->UpdateSubresource(target, 0, &box, pixels.data(), desc.Width * 4, 0);
+	}
+
+	ctx->Flush();
+
 	XrSwapchainImageReleaseInfo relInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 	xrReleaseSwapchainImage(m_outputSwapchain, &relInfo);
 
@@ -748,14 +2424,14 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 					depthBox.front = 0;
 					depthBox.back = 1;
 					ctx->CopySubresourceRegion(depthTarget, 0,
-					    0, 0, 0, m_cachedDepth[0], 0, &depthBox);
+					    0, 0, 0, m_cachedDepth[slot][0], 0, &depthBox);
 					ctx->CopySubresourceRegion(depthTarget, 0,
-					    m_eyeWidth, 0, 0, m_cachedDepth[1], 0, &depthBox);
+					    m_eyeWidth, 0, 0, m_cachedDepth[slot][1], 0, &depthBox);
+					ctx->Flush();
 				}
 				XrSwapchainImageReleaseInfo depthRel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 				xrReleaseSwapchainImage(m_depthSwapchain, &depthRel);
 			} else {
-				// Wait failed — don't release (spec violation). Depth swapchain stuck but non-fatal.
 				OOVR_LOGF("ASW: Depth wait failed result=%d — depth layer disabled", (int)depthRes);
 			}
 		}
@@ -763,7 +2439,65 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 
 	static int s = 0;
 	if (s++ < 3)
-		OOVR_LOG("ASW: Warped output submitted to swapchain");
+		OOVR_LOG("ASW: Warped output submitted to swapchain (D3D11 fallback)");
+
+	m_warpReadSlot.store(-1, std::memory_order_release);
+	return true;
+}
+
+bool ASWProvider::SubmitBlackOutput(ID3D11DeviceContext* ctx)
+{
+	if (!m_ready || m_outputSwapchain == XR_NULL_HANDLE)
+		return false;
+
+	// Acquire output swapchain
+	XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	uint32_t idx = 0;
+	XrResult res = xrAcquireSwapchainImage(m_outputSwapchain, &acquireInfo, &idx);
+	if (XR_FAILED(res))
+		return false;
+
+	XrSwapchainImageWaitInfo waitInfo = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	waitInfo.timeout = XR_INFINITE_DURATION;
+	res = xrWaitSwapchainImage(m_outputSwapchain, &waitInfo);
+	if (XR_FAILED(res))
+		return false;
+
+	if (idx < m_outputSwapchainImages.size()) {
+		ID3D11Texture2D* target = m_outputSwapchainImages[idx];
+		// Create a temporary RTV to clear the texture to black
+		ID3D11RenderTargetView* rtv = nullptr;
+		ID3D11Device* dev = nullptr;
+		ctx->GetDevice(&dev);
+		if (dev) {
+			HRESULT hr = dev->CreateRenderTargetView(target, nullptr, &rtv);
+			if (SUCCEEDED(hr) && rtv) {
+				float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+				ctx->ClearRenderTargetView(rtv, black);
+				rtv->Release();
+			}
+			dev->Release();
+		}
+	}
+
+	XrSwapchainImageReleaseInfo relInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	xrReleaseSwapchainImage(m_outputSwapchain, &relInfo);
+
+	// Also handle depth swapchain if present
+	if (m_depthSwapchain != XR_NULL_HANDLE) {
+		XrSwapchainImageAcquireInfo depthAcquire = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+		uint32_t depthIdx = 0;
+		XrResult depthRes = xrAcquireSwapchainImage(m_depthSwapchain, &depthAcquire, &depthIdx);
+		if (XR_SUCCEEDED(depthRes)) {
+			XrSwapchainImageWaitInfo depthWait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+			depthWait.timeout = XR_INFINITE_DURATION;
+			depthRes = xrWaitSwapchainImage(m_depthSwapchain, &depthWait);
+			if (XR_SUCCEEDED(depthRes)) {
+				XrSwapchainImageReleaseInfo depthRel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+				xrReleaseSwapchainImage(m_depthSwapchain, &depthRel);
+			}
+		}
+	}
 
 	return true;
 }
@@ -775,7 +2509,14 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 void ASWProvider::Shutdown()
 {
 	m_ready = false;
-	m_hasCachedFrame = false;
+	m_publishedSlot.store(-1, std::memory_order_relaxed);
+	m_previousPublishedSlot.store(-1, std::memory_order_relaxed);
+	m_warpReadSlot.store(-1, std::memory_order_relaxed);
+	m_buildSlot = 0;
+	m_buildEyeReady[0] = false;
+	m_buildEyeReady[1] = false;
+	m_hasLastPublishedPose = false;
+	m_frameCounter = 0;
 
 	if (m_depthSwapchain != XR_NULL_HANDLE) {
 		xrDestroySwapchain(m_depthSwapchain);
@@ -790,20 +2531,207 @@ void ASWProvider::Shutdown()
 	m_outputSwapchainImages.clear();
 
 	for (int i = 0; i < 2; i++) {
-		if (m_uavOutput[i]) { m_uavOutput[i]->Release(); m_uavOutput[i] = nullptr; }
-		if (m_warpedOutput[i]) { m_warpedOutput[i]->Release(); m_warpedOutput[i] = nullptr; }
-		if (m_srvDepth[i]) { m_srvDepth[i]->Release(); m_srvDepth[i] = nullptr; }
-		if (m_srvMV[i]) { m_srvMV[i]->Release(); m_srvMV[i] = nullptr; }
-		if (m_srvColor[i]) { m_srvColor[i]->Release(); m_srvColor[i] = nullptr; }
-		if (m_cachedDepth[i]) { m_cachedDepth[i]->Release(); m_cachedDepth[i] = nullptr; }
-		if (m_cachedMV[i]) { m_cachedMV[i]->Release(); m_cachedMV[i] = nullptr; }
-		if (m_cachedColor[i]) { m_cachedColor[i]->Release(); m_cachedColor[i] = nullptr; }
+		if (m_uavOutput[i]) {
+			m_uavOutput[i]->Release();
+			m_uavOutput[i] = nullptr;
+		}
+		if (m_warpedOutput[i]) {
+			m_warpedOutput[i]->Release();
+			m_warpedOutput[i] = nullptr;
+		}
+	}
+	for (uint32_t slot = 0; slot < kAswCacheSlotCount; ++slot) {
+		for (int eye = 0; eye < 2; ++eye) {
+			if (m_srvDepth[slot][eye]) {
+				m_srvDepth[slot][eye]->Release();
+				m_srvDepth[slot][eye] = nullptr;
+			}
+			if (m_srvMV[slot][eye]) {
+				m_srvMV[slot][eye]->Release();
+				m_srvMV[slot][eye] = nullptr;
+			}
+			if (m_srvColor[slot][eye]) {
+				m_srvColor[slot][eye]->Release();
+				m_srvColor[slot][eye] = nullptr;
+			}
+			if (m_cachedDepth[slot][eye]) {
+				m_cachedDepth[slot][eye]->Release();
+				m_cachedDepth[slot][eye] = nullptr;
+			}
+			if (m_cachedMV[slot][eye]) {
+				m_cachedMV[slot][eye]->Release();
+				m_cachedMV[slot][eye] = nullptr;
+			}
+			if (m_cachedColor[slot][eye]) {
+				m_cachedColor[slot][eye]->Release();
+				m_cachedColor[slot][eye] = nullptr;
+			}
+		}
 	}
 
-	if (m_linearSampler) { m_linearSampler->Release(); m_linearSampler = nullptr; }
-	if (m_constantBuffer) { m_constantBuffer->Release(); m_constantBuffer = nullptr; }
-	if (m_warpCS) { m_warpCS->Release(); m_warpCS = nullptr; }
-	if (m_device) { m_device->Release(); m_device = nullptr; }
+	if (m_linearSampler) {
+		m_linearSampler->Release();
+		m_linearSampler = nullptr;
+	}
+	if (m_constantBuffer) {
+		m_constantBuffer->Release();
+		m_constantBuffer = nullptr;
+	}
+	if (m_warpCS) {
+		m_warpCS->Release();
+		m_warpCS = nullptr;
+	}
+
+	// D3D12 cleanup — drain GPU first
+	if (m_d3d12Ready && m_d3d12CmdQueue && m_d3d12Fence && m_fenceEvent) {
+		uint64_t drainVal = ++m_fenceValue;
+		m_d3d12CmdQueue->Signal(m_d3d12Fence, drainVal);
+		m_d3d12Fence->SetEventOnCompletion(drainVal, m_fenceEvent);
+		WaitForSingleObject(m_fenceEvent, 5000);
+	}
+	m_d3d12Ready = false;
+
+	// D3D12 shared resources
+	for (uint32_t sl = 0; sl < kAswCacheSlotCount; ++sl) {
+		for (int e = 0; e < 2; ++e) {
+			if (m_d3d12CachedColor[sl][e]) {
+				m_d3d12CachedColor[sl][e]->Release();
+				m_d3d12CachedColor[sl][e] = nullptr;
+			}
+			if (m_d3d12CachedMV[sl][e]) {
+				m_d3d12CachedMV[sl][e]->Release();
+				m_d3d12CachedMV[sl][e] = nullptr;
+			}
+			if (m_d3d12CachedDepth[sl][e]) {
+				m_d3d12CachedDepth[sl][e]->Release();
+				m_d3d12CachedDepth[sl][e] = nullptr;
+			}
+		}
+	}
+	for (int e = 0; e < 2; ++e) {
+		if (m_d3d12WarpedOutput[e]) {
+			m_d3d12WarpedOutput[e]->Release();
+			m_d3d12WarpedOutput[e] = nullptr;
+		}
+	}
+	for (uint32_t i = 0; i < kMaxSwapchainImages; i++) {
+		if (m_d3d12SwapchainImages[i]) {
+			m_d3d12SwapchainImages[i]->Release();
+			m_d3d12SwapchainImages[i] = nullptr;
+		}
+	}
+	m_d3d12DirectCopy = false;
+
+	// D3D12 constant buffer
+	if (m_d3d12ConstantBuffer) {
+		m_d3d12ConstantBuffer->Unmap(0, nullptr);
+		m_d3d12CbMappedPtr = nullptr;
+		m_d3d12ConstantBuffer->Release();
+		m_d3d12ConstantBuffer = nullptr;
+	}
+
+	// D3D12 pipeline
+	if (m_d3d12SrvUavHeap) {
+		m_d3d12SrvUavHeap->Release();
+		m_d3d12SrvUavHeap = nullptr;
+	}
+	if (m_d3d12PipelineState) {
+		m_d3d12PipelineState->Release();
+		m_d3d12PipelineState = nullptr;
+	}
+	if (m_d3d12RootSig) {
+		m_d3d12RootSig->Release();
+		m_d3d12RootSig = nullptr;
+	}
+
+	// D3D12 fence
+	if (m_d3d11Fence) {
+		m_d3d11Fence->Release();
+		m_d3d11Fence = nullptr;
+	}
+	if (m_d3d12Fence) {
+		m_d3d12Fence->Release();
+		m_d3d12Fence = nullptr;
+	}
+	if (m_fenceSharedHandle) {
+		CloseHandle(m_fenceSharedHandle);
+		m_fenceSharedHandle = nullptr;
+	}
+	if (m_fenceEvent) {
+		CloseHandle(m_fenceEvent);
+		m_fenceEvent = nullptr;
+	}
+	m_fenceValue = 0;
+	m_cacheFenceValue.store(0, std::memory_order_relaxed);
+
+	// D3D12 gap fence
+	if (m_d3d11GapFence) {
+		m_d3d11GapFence->Release();
+		m_d3d11GapFence = nullptr;
+	}
+	if (m_d3d12GapFence) {
+		m_d3d12GapFence->Release();
+		m_d3d12GapFence = nullptr;
+	}
+	if (m_gapFenceSharedHandle) {
+		CloseHandle(m_gapFenceSharedHandle);
+		m_gapFenceSharedHandle = nullptr;
+	}
+	m_gapFenceValue.store(0, std::memory_order_relaxed);
+	m_gapTargetValue.store(0, std::memory_order_relaxed);
+
+	// D3D12 game staging copy infrastructure
+	for (uint32_t i = 0; i < m_gameSharedTexCount; i++) {
+		if (m_gameSharedTexCache[i].d3d12Res) {
+			m_gameSharedTexCache[i].d3d12Res->Release();
+			m_gameSharedTexCache[i].d3d12Res = nullptr;
+		}
+		m_gameSharedTexCache[i].d3d11Tex = nullptr;
+	}
+	m_gameSharedTexCount = 0;
+	if (m_d3d12GameCopyCmdList) {
+		m_d3d12GameCopyCmdList->Release();
+		m_d3d12GameCopyCmdList = nullptr;
+	}
+	if (m_d3d12GameCopyCmdAlloc) {
+		m_d3d12GameCopyCmdAlloc->Release();
+		m_d3d12GameCopyCmdAlloc = nullptr;
+	}
+	if (m_gameCopyFenceEvent) {
+		CloseHandle(m_gameCopyFenceEvent);
+		m_gameCopyFenceEvent = nullptr;
+	}
+	m_gameCopyFenceWaitPending = false;
+	m_gameCopyFenceValue = 0;
+
+	// D3D12 command infrastructure
+	if (m_d3d12CmdList) {
+		m_d3d12CmdList->Release();
+		m_d3d12CmdList = nullptr;
+	}
+	if (m_d3d12CmdAlloc) {
+		m_d3d12CmdAlloc->Release();
+		m_d3d12CmdAlloc = nullptr;
+	}
+	if (m_d3d12CmdQueue) {
+		m_d3d12CmdQueue->Release();
+		m_d3d12CmdQueue = nullptr;
+	}
+	if (m_d3d12Device) {
+		m_d3d12Device->Release();
+		m_d3d12Device = nullptr;
+	}
+
+	// D3D11 QI refs
+	if (m_d3d11Device5) {
+		m_d3d11Device5->Release();
+		m_d3d11Device5 = nullptr;
+	}
+
+	if (m_device) {
+		m_device->Release();
+		m_device = nullptr;
+	}
 
 	m_eyeWidth = 0;
 	m_eyeHeight = 0;
