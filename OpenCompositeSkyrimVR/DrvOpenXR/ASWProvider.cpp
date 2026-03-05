@@ -70,11 +70,12 @@ cbuffer WarpParams : register(b0) {
     float3 _pad3;
 };
 
-// LinearizeDepth: used by the parallax warp, depth-edge detection, nearFadeDepth.
-// This formula was calibrated with the rest of the ASW parallax system; do NOT change
-// without re-tuning depthScale and related parameters.
+// LinearizeDepth: convert raw depth buffer value to linear distance in game units.
+// Skyrim's depth convention: d=0 is near plane, d=1 is far plane (standard-Z).
+// Formula: z_linear = zNear * zFar / (zFar - d * (zFar - zNear))
+//   d=0 → zNear, d=1 → zFar
 float LinearizeDepth(float d, float zNear, float zFar) {
-    float denom = zNear + d * (zFar - zNear);
+    float denom = zFar - d * (zFar - zNear);
     return (abs(denom) > 0.0001) ? (zNear * zFar / denom) : zFar;
 }
 
@@ -123,7 +124,10 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float edgeFade = saturate(1.0 - (depthRatio - 1.0) / max(edgeFadeWidth, 0.001));
     // edgeFade = 1.0 on flat surfaces, approaches 0.0 at depth edges
 
-    // 3. Depth parallax warp (camera translation correction)
+    // 3. Depth parallax warp (head rot + head trans from OpenXR predicted poses)
+    //    poseDeltaMatrix has correct timing for the warp display time.
+    //    Stick yaw is injected into poseDeltaMatrix on the C++ side.
+    //    Locomotion is handled by the MV path below.
     float scaledDepth = linearDepth * depthScale;
     float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
     float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
@@ -139,72 +143,60 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         parallaxUV.y = (oldTanY - fovTanUp) / (fovTanDown - fovTanUp);
     }
 
-    // 4. Near-field depth fade: objects closer than nearFadeDepth get zero parallax.
-    //    Ramps from 0 at nearFadeDepth to full at 2*nearFadeDepth.
-    //    Prevents "frame split" on hands, nearby NPCs, walls you're next to.
+    // 4. Near-field depth fade
     float depthFade = (nearFadeDepth > 0.0) ? saturate((linearDepth - nearFadeDepth) / nearFadeDepth) : 1.0;
 
-    // 4b. Combine depth parallax + MV correction additively.
-    //    Depth parallax (parallaxUV - uv): head translation + locomotion (depth-dependent).
-    //    MV correction: stick rotation + head trans residual from camera MVs minus head rot.
-    //    Camera MVs from RSS VP capture rotation + head tracking but NOT locomotion.
-    //    Both offsets use uv as common base to avoid double-counting.
-    float2 parallaxOffset = parallaxUV - uv;  // depth-dependent translation correction
-    float2 mvOffset = float2(0, 0);           // rotation correction from MVs
-    if (abs(mvConfidence) > 0.001) {
-        // Compute head MV (head rotation + head translation, no locomotion)
-        // to subtract from total camera MV, isolating locomotion for the warp.
-        float2 headMV = float2(0, 0);
+    float2 parallaxOffset = parallaxUV - uv;
 
-        if (hasClipToClipNoLoco) {
-            // PRIMARY PATH: Use clipToClipNoLoco from the same VP source as camera MVs.
-            // clipToClipNoLoco = prevVP * inv(curVP_original) — captures head rotation +
-            // head translation but NOT locomotion. Using the same VP matrices that
-            // generated the camera MVs ensures exact cancellation of head motion,
-            // eliminating the mismatch between OpenXR poses and game VP matrices.
-            float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-            float4 clipPos = float4(ndc, d, 1.0);
-            float4 prevClip = mul(clipToClipNoLoco, clipPos);
-            if (abs(prevClip.w) > 0.0001) {
-                float2 prevNDC = prevClip.xy / prevClip.w;
-                float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
-                headMV = prevUV - uv;
-            }
-        } else {
-            // FALLBACK: Use OpenXR-pose-derived headRotMatrix (rotation only).
-            float tanX_here = lerp(fovTanLeft, fovTanRight, uv.x);
-            float tanY_here = lerp(fovTanUp, fovTanDown, uv.y);
-            float3 viewDir = float3(tanX_here, tanY_here, 1.0);
-            float3 rotDir = mul((float3x3)headRotMatrix, viewDir);
-            float2 headPrevUV = uv;
-            if (rotDir.z > 0.001) {
-                headPrevUV.x = (rotDir.x / rotDir.z - fovTanLeft) / (fovTanRight - fovTanLeft);
-                headPrevUV.y = (rotDir.y / rotDir.z - fovTanUp) / (fovTanDown - fovTanUp);
-            }
-            headMV = headPrevUV - uv;
+    // Compute all MV-related values unconditionally for diagnostics.
+    int2 mvPixel = ToMVCoord((int2)tid.xy);
+    float2 rawMV = mvTex[mvPixel];
+    float2 totalMV = rawMV * mvPixelScale;
+    totalMV = clamp(totalMV, float2(-0.15, -0.15), float2(0.15, 0.15));
+
+    // headOnlyMV from headRotMatrix (OpenXR frame-to-frame, NO stick rotation).
+    // Same reprojection math as parallax, but using headRotMatrix over the game
+    // frame interval instead of poseDeltaMatrix over the game-to-warp interval.
+    // This lets the residual (totalMV - headOnlyMV) capture stick rotation + locomotion.
+    // headRotMatrix is cur→prev full head delta (rotation + translation, row_major).
+    // Built from OpenXR poses only — no stick rotation. Same direction as c2c.
+    float2 headOnlyMV = float2(0, 0);
+    {
+        float3 viewPos = float3(tanX * scaledDepth, tanY * scaledDepth, scaledDepth);
+        float4 rotated = mul(headRotMatrix, float4(viewPos, 1.0));
+        if (scaledDepth > 0.001 && rotated.z > 0.001) {
+            float rotTanX = rotated.x / rotated.z;
+            float rotTanY = rotated.y / rotated.z;
+            float2 rotUV = float2(
+                (rotTanX - fovTanLeft) / (fovTanRight - fovTanLeft),
+                (rotTanY - fovTanUp) / (fovTanDown - fovTanUp));
+            headOnlyMV = rotUV - uv;
         }
-
-        // Read total camera MV and subtract head motion component
-        int2 mvPixel = ToMVCoord((int2)tid.xy);
-        float2 totalMV = mvTex[mvPixel] * mvPixelScale;
-
-        // Reject MV outliers: clamp to ±0.15 UV (~540px at 3560).
-        // Game MV buffer can contain garbage values >1.0 from skybox vertices,
-        // objects entering/leaving frustum, or particle shaders.
-        totalMV = clamp(totalMV, float2(-0.15, -0.15), float2(0.15, 0.15));
-
-        float2 locoMV = totalMV - headMV;
-
-        // Apply locomotion MV to displacement.
-        // mvConfidence evaluates negatively (`-m_mvTimingRatio * scale`).
-        // To sample backwards along the MV direction (gather warp), we add the negative MV 
-        // to the read coordinate instead of subtracting it.
-        mvOffset = mvConfidence * locoMV;
     }
 
-    // 5. Combine corrections with fading:
-    //    Depth parallax (translation): faded at depth edges and near-field.
-    //    MV locomotion (mvOffset): full strength everywhere.
+    // c2cHeadMV for diagnostics (captures head + stick rotation from RSS VP)
+    float2 c2cHeadMV = float2(0, 0);
+    if (hasClipToClipNoLoco) {
+        float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        float4 clipPos = float4(ndc, d, 1.0);
+        float4 prevClip = mul(clipToClipNoLoco, clipPos);
+        if (abs(prevClip.w) > 0.0001) {
+            float2 prevNDC = prevClip.xy / prevClip.w;
+            c2cHeadMV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5) - uv;
+        }
+    }
+
+    // Residuals for diagnostics
+    float2 c2cResidual = totalMV - c2cHeadMV;       // head+stick subtracted (loco only)
+    float2 headOnlyResidual = totalMV - headOnlyMV;  // head-only subtracted (stick + loco)
+
+    // Apply MV correction: subtract head-only MV so residual includes stick rotation + loco
+    float2 mvOffset = float2(0, 0);
+    if (abs(mvConfidence) > 0.001) {
+        mvOffset = mvConfidence * headOnlyResidual;
+    }
+
+    // 5. Combine: parallax (faded at depth edges/near-field) + MV loco correction.
     float2 fadedParallax = parallaxOffset * edgeFade * depthFade;
     float2 sourceUV = uv + fadedParallax + mvOffset;
 
@@ -235,6 +227,78 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         float2 mv = mvTex[mvPixel];
         float mvMag = length(mv) * 100.0;  // scale for visibility
         color = float4(saturate(mvMag), saturate(1.0 - mvMag), 0.0, 1.0);
+    } else if (debugMode == 4) {
+        // locoMV viz: shows totalMV - headMV (isolated locomotion).
+        // Red = large locoMV, green = small. If green during loco, headMV is eating the signal.
+        int2 mvPixel = ToMVCoord((int2)tid.xy);
+        float2 rawMV = mvTex[mvPixel];
+        float2 totalMV = rawMV * 1.0f * mvPixelScale;
+        float2 headMV2 = float2(0, 0);
+        if (hasClipToClipNoLoco) {
+            float2 ndc2 = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+            float4 cp2 = float4(ndc2, d, 1.0);
+            float4 pc2 = mul(clipToClipNoLoco, cp2);
+            if (abs(pc2.w) > 0.0001) {
+                float2 pndc2 = pc2.xy / pc2.w;
+                headMV2 = float2(pndc2.x * 0.5 + 0.5, 0.5 - pndc2.y * 0.5) - uv;
+            }
+        }
+        float2 loco2 = totalMV - headMV2;
+        float locoMag = length(loco2) * 100.0;
+        color = float4(saturate(locoMag), saturate(1.0 - locoMag), 0.0, 1.0);
+    } else if (debugMode == 6) {
+        // mvOffset viz: shows actual applied MV correction (mvConfidence * locoMV).
+        // Blue channel = magnitude. If zero during loco, mvOffset is being killed somewhere.
+        float mvOffMag = length(mvOffset) * 100.0;
+        // Also show if OOB would trigger: red = OOB (identity fallback)
+        float2 testUV = uv + fadedParallax + mvOffset;
+        float oob = (any(testUV < -0.01) || any(testUV > 1.01)) ? 1.0 : 0.0;
+        color = float4(oob, 0.0, saturate(mvOffMag), 1.0);
+    } else if (debugMode == 5) {
+        // headMV viz: shows clipToClipNoLoco-derived head motion.
+        // Red = large headMV, green = small.
+        float headMag = length(c2cHeadMV) * 100.0;
+        color = float4(saturate(headMag), saturate(1.0 - headMag), 0.0, 1.0);
+    } else if (debugMode == 7) {
+        // C2C RESIDUAL: totalMV - c2cHeadMV. Shows what locoMV looks like.
+        // Red = +X residual, Cyan = -X residual, Green = +Y, Magenta = -Y.
+        // Black center = perfect cancellation. Bright = large mismatch.
+        // Compare left vs right eye: if right eye is brighter, c2c doesn't match right eye MVs.
+        float scale = 200.0;  // amplify for visibility
+        float rx = c2cResidual.x * scale;
+        float ry = c2cResidual.y * scale;
+        color = float4(
+            saturate(rx) + saturate(-ry),   // R: +X or -Y
+            saturate(ry) + saturate(-rx),   // G: +Y or -X
+            saturate(-rx) + saturate(-ry),  // B: -X or -Y
+            1.0);
+    } else if (debugMode == 8) {
+        // PDM RESIDUAL: totalMV - parallaxOffset. Shows what extraMV looks like.
+        // Same color scheme as mode 7. Compare to mode 7 to see which headMV is better.
+        float scale = 200.0;
+        float rx = headOnlyResidual.x * scale;
+        float ry = headOnlyResidual.y * scale;
+        color = float4(
+            saturate(rx) + saturate(-ry),
+            saturate(ry) + saturate(-rx),
+            saturate(-rx) + saturate(-ry),
+            1.0);
+    } else if (debugMode == 9) {
+        // RAW MV direction: R = +X (rightward), G = +Y (downward), B = -X or -Y.
+        // Shows raw game MV direction and magnitude per-pixel.
+        float scale = 50.0;
+        color = float4(
+            saturate(totalMV.x * scale),
+            saturate(totalMV.y * scale),
+            saturate(-totalMV.x * scale) + saturate(-totalMV.y * scale),
+            1.0);
+    } else if (debugMode == 10) {
+        // PARALLAX vs C2C comparison: shows difference between poseDeltaMatrix
+        // and clipToClipNoLoco predictions. R=|diff.x|, G=|diff.y|. Should be
+        // near-black if both compute the same head rotation.
+        float2 diff = parallaxOffset - c2cHeadMV;
+        float scale = 500.0;  // high amplification — differences should be tiny
+        color = float4(saturate(abs(diff.x) * scale), saturate(abs(diff.y) * scale), 0.0, 1.0);
     }
 
     output[tid.xy] = color;
@@ -1505,54 +1569,82 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	}
 
 	WarpConstants cb = {};
-	// poseDeltaMatrix: depth-aware rotation from warp target orientation (newPose)
-	// back to cached game orientation (m_slotPose). This rotates the warp output
-	// to match the warp display time's predicted pose. Combined with declaring
-	// newPose (GetPrecompPose) in the composition layer, ATW correction ≈ 0
-	// for the warp slot — eliminating the parallax alternation between game/warp.
-	BuildPoseDeltaMatrix(m_slotPose[slot][eye], newPose, cb.poseDeltaMatrix);
+	// poseDeltaMatrix: backward warp transform (new view → old view) in shader coords.
+	// The shader uses +Z-forward but OpenXR uses -Z-forward. The correct transform is
+	// F * M * F where M = V_old * W_new (OpenXR backward warp) and F = diag(1,1,-1,1).
+	// BuildPoseDeltaMatrix(new, cached) gives M directly. Then apply F conjugation:
+	//   - Negate rotation column 2 (m[2], m[6]) and row 2 (m[8], m[9])
+	//   - m[10] double-negated → unchanged
+	//   - Negate Z translation (m[11]); X,Y translation unchanged
+	// This correctly handles ALL rotation axes (yaw, pitch, AND roll).
+	BuildPoseDeltaMatrix(newPose, m_slotPose[slot][eye], cb.poseDeltaMatrix);
+	// Z-flip conjugation: F * M * F
+	cb.poseDeltaMatrix[2]  = -cb.poseDeltaMatrix[2];
+	cb.poseDeltaMatrix[6]  = -cb.poseDeltaMatrix[6];
+	cb.poseDeltaMatrix[8]  = -cb.poseDeltaMatrix[8];
+	cb.poseDeltaMatrix[9]  = -cb.poseDeltaMatrix[9];
+	cb.poseDeltaMatrix[11] = -cb.poseDeltaMatrix[11];
 	m_precompPose[eye] = newPose;
 
 	cb.debugMode = oovr_global_configuration.ASWDebugMode();
 
+	// headRotMatrix: full frame-to-frame head delta (rotation + translation) from OpenXR poses.
+	// NO stick rotation — only head tracking. Used to subtract head motion from game MVs,
+	// so the residual captures stick rotation + locomotion for mvOffset correction.
+	// BuildPoseDeltaMatrix(old, new) transforms from old→new view space.
+	// We need backward direction (same as c2c/game MVs): swap args to get cur→prev.
 	if (m_slotHasPrevPose[slot]) {
-		XrQuaternionf prevInv;
-		QuatInverse(m_slotPrevPose[slot][eye].orientation, prevInv);
-		XrQuaternionf dq;
-		QuatMultiply(prevInv, m_slotPose[slot][eye].orientation, dq);
-		dq.x = -dq.x;
-		dq.y = -dq.y;
-		float qx = dq.x, qy = dq.y, qz = dq.z, qw = dq.w;
-		float xx = qx * qx, yy = qy * qy, zz = qz * qz;
-		float xy = qx * qy, xz = qx * qz, yz = qy * qz;
-		float wx = qw * qx, wy = qw * qy, wz = qw * qz;
-		float* m = cb.headRotMatrix;
-		m[0] = 1 - 2 * (yy + zz);
-		m[1] = 2 * (xy - wz);
-		m[2] = 2 * (xz + wy);
-		m[3] = 0;
-		m[4] = 2 * (xy + wz);
-		m[5] = 1 - 2 * (xx + zz);
-		m[6] = 2 * (yz - wx);
-		m[7] = 0;
-		m[8] = 2 * (xz - wy);
-		m[9] = 2 * (yz + wx);
-		m[10] = 1 - 2 * (xx + yy);
-		m[11] = 0;
-		m[12] = 0;
-		m[13] = 0;
-		m[14] = 0;
-		m[15] = 1;
+		BuildPoseDeltaMatrix(m_slotPose[slot][eye], m_slotPrevPose[slot][eye], cb.headRotMatrix);
+		// Z-flip conjugation: F * M * F (OpenXR right-hand → Skyrim left-hand)
+		cb.headRotMatrix[2]  = -cb.headRotMatrix[2];
+		cb.headRotMatrix[6]  = -cb.headRotMatrix[6];
+		cb.headRotMatrix[8]  = -cb.headRotMatrix[8];
+		cb.headRotMatrix[9]  = -cb.headRotMatrix[9];
+		cb.headRotMatrix[11] = -cb.headRotMatrix[11];
 	} else {
 		for (int i = 0; i < 16; i++)
 			cb.headRotMatrix[i] = 0;
 		cb.headRotMatrix[0] = cb.headRotMatrix[5] = cb.headRotMatrix[10] = cb.headRotMatrix[15] = 1;
 	}
 
+	// Stick turn correction: inject yaw rotation from actorYaw into poseDeltaMatrix.
+	// actorYaw (PlayerCharacter::data.angle.z) only changes with stick rotation, not head.
+	// Dead zone filters physics wobble. Y-axis rotation in view space (XZ plane).
+	float rotS = oovr_global_configuration.ASWRotationScale();
+	if (rotS != 0.0f && fabsf(m_locoYaw) > 0.002f) { // ~0.1 degree dead zone
+		float theta = m_locoYaw * rotS;
+		float co = cosf(theta), si = sinf(theta);
+		float* M = cb.poseDeltaMatrix;
+		// Rotate rows 0 and 2 (Y-axis rotation in row-major layout)
+		for (int col = 0; col < 4; col++) {
+			float r0 = M[0 * 4 + col];
+			float r2 = M[2 * 4 + col];
+			M[0 * 4 + col] = co * r0 + si * r2;
+			M[2 * 4 + col] = -si * r0 + co * r2;
+		}
+	}
+
+	// Apply locomotion translation
+	// Scale by translation scale and warp strength
+	float masterStr = oovr_global_configuration.ASWWarpStrength();
+	float transStr = masterStr * oovr_global_configuration.ASWTranslationScale();
+	transStr = (transStr < 0.0f) ? 0.0f : transStr;
+
+	if (transStr != 1.0f) {
+		cb.poseDeltaMatrix[3] *= transStr;
+		cb.poseDeltaMatrix[7] *= transStr;
+		cb.poseDeltaMatrix[11] *= transStr;
+	}
+
+	// Locomotion correction: handled by MV path (locoMV = totalMV - headMV) in shader.
+	// The game's per-pixel MVs already contain depth-dependent locomotion parallax.
+	// poseDeltaMatrix only handles head rotation/translation from OpenXR poses.
+	// Previous approach of injecting actorPos delta into poseDeltaMatrix failed because
+	// a uniform translation cannot capture depth-dependent parallax correctly through
+	// the unproject→transform→reproject pipeline when coordinate frames don't match.
+
 	// clipToClipNoLoco: prevVP * inv(curVP_original) — head rotation + head translation,
-	// no locomotion injection. Matches the exact VP matrices used to generate camera MVs,
-	// ensuring perfect cancellation of head motion in locoMV = totalMV - headMV.
-	// Read from the SAME cache slot as color/MV/depth to avoid race with game thread.
+	// no locomotion injection. Per-eye from RSS VP matrices.
 	if (m_slotHasClipToClipNoLoco[slot] && eye >= 0 && eye < 2) {
 		memcpy(cb.clipToClipNoLoco, m_slotClipToClipNoLoco[slot][eye], sizeof(cb.clipToClipNoLoco));
 		cb.hasClipToClipNoLoco = 1;
@@ -1577,13 +1669,10 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	cb.edgeFadeWidth = oovr_global_configuration.ASWEdgeFadeWidth();
 	cb.nearFadeDepth = oovr_global_configuration.ASWNearFadeDepth() * 72.0f;
 	{
-		float configConf = oovr_global_configuration.ASWMVConfidence();
-		if (fabsf(configConf) > 0.001f) {
-			float scale = configConf / -0.5f;
-			cb.mvConfidence = -m_mvTimingRatio * scale;
-		} else {
-			cb.mvConfidence = 0.0f;
-		}
+		// MV correction: locoMV = totalMV - headMV isolates per-pixel locomotion
+		// from the game's MV buffer. headMV comes from clipToClipNoLoco (RSS VP).
+		// poseDeltaMatrix handles head rotation/translation only (no loco injection).
+		cb.mvConfidence = oovr_global_configuration.ASWMVConfidence();
 	}
 	cb.mvPixelScale = oovr_global_configuration.ASWMVPixelScale();
 	cb.depthResolution[0] = (m_slotDepthDataW[slot] > 0) ? (float)m_slotDepthDataW[slot] : (float)m_eyeWidth;
@@ -1610,6 +1699,136 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 			    m_slotPose[slot][eye].position.x, m_slotPose[slot][eye].position.y, m_slotPose[slot][eye].position.z,
 			    newPose.position.x, newPose.position.y, newPose.position.z);
 			s_fovLogCount++;
+		}
+	}
+
+	// ── MV DIAGNOSTIC READBACK ──
+	// Read back center pixel of cached MV texture and compare to c2c/pdm predictions.
+	// Logs actual numeric values for both eyes every 60 frames.
+	{
+		static int s_mvDiagCount[2] = { 0, 0 };
+		int eyeIdx = (eye >= 0 && eye < 2) ? eye : 0;
+		s_mvDiagCount[eyeIdx]++;
+		int fc = s_mvDiagCount[eyeIdx];
+		bool doMvDiag = (fc > 15 && fc < 80 && (fc % 5 == 0))
+		             || (fc % 150 == 0);
+		if (doMvDiag && m_cachedMV[slot][eye] && cb.hasClipToClipNoLoco) {
+			ID3D11DeviceContext* diagCtx = nullptr;
+			m_device->GetImmediateContext(&diagCtx);
+			if (diagCtx) {
+				// Create staging texture on first use
+				static ID3D11Texture2D* s_mvStaging = nullptr;
+				if (!s_mvStaging) {
+					D3D11_TEXTURE2D_DESC mvDesc;
+					m_cachedMV[slot][eye]->GetDesc(&mvDesc);
+					D3D11_TEXTURE2D_DESC stgDesc = {};
+					stgDesc.Width = 1;
+					stgDesc.Height = 1;
+					stgDesc.MipLevels = 1;
+					stgDesc.ArraySize = 1;
+					stgDesc.Format = mvDesc.Format;
+					stgDesc.SampleDesc.Count = 1;
+					stgDesc.Usage = D3D11_USAGE_STAGING;
+					stgDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+					m_device->CreateTexture2D(&stgDesc, nullptr, &s_mvStaging);
+				}
+				if (s_mvStaging) {
+					// Copy center pixel
+					uint32_t mvW = (m_slotMVDataW[slot] > 0) ? m_slotMVDataW[slot] : m_eyeWidth;
+					uint32_t mvH = (m_slotMVDataH[slot] > 0) ? m_slotMVDataH[slot] : m_eyeHeight;
+					D3D11_BOX box = {};
+					box.left = mvW / 2;
+					box.right = box.left + 1;
+					box.top = mvH / 2;
+					box.bottom = box.top + 1;
+					box.front = 0;
+					box.back = 1;
+					diagCtx->CopySubresourceRegion(s_mvStaging, 0, 0, 0, 0,
+					    m_cachedMV[slot][eye], 0, &box);
+
+					D3D11_MAPPED_SUBRESOURCE mapped;
+					if (SUCCEEDED(diagCtx->Map(s_mvStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
+						float mvX = 0, mvY = 0;
+						// MV textures are typically R16G16_FLOAT or R32G32_FLOAT
+						D3D11_TEXTURE2D_DESC mvDesc;
+						m_cachedMV[slot][eye]->GetDesc(&mvDesc);
+						if (mvDesc.Format == DXGI_FORMAT_R16G16_FLOAT) {
+							uint16_t* px = (uint16_t*)mapped.pData;
+							// Convert half-float to float (approximate)
+							auto halfToFloat = [](uint16_t h) -> float {
+								uint32_t sign = (h >> 15) & 1;
+								uint32_t exp = (h >> 10) & 0x1F;
+								uint32_t mant = h & 0x3FF;
+								if (exp == 0) return sign ? -0.0f : 0.0f;
+								if (exp == 31) return sign ? -1e30f : 1e30f;
+								float f = ldexpf((float)(mant | 0x400) / 1024.0f, (int)exp - 15);
+								return sign ? -f : f;
+							};
+							mvX = halfToFloat(px[0]);
+							mvY = halfToFloat(px[1]);
+						} else {
+							float* px = (float*)mapped.pData;
+							mvX = px[0];
+							mvY = px[1];
+						}
+						diagCtx->Unmap(s_mvStaging, 0);
+
+						// Compute c2c prediction at center pixel (uv = 0.5, 0.5)
+						// clipToClipNoLoco is in cb already
+						float ndc[2] = { 0.0f, 0.0f }; // center = uv(0.5,0.5) → ndc(0,0)
+						// We need depth at center — use 0.5 as a reasonable approximation
+						// (midrange depth in clip space)
+						float clipD = 0.9f; // typical scene depth in clip space
+						float c2c[16];
+						memcpy(c2c, cb.clipToClipNoLoco, sizeof(c2c));
+						// clipPos = (0, 0, clipD, 1) → prevClip = c2c * clipPos
+						// Column-major: M[col*4+row], so result[row] = sum_col M[col*4+row]*v[col]
+						// For v=(0,0,clipD,1): result[row] = c2c[8+row]*clipD + c2c[12+row]
+						float prevClip[4];
+						for (int i = 0; i < 4; i++)
+							prevClip[i] = c2c[8 + i] * clipD + c2c[12 + i];
+						float c2cMVx = 0, c2cMVy = 0;
+						if (fabsf(prevClip[3]) > 0.0001f) {
+							float prevNDCx = prevClip[0] / prevClip[3];
+							float prevNDCy = prevClip[1] / prevClip[3];
+							c2cMVx = prevNDCx * 0.5f; // prevUV.x - 0.5
+							c2cMVy = -prevNDCy * 0.5f; // prevUV.y - 0.5
+						}
+
+						// Compute headOnlyMV from headRotMatrix at center pixel
+						float ds = cb.depthScale;
+						float tanXc = (cb.fovTanLeft + cb.fovTanRight) * 0.5f;
+						float tanYc = (cb.fovTanUp + cb.fovTanDown) * 0.5f;
+						float linD = cb.nearZ * cb.farZ / (cb.farZ - clipD * (cb.farZ - cb.nearZ));
+						float sd = linD * ds;
+						float vp[4] = { tanXc * sd, tanYc * sd, sd, 1.0f };
+
+						// headRotMatrix: cur→prev full head delta (row_major in CB).
+						// Row-major multiply: hp[row] = sum_col H[row*4+col] * vp[col]
+						float* H = cb.headRotMatrix;
+						float hp[4];
+						for (int i = 0; i < 4; i++)
+							hp[i] = H[i * 4 + 0] * vp[0] + H[i * 4 + 1] * vp[1] + H[i * 4 + 2] * vp[2] + H[i * 4 + 3] * vp[3];
+						float hrmMVx = 0, hrmMVy = 0;
+						if (sd > 0.001f && hp[2] > 0.001f) {
+							float oldTanX = hp[0] / hp[2];
+							float oldTanY = hp[1] / hp[2];
+							hrmMVx = (oldTanX - cb.fovTanLeft) / (cb.fovTanRight - cb.fovTanLeft) - 0.5f;
+							hrmMVy = (oldTanY - cb.fovTanUp) / (cb.fovTanDown - cb.fovTanUp) - 0.5f;
+						}
+
+						OOVR_LOGF("ASW MV_DIAG eye=%d frame=%d: rawMV(%.6f,%.6f) c2cMV(%.6f,%.6f) hrmMV(%.6f,%.6f) "
+						          "c2cRes(%.6f,%.6f) hrmRes(%.6f,%.6f)",
+						    eye, fc,
+						    mvX, mvY,
+						    c2cMVx, c2cMVy,
+						    hrmMVx, hrmMVy,
+						    mvX - c2cMVx, mvY - c2cMVy,
+						    mvX - hrmMVx, mvY - hrmMVy);
+					}
+				}
+				diagCtx->Release();
+			}
 		}
 	}
 

@@ -30,8 +30,9 @@
 #include "../OpenOVR/convert.h"
 #include "generated/static_bases.gen.h"
 
-#include "generated/interfaces/IVRCompositor_018.h"
 #include "../OpenOVR/Misc/OVRPerfHook.h"
+#include "generated/interfaces/IVRCompositor_018.h"
+
 
 #include "tmp_gfx/TemporaryGraphics.h"
 
@@ -68,7 +69,8 @@ struct OCAimPoseData {
 static OCAimPoseData g_aimPoses = {};
 static HWND g_aimPoseHwnd = nullptr;
 
-static BOOL CALLBACK FindGameWindowCB(HWND hwnd, LPARAM lParam) {
+static BOOL CALLBACK FindGameWindowCB(HWND hwnd, LPARAM lParam)
+{
 	DWORD pid;
 	GetWindowThreadProcessId(hwnd, &pid);
 	if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd)) {
@@ -620,21 +622,26 @@ void XrBackend::WaitForTrackingData()
 	xr_gbl->latchedViewStateFlags = viewState.viewStateFlags;
 	xr_gbl->viewSpaceViewsLatched = false;
 	xr_gbl->viewsLatched = true;
-	{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] WaitForTrackingData: views LATCHED (viewsLatched=true)");
+	{
+		static bool s = false;
+		if (!s) {
+			s = true;
+			OOVR_LOGF("[diag] WaitForTrackingData: views LATCHED (viewsLatched=true)");
 #ifdef _WIN32
-		// Read VDXR's jiggle_view_rotations registry key so we can confirm its state in our log
-		DWORD jiggleVal = 0;
-		DWORD jiggleSize = sizeof(jiggleVal);
-		LONG jiggleResult = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Virtual Desktop, Inc.\\OpenXR",
-			L"jiggle_view_rotations", RRF_RT_REG_DWORD, nullptr, &jiggleVal, &jiggleSize);
-		if (jiggleResult == ERROR_SUCCESS)
-			OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations = %lu", jiggleVal);
-		else if (jiggleResult == ERROR_FILE_NOT_FOUND)
-			OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations NOT SET (key absent)");
-		else
-			OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations read failed (error %ld)", jiggleResult);
+			// Read VDXR's jiggle_view_rotations registry key so we can confirm its state in our log
+			DWORD jiggleVal = 0;
+			DWORD jiggleSize = sizeof(jiggleVal);
+			LONG jiggleResult = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Virtual Desktop, Inc.\\OpenXR",
+			    L"jiggle_view_rotations", RRF_RT_REG_DWORD, nullptr, &jiggleVal, &jiggleSize);
+			if (jiggleResult == ERROR_SUCCESS)
+				OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations = %lu", jiggleVal);
+			else if (jiggleResult == ERROR_FILE_NOT_FOUND)
+				OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations NOT SET (key absent)");
+			else
+				OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations read failed (error %ld)", jiggleResult);
 #endif
-	} }
+		}
+	}
 
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 	// GPU timing: read previous frame's results, then start new measurement
@@ -858,8 +865,12 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 						char line[512];
 						bool inDefaultSection = true;
 						while (fgets(line, sizeof(line), f)) {
-							if (line[0] == '[') { inDefaultSection = false; continue; }
-							if (!inDefaultSection) continue;
+							if (line[0] == '[') {
+								inDefaultSection = false;
+								continue;
+							}
+							if (!inDefaultSection)
+								continue;
 							float fval;
 							if (sscanf(line, "aswWarpStrength=%f", &fval) == 1)
 								oovr_global_configuration.aswWarpStrength = fval;
@@ -941,7 +952,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 					// 4. Warp cached frame — translation/parallax only (rotation=0, handled by runtime ATW)
 					bool warpOk = true;
 					for (int eye = 0; eye < 2; eye++) {
-						if (!g_aswProvider->WarpFrame(eye, aswCtx, views[eye].pose)) {
+						if (!g_aswProvider->WarpFrame(eye, views[eye].pose)) {
 							warpOk = false;
 							break;
 						}
@@ -958,7 +969,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 
 						for (int eye = 0; eye < 2; eye++) {
 							warpedViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-							warpedViews[eye].pose = g_aswProvider->GetCachedPose(eye);
+							warpedViews[eye].pose = g_aswProvider->GetPrecompPose(eye);
 							warpedViews[eye].fov = g_aswProvider->GetCachedFov(eye);
 							warpedViews[eye].subImage.swapchain = g_aswProvider->GetOutputSwapchain();
 							warpedViews[eye].subImage.imageArrayIndex = 0;
@@ -998,8 +1009,10 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 						aswEndInfo.layerCount = (uint32_t)aswLayers.size();
 
 						XrResult endRes = xrEndFrame(xr_session.get(), &aswEndInfo);
-						{ static int s = 0; if (s++ < 5)
-							OOVR_LOGF("ASW: Warped frame injected (result=%d)", (int)endRes);
+						{
+							static int s = 0;
+							if (s++ < 5)
+								OOVR_LOGF("ASW: Warped frame injected (result=%d)", (int)endRes);
 						}
 					} else {
 						// Warp failed — submit empty frame to keep runtime in sync
@@ -1012,7 +1025,8 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 					}
 				}
 			} else {
-				static int s = 0; if (s++ < 3)
+				static int s = 0;
+				if (s++ < 3)
 					OOVR_LOGF("ASW: xrWaitFrame for warped slot failed result=%d", (int)res);
 			}
 			aswCtx->Release(); // GetImmediateContext adds a ref
@@ -1149,8 +1163,8 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
 		}
 
 		pTiming->m_nNumDroppedFrames = ovrPerf.available
-			? (ovrPerf.appDroppedFrames + ovrPerf.compositorDroppedFrames)
-			: 0;
+		    ? (ovrPerf.appDroppedFrames + ovrPerf.compositorDroppedFrames)
+		    : 0;
 
 		// --- GPU timing ---
 		float displayPeriod = predictedDisplayPeriodMs > 0.0f ? predictedDisplayPeriodMs : 11.1f;
@@ -1162,7 +1176,7 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
 			pTiming->m_flTotalRenderGpuMs = ovrPerf.appGpuMs + measuredEndFrameMs;
 		} else
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
-		if (gpuTimingInitialized && measuredGpuTimeMs > 0.0f) {
+		    if (gpuTimingInitialized && measuredGpuTimeMs > 0.0f) {
 			pTiming->m_flPreSubmitGpuMs = measuredGpuTimeMs;
 			pTiming->m_flPostSubmitGpuMs = measuredEndFrameMs;
 			pTiming->m_flTotalRenderGpuMs = measuredGpuTimeMs + measuredEndFrameMs;
@@ -1198,8 +1212,8 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
 		// Reference point: waitFrameStart (beginning of the frame cycle).
 		// Convert QPC deltas to milliseconds relative to that reference.
 		float qpcToMs = (qpcInitialized && qpcFrequency.QuadPart > 0)
-			? (1000.0f / (float)qpcFrequency.QuadPart)
-			: 0.0f;
+		    ? (1000.0f / (float)qpcFrequency.QuadPart)
+		    : 0.0f;
 
 		if (qpcToMs > 0.0f && waitFrameStart.QuadPart > 0) {
 			// WaitGetPoses was called at the frame reference point (offset = 0)

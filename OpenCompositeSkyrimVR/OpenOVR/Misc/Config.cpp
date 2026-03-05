@@ -247,6 +247,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, aswWarpStrength);
 		CFGOPT(float, aswRotationScale);
 		CFGOPT(float, aswTranslationScale);
+		CFGOPT(float, aswLocoScale);
 		CFGOPT(float, aswDepthScale);
 		CFGOPT(float, aswEdgeFadeWidth);
 		CFGOPT(float, aswNearFadeDepth);
