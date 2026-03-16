@@ -75,7 +75,10 @@ public:
 	XrSwapchain GetOutputSwapchain() const { return m_outputSwapchain; }
 
 	/// Get the depth XR swapchain for the warped frame (for XR_KHR_composition_layer_depth).
-	XrSwapchain GetDepthSwapchain() const { return m_depthSwapchain; }
+	/// Currently returns XR_NULL_HANDLE: submitting unwarped depth with warped color causes
+	/// double reprojection (runtime's depth-based reproject on top of our ASW warp = "flying borders").
+	/// TODO: Once forward scatter outputs warped depth, enable this to submit matching depth.
+	XrSwapchain GetDepthSwapchain() const { return XR_NULL_HANDLE; }
 
 	/// Get per-eye sub-image rect for the warped output (stereo-combined).
 	XrRect2Di GetOutputRect(int eye) const;
@@ -317,10 +320,19 @@ private:
 	uint32_t m_eyeWidth = 0, m_eyeHeight = 0;
 	ID3D11Device* m_device = nullptr; // kept for obtaining immediate context in XrBackend
 
-	// Compute shader
-	ID3D11ComputeShader* m_warpCS = nullptr;
+	// Compute shaders
+	ID3D11ComputeShader* m_warpCS = nullptr;       // CSMain (backward warp)
+	ID3D11ComputeShader* m_clearCS = nullptr;       // CSClear (clear atomicDepth + output)
+	ID3D11ComputeShader* m_forwardCS = nullptr;     // CSForward (legacy single-pass scatter)
+	ID3D11ComputeShader* m_forwardDepthCS = nullptr; // CSForwardDepth (two-pass: depth only)
+	ID3D11ComputeShader* m_forwardColorCS = nullptr; // CSForwardColor (two-pass: color with finalized depth)
+	ID3D11ComputeShader* m_dilateCS = nullptr;      // CSDilate (gap fill)
 	ID3D11Buffer* m_constantBuffer = nullptr;
 	ID3D11SamplerState* m_linearSampler = nullptr;
+
+	// Forward scatter: per-eye atomic depth buffer for depth test
+	ID3D11Texture2D* m_atomicDepth[2] = {};
+	ID3D11UnorderedAccessView* m_uavAtomicDepth[2] = {};
 
 	// Triple-buffered cached textures:
 	// game writes build slot while warp reads published slot.
@@ -390,7 +402,8 @@ private:
 		                               // exact head MV subtraction from camera MVs    — 64 bytes
 		int hasClipToClipNoLoco;       // 1 if clipToClipNoLoco is valid, 0 = fallback to headRotMatrix
 		float _pad3[3];                // alignment                                    — 16 bytes
-	};                                 //                         total: 304 bytes
+		float forwardPoseDelta[16];    // 4x4 row-major: OLD view -> NEW view (forward scatter) — 64 bytes
+	};                                 //                         total: 368 bytes
 
 	// Depth/MV data dimensions are tracked per cache slot.
 
@@ -401,7 +414,12 @@ private:
 	ID3D12CommandAllocator* m_d3d12CmdAlloc = nullptr;      // Warp compute (step P)
 	ID3D12GraphicsCommandList* m_d3d12CmdList = nullptr;   // Warp compute (step P)
 	ID3D12RootSignature* m_d3d12RootSig = nullptr;
-	ID3D12PipelineState* m_d3d12PipelineState = nullptr;
+	ID3D12PipelineState* m_d3d12PipelineState = nullptr;     // CSMain PSO
+	ID3D12PipelineState* m_d3d12ClearPSO = nullptr;          // CSClear PSO
+	ID3D12PipelineState* m_d3d12ForwardPSO = nullptr;        // CSForward PSO (legacy)
+	ID3D12PipelineState* m_d3d12ForwardDepthPSO = nullptr;   // CSForwardDepth PSO (two-pass)
+	ID3D12PipelineState* m_d3d12ForwardColorPSO = nullptr;   // CSForwardColor PSO (two-pass)
+	ID3D12PipelineState* m_d3d12DilatePSO = nullptr;         // CSDilate PSO
 	ID3D12DescriptorHeap* m_d3d12SrvUavHeap = nullptr;
 	ID3D12Resource* m_d3d12ConstantBuffer = nullptr;     // Upload heap, CPU-writable (2x regions, one per eye)
 	void* m_d3d12CbMappedPtr = nullptr;                  // Persistent map (base of 2-eye buffer)
@@ -415,6 +433,7 @@ private:
 	HANDLE m_fenceSharedHandle = nullptr;
 	HANDLE m_fenceEvent = nullptr;
 	uint64_t m_fenceValue = 0;
+	uint64_t m_warpFenceValue = 0;  // Fence value for warp dispatch completion
 	std::atomic<uint64_t> m_cacheFenceValue{ 0 };  // Latest cache-done fence value
 	uint64_t m_slotCacheFenceValue[kAswCacheSlotCount] = {};  // Per-slot cache-done fence value
 	bool m_cacheFenceWaitedEarly = false;  // Set by WaitForCacheFence(), cleared by WarpFrame
@@ -434,6 +453,7 @@ private:
 	ID3D12Resource* m_d3d12CachedMV[kAswCacheSlotCount][2] = {};
 	ID3D12Resource* m_d3d12CachedDepth[kAswCacheSlotCount][2] = {};
 	ID3D12Resource* m_d3d12WarpedOutput[2] = {};
+	ID3D12Resource* m_d3d12AtomicDepth[2] = {};    // forward scatter depth test (R32_UINT)
 	bool m_d3d12Ready = false;  // true when D3D12 pipeline is fully initialized
 	bool m_precomputedWarpReady = false;  // true when warp GPU work is confirmed done
 	bool m_warpFenceWaitPending = false;  // true when GPU work submitted but not yet CPU-waited
@@ -470,4 +490,8 @@ private:
 	uint32_t m_gameSharedTexCount = 0;
 
 	ID3D12Resource* GetOrShareTextureD3D12(ID3D11Texture2D* d3d11Tex);
+
+	// Diagnostic capture: saves warp inputs/outputs to disk for offline iteration
+	void CaptureWarpDiagnostics(int eye, int slot, const WarpConstants& cb,
+	    ID3D11DeviceContext* ctx, bool isPreDispatch);
 };

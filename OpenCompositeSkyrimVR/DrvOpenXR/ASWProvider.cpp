@@ -9,6 +9,9 @@
 
 #include <cmath>
 #include <cstring>
+#include <string>
+#include <fstream>
+#include <filesystem>
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -44,6 +47,7 @@ Texture2D<float4> prevColor    : register(t0);
 Texture2D<float2> mvTex        : register(t1);  // camera MVs: prevUV - uv (UV space)
 Texture2D<float>  depthTex     : register(t2);
 RWTexture2D<float4> output     : register(u0);
+RWTexture2D<uint> atomicDepth  : register(u1);  // forward scatter depth test buffer (R32_UINT)
 SamplerState linearClamp       : register(s0);
 
 cbuffer WarpParams : register(b0) {
@@ -68,6 +72,7 @@ cbuffer WarpParams : register(b0) {
                                               // matches camera MV source exactly
     int hasClipToClipNoLoco;           // 1 = use clipToClipNoLoco, 0 = fallback to headRotMatrix
     float3 _pad3;
+    row_major float4x4 forwardPoseDelta;  // transforms OLD view -> NEW view (forward scatter)
 };
 
 // LinearizeDepth: convert raw depth buffer value to linear distance in game units.
@@ -103,66 +108,184 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     float2 uv = ((float2)tid.xy + 0.5) / resolution;
 
-    // 1. Read and linearize depth (using scaled coordinates for render-res depth)
-    int2 depthPixel = ToDepthCoord((int2)tid.xy);
-    float d = depthTex[depthPixel];
-    float linearDepth = LinearizeDepth(d, nearZ, farZ);
-
-    // 2. Depth-edge detection: sample 4 cardinal neighbours
-    //    At depth discontinuities (tree against sky, NPC against wall),
-    //    parallax pulls objects apart creating tears. Fade parallax at edges.
-    float minD = linearDepth, maxD = linearDepth;
+    // 1. Read depth and search for foreground along combined parallax + locomotion direction.
+    //    At disocclusion edges (object moved, revealing background), the cached depth
+    //    is background. During locomotion, poseDeltaMatrix only captures head motion,
+    //    so we also use the raw game MV to find the correct search direction.
     int2 pixel = (int2)tid.xy;
-    int2 offsets[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };
-    [unroll] for (int i = 0; i < 4; i++) {
-        int2 np = ToDepthCoord(pixel + offsets[i]);
-        float nd = LinearizeDepth(depthTex[np], nearZ, farZ);
-        minD = min(minD, nd);
-        maxD = max(maxD, nd);
-    }
-    float depthRatio = maxD / max(minD, 0.001);
-    float edgeFade = saturate(1.0 - (depthRatio - 1.0) / max(edgeFadeWidth, 0.001));
-    // edgeFade = 1.0 on flat surfaces, approaches 0.0 at depth edges
+    int2 depthPixel = ToDepthCoord(pixel);
+    float d = depthTex[depthPixel];
+    float origD = d;  // save for disocclusion detection
 
-    // 3. Depth parallax warp (head rot + head trans from OpenXR predicted poses)
-    //    poseDeltaMatrix has correct timing for the warp display time.
-    //    Stick yaw is injected into poseDeltaMatrix on the C++ side.
-    //    Locomotion is handled by the MV path below.
-    float scaledDepth = linearDepth * depthScale;
     float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
     float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
+
+    // Compute parallax direction from head pose delta (may be tiny during pure locomotion).
+    float linearDepth = LinearizeDepth(d, nearZ, farZ);
+    float scaledDepth = linearDepth * depthScale;
     float3 newViewPos = float3(tanX * scaledDepth, tanY * scaledDepth, scaledDepth);
     float4 transformed = mul(poseDeltaMatrix, float4(newViewPos, 1.0));
+
+    float2 parallaxDir = float2(0, 0);
+    if (scaledDepth > 0.001 && transformed.z > 0.001) {
+        float oldTanX = transformed.x / transformed.z;
+        float oldTanY = transformed.y / transformed.z;
+        parallaxDir = float2(
+            (oldTanX - fovTanLeft) / (fovTanRight - fovTanLeft) - uv.x,
+            (oldTanY - fovTanUp) / (fovTanDown - fovTanUp) - uv.y);
+    }
+
+    // Read raw MV at current pixel for locomotion-aware search direction.
+    // During pure locomotion, parallaxDir is tiny (head-only) but game MVs capture
+    // the full scene motion. MV points from current UV toward previous UV (cached frame).
+    float2 roughMV = mvTex[ToMVCoord(pixel)] * mvPixelScale;
+    roughMV = clamp(roughMV, float2(-0.15, -0.15), float2(0.15, 0.15));
+
+    // Pick the search direction with larger screen-space magnitude.
+    // parallaxDir dominates during head rotation; roughMV dominates during locomotion.
+    float2 searchDir = parallaxDir;
+    float parallaxMagPx = length(parallaxDir * resolution);
+    float mvSearchMagPx = length(roughMV * resolution);
+    if (mvSearchMagPx > parallaxMagPx)
+        searchDir = roughMV;
+    float searchMagPx = max(parallaxMagPx, mvSearchMagPx);
+
+    // Convert to pixel-space stepping: normalize so dominant axis = +/-1 pixel/step.
+    float2 searchDirPx = searchDir * resolution;
+    float maxComp = max(abs(searchDirPx.x), abs(searchDirPx.y));
+    float2 stepVec = (maxComp > 0.001) ? (searchDirPx / maxComp) : float2(0, 0);
+
+    // Search for foreground depth edge along motion direction.
+    // Track found pixel position — its MV is needed for correct locomotion correction.
+    // Range covers typical locomotion disocclusion (up to ~36 pixels at sprint speed).
+    // Early exit on "found deeper" prevents wasted reads through foreground interiors.
+    int2 fgPixel = pixel;
+    bool foundForeground = false;
+
+    if (searchMagPx > 0.5) {
+        int maxSearch = min(48, max(24, (int)searchMagPx + 16));
+        for (int step = 1; step <= maxSearch; step++) {
+            int2 searchPx = pixel + int2(stepVec * (float)step);
+            searchPx = clamp(searchPx, int2(0,0), int2(resolution) - 1);
+            float searchD = depthTex[ToDepthCoord(searchPx)];
+            if (d - searchD > 0.01) {
+                d = searchD;
+                fgPixel = searchPx;
+                foundForeground = true;
+                break;
+            }
+            if (searchD - d > 0.01)
+                break;  // entered deeper background — stop early
+        }
+    }
+
+    // Cardinal search fallback: if directed search didn't find foreground and this pixel
+    // is background, search 8 directions (cardinal + diagonal) at stride 2 up to 48 pixels.
+    // Deep backgrounds have near-zero MVs so the directed search can't trigger.
+    // Stride 2 ensures thin foreground edges aren't missed by coarse stepping.
+    // 8 directions catch diagonal edges that cardinal-only would miss.
+    // Gate on meaningful motion — without displacement there's no disocclusion to fix,
+    // and the search would just create dark halos at every static depth edge.
+    if (!foundForeground && origD > 0.50 && searchMagPx > 0.5) {
+        int bestDist = 49;
+        int2 dirs[8] = {
+            int2(1,0), int2(-1,0), int2(0,1), int2(0,-1),
+            int2(1,1), int2(1,-1), int2(-1,1), int2(-1,-1)
+        };
+        [unroll]
+        for (int dir = 0; dir < 8; dir++) {
+            for (int step = 2; step < bestDist; step += 2) {
+                int2 sp = pixel + dirs[dir] * step;
+                if (any(sp < 0) || sp.x >= (int)resolution.x || sp.y >= (int)resolution.y)
+                    break;
+                float sd = depthTex[ToDepthCoord(sp)];
+                if (origD - sd > 0.01) {
+                    bestDist = step;
+                    d = sd;
+                    fgPixel = sp;
+                    foundForeground = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // After finding foreground, step a few pixels deeper into the object interior
+    // for cleaner depth/MV values. Edge pixels can have MV contaminated by the
+    // background (bilinear filtering, sub-pixel coverage), and the contamination
+    // is worse when the background is deeper (its MV → 0, pulling the edge MV
+    // away from the true foreground MV). Stepping inward avoids this.
+    if (foundForeground) {
+        float2 stepInDir = float2(fgPixel - pixel);
+        float stepInLen = length(stepInDir);
+        if (stepInLen > 0.5) {
+            stepInDir /= stepInLen;
+            for (int extra = 1; extra <= 4; extra++) {
+                int2 deepPx = fgPixel + int2(round(stepInDir * (float)extra));
+                deepPx = clamp(deepPx, int2(0,0), int2(resolution) - 1);
+                float deepD = depthTex[ToDepthCoord(deepPx)];
+                if (abs(deepD - d) < 0.02) {
+                    fgPixel = deepPx;  // deeper into foreground, cleaner MV
+                } else {
+                    break;  // hit a different surface or edge — stop
+                }
+            }
+        }
+    }
+
+    // Recompute parallax with (possibly foreground) depth.
+    // When foreground was found, use fgPixel's screen angle (where the surface actually is)
+    // instead of the output pixel's angle (which points at background). Using the output
+    // pixel's angle with foreground depth creates a phantom 3D point that projects to the
+    // wrong location in the cached frame, causing missing chunks at depth edges.
+    float2 fgUV = foundForeground ? (float2(fgPixel) + 0.5) / resolution : uv;
+    float fgTanX = foundForeground ? lerp(fovTanLeft, fovTanRight, fgUV.x) : tanX;
+    float fgTanY = foundForeground ? lerp(fovTanUp, fovTanDown, fgUV.y) : tanY;
+
+    linearDepth = LinearizeDepth(d, nearZ, farZ);
+    scaledDepth = linearDepth * depthScale;
+    newViewPos = float3(fgTanX * scaledDepth, fgTanY * scaledDepth, scaledDepth);
+    transformed = mul(poseDeltaMatrix, float4(newViewPos, 1.0));
     float3 oldViewPos = transformed.xyz;
 
     float2 parallaxUV = uv;
     if (scaledDepth > 0.001 && oldViewPos.z > 0.001) {
         float oldTanX = oldViewPos.x / oldViewPos.z;
         float oldTanY = oldViewPos.y / oldViewPos.z;
-        parallaxUV.x = (oldTanX - fovTanLeft) / (fovTanRight - fovTanLeft);
-        parallaxUV.y = (oldTanY - fovTanUp) / (fovTanDown - fovTanUp);
+        // Compute where fgPixel's surface projects in the cached frame, then express
+        // as an offset relative to the OUTPUT pixel so parallax is a warp displacement.
+        float2 cachedUV = float2(
+            (oldTanX - fovTanLeft) / (fovTanRight - fovTanLeft),
+            (oldTanY - fovTanUp) / (fovTanDown - fovTanUp));
+        parallaxUV = uv + (cachedUV - fgUV);
     }
 
-    // 4. Near-field depth fade
+    // Near-field depth fade
     float depthFade = (nearFadeDepth > 0.0) ? saturate((linearDepth - nearFadeDepth) / nearFadeDepth) : 1.0;
 
     float2 parallaxOffset = parallaxUV - uv;
 
-    // Compute all MV-related values unconditionally for diagnostics.
-    int2 mvPixel = ToMVCoord((int2)tid.xy);
-    float2 rawMV = mvTex[mvPixel];
+    // 3. Combine: parallax (faded at near-field only) to get source position in cached frame.
+    float2 fadedParallax = parallaxOffset * depthFade;
+    float2 parallaxSourceUV = uv + fadedParallax;
+
+    // Read MV: at disocclusion edges, use the foreground pixel's MV (object MV, not background).
+    int2 mvSourcePixel;
+    if (foundForeground) {
+        mvSourcePixel = ToMVCoord(fgPixel);
+    } else {
+        mvSourcePixel = ToMVCoord(clamp(int2(parallaxSourceUV * resolution), int2(0,0), int2(resolution) - 1));
+    }
+    float2 rawMV = mvTex[mvSourcePixel];
     float2 totalMV = rawMV * mvPixelScale;
     totalMV = clamp(totalMV, float2(-0.15, -0.15), float2(0.15, 0.15));
 
     // headOnlyMV from headRotMatrix (OpenXR frame-to-frame, NO stick rotation).
-    // Same reprojection math as parallax, but using headRotMatrix over the game
-    // frame interval instead of poseDeltaMatrix over the game-to-warp interval.
-    // This lets the residual (totalMV - headOnlyMV) capture stick rotation + locomotion.
-    // headRotMatrix is cur→prev full head delta (rotation + translation, row_major).
-    // Built from OpenXR poses only — no stick rotation. Same direction as c2c.
+    // Use fgPixel's angle when foreground found — game MV at fgPixel is relative to fgPixel's
+    // position, so headOnlyMV must match to get a clean residual (loco component).
     float2 headOnlyMV = float2(0, 0);
     {
-        float3 viewPos = float3(tanX * scaledDepth, tanY * scaledDepth, scaledDepth);
+        float3 viewPos = float3(fgTanX * scaledDepth, fgTanY * scaledDepth, scaledDepth);
         float4 rotated = mul(headRotMatrix, float4(viewPos, 1.0));
         if (scaledDepth > 0.001 && rotated.z > 0.001) {
             float rotTanX = rotated.x / rotated.z;
@@ -170,7 +293,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             float2 rotUV = float2(
                 (rotTanX - fovTanLeft) / (fovTanRight - fovTanLeft),
                 (rotTanY - fovTanUp) / (fovTanDown - fovTanUp));
-            headOnlyMV = rotUV - uv;
+            headOnlyMV = rotUV - fgUV;
         }
     }
 
@@ -196,9 +319,11 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         mvOffset = mvConfidence * headOnlyResidual;
     }
 
-    // 5. Combine: parallax (faded at depth edges/near-field) + MV loco correction.
-    float2 fadedParallax = parallaxOffset * edgeFade * depthFade;
-    float2 sourceUV = uv + fadedParallax + mvOffset;
+    // Final source UV: parallax (using foreground depth if found) + MV loco correction.
+    // The foreground search sets d to the closer object's depth and reads its MV,
+    // so parallax naturally uses the correct depth and MV captures foreground motion.
+    // Head rotation parallax must always be applied so edges track head movement.
+    float2 sourceUV = parallaxSourceUV + mvOffset;
 
     // OOB safety: if warped UV is outside frame, try without parallax, then identity
     if (any(sourceUV < -0.01) || any(sourceUV > 1.01)) {
@@ -210,7 +335,11 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     // Sample cached frame
     float4 color = prevColor.SampleLevel(linearClamp, sourceUV, 0);
+)";
 
+// Third part of the shader — debug visualization + output write.
+// Separate string literal to stay within MSVC's 16380-char limit.
+static const char* s_warpShaderDebugHLSL = R"(
     // Debug visualization modes (set via aswDebugMode in INI, hot-reloadable)
     if (debugMode == 1) {
         // RAW depth viz: shows the raw depth buffer value (0-1 reversed-Z) as grayscale
@@ -299,9 +428,376 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         float2 diff = parallaxOffset - c2cHeadMV;
         float scale = 500.0;  // high amplification — differences should be tiny
         color = float4(saturate(abs(diff.x) * scale), saturate(abs(diff.y) * scale), 0.0, 1.0);
+    } else if (debugMode == 11) {
+        // DEPTH SEARCH VIZ: Green = foreground found by directed/cardinal search,
+        // Red = original cached depth used (no foreground found).
+        float brightness = d;
+        if (foundForeground) {
+            color = float4(0.0, brightness, 0.0, 1.0);  // green = search found foreground
+        } else {
+            color = float4(brightness, 0.0, 0.0, 1.0);  // red = original depth
+        }
+    } else if (debugMode == 12) {
+        // RAW DEPTH HEAT MAP — fine-grained bands in 0.0-0.20 range
+        // since all values appear to be < 0.50.
+        //   Black  = d == 0 or negative
+        //   Dark blue  = 0.00 - 0.02
+        //   Blue       = 0.02 - 0.05
+        //   Cyan       = 0.05 - 0.10
+        //   Green      = 0.10 - 0.15
+        //   Yellow     = 0.15 - 0.20
+        //   Orange     = 0.20 - 0.50
+        //   Red        = 0.50 - 1.00
+        //   White      = d >= 1.0
+        float od = origD;
+        if (od >= 1.0)        color = float4(1,1,1,1);
+        else if (od > 0.50)   color = float4(1, 0, 0, 1);
+        else if (od > 0.20)   color = float4(1, 0.5, 0, 1);
+        else if (od > 0.15)   color = float4(1, 1, 0, 1);
+        else if (od > 0.10)   color = float4(0, 1, 0, 1);
+        else if (od > 0.05)   color = float4(0, 1, 1, 1);
+        else if (od > 0.02)   color = float4(0, 0, 1, 1);
+        else if (od > 0.001)  color = float4(0, 0, 0.4, 1);
+        else                  color = float4(0, 0, 0, 1);
+
+        if (foundForeground) {
+            color.rgb = color.rgb * 0.3 + float3(0.7, 0.0, 0.7);
+        }
     }
 
     output[tid.xy] = color;
+}
+)";
+
+// Second part of the shader — forward scatter kernels.
+// Separate string literal to stay within MSVC's 16380-char limit.
+static const char* s_forwardScatterHLSL = R"(
+
+// ── Forward scatter pass 0: clear buffers ──
+[numthreads(8, 8, 1)]
+void CSClear(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+    atomicDepth[tid.xy] = 0xFFFFFFFF;   // clear to max for InterlockedMin (smaller depth = closer = wins)
+    output[tid.xy] = float4(0, 0, 0, 1);
+}
+
+// Helper: compute destination UV for a given source pixel coordinate.
+// Used by CSForward to compute the Jacobian (destination spacing) for
+// adaptive splat sizing.
+float2 computeForwardDstUV(int2 srcPixel, bool skipMVCorrection) {
+    float2 srcUV = (float2(srcPixel) + 0.5) / resolution;
+    float d = depthTex[ToDepthCoord(srcPixel)];
+    float linearDepth = LinearizeDepth(d, nearZ, farZ);
+    float scaledDepth = linearDepth * depthScale;
+
+    float tanX = lerp(fovTanLeft, fovTanRight, srcUV.x);
+    float tanY = lerp(fovTanUp,   fovTanDown,  srcUV.y);
+    float3 oldViewPos = float3(tanX * scaledDepth, tanY * scaledDepth, scaledDepth);
+    float4 transformed = mul(forwardPoseDelta, float4(oldViewPos, 1.0));
+
+    float2 dstUV = srcUV;
+    if (scaledDepth > 0.001 && transformed.z > 0.001) {
+        dstUV.x = (transformed.x / transformed.z - fovTanLeft) / (fovTanRight - fovTanLeft);
+        dstUV.y = (transformed.y / transformed.z - fovTanUp)   / (fovTanDown  - fovTanUp);
+    }
+
+    float depthFade = (nearFadeDepth > 0.0) ? saturate((linearDepth - nearFadeDepth) / nearFadeDepth) : 1.0;
+    dstUV = lerp(srcUV, dstUV, depthFade);
+
+    if (!skipMVCorrection && abs(mvConfidence) > 0.001) {
+        float2 rawMV = mvTex[ToMVCoord(srcPixel)];
+        float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
+
+        float3 viewPos = float3(tanX * scaledDepth, tanY * scaledDepth, scaledDepth);
+        float4 rotated = mul(headRotMatrix, float4(viewPos, 1.0));
+        float2 headOnlyMV = float2(0, 0);
+        if (scaledDepth > 0.001 && rotated.z > 0.001) {
+            headOnlyMV = float2(
+                (rotated.x / rotated.z - fovTanLeft) / (fovTanRight - fovTanLeft),
+                (rotated.y / rotated.z - fovTanUp) / (fovTanDown - fovTanUp)) - srcUV;
+        }
+        dstUV -= mvConfidence * (totalMV - headOnlyMV);
+    }
+
+    return dstUV;
+}
+
+// Compute splat half-size for a source pixel using depth-aware Jacobian.
+// At depth discontinuities (fg next to sky, or different-depth surfaces),
+// the Jacobian falls back to stretch=1 to prevent cross-layer parallax
+// from inflating splat sizes. This keeps branches/foliage at correct thickness.
+int2 computeSplatHalf(int2 srcPixel, bool skipMV) {
+    float2 srcUV = ((float2)srcPixel + 0.5) / resolution;
+    float d = depthTex[ToDepthCoord(srcPixel)];
+
+    // Sky pixels don't need large splats — they lose depth test to fg anyway
+    if (d >= 0.999) return int2(0, 0);
+
+    float2 dstPx = computeForwardDstUV(srcPixel, skipMV) * resolution;
+
+    // Depth-aware Jacobian: only use neighbor destination if at similar depth.
+    // When neighbor is sky or at very different depth (different surface),
+    // fall back to stretch=1 to prevent cross-layer parallax inflation.
+    int2 rightPx = min(srcPixel + int2(1, 0), int2(resolution) - 1);
+    int2 downPx  = min(srcPixel + int2(0, 1), int2(resolution) - 1);
+    float dR = depthTex[ToDepthCoord(rightPx)];
+    float dD = depthTex[ToDepthCoord(downPx)];
+
+    float depthThresh = d * 0.03;  // 3% relative depth threshold
+    bool rSameDepth = (dR < 0.999) && (abs(dR - d) < depthThresh);
+    bool dSameDepth = (dD < 0.999) && (abs(dD - d) < depthThresh);
+
+    float2 dDx = rSameDepth ? (computeForwardDstUV(rightPx, skipMV) * resolution - dstPx) : float2(1, 0);
+    float2 dDy = dSameDepth ? (computeForwardDstUV(downPx, skipMV) * resolution - dstPx) : float2(0, 1);
+
+    float stretchX = abs(dDx.x) + abs(dDy.x);
+    float stretchY = abs(dDx.y) + abs(dDy.y);
+
+    // half=0 when stretch=1 (single pixel, no gap). Max=2 (5x5) to prevent
+    // foliage over-fill. Old min=1 made every pixel 3x3, thickening branches.
+    int halfW = clamp((int)ceil((stretchX - 1.0) * 0.5), 0, 2);
+    int halfH = clamp((int)ceil((stretchY - 1.0) * 0.5), 0, 2);
+    return int2(halfW, halfH);
+}
+
+// ── Forward scatter pass 1 (depth only): scatter depth with InterlockedMin ──
+// After this pass, atomicDepth contains the final closest depth at each pixel.
+// No color writes — eliminates race condition where a farther pixel's color
+// overwrites a closer pixel's color due to non-atomic depth+color updates.
+[numthreads(8, 8, 1)]
+void CSForwardDepth(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    int2 depthPixel = ToDepthCoord((int2)tid.xy);
+    float d = depthTex[depthPixel];
+    uint quantizedDepth = (d >= 0.999) ? 0xFFFFFFFE : asuint(d);
+
+    bool skipMV = (debugMode == 53);
+    float2 dstUV = computeForwardDstUV((int2)tid.xy, skipMV);
+    float2 dstPx = dstUV * resolution;
+
+    if (any(dstUV < -0.001) || any(dstUV >= 1.001)) return;
+
+    int2 half = computeSplatHalf((int2)tid.xy, skipMV);
+    int2 centerPx = int2(floor(dstPx));
+
+    for (int sy = -half.y; sy <= half.y; sy++) {
+        for (int sx = -half.x; sx <= half.x; sx++) {
+            int2 p = centerPx + int2(sx, sy);
+            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
+                continue;
+            InterlockedMin(atomicDepth[p], quantizedDepth);
+        }
+    }
+}
+
+// ── Forward scatter pass 2 (color only): write color using finalized depth ──
+// For each source pixel, write color ONLY to destinations where this pixel's
+// depth matches the finalized depth buffer (depth test already resolved).
+[numthreads(8, 8, 1)]
+void CSForwardColor(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    float2 srcUV = ((float2)tid.xy + 0.5) / resolution;
+    int2 depthPixel = ToDepthCoord((int2)tid.xy);
+    float d = depthTex[depthPixel];
+    uint quantizedDepth = (d >= 0.999) ? 0xFFFFFFFE : asuint(d);
+
+    // debugMode 50: output raw depth as grayscale (no scatter, writes in-place)
+    if (debugMode == 50) {
+        float vis = saturate((d - 0.84) / 0.16);
+        output[tid.xy] = float4(vis, vis, vis, 1);
+        return;
+    }
+
+    // debugMode 52: identity forward scatter (no parallax, no MV, just copy).
+    if (debugMode == 52) {
+        float4 color = prevColor.SampleLevel(linearClamp, srcUV, 0);
+        int2 p = (int2)tid.xy;
+        if (quantizedDepth == atomicDepth[p])
+            output[p] = color;
+        return;
+    }
+
+    bool skipMV = (debugMode == 53);
+    float2 dstUV = computeForwardDstUV((int2)tid.xy, skipMV);
+    float2 dstPx = dstUV * resolution;
+
+    if (any(dstUV < -0.001) || any(dstUV >= 1.001)) return;
+
+    // debugMode 51: show parallax offset magnitude as color
+    float4 color;
+    if (debugMode == 51) {
+        float2 offset = dstUV - srcUV;
+        float t = saturate(length(offset * resolution) / 30.0);
+        color = float4(t, 1.0 - abs(t - 0.5) * 2.0, 1.0 - t, 1);
+    } else {
+        color = prevColor.SampleLevel(linearClamp, srcUV, 0);
+    }
+
+    int2 half = computeSplatHalf((int2)tid.xy, skipMV);
+    int2 centerPx = int2(floor(dstPx));
+
+    for (int sy = -half.y; sy <= half.y; sy++) {
+        for (int sx = -half.x; sx <= half.x; sx++) {
+            int2 p = centerPx + int2(sx, sy);
+            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
+                continue;
+            if (quantizedDepth == atomicDepth[p]) {
+                output[p] = color;
+            }
+        }
+    }
+}
+
+// ── Legacy single-pass CSForward (kept for fallback/debug) ──
+[numthreads(8, 8, 1)]
+void CSForward(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    float2 srcUV = ((float2)tid.xy + 0.5) / resolution;
+    int2 depthPixel = ToDepthCoord((int2)tid.xy);
+    float d = depthTex[depthPixel];
+
+    if (debugMode == 50) {
+        float vis = saturate((d - 0.84) / 0.16);
+        output[tid.xy] = float4(vis, vis, vis, 1);
+        return;
+    }
+    if (debugMode == 52) {
+        float4 color = prevColor.SampleLevel(linearClamp, srcUV, 0);
+        uint quantizedDepth = asuint(d);
+        int2 p = (int2)tid.xy;
+        uint prevD;
+        InterlockedMin(atomicDepth[p], quantizedDepth, prevD);
+        if (quantizedDepth <= prevD) output[p] = color;
+        return;
+    }
+
+    bool skipMV = (debugMode == 53);
+    float2 dstUV = computeForwardDstUV((int2)tid.xy, skipMV);
+    float2 dstPx = dstUV * resolution;
+    if (any(dstUV < -0.001) || any(dstUV >= 1.001)) return;
+
+    float4 color = prevColor.SampleLevel(linearClamp, srcUV, 0);
+    uint quantizedDepth = (d >= 0.999) ? 0xFFFFFFFE : asuint(d);
+    int2 half = computeSplatHalf((int2)tid.xy, skipMV);
+    int2 centerPx = int2(floor(dstPx));
+
+    for (int sy = -half.y; sy <= half.y; sy++) {
+        for (int sx = -half.x; sx <= half.x; sx++) {
+            int2 p = centerPx + int2(sx, sy);
+            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
+                continue;
+            uint prevD;
+            InterlockedMin(atomicDepth[p], quantizedDepth, prevD);
+            if (quantizedDepth <= prevD) output[p] = color;
+        }
+    }
+}
+
+// ── Forward scatter pass 2: depth-edge cleanup + disocclusion fill ──
+//
+// Three cases handled:
+// 1. FILLED pixels at depth edges: background pixels (walls, ground) that
+//    scattered to positions adjacent to foreground (NPCs, objects). Detected
+//    by checking if this pixel is significantly farther than its 3x3 min
+//    neighbor. Replaced with the nearer neighbor's color.
+// 2. SKY-MARKED pixels (0xFFFFFFFE): sky interleaved with thin geometry
+//    (branches, poles). Only replaced if adjacent to real foreground.
+// 3. UNFILLED pixels (0xFFFFFFFF): disocclusion gaps from scatter. Filled
+//    by searching up to 128px in 8 directions. PREFERS FARTHER depth so
+//    background fills gaps (near-prefer was tested and proven worse).
+[numthreads(8, 8, 1)]
+void CSDilate(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    uint myDepth = atomicDepth[tid.xy];
+
+    // Case 1: Filled non-sky pixel — check for depth-edge bleed.
+    if (myDepth < 0xFFFFFFFE) {
+        float myD = asfloat(myDepth);
+        uint minNeighborDepth = myDepth;
+        int2 bestPos = (int2)tid.xy;
+        [unroll]
+        for (int ny = -1; ny <= 1; ny++) {
+            [unroll]
+            for (int nx = -1; nx <= 1; nx++) {
+                if (nx == 0 && ny == 0) continue;
+                int2 np = (int2)tid.xy + int2(nx, ny);
+                if (np.x >= 0 && np.x < (int)resolution.x &&
+                    np.y >= 0 && np.y < (int)resolution.y) {
+                    uint nd = atomicDepth[np];
+                    if (nd < minNeighborDepth && nd < 0xFFFFFFFE) {
+                        minNeighborDepth = nd;
+                        bestPos = np;
+                    }
+                }
+            }
+        }
+        float minD = asfloat(minNeighborDepth);
+        if (myD - minD > 0.01) {
+            output[tid.xy] = output[bestPos];
+        }
+        return;
+    }
+
+    // Case 3 only: unfilled (black) pixels with mirror-fill.
+    // Sky-marked pixels (Case 2) are deliberately NOT filled — filling sky gaps
+    // with fg color makes distant trees/foliage look solid and blocky.
+    if (myDepth != 0xFFFFFFFF) return;  // only process unfilled pixels
+
+    // Mirror-fill: find the nearest background (far-depth) pixel, then sample
+    // at a mirrored position past it. Reflects nearby background into the
+    // disocclusion gap for a smooth transition instead of stretching a single
+    // edge pixel across the whole gap.
+    int maxSearch = 128;
+
+    int bestDist = maxSearch + 1;
+    uint bestDepth = 0;  // prefer far depth (background)
+    int2 bestDir = int2(0, 0);
+
+    int2 dirs[8] = {
+        int2(-1,0), int2(1,0), int2(0,-1), int2(0,1),
+        int2(-1,-1), int2(1,-1), int2(-1,1), int2(1,1)
+    };
+
+    [unroll]
+    for (int dir = 0; dir < 8; dir++) {
+        for (int step = 1; step <= maxSearch; step++) {
+            int2 p = (int2)tid.xy + dirs[dir] * step;
+            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
+                break;
+            uint nd = atomicDepth[p];
+            if (nd == 0xFFFFFFFF) continue;  // skip other unfilled pixels
+            if (step < bestDist || (step == bestDist && nd > bestDepth)) {
+                bestDist = step;
+                bestDepth = nd;
+                bestDir = dirs[dir];
+            }
+            break;
+        }
+    }
+
+    if (bestDist <= maxSearch) {
+        // Mirror sample: go bestDist steps past the bg edge in the same direction
+        int2 bgEdge = (int2)tid.xy + bestDir * bestDist;
+        int2 mirrorPos = bgEdge + bestDir * bestDist;
+        mirrorPos = clamp(mirrorPos, int2(0, 0),
+                          int2((int)resolution.x - 1, (int)resolution.y - 1));
+
+        uint mirrorDepth = atomicDepth[mirrorPos];
+        if (mirrorDepth != 0xFFFFFFFF) {
+            output[tid.xy] = output[mirrorPos];
+        } else {
+            output[tid.xy] = output[bgEdge];
+        }
+    }
 }
 )";
 
@@ -498,7 +994,8 @@ bool ASWProvider::CreateComputeShader(ID3D11Device* device)
 
 	ID3DBlob* compiled = nullptr;
 	ID3DBlob* errors = nullptr;
-	HRESULT hr = D3DCompile(s_warpShaderHLSL, strlen(s_warpShaderHLSL),
+	std::string csMainSrc = std::string(s_warpShaderHLSL) + s_warpShaderDebugHLSL;
+	HRESULT hr = D3DCompile(csMainSrc.c_str(), csMainSrc.size(),
 	    "ASWWarp", nullptr, nullptr, "CSMain", "cs_5_0", flags, 0, &compiled, &errors);
 	if (FAILED(hr)) {
 		if (errors) {
@@ -514,8 +1011,44 @@ bool ASWProvider::CreateComputeShader(ID3D11Device* device)
 	    compiled->GetBufferSize(), nullptr, &m_warpCS);
 	compiled->Release();
 	if (FAILED(hr)) {
-		OOVR_LOGF("ASW: CreateComputeShader failed hr=0x%08x", (unsigned)hr);
+		OOVR_LOGF("ASW: CreateComputeShader(CSMain) failed hr=0x%08x", (unsigned)hr);
 		return false;
+	}
+
+	// Compile forward scatter shaders (CSClear, CSForward, CSDilate)
+	// Need full shader source: base declarations + forward scatter kernels
+	std::string fullShaderSrc = std::string(s_warpShaderHLSL) + s_warpShaderDebugHLSL + s_forwardScatterHLSL;
+	auto compileEntry = [&](const char* entry, ID3D11ComputeShader** outCS) -> bool {
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errs = nullptr;
+		HRESULT r = D3DCompile(fullShaderSrc.c_str(), fullShaderSrc.size(),
+		    entry, nullptr, nullptr, entry, "cs_5_0", flags, 0, &blob, &errs);
+		if (FAILED(r)) {
+			if (errs) {
+				OOVR_LOGF("ASW: Shader compile error (%s): %s", entry, (char*)errs->GetBufferPointer());
+				errs->Release();
+			}
+			return false;
+		}
+		if (errs) errs->Release();
+		r = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, outCS);
+		blob->Release();
+		if (FAILED(r)) {
+			OOVR_LOGF("ASW: CreateComputeShader(%s) failed hr=0x%08x", entry, (unsigned)r);
+			return false;
+		}
+		return true;
+	};
+
+	if (!compileEntry("CSClear", &m_clearCS) ||
+	    !compileEntry("CSForward", &m_forwardCS) ||
+	    !compileEntry("CSForwardDepth", &m_forwardDepthCS) ||
+	    !compileEntry("CSForwardColor", &m_forwardColorCS) ||
+	    !compileEntry("CSDilate", &m_dilateCS)) {
+		OOVR_LOG("ASW: Forward scatter shader compilation failed (non-fatal — backward warp still available)");
+		// Non-fatal: backward warp (CSMain) still works
+	} else {
+		OOVR_LOG("ASW: Forward scatter shaders compiled (CSClear, CSForwardDepth, CSForwardColor, CSForward, CSDilate)");
 	}
 
 	// Constant buffer
@@ -606,15 +1139,20 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 				return false;
 			}
 
-			// Cached depth (R32_FLOAT)
+			// Cached depth (R32_FLOAT — depth is extracted from R24G8 via compute shader
+			// in dx11compositor.cpp before CacheFrame. CopySubresourceRegion silently
+			// produces zeros for R24G8_TYPELESS depth-stencil textures.)
 			desc.Format = DXGI_FORMAT_R32_FLOAT;
 			hr = device->CreateTexture2D(&desc, nullptr, &m_cachedDepth[slot][eye]);
 			if (FAILED(hr)) {
-				OOVR_LOGF("ASW: CreateTexture2D depth[%u][%d] failed hr=0x%08X", slot, eye, hr);
+				OOVR_LOGF("ASW: CreateTexture2D depth[%u][%d] R32F failed hr=0x%08X", slot, eye, hr);
 				return false;
 			}
 			srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
 			hr = device->CreateShaderResourceView(m_cachedDepth[slot][eye], &srvDesc, &m_srvDepth[slot][eye]);
+			if (slot == 0 && eye == 0) {
+				OOVR_LOGF("ASW: Depth format=R32F, SRV format=%u", srvDesc.Format);
+			}
 			if (FAILED(hr)) {
 				OOVR_LOGF("ASW: CreateSRV depth[%u][%d] failed", slot, eye);
 				return false;
@@ -643,7 +1181,7 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 					d3d12SrvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
 					m_d3d12Device->CreateShaderResourceView(m_d3d12CachedMV[slot][eye], &d3d12SrvDesc, cpuHandle);
 
-					// Depth SRV (t2)
+					// Depth SRV (t2) — always R32_FLOAT (extracted from R24G8 via compute shader)
 					cpuHandle.ptr = heapCpuStart.ptr + (SIZE_T)(descBaseIndex + 2) * m_d3d12HeapDescriptorSize;
 					d3d12SrvDesc.Format = DXGI_FORMAT_R32_FLOAT;
 					m_d3d12Device->CreateShaderResourceView(m_d3d12CachedDepth[slot][eye], &d3d12SrvDesc, cpuHandle);
@@ -676,10 +1214,11 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 		}
 
 		// Share warped output to D3D12 and create UAV descriptor
+		// Heap layout: [18 SRVs] [eye0: output_uav, atomicDepth_uav] [eye1: output_uav, atomicDepth_uav]
 		if (m_d3d12Ready) {
 			ShareTextureD3D11ToD3D12(m_warpedOutput[eye], &m_d3d12WarpedOutput[eye]);
 			if (m_d3d12WarpedOutput[eye]) {
-				uint32_t uavIndex = 3 * kAswCacheSlotCount * 2 + eye;
+				uint32_t uavIndex = 3 * kAswCacheSlotCount * 2 + eye * 2; // u0 for this eye
 				D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
 				cpuHandle.ptr = heapCpuStart.ptr + (SIZE_T)uavIndex * m_d3d12HeapDescriptorSize;
 				D3D12_UNORDERED_ACCESS_VIEW_DESC d3d12UavDesc = {};
@@ -688,6 +1227,44 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 				m_d3d12Device->CreateUnorderedAccessView(m_d3d12WarpedOutput[eye], nullptr, &d3d12UavDesc, cpuHandle);
 			} else {
 				OOVR_LOGF("ASW D3D12: Failed to share warped output eye=%d", eye);
+				m_d3d12Ready = false;
+			}
+		}
+	}
+
+	// Forward scatter: atomic depth buffers (R32_UINT, per-eye)
+	for (int eye = 0; eye < 2; eye++) {
+		desc.Format = DXGI_FORMAT_R32_UINT;
+		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		desc.MiscFlags = sharedFlags;
+		HRESULT hr = device->CreateTexture2D(&desc, nullptr, &m_atomicDepth[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateTexture2D atomicDepth[%d] failed hr=0x%08X", eye, hr);
+			return false;
+		}
+
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+		uavDesc.Format = DXGI_FORMAT_R32_UINT;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		hr = device->CreateUnorderedAccessView(m_atomicDepth[eye], &uavDesc, &m_uavAtomicDepth[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateUAV atomicDepth[%d] failed", eye);
+			return false;
+		}
+
+		// Share to D3D12 and create UAV descriptor (u1 slot for this eye)
+		if (m_d3d12Ready) {
+			ShareTextureD3D11ToD3D12(m_atomicDepth[eye], &m_d3d12AtomicDepth[eye]);
+			if (m_d3d12AtomicDepth[eye]) {
+				uint32_t uavIndex = 3 * kAswCacheSlotCount * 2 + eye * 2 + 1; // u1 for this eye
+				D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle;
+				cpuHandle.ptr = heapCpuStart.ptr + (SIZE_T)uavIndex * m_d3d12HeapDescriptorSize;
+				D3D12_UNORDERED_ACCESS_VIEW_DESC d3d12UavDesc = {};
+				d3d12UavDesc.Format = DXGI_FORMAT_R32_UINT;
+				d3d12UavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+				m_d3d12Device->CreateUnorderedAccessView(m_d3d12AtomicDepth[eye], nullptr, &d3d12UavDesc, cpuHandle);
+			} else {
+				OOVR_LOGF("ASW D3D12: Failed to share atomicDepth eye=%d", eye);
 				m_d3d12Ready = false;
 			}
 		}
@@ -825,8 +1402,8 @@ XrRect2Di ASWProvider::GetOutputRect(int eye) const
 bool ASWProvider::CreateDepthSwapchain(uint32_t width, uint32_t height)
 {
 	XrSwapchainCreateInfo ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-	ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-	ci.format = DXGI_FORMAT_R32_FLOAT;
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.format = DXGI_FORMAT_D32_FLOAT;
 	ci.sampleCount = 1;
 	ci.width = width;
 	ci.height = height;
@@ -1009,7 +1586,8 @@ bool ASWProvider::CreateDX12ComputePipeline()
 
 	ID3DBlob* compiled = nullptr;
 	ID3DBlob* errors = nullptr;
-	HRESULT hr = D3DCompile(s_warpShaderHLSL, strlen(s_warpShaderHLSL),
+	std::string csMainDX12Src = std::string(s_warpShaderHLSL) + s_warpShaderDebugHLSL;
+	HRESULT hr = D3DCompile(csMainDX12Src.c_str(), csMainDX12Src.size(),
 	    "ASWWarp_DX12", nullptr, nullptr, "CSMain", "cs_5_1", flags, 0, &compiled, &errors);
 	if (FAILED(hr)) {
 		if (errors) {
@@ -1021,7 +1599,7 @@ bool ASWProvider::CreateDX12ComputePipeline()
 	if (errors)
 		errors->Release();
 
-	// 2. Root signature: CBV(b0) + SRV table(t0-t2) + UAV table(u0) + static sampler(s0)
+	// 2. Root signature: CBV(b0) + SRV table(t0-t2) + UAV table(u0-u1) + static sampler(s0)
 	D3D12_DESCRIPTOR_RANGE1 srvRange = {};
 	srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 	srvRange.NumDescriptors = 3;
@@ -1032,7 +1610,7 @@ bool ASWProvider::CreateDX12ComputePipeline()
 
 	D3D12_DESCRIPTOR_RANGE1 uavRange = {};
 	uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-	uavRange.NumDescriptors = 1;
+	uavRange.NumDescriptors = 2;  // u0 = output, u1 = atomicDepth
 	uavRange.BaseShaderRegister = 0;
 	uavRange.RegisterSpace = 0;
 	uavRange.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
@@ -1050,7 +1628,7 @@ bool ASWProvider::CreateDX12ComputePipeline()
 	rootParams[1].DescriptorTable.NumDescriptorRanges = 1;
 	rootParams[1].DescriptorTable.pDescriptorRanges = &srvRange;
 	rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-	// Param 2: UAV descriptor table (u0)
+	// Param 2: UAV descriptor table (u0-u1)
 	rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 	rootParams[2].DescriptorTable.NumDescriptorRanges = 1;
 	rootParams[2].DescriptorTable.pDescriptorRanges = &uavRange;
@@ -1096,7 +1674,7 @@ bool ASWProvider::CreateDX12ComputePipeline()
 		return false;
 	}
 
-	// 3. Compute PSO
+	// 3. Compute PSOs (CSMain + forward scatter shaders)
 	D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
 	psoDesc.pRootSignature = m_d3d12RootSig;
 	psoDesc.CS.pShaderBytecode = compiled->GetBufferPointer();
@@ -1104,13 +1682,53 @@ bool ASWProvider::CreateDX12ComputePipeline()
 	hr = m_d3d12Device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_d3d12PipelineState));
 	compiled->Release();
 	if (FAILED(hr)) {
-		OOVR_LOGF("ASW D3D12: CreateComputePipelineState failed (hr=0x%08X)", hr);
+		OOVR_LOGF("ASW D3D12: CreateComputePipelineState(CSMain) failed (hr=0x%08X)", hr);
 		return false;
 	}
 
-	// 4. Descriptor heap: 3 SRVs per slot/eye + 2 UAVs for warped output
-	// Layout: [slot0_eye0: colorSRV, mvSRV, depthSRV] [slot0_eye1: ...] ... [uav_eye0] [uav_eye1]
-	uint32_t totalDescriptors = 3 * kAswCacheSlotCount * 2 + 2;
+	// Compile and create PSOs for forward scatter shaders
+	// Full shader source for forward scatter compilation (base + forward scatter parts)
+	std::string fullDX12Src = std::string(s_warpShaderHLSL) + s_warpShaderDebugHLSL + s_forwardScatterHLSL;
+	auto compileDX12Entry = [&](const char* entry, ID3D12PipelineState** outPSO) -> bool {
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errs = nullptr;
+		HRESULT r = D3DCompile(fullDX12Src.c_str(), fullDX12Src.size(),
+		    entry, nullptr, nullptr, entry, "cs_5_1", flags, 0, &blob, &errs);
+		if (FAILED(r)) {
+			if (errs) {
+				OOVR_LOGF("ASW D3D12: Shader compile error (%s): %s", entry, (char*)errs->GetBufferPointer());
+				errs->Release();
+			}
+			return false;
+		}
+		if (errs) errs->Release();
+		D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+		pd.pRootSignature = m_d3d12RootSig;
+		pd.CS.pShaderBytecode = blob->GetBufferPointer();
+		pd.CS.BytecodeLength = blob->GetBufferSize();
+		r = m_d3d12Device->CreateComputePipelineState(&pd, IID_PPV_ARGS(outPSO));
+		blob->Release();
+		if (FAILED(r)) {
+			OOVR_LOGF("ASW D3D12: CreateComputePipelineState(%s) failed (hr=0x%08X)", entry, r);
+			return false;
+		}
+		return true;
+	};
+
+	if (!compileDX12Entry("CSClear", &m_d3d12ClearPSO) ||
+	    !compileDX12Entry("CSForward", &m_d3d12ForwardPSO) ||
+	    !compileDX12Entry("CSForwardDepth", &m_d3d12ForwardDepthPSO) ||
+	    !compileDX12Entry("CSForwardColor", &m_d3d12ForwardColorPSO) ||
+	    !compileDX12Entry("CSDilate", &m_d3d12DilatePSO)) {
+		OOVR_LOG("ASW D3D12: Forward scatter PSO creation failed (non-fatal)");
+	} else {
+		OOVR_LOG("ASW D3D12: Forward scatter PSOs created (CSClear, CSForwardDepth, CSForwardColor, CSDilate)");
+	}
+
+	// 4. Descriptor heap: 3 SRVs per slot/eye + 4 UAVs (output + atomicDepth per eye)
+	// Layout: [slot0_eye0: colorSRV, mvSRV, depthSRV] [slot0_eye1: ...] ...
+	//         [eye0: output_uav, atomicDepth_uav] [eye1: output_uav, atomicDepth_uav]
+	uint32_t totalDescriptors = 3 * kAswCacheSlotCount * 2 + 4;
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
 	heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	heapDesc.NumDescriptors = totalDescriptors;
@@ -1172,8 +1790,8 @@ D3D12_GPU_DESCRIPTOR_HANDLE ASWProvider::GetSrvGpuHandle(int slot, int eye) cons
 
 D3D12_GPU_DESCRIPTOR_HANDLE ASWProvider::GetUavGpuHandle(int eye) const
 {
-	// UAVs are after all SRVs
-	uint32_t index = 3 * kAswCacheSlotCount * 2 + eye;
+	// UAVs are after all SRVs: [eye0: output, atomicDepth] [eye1: output, atomicDepth]
+	uint32_t index = 3 * kAswCacheSlotCount * 2 + eye * 2;
 	D3D12_GPU_DESCRIPTOR_HANDLE handle = m_d3d12SrvUavHeap->GetGPUDescriptorHandleForHeapStart();
 	handle.ptr += (SIZE_T)index * m_d3d12HeapDescriptorSize;
 	return handle;
@@ -1418,8 +2036,35 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		}
 	}
 
-	// Copy depth (extracted R32F -> cached slot)
+	// Copy depth (R24G8_TYPELESS or R32F -> cached slot, same-format copy)
+	{
+		static int s_depthNullCount = 0;
+		if (!depthTex || !depthRegion) {
+			if (s_depthNullCount < 5) {
+				OOVR_LOGF("ASW: depth %s for eye %d (depthTex=%p depthRegion=%p)",
+				    !depthTex ? "NULL" : "no-region", eye, depthTex, depthRegion);
+				s_depthNullCount++;
+			}
+		} else {
+			s_depthNullCount = 0;
+		}
+	}
 	if (depthTex && depthRegion) {
+		// Log source depth format once to diagnose format mismatch
+		{
+			static int s_depthFmtLog = 0;
+			if (s_depthFmtLog < 3) {
+				D3D11_TEXTURE2D_DESC srcDesc = {};
+				depthTex->GetDesc(&srcDesc);
+				D3D11_TEXTURE2D_DESC dstDesc = {};
+				m_cachedDepth[slot][eye]->GetDesc(&dstDesc);
+				OOVR_LOGF("ASW CacheFrame: depth src fmt=%u (%ux%u bind=0x%X) -> dst fmt=%u (%ux%u bind=0x%X) region=[%u,%u - %u,%u]",
+				    srcDesc.Format, srcDesc.Width, srcDesc.Height, srcDesc.BindFlags,
+				    dstDesc.Format, dstDesc.Width, dstDesc.Height, dstDesc.BindFlags,
+				    depthRegion->left, depthRegion->top, depthRegion->right, depthRegion->bottom);
+				s_depthFmtLog++;
+			}
+		}
 		if (!SafeBridgeCopy(ctx, m_cachedDepth[slot][eye], 0, 0, 0, 0,
 		        depthTex, 0, depthRegion)) {
 			OOVR_LOG("ASW: TOCTOU - depth texture freed during copy");
@@ -1428,56 +2073,37 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		m_slotDepthDataW[slot] = depthRegion->right - depthRegion->left;
 		m_slotDepthDataH[slot] = depthRegion->bottom - depthRegion->top;
 
-		// Optional readback diagnostics (left eye only)
+		// Readback a single pixel from cached depth to verify copy succeeded
 		{
-			static int s_readbackFrame = 0;
 			static int s_readbackCount = 0;
-			static float s_lastLoggedNear = 0, s_lastLoggedFar = 0;
-			s_readbackFrame++;
-			bool areaChanged = (fabsf(nearZ - s_lastLoggedNear) > 0.5f || fabsf(farZ - s_lastLoggedFar) > 1000.0f);
-			if (enableReadbackDiag && areaChanged && s_readbackFrame > 90) {
-				OOVR_LOGF("ASW area change: near %.1f->%.1f far %.0f->%.0f - resetting depth sampling",
-				    s_lastLoggedNear, nearZ, s_lastLoggedFar, farZ);
-				s_readbackCount = 0;
-				s_readbackFrame = 0;
-				s_lastLoggedNear = nearZ;
-				s_lastLoggedFar = farZ;
-			}
-			if (enableReadbackDiag && s_readbackFrame > 225 && s_readbackCount < 20
-			    && (s_readbackFrame % 45) == 0 && eye == 0) {
-				s_readbackCount++;
-				s_lastLoggedNear = nearZ;
-				s_lastLoggedFar = farZ;
+			if (s_readbackCount < 5 && eye == 0) {
+				D3D11_TEXTURE2D_DESC dstDesc = {};
+				m_cachedDepth[slot][eye]->GetDesc(&dstDesc);
+				D3D11_TEXTURE2D_DESC stg = dstDesc;
+				stg.Width = 1; stg.Height = 1;
+				stg.Usage = D3D11_USAGE_STAGING;
+				stg.BindFlags = 0; stg.MiscFlags = 0;
+				stg.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+				ID3D11Texture2D* staging = nullptr;
 				ID3D11Device* dev = nullptr;
 				ctx->GetDevice(&dev);
-				if (dev) {
-					D3D11_TEXTURE2D_DESC readDesc;
-					m_cachedDepth[slot][eye]->GetDesc(&readDesc);
-					readDesc.Usage = D3D11_USAGE_STAGING;
-					readDesc.BindFlags = 0;
-					readDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-					ID3D11Texture2D* readback = nullptr;
-					if (SUCCEEDED(dev->CreateTexture2D(&readDesc, nullptr, &readback))) {
-						ctx->CopyResource(readback, m_cachedDepth[slot][eye]);
-						D3D11_MAPPED_SUBRESOURCE mapped;
-						if (SUCCEEDED(ctx->Map(readback, 0, D3D11_MAP_READ, 0, &mapped))) {
-							const float* pixels = (const float*)mapped.pData;
-							uint32_t stride = mapped.RowPitch / sizeof(float);
-							uint32_t dw = m_slotDepthDataW[slot] > 0 ? m_slotDepthDataW[slot] : readDesc.Width;
-							uint32_t dh = m_slotDepthDataH[slot] > 0 ? m_slotDepthDataH[slot] : readDesc.Height;
-							float center = pixels[(dh / 2) * stride + (dw / 2)];
-							float topCtr = pixels[(dh / 8) * stride + (dw / 2)];
-							float botCtr = pixels[(dh * 7 / 8) * stride + (dw / 2)];
-							float leftCtr = pixels[(dh / 2) * stride + (dw / 8)];
-							float rightCtr = pixels[(dh / 2) * stride + (dw * 7 / 8)];
-							OOVR_LOGF("ASW depth[%d]: center=%.5f top=%.5f bot=%.5f left=%.5f right=%.5f near=%.1f far=%.0f (data %ux%u)",
-							    s_readbackCount, center, topCtr, botCtr, leftCtr, rightCtr, nearZ, farZ, dw, dh);
-							ctx->Unmap(readback, 0);
-						}
-						readback->Release();
+				if (dev && SUCCEEDED(dev->CreateTexture2D(&stg, nullptr, &staging))) {
+					// Copy center pixel from cached depth (now R32F)
+					uint32_t cx = dstDesc.Width / 2;
+					uint32_t cy = dstDesc.Height / 2;
+					D3D11_BOX box = { cx, cy, 0, cx + 1, cy + 1, 1 };
+					ctx->CopySubresourceRegion(staging, 0, 0, 0, 0,
+					    m_cachedDepth[slot][eye], 0, &box);
+					D3D11_MAPPED_SUBRESOURCE mapped;
+					if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+						float val = *(const float*)mapped.pData;
+						OOVR_LOGF("ASW CacheFrame READBACK: cachedDepth center = %.6f (0=near, 1=far)", val);
+						ctx->Unmap(staging, 0);
 					}
-					dev->Release();
+					staging->Release();
 				}
+				if (dev) dev->Release();
+				s_readbackCount++;
 			}
 		}
 	}
@@ -1543,6 +2169,262 @@ void ASWProvider::WaitForCacheFence()
 	m_cacheFenceWaitedEarly = true;
 }
 
+// ============================================================================
+// Warp diagnostic capture — saves all inputs/outputs for offline iteration
+// ============================================================================
+
+static void WriteBMP(const char* path, const uint8_t* pixelData, uint32_t w, uint32_t h,
+    uint32_t srcStride, int bytesPerPx, bool swapRB)
+{
+	uint32_t rowBytes = w * 3;
+	uint32_t rowPad = (4 - (rowBytes % 4)) % 4;
+	uint32_t imgSize = (rowBytes + rowPad) * h;
+	uint8_t hdr[54] = {};
+	hdr[0] = 'B'; hdr[1] = 'M';
+	*(uint32_t*)(hdr + 2) = 54 + imgSize;
+	*(uint32_t*)(hdr + 10) = 54;
+	*(uint32_t*)(hdr + 14) = 40;
+	*(int32_t*)(hdr + 18) = (int32_t)w;
+	*(int32_t*)(hdr + 22) = -(int32_t)h; // top-down
+	*(uint16_t*)(hdr + 26) = 1;
+	*(uint16_t*)(hdr + 28) = 24;
+	*(uint32_t*)(hdr + 34) = imgSize;
+	std::ofstream f(path, std::ios::binary);
+	if (!f) return;
+	f.write((const char*)hdr, 54);
+	std::vector<uint8_t> row(rowBytes + rowPad, 0);
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t* src = pixelData + y * srcStride;
+		for (uint32_t x = 0; x < w; x++) {
+			uint8_t r, g, b;
+			if (bytesPerPx == 4) {
+				r = src[x * 4 + 0]; g = src[x * 4 + 1]; b = src[x * 4 + 2];
+			} else if (bytesPerPx == 1) {
+				r = g = b = src[x];
+			} else {
+				r = g = b = 0;
+			}
+			// BMP = BGR
+			row[x * 3 + 0] = swapRB ? r : b;
+			row[x * 3 + 1] = g;
+			row[x * 3 + 2] = swapRB ? b : r;
+		}
+		f.write((const char*)row.data(), rowBytes + rowPad);
+	}
+}
+
+static void WriteRaw(const char* path, const void* data, uint32_t w, uint32_t h,
+    uint32_t stride, uint32_t dxgiFormat, uint32_t bpp)
+{
+	std::ofstream f(path, std::ios::binary);
+	if (!f) return;
+	// Header: width, height, DXGI format, bytes-per-pixel, row pitch
+	uint32_t header[5] = { w, h, dxgiFormat, bpp, stride };
+	f.write((const char*)header, sizeof(header));
+	for (uint32_t y = 0; y < h; y++)
+		f.write((const char*)data + y * stride, w * bpp);
+}
+
+static bool CopyAndSaveTexture(ID3D11Device* dev, ID3D11DeviceContext* ctx,
+    ID3D11Texture2D* tex, const std::string& folder, const char* baseName,
+    bool saveBMP, bool saveRaw)
+{
+	if (!tex) return false;
+	D3D11_TEXTURE2D_DESC desc;
+	tex->GetDesc(&desc);
+
+	D3D11_TEXTURE2D_DESC stg = desc;
+	stg.Usage = D3D11_USAGE_STAGING;
+	stg.BindFlags = 0;
+	stg.MiscFlags = 0;
+	stg.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+	ID3D11Texture2D* staging = nullptr;
+	if (FAILED(dev->CreateTexture2D(&stg, nullptr, &staging)))
+		return false;
+
+	ctx->CopyResource(staging, tex);
+
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+		staging->Release();
+		return false;
+	}
+
+	uint32_t w = desc.Width, h = desc.Height;
+
+	if (saveBMP) {
+		std::string bmpPath = folder + "\\" + baseName + ".bmp";
+		if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+			WriteBMP(bmpPath.c_str(), (const uint8_t*)mapped.pData, w, h, mapped.RowPitch, 4, false);
+		} else if (desc.Format == DXGI_FORMAT_R24G8_TYPELESS) {
+			// Convert R24G8 depth to grayscale BMP
+			std::vector<uint8_t> gray(w * h);
+			for (uint32_t y = 0; y < h; y++) {
+				const uint32_t* row = (const uint32_t*)((const uint8_t*)mapped.pData + y * mapped.RowPitch);
+				for (uint32_t x = 0; x < w; x++) {
+					uint32_t d24 = row[x] & 0x00FFFFFF;
+					float d = (float)d24 / 16777215.0f;
+					float vis = (d - 0.84f) / 0.16f;
+					vis = vis < 0.0f ? 0.0f : (vis > 1.0f ? 1.0f : vis);
+					gray[y * w + x] = (uint8_t)(vis * 255.0f);
+				}
+			}
+			WriteBMP(bmpPath.c_str(), gray.data(), w, h, w, 1, false);
+		} else if (desc.Format == DXGI_FORMAT_R32_FLOAT) {
+			// Convert R32F depth to grayscale BMP
+			std::vector<uint8_t> gray(w * h);
+			for (uint32_t y = 0; y < h; y++) {
+				const float* row = (const float*)((const uint8_t*)mapped.pData + y * mapped.RowPitch);
+				for (uint32_t x = 0; x < w; x++) {
+					float d = row[x];
+					float vis = (d - 0.84f) / 0.16f;
+					vis = vis < 0.0f ? 0.0f : (vis > 1.0f ? 1.0f : vis);
+					gray[y * w + x] = (uint8_t)(vis * 255.0f);
+				}
+			}
+			WriteBMP(bmpPath.c_str(), gray.data(), w, h, w, 1, false);
+		}
+	}
+
+	if (saveRaw) {
+		std::string rawPath = folder + "\\" + baseName + ".raw";
+		uint32_t bpp = 4;
+		if (desc.Format == DXGI_FORMAT_R16G16_FLOAT) bpp = 4;
+		else if (desc.Format == DXGI_FORMAT_R32_FLOAT) bpp = 4;
+		else if (desc.Format == DXGI_FORMAT_R24G8_TYPELESS) bpp = 4;
+		else if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) bpp = 4;
+		WriteRaw(rawPath.c_str(), mapped.pData, w, h, mapped.RowPitch, desc.Format, bpp);
+	}
+
+	ctx->Unmap(staging, 0);
+	staging->Release();
+	return true;
+}
+
+void ASWProvider::CaptureWarpDiagnostics(int eye, int slot, const WarpConstants& cb,
+    ID3D11DeviceContext* ctx, bool /*isPreDispatch*/)
+{
+	static int s_warpFrame = 0;
+	static int s_captureIdx = 0;
+
+	if (eye != 0) return;
+
+	s_warpFrame++;
+	// Start capturing ~10 seconds after game start (375 warp pairs at ~37.5 fps)
+	if (s_warpFrame < 375) return;
+	if (s_captureIdx >= 30) return;
+
+	// Only capture when pose delta is large enough to show artifacts.
+	// Measure off-diagonal rotation magnitude in forwardPoseDelta — these elements
+	// are approximately the rotation angle in radians for small rotations.
+	float rotMag = fabsf(cb.forwardPoseDelta[1]) + fabsf(cb.forwardPoseDelta[2])
+	             + fabsf(cb.forwardPoseDelta[4]) + fabsf(cb.forwardPoseDelta[6])
+	             + fabsf(cb.forwardPoseDelta[8]) + fabsf(cb.forwardPoseDelta[9]);
+	// Also check translation magnitude
+	float transMag = fabsf(cb.forwardPoseDelta[3]) + fabsf(cb.forwardPoseDelta[7])
+	               + fabsf(cb.forwardPoseDelta[11]);
+	// Threshold: ~0.005 rad total rotation ≈ 7-8px displacement at 3560px.
+	// Previous captures had rotMag ~0.002 (too small). Need at least 0.005.
+	if (rotMag < 0.005f && transMag < 0.001f) return;
+
+	// Throttle: don't capture every qualifying frame, space them out
+	static int s_lastCaptureFrame = 0;
+	if (s_warpFrame - s_lastCaptureFrame < 30) return;
+	s_lastCaptureFrame = s_warpFrame;
+
+	// Create cycle folder
+	std::string folder = "C:\\Users\\JLWel\\AppData\\Local\\OpenXR-Toolkit\\screenshots\\TestWarp\\Cycle"
+	    + std::to_string(s_captureIdx);
+	std::error_code ec;
+	std::filesystem::create_directories(folder, ec);
+	if (ec) {
+		OOVR_LOGF("ASW CAPTURE: Failed to create folder %s: %s", folder.c_str(), ec.message().c_str());
+		s_captureIdx++;
+		return;
+	}
+
+	OOVR_LOGF("ASW CAPTURE: Saving cycle %d to %s (warpFrame=%d)", s_captureIdx, folder.c_str(), s_warpFrame);
+
+	// Save inputs (color, depth, MV)
+	CopyAndSaveTexture(m_device, ctx, m_cachedColor[slot][0], folder, "color", true, false);
+	CopyAndSaveTexture(m_device, ctx, m_cachedDepth[slot][0], folder, "depth", true, true);
+	CopyAndSaveTexture(m_device, ctx, m_cachedMV[slot][0], folder, "mv", false, true);
+
+	// Save WarpConstants as binary
+	{
+		std::string cbPath = folder + "\\warp_constants.bin";
+		std::ofstream f(cbPath, std::ios::binary);
+		if (f) f.write((const char*)&cb, sizeof(cb));
+	}
+
+	// Save a text summary of key parameters
+	{
+		std::string infoPath = folder + "\\info.txt";
+		std::ofstream f(infoPath);
+		if (f) {
+			f << "Warp frame: " << s_warpFrame << "\n";
+			f << "Slot: " << slot << "\n";
+			f << "Resolution: " << cb.resolution[0] << " x " << cb.resolution[1] << "\n";
+			f << "Depth resolution: " << cb.depthResolution[0] << " x " << cb.depthResolution[1] << "\n";
+			f << "MV resolution: " << cb.mvResolution[0] << " x " << cb.mvResolution[1] << "\n";
+			f << "nearZ: " << cb.nearZ << " farZ: " << cb.farZ << "\n";
+			f << "depthScale: " << cb.depthScale << "\n";
+			f << "fovTan: L=" << cb.fovTanLeft << " R=" << cb.fovTanRight
+			  << " U=" << cb.fovTanUp << " D=" << cb.fovTanDown << "\n";
+			f << "mvConfidence: " << cb.mvConfidence << "\n";
+			f << "mvPixelScale: " << cb.mvPixelScale << "\n";
+			f << "debugMode: " << cb.debugMode << "\n";
+			f << "hasClipToClipNoLoco: " << cb.hasClipToClipNoLoco << "\n";
+			f << "d3d12Ready: " << (m_d3d12Ready ? 1 : 0) << "\n";
+
+			// Depth format
+			D3D11_TEXTURE2D_DESC depthDesc;
+			if (m_cachedDepth[slot][0]) {
+				m_cachedDepth[slot][0]->GetDesc(&depthDesc);
+				f << "Depth format: " << depthDesc.Format
+				  << " (44=R24G8, 41=R32F, bindFlags=0x" << std::hex << depthDesc.BindFlags << std::dec << ")\n";
+			}
+
+			// Forward pose delta matrix
+			f << "forwardPoseDelta:\n";
+			for (int r = 0; r < 4; r++) {
+				f << "  ";
+				for (int c = 0; c < 4; c++)
+					f << cb.forwardPoseDelta[r * 4 + c] << " ";
+				f << "\n";
+			}
+			f << "poseDeltaMatrix:\n";
+			for (int r = 0; r < 4; r++) {
+				f << "  ";
+				for (int c = 0; c < 4; c++)
+					f << cb.poseDeltaMatrix[r * 4 + c] << " ";
+				f << "\n";
+			}
+			f << "headRotMatrix:\n";
+			for (int r = 0; r < 4; r++) {
+				f << "  ";
+				for (int c = 0; c < 4; c++)
+					f << cb.headRotMatrix[r * 4 + c] << " ";
+				f << "\n";
+			}
+		}
+	}
+
+	// Save warped output — m_warpedOutput[0] contains the PREVIOUS frame's warp result
+	// which is complete on the GPU (D3D12 fence was waited before this frame started).
+	// This is the warp output corresponding to inputs from 1 cycle ago, not this cycle's
+	// inputs. But for visual inspection of warp quality it's still useful.
+	if (m_warpedOutput[0]) {
+		// Flush any pending D3D11 work to ensure D3D12→D3D11 shared texture is readable
+		ctx->Flush();
+		CopyAndSaveTexture(m_device, ctx, m_warpedOutput[0], folder, "output_prev", true, false);
+	}
+
+	OOVR_LOGF("ASW CAPTURE: Cycle %d complete", s_captureIdx);
+	s_captureIdx++;
+}
+
 bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 {
 	if (!m_ready || eye < 0 || eye > 1)
@@ -1586,6 +2468,16 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	cb.poseDeltaMatrix[11] = -cb.poseDeltaMatrix[11];
 	m_precompPose[eye] = newPose;
 
+	// forwardPoseDelta: OLD view → NEW view (forward scatter — inverse of poseDeltaMatrix)
+	// BuildPoseDeltaMatrix(cached, new) gives cached→new transform.
+	BuildPoseDeltaMatrix(m_slotPose[slot][eye], newPose, cb.forwardPoseDelta);
+	// Z-flip conjugation: F * M * F (same as poseDeltaMatrix)
+	cb.forwardPoseDelta[2]  = -cb.forwardPoseDelta[2];
+	cb.forwardPoseDelta[6]  = -cb.forwardPoseDelta[6];
+	cb.forwardPoseDelta[8]  = -cb.forwardPoseDelta[8];
+	cb.forwardPoseDelta[9]  = -cb.forwardPoseDelta[9];
+	cb.forwardPoseDelta[11] = -cb.forwardPoseDelta[11];
+
 	cb.debugMode = oovr_global_configuration.ASWDebugMode();
 
 	// headRotMatrix: full frame-to-frame head delta (rotation + translation) from OpenXR poses.
@@ -1614,13 +2506,22 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	if (rotS != 0.0f && fabsf(m_locoYaw) > 0.002f) { // ~0.1 degree dead zone
 		float theta = m_locoYaw * rotS;
 		float co = cosf(theta), si = sinf(theta);
+		// Apply to poseDeltaMatrix (backward: new→old)
 		float* M = cb.poseDeltaMatrix;
-		// Rotate rows 0 and 2 (Y-axis rotation in row-major layout)
 		for (int col = 0; col < 4; col++) {
 			float r0 = M[0 * 4 + col];
 			float r2 = M[2 * 4 + col];
 			M[0 * 4 + col] = co * r0 + si * r2;
 			M[2 * 4 + col] = -si * r0 + co * r2;
+		}
+		// Apply to forwardPoseDelta (forward: old→new, negate theta)
+		float coN = co, siN = -si; // cos(-θ)=cos(θ), sin(-θ)=-sin(θ)
+		float* F = cb.forwardPoseDelta;
+		for (int col = 0; col < 4; col++) {
+			float r0 = F[0 * 4 + col];
+			float r2 = F[2 * 4 + col];
+			F[0 * 4 + col] = coN * r0 + siN * r2;
+			F[2 * 4 + col] = -siN * r0 + coN * r2;
 		}
 	}
 
@@ -1634,6 +2535,9 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		cb.poseDeltaMatrix[3] *= transStr;
 		cb.poseDeltaMatrix[7] *= transStr;
 		cb.poseDeltaMatrix[11] *= transStr;
+		cb.forwardPoseDelta[3] *= transStr;
+		cb.forwardPoseDelta[7] *= transStr;
+		cb.forwardPoseDelta[11] *= transStr;
 	}
 
 	// Locomotion correction: handled by MV path (locoMV = totalMV - headMV) in shader.
@@ -1832,6 +2736,16 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		}
 	}
 
+	// ── Diagnostic capture (inputs) — runs before D3D12 or D3D11 dispatch ──
+	{
+		ID3D11DeviceContext* captureCtx = nullptr;
+		m_device->GetImmediateContext(&captureCtx);
+		if (captureCtx) {
+			CaptureWarpDiagnostics(eye, slot, cb, captureCtx, true);
+			captureCtx->Release();
+		}
+	}
+
 	// ── D3D12 warp path ──
 	if (m_d3d12Ready) {
 		// Write constants to per-eye upload heap region (eye 0 at offset 0, eye 1 at offset stride)
@@ -1855,7 +2769,7 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 			m_d3d12CmdList->Reset(m_d3d12CmdAlloc, m_d3d12PipelineState);
 		}
 
-		// Bind compute root signature + per-eye constant buffer region
+		// Bind compute root signature + per-eye constant buffer + descriptor heaps
 		m_d3d12CmdList->SetComputeRootSignature(m_d3d12RootSig);
 		m_d3d12CmdList->SetComputeRootConstantBufferView(0,
 		    m_d3d12ConstantBuffer->GetGPUVirtualAddress() + eye * m_d3d12CbEyeStride);
@@ -1865,10 +2779,38 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		m_d3d12CmdList->SetComputeRootDescriptorTable(1, GetSrvGpuHandle(slot, eye));
 		m_d3d12CmdList->SetComputeRootDescriptorTable(2, GetUavGpuHandle(eye));
 
-		// Dispatch warp compute (same 8x8 thread groups)
 		uint32_t groupsX = (m_eyeWidth + 7) / 8;
 		uint32_t groupsY = (m_eyeHeight + 7) / 8;
-		m_d3d12CmdList->Dispatch(groupsX, groupsY, 1);
+
+		// Two-pass forward scatter pipeline: depth-first eliminates color race conditions.
+		if (m_d3d12ClearPSO && m_d3d12ForwardDepthPSO && m_d3d12ForwardColorPSO && m_d3d12DilatePSO) {
+			D3D12_RESOURCE_BARRIER uavBarrier = {};
+			uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+			uavBarrier.UAV.pResource = nullptr; // full UAV barrier (all resources)
+
+			// Pass 0: clear output + atomic depth
+			m_d3d12CmdList->SetPipelineState(m_d3d12ClearPSO);
+			m_d3d12CmdList->Dispatch(groupsX, groupsY, 1);
+			m_d3d12CmdList->ResourceBarrier(1, &uavBarrier);
+
+			// Pass 1: forward scatter depth only (finalize atomicDepth)
+			m_d3d12CmdList->SetPipelineState(m_d3d12ForwardDepthPSO);
+			m_d3d12CmdList->Dispatch(groupsX, groupsY, 1);
+			m_d3d12CmdList->ResourceBarrier(1, &uavBarrier);
+
+			// Pass 2: forward scatter color (write where depth matches)
+			m_d3d12CmdList->SetPipelineState(m_d3d12ForwardColorPSO);
+			m_d3d12CmdList->Dispatch(groupsX, groupsY, 1);
+			m_d3d12CmdList->ResourceBarrier(1, &uavBarrier);
+
+			// Pass 3: dilate (mirror-fill disocclusion + depth-edge cleanup)
+			m_d3d12CmdList->SetPipelineState(m_d3d12DilatePSO);
+			m_d3d12CmdList->Dispatch(groupsX, groupsY, 1);
+		} else {
+			// Fallback: backward warp
+			m_d3d12CmdList->SetPipelineState(m_d3d12PipelineState);
+			m_d3d12CmdList->Dispatch(groupsX, groupsY, 1);
+		}
 
 		return true;
 	}
@@ -1900,23 +2842,55 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	memcpy(mapped.pData, &cb, sizeof(cb));
 	ctx->Unmap(m_constantBuffer, 0);
 
-	ctx->CSSetShader(m_warpCS, nullptr, 0);
 	ID3D11ShaderResourceView* mvSRV = (fabsf(cb.mvConfidence) > 0.001f) ? m_srvMV[slot][eye] : nullptr;
 	ID3D11ShaderResourceView* srvs[] = { m_srvColor[slot][eye], mvSRV, m_srvDepth[slot][eye] };
 	ctx->CSSetShaderResources(0, 3, srvs);
-	ID3D11UnorderedAccessView* uavs[] = { m_uavOutput[eye] };
-	ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+	ID3D11UnorderedAccessView* uavs2[] = { m_uavOutput[eye], m_uavAtomicDepth[eye] };
+	ctx->CSSetUnorderedAccessViews(0, 2, uavs2, nullptr);
 	ctx->CSSetConstantBuffers(0, 1, &m_constantBuffer);
 	ctx->CSSetSamplers(0, 1, &m_linearSampler);
 
 	uint32_t groupsX = (m_eyeWidth + 7) / 8;
 	uint32_t groupsY = (m_eyeHeight + 7) / 8;
-	ctx->Dispatch(groupsX, groupsY, 1);
+
+	// Forward scatter pipeline: each SOURCE pixel projects to its destination.
+	// Depth test via InterlockedMin ensures closest pixel wins (tree over sky).
+	// This naturally handles locomotion disocclusion without expensive searches.
+	if (m_clearCS && m_forwardDepthCS && m_forwardColorCS && m_dilateCS) {
+		{
+			static int s_pathLog = 0;
+			if (s_pathLog++ < 5)
+				OOVR_LOGF("ASW D3D11: Two-pass forward scatter (CSClear+CSForwardDepth+CSForwardColor+CSDilate) eye=%d slot=%d", eye, slot);
+		}
+		// Pass 0: clear output + atomic depth
+		ctx->CSSetShader(m_clearCS, nullptr, 0);
+		ctx->Dispatch(groupsX, groupsY, 1);
+
+		// Pass 1: forward scatter depth only (finalize atomicDepth via InterlockedMin)
+		ctx->CSSetShader(m_forwardDepthCS, nullptr, 0);
+		ctx->Dispatch(groupsX, groupsY, 1);
+
+		// Pass 2: forward scatter color (write color only where depth matches finalized buffer)
+		ctx->CSSetShader(m_forwardColorCS, nullptr, 0);
+		ctx->Dispatch(groupsX, groupsY, 1);
+
+		// Pass 3: dilate to fill disocclusion gaps (mirror-fill) + depth-edge cleanup
+		ctx->CSSetShader(m_dilateCS, nullptr, 0);
+		ctx->Dispatch(groupsX, groupsY, 1);
+	} else {
+		{
+			static int s_pathLog2 = 0;
+			if (s_pathLog2++ < 5)
+				OOVR_LOGF("ASW D3D11: Backward warp path (CSMain) eye=%d", eye);
+		}
+		ctx->CSSetShader(m_warpCS, nullptr, 0);
+		ctx->Dispatch(groupsX, groupsY, 1);
+	}
 
 	ID3D11ShaderResourceView* nullSRVs[3] = {};
-	ID3D11UnorderedAccessView* nullUAVs[1] = {};
+	ID3D11UnorderedAccessView* nullUAVs[2] = {};
 	ctx->CSSetShaderResources(0, 3, nullSRVs);
-	ctx->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
+	ctx->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
 	ctx->CSSetShader(nullptr, nullptr, 0);
 
 	ctx->Release();
@@ -1940,17 +2914,28 @@ bool ASWProvider::FlushWarpCommandList()
 	ID3D12CommandList* lists[] = { m_d3d12CmdList };
 	m_d3d12CmdQueue->ExecuteCommandLists(1, lists);
 
-	// EXPERIMENT: no-fence test — skip fence signal, just mark ready immediately.
-	// D3D12 queue will execute in order, copy follows warp on same queue.
+	// Signal fence after warp dispatches — CopyWarpedOutputToSwapchain must wait
+	// before resetting the command allocator (D3D12 requires GPU to be done first).
+	uint64_t val = ++m_fenceValue;
+	m_d3d12CmdQueue->Signal(m_d3d12Fence, val);
+	m_warpFenceValue = val;
 	m_precomputedWarpReady = true;
-	m_warpFenceWaitPending = false;
+	m_warpFenceWaitPending = true;
 	m_warpReadSlot.store(-1, std::memory_order_release);
 	return true;
 }
 
 bool ASWProvider::WaitForWarpCompletion()
 {
-	// EXPERIMENT: no-fence test — return immediately, no CPU-wait.
+	if (!m_precomputedWarpReady)
+		return false;
+	if (m_warpFenceWaitPending && m_d3d12Fence && m_fenceEvent) {
+		if (m_d3d12Fence->GetCompletedValue() < m_warpFenceValue) {
+			m_d3d12Fence->SetEventOnCompletion(m_warpFenceValue, m_fenceEvent);
+			WaitForSingleObject(m_fenceEvent, 50);
+		}
+		m_warpFenceWaitPending = false;
+	}
 	return m_precomputedWarpReady;
 }
 
@@ -2800,6 +3785,16 @@ void ASWProvider::Shutdown()
 		m_warpCS->Release();
 		m_warpCS = nullptr;
 	}
+	if (m_clearCS) { m_clearCS->Release(); m_clearCS = nullptr; }
+	if (m_forwardCS) { m_forwardCS->Release(); m_forwardCS = nullptr; }
+	if (m_forwardDepthCS) { m_forwardDepthCS->Release(); m_forwardDepthCS = nullptr; }
+	if (m_forwardColorCS) { m_forwardColorCS->Release(); m_forwardColorCS = nullptr; }
+	if (m_dilateCS) { m_dilateCS->Release(); m_dilateCS = nullptr; }
+
+	for (int e = 0; e < 2; ++e) {
+		if (m_uavAtomicDepth[e]) { m_uavAtomicDepth[e]->Release(); m_uavAtomicDepth[e] = nullptr; }
+		if (m_atomicDepth[e]) { m_atomicDepth[e]->Release(); m_atomicDepth[e] = nullptr; }
+	}
 
 	// D3D12 cleanup — drain GPU first
 	if (m_d3d12Ready && m_d3d12CmdQueue && m_d3d12Fence && m_fenceEvent) {
@@ -2832,6 +3827,10 @@ void ASWProvider::Shutdown()
 			m_d3d12WarpedOutput[e]->Release();
 			m_d3d12WarpedOutput[e] = nullptr;
 		}
+		if (m_d3d12AtomicDepth[e]) {
+			m_d3d12AtomicDepth[e]->Release();
+			m_d3d12AtomicDepth[e] = nullptr;
+		}
 	}
 	for (uint32_t i = 0; i < kMaxSwapchainImages; i++) {
 		if (m_d3d12SwapchainImages[i]) {
@@ -2854,10 +3853,12 @@ void ASWProvider::Shutdown()
 		m_d3d12SrvUavHeap->Release();
 		m_d3d12SrvUavHeap = nullptr;
 	}
-	if (m_d3d12PipelineState) {
-		m_d3d12PipelineState->Release();
-		m_d3d12PipelineState = nullptr;
-	}
+	if (m_d3d12PipelineState) { m_d3d12PipelineState->Release(); m_d3d12PipelineState = nullptr; }
+	if (m_d3d12ClearPSO) { m_d3d12ClearPSO->Release(); m_d3d12ClearPSO = nullptr; }
+	if (m_d3d12ForwardPSO) { m_d3d12ForwardPSO->Release(); m_d3d12ForwardPSO = nullptr; }
+	if (m_d3d12ForwardDepthPSO) { m_d3d12ForwardDepthPSO->Release(); m_d3d12ForwardDepthPSO = nullptr; }
+	if (m_d3d12ForwardColorPSO) { m_d3d12ForwardColorPSO->Release(); m_d3d12ForwardColorPSO = nullptr; }
+	if (m_d3d12DilatePSO) { m_d3d12DilatePSO->Release(); m_d3d12DilatePSO = nullptr; }
 	if (m_d3d12RootSig) {
 		m_d3d12RootSig->Release();
 		m_d3d12RootSig = nullptr;

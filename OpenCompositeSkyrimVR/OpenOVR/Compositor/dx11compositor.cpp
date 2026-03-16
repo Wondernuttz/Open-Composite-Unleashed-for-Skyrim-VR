@@ -3587,20 +3587,34 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				colorRegion.back = 1;
 			}
 
-			// Build per-eye depth region
+			// Extract bridge depth (R24G8_TYPELESS) to R32F via compute shader.
+			// CopySubresourceRegion silently produces zeros for depth-stencil textures
+			// due to GPU-internal depth compression. SRV read via CS works correctly.
+			ID3D11Texture2D* aswDepthSrc = nullptr;
 			D3D11_BOX depthRegion = {};
 			if (depthTex) {
 				D3D11_TEXTURE2D_DESC depthDesc;
 				if (SafeGetTextureDesc(depthTex, &depthDesc)) {
-					uint32_t depthEyeW = depthDesc.Width / 2;
-					depthRegion.left = eyeIdx * depthEyeW;
-					depthRegion.right = depthRegion.left + depthEyeW;
-					depthRegion.top = 0;
-					depthRegion.bottom = depthDesc.Height;
-					depthRegion.front = 0;
-					depthRegion.back = 1;
-				} else {
-					depthTex = nullptr;
+					if (EnsureDepthExtractResources(device, depthDesc.Width, depthDesc.Height)) {
+						auto* depthSRV = GetOrCreateDepthSRV(device, depthTex,
+						    depthDesc.Format, depthDesc.Width, depthDesc.Height);
+						if (depthSRV && ExtractDepthToR32F(context, depthSRV,
+						        depthDesc.Width, depthDesc.Height)) {
+							// Use the R32F extraction result instead of raw bridge depth
+							aswDepthSrc = s_depthR32F;
+							uint32_t depthEyeW = depthDesc.Width / 2;
+							depthRegion.left = eyeIdx * depthEyeW;
+							depthRegion.right = depthRegion.left + depthEyeW;
+							depthRegion.top = 0;
+							depthRegion.bottom = depthDesc.Height;
+							depthRegion.front = 0;
+							depthRegion.back = 1;
+							static int s_log = 0;
+							if (s_log++ < 3)
+								OOVR_LOGF("ASW: Depth extracted R24G8→R32F (%ux%u) for CacheFrame",
+								    depthDesc.Width, depthDesc.Height);
+						}
+					}
 				}
 			}
 
@@ -3631,7 +3645,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			g_aswProvider->CacheFrame(eyeIdx, context,
 			    colorSrc, &colorRegion,
 			    mvTex, &mvRegion,
-			    depthTex, depthTex ? &depthRegion : nullptr,
+			    aswDepthSrc, aswDepthSrc ? &depthRegion : nullptr,
 			    layer.pose, layer.fov,
 			    g_fsr3CameraNear, g_fsr3CameraFar);
 
