@@ -403,7 +403,10 @@ private:
 		int hasClipToClipNoLoco;       // 1 if clipToClipNoLoco is valid, 0 = fallback to headRotMatrix
 		float _pad3[3];                // alignment                                    — 16 bytes
 		float forwardPoseDelta[16];    // 4x4 row-major: OLD view -> NEW view (forward scatter) — 64 bytes
-	};                                 //                         total: 368 bytes
+		float locoScreenDir[2];        // screen-space locomotion direction (from actorPos delta) — 8 bytes
+		float staticBlendFactor;       // 1.0 when near-stationary (blend scatter→prevColor), 0.0 when moving — 4 bytes
+		float _pad4;                   // alignment                                    — 4 bytes
+	};                                 //                         total: 384 bytes
 
 	// Depth/MV data dimensions are tracked per cache slot.
 

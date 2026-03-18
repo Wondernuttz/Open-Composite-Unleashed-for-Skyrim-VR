@@ -3710,7 +3710,10 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 							}
 							s_locoLogCount++;
 						}
-					} else if (dist2 >= 225.0f) {
+					} else {
+						// Dead zone (dist2 <= 0.0001) or teleport (dist2 >= 225):
+						// zero out locomotion so stationary frames aren't contaminated
+						// by stale loco values from the last movement.
 						g_aswProvider->SetLocomotionTranslation(0.0f, 0.0f, 0.0f);
 					}
 
