@@ -125,6 +125,7 @@ public:
 	inline float ASWMVConfidence() const { return aswMVConfidence; }
 	inline float ASWMVPixelScale() const { return aswMVPixelScale; }
 	inline int ASWDebugMode() const { return aswDebugMode; }
+	inline bool ASWCaptureEnabled() const { return aswCaptureEnabled; }
 	inline bool ASWConcurrentFrameThread() const { return aswConcurrentFrameThread; }
 	inline bool ASWSpeculativeTrackingLead() const { return aswSpeculativeTrackingLead; }
 	inline bool ASWBufferEnabled() const { return aswBufferEnabled; }
@@ -157,7 +158,8 @@ public:
 	float aswNearFadeDepth = 0.0f;   // parallax fades to 0 below this depth (meters); 0 = disabled
 	float aswMVConfidence = 0.5f;    // MV loco correction strength: 0.5 = half-frame (midpoint warp). 0 = off.
 	float aswMVPixelScale = 1.0f;    // overall MV magnitude multiplier (1.0 = identity)
-	int aswDebugMode = 0;            // 0=normal, 1=depth viz, 2=linearized depth, 3=MV magnitude, 50=black warp frame
+	int aswDebugMode = 0;            // 0=normal, 1=depth viz, 2=linearized depth, 3=MV magnitude, 50=black warp frame, 56=stationary NPC dest-depth reject, 57=stationary NPC path overview
+	bool aswCaptureEnabled = false;  // true = capture warp diagnostics (color/depth/MV/CB) to TestWarp folder
 
 private:
 	static int ini_handler(

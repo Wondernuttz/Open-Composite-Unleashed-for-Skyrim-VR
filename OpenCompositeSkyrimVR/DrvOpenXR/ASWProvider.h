@@ -326,13 +326,18 @@ private:
 	ID3D11ComputeShader* m_forwardCS = nullptr;     // CSForward (legacy single-pass scatter)
 	ID3D11ComputeShader* m_forwardDepthCS = nullptr; // CSForwardDepth (two-pass: depth only)
 	ID3D11ComputeShader* m_forwardColorCS = nullptr; // CSForwardColor (two-pass: color with finalized depth)
+	ID3D11ComputeShader* m_forwardDepthNpcOnlyCS = nullptr; // CSForwardDepthNpcOnly
+	ID3D11ComputeShader* m_forwardColorNpcOnlyCS = nullptr; // CSForwardColorNpcOnly
+	ID3D11ComputeShader* m_compositeNpcForwardCS = nullptr; // CSCompositeNpcForward
 	ID3D11ComputeShader* m_dilateCS = nullptr;      // CSDilate (gap fill)
+	ID3D11ComputeShader* m_npcDepthScatterCS = nullptr; // CSNpcDepthScatter (moving-NPC boundary extension)
 	ID3D11Buffer* m_constantBuffer = nullptr;
 	ID3D11SamplerState* m_linearSampler = nullptr;
 
 	// Forward scatter: per-eye atomic depth buffer for depth test
 	ID3D11Texture2D* m_atomicDepth[2] = {};
 	ID3D11UnorderedAccessView* m_uavAtomicDepth[2] = {};
+	ID3D11ShaderResourceView* m_srvAtomicDepth[2] = {};
 
 	// Triple-buffered cached textures:
 	// game writes build slot while warp reads published slot.
@@ -346,6 +351,9 @@ private:
 	// Per-eye warped output (compute shader writes here)
 	ID3D11Texture2D* m_warpedOutput[2] = {};
 	ID3D11UnorderedAccessView* m_uavOutput[2] = {};
+	ID3D11Texture2D* m_forwardNpcOutput[2] = {};
+	ID3D11UnorderedAccessView* m_uavForwardNpcOutput[2] = {};
+	ID3D11ShaderResourceView* m_srvForwardNpcOutput[2] = {};
 
 	// Stereo-combined XR swapchain for warped output (both eyes side-by-side)
 	XrSwapchain m_outputSwapchain = {};
@@ -392,7 +400,8 @@ private:
 		float depthResolution[2];  // actual depth dimensions (may differ from resolution)
 		float _pad0;               // alignment padding             — 16
 		float mvResolution[2];     // actual MV dimensions (render-res when camera MVs + upscaler)
-		float _pad1[2];            // alignment padding             — 16
+		int _pad_npcMask;          // removed: was hasNpcMask
+		float _pad1;               // alignment padding             — 16
 		int debugMode;             // 0=normal, 1=depth viz, 2=MV magnitude viz
 		float _pad2[3];            // alignment to 16 bytes                        — 16
 		float headRotMatrix[16];       // 4x4 row-major: head rotation delta (prev→cur cached pose)

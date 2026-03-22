@@ -75,7 +75,6 @@ struct OCRenderTargetBridge {
 static HANDLE s_hBridgeMap = nullptr;
 static OCRenderTargetBridge* s_pBridge = nullptr;
 static bool s_bridgeTried = false;
-
 static void OpenRenderTargetBridge()
 {
 	if (s_pBridge)
@@ -3699,6 +3698,12 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 							float viewX = dwx * vm[0] + dwy * vm[4] + dwz * vm[8];
 							float viewY = dwx * vm[1] + dwy * vm[5] + dwz * vm[9];
 							float viewZ = dwx * vm[2] + dwy * vm[6] + dwz * vm[10];
+							float viewMag2 = viewX * viewX + viewY * viewY + viewZ * viewZ;
+							if (viewMag2 < 0.0225f) { // ~0.15 view-space units: suppress idle/physics drift
+								viewX = 0.0f;
+								viewY = 0.0f;
+								viewZ = 0.0f;
+							}
 							g_aswProvider->SetLocomotionTranslation(viewX, viewY, viewZ);
 
 							static int s_locoLogCount = 0;
@@ -3728,6 +3733,8 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 					if (yawDelta < -3.14159f)
 						yawDelta += 6.28318f;
 					if (fabsf(yawDelta) > 0.5f)
+						yawDelta = 0.0f;
+					if (fabsf(yawDelta) < 0.05f)
 						yawDelta = 0.0f;
 					g_aswProvider->SetLocomotionYaw(yawDelta);
 					s_prevActorYaw = yaw;

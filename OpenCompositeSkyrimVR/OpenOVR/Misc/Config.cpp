@@ -254,6 +254,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, aswMVConfidence);
 		CFGOPT(float, aswMVPixelScale);
 		CFGOPT(int, aswDebugMode);
+		CFGOPT(bool, aswCaptureEnabled);
 		CFGOPT(bool, aswConcurrentFrameThread);
 		CFGOPT(bool, aswSpeculativeTrackingLead);
 		CFGOPT(bool, aswBufferEnabled);
@@ -300,6 +301,23 @@ int Config::ini_handler(void* user, const char* pSection,
 	// Don't abort on unknown options — just log and ignore
 	OOVR_LOGF("Unknown config option '%s' in section [%s] on line %d", name.c_str(), section.c_str(), lineno);
 	return true;
+}
+
+static float dlss_preset_render_scale(int preset)
+{
+	switch (preset) {
+	case 0:
+		return 0.67f; // Quality
+	case 1:
+		return 0.58f; // Balanced
+	case 2:
+		return 0.50f; // Performance
+	case 3:
+		return 0.33f; // Ultra Performance
+	default:
+		OOVR_LOGF("DLSS: Unknown preset %d, defaulting render scale to Quality", preset);
+		return 0.67f;
+	}
 }
 
 static int wini_parse(const wchar_t* filename, ini_handler handler, void* user)
@@ -376,6 +394,11 @@ Config::Config()
 	if (err == -1) {
 		// Couldn't open file, no problem since the config file is optional and
 		//  the defaults are set up as the default values for the variables
+		if (dlssEnabled && !fsrEnabled) {
+			fsrRenderScale = dlss_preset_render_scale(dlssPreset);
+			OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",
+			    dlssPreset, fsrRenderScale);
+		}
 		return;
 	} else if (err) {
 		// err is the line number
@@ -401,6 +424,11 @@ Config::Config()
 	if (err == -1) {
 		// Couldn't open file, no problem since the config file is optional and
 		//  the defaults are set up as the default values for the variables
+		if (dlssEnabled && !fsrEnabled) {
+			fsrRenderScale = dlss_preset_render_scale(dlssPreset);
+			OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",
+			    dlssPreset, fsrRenderScale);
+		}
 		return;
 	} else if (err) {
 		// err is the line number
@@ -409,6 +437,11 @@ Config::Config()
 	}
 
 	// Everything should have been set up by ini_handler
+	if (dlssEnabled && !fsrEnabled) {
+		fsrRenderScale = dlss_preset_render_scale(dlssPreset);
+		OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",
+		    dlssPreset, fsrRenderScale);
+	}
 }
 
 Config::~Config()
