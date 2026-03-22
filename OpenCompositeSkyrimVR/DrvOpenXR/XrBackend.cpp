@@ -565,6 +565,7 @@ void XrBackend::ResetAswSplitFrameState()
 bool XrBackend::ShouldUseAswSplitPipeline() const
 {
 	return g_aswProvider && g_aswProvider->IsReady() && g_aswProvider->HasPreviousCachedFrame()
+	    && !g_aswProvider->IsPaused()
 	    && oovr_global_configuration.ASWEnabled() && sessionActive
 	    && aswStallCount < 5;
 }
@@ -893,6 +894,9 @@ void XrBackend::WaitForTrackingData()
 		OOVR_FAILED_XR_ABORT(xrWaitFrame(xr_session.get(), &waitInfo, &state));
 		QueryPerformanceCounter(&waitFrameEnd);
 		measuredWaitFrameMs = (float)(waitFrameEnd.QuadPart - waitFrameStart.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+		if (measuredWaitFrameMs > 1000.0f) {
+			OOVR_LOGF("ASW FREEZE: xrWaitFrame blocked %.1fms — possible TDR or runtime stall", measuredWaitFrameMs);
+		}
 
 		xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
 

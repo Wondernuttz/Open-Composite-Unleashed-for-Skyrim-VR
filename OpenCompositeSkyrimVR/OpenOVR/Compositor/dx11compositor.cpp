@@ -3524,13 +3524,43 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	if (oovr_global_configuration.ASWEnabled()) {
 		OpenRenderTargetBridge();
 		if (!g_aswProvider && s_pBridge && s_pBridge->status == 1) {
-			// Get eye resolution from the submitted texture
+			// Get eye resolution — use display-res when upscaler is active so
+			// ASW staging textures match the upscaled output resolution.
 			auto* src = (ID3D11Texture2D*)texture->handle;
 			D3D11_TEXTURE2D_DESC srcDesc;
 			if (SafeGetTextureDesc(src, &srcDesc)) {
-				uint32_t eyeW = ptrBounds ? srcDesc.Width / 2 : srcDesc.Width;
+				uint32_t renderEyeW = ptrBounds ? srcDesc.Width / 2 : srcDesc.Width;
+				uint32_t renderEyeH = srcDesc.Height;
+				uint32_t aswEyeW = renderEyeW;
+				uint32_t aswEyeH = renderEyeH;
+
+				// If an upscaler is active, initialize ASW at display resolution
+				float renderScale = oovr_global_configuration.FsrRenderScale();
+				bool upscalerActive = false;
+				bool dlssEn = false;
+#ifdef OC_HAS_DLSS
+				dlssEn = oovr_global_configuration.DlssEnabled();
+				upscalerActive = upscalerActive || (dlssEn && renderScale < 0.99f);
+#endif
+#ifdef OC_HAS_FSR3
+				if (!upscalerActive)
+					upscalerActive = (renderScale < 0.99f && !dlssEn);
+#endif
+				OOVR_LOGF("ASW INIT_DIAG: renderScale=%.3f dlssEnabled=%d upscalerActive=%d render=%ux%u swapchain=%ux%u",
+				    renderScale, dlssEn ? 1 : 0, upscalerActive ? 1 : 0,
+				    renderEyeW, renderEyeH, (uint32_t)createInfo.width, (uint32_t)createInfo.height);
+				if (upscalerActive) {
+					float invScale = 1.0f / std::max(0.5f, renderScale);
+					aswEyeW = (uint32_t)(renderEyeW * invScale);
+					aswEyeH = (uint32_t)(renderEyeH * invScale);
+					// Don't clamp to current swapchain — it may not be inflated yet
+					// (swapchain inflation happens on first upscaler dispatch).
+					OOVR_LOGF("ASW: Upscaler active — initializing at display-res %ux%u (render %ux%u, scale %.2f)",
+					    aswEyeW, aswEyeH, renderEyeW, renderEyeH, renderScale);
+				}
+
 				g_aswProvider = new ASWProvider();
-				if (!g_aswProvider->Initialize(device, eyeW, srcDesc.Height)) {
+				if (!g_aswProvider->Initialize(device, aswEyeW, aswEyeH)) {
 					OOVR_LOG("ASW: Initialization failed — disabling");
 					delete g_aswProvider;
 					g_aswProvider = nullptr;
@@ -3541,6 +3571,12 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 	// Copy the texture across
 	Invoke(texture, ptrBounds);
+
+	// OCU ASW: pause warping during loading screens (prevents black flashing
+	// from warping stale pre-loading content).
+	if (g_aswProvider && s_pBridge) {
+		g_aswProvider->SetPaused(s_pBridge->isLoadingScreen != 0);
+	}
 
 	// OCU ASW: cache frame data (color + MV + depth + pose) for warping
 	// Skip caching during main menu / loading screen — MV and depth data are invalid,
@@ -3572,14 +3608,42 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			mvRegion.front = 0;
 			mvRegion.back = 1;
 
-			// Build per-eye color region from submitted texture
-			auto* colorSrc = (ID3D11Texture2D*)texture->handle;
+			// Use upscaler output (display-res, single-eye) when available.
+			// ASW staging textures are sized at display-res when upscaler is active.
+			// Falls back to raw submitted texture when no upscaler.
+			ID3D11Texture2D* colorSrc = nullptr;
 			D3D11_TEXTURE2D_DESC colorDesc;
 			D3D11_BOX colorRegion = {};
+			bool usedUpscaledColor = false;
+#ifdef OC_HAS_DLSS
+			if (!colorSrc && s_dlssUpscaler && s_dlssUpscaler->IsReady()
+			    && oovr_global_configuration.DlssEnabled()
+			    && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+				ID3D11Texture2D* dlssOut = s_dlssUpscaler->GetOutputDX11(eyeIdx);
+				if (dlssOut) { colorSrc = dlssOut; usedUpscaledColor = true; }
+			}
+#endif
+#ifdef OC_HAS_FSR3
+			if (!colorSrc && s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
+			    && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+				ID3D11Texture2D* fsr3Out = s_fsr3Upscaler->GetOutputDX11(eyeIdx);
+				if (fsr3Out) { colorSrc = fsr3Out; usedUpscaledColor = true; }
+			}
+#endif
+			if (!colorSrc)
+				colorSrc = (ID3D11Texture2D*)texture->handle;
+
 			if (SafeGetTextureDesc(colorSrc, &colorDesc)) {
-				uint32_t colorEyeW = ptrBounds ? colorDesc.Width / 2 : colorDesc.Width;
-				colorRegion.left = ptrBounds ? eyeIdx * colorEyeW : 0;
-				colorRegion.right = colorRegion.left + colorEyeW;
+				if (usedUpscaledColor) {
+					// Upscaler output is single-eye, full texture
+					colorRegion.left = 0;
+					colorRegion.right = colorDesc.Width;
+				} else {
+					// Raw submitted texture may be stereo-packed
+					uint32_t colorEyeW = ptrBounds ? colorDesc.Width / 2 : colorDesc.Width;
+					colorRegion.left = ptrBounds ? eyeIdx * colorEyeW : 0;
+					colorRegion.right = colorRegion.left + colorEyeW;
+				}
 				colorRegion.top = 0;
 				colorRegion.bottom = colorDesc.Height;
 				colorRegion.front = 0;

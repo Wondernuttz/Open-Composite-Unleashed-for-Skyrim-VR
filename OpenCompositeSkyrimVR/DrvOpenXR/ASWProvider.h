@@ -198,6 +198,10 @@ public:
 		return std::chrono::duration<float, std::milli>(now - m_slotTimestamp[slot]).count();
 	}
 
+	/// Pause/unpause ASW warping (e.g. during loading screens).
+	void SetPaused(bool paused) { m_paused = paused; }
+	bool IsPaused() const { return m_paused; }
+
 	/// Set stick yaw delta (old − new, radians) for stick turn correction.
 	void SetLocomotionYaw(float yawDelta) { m_locoYaw = yawDelta; }
 
@@ -302,6 +306,7 @@ private:
 	static void BuildPoseDeltaMatrix(const XrPosef& oldPose, const XrPosef& newPose,
 	    float* outMatrix4x4);
 
+	bool m_paused = false; // true during loading screens — suppresses warp
 	float m_locoYaw   = 0.0f;  // stick yaw delta (old − new, radians)
 	float m_locoTransX = 0.0f, m_locoTransY = 0.0f, m_locoTransZ = 0.0f; // loco translation (view-space, game units)
 	float m_mvTimingRatio = 0.5f; // dynamic MV extrapolation weight (computed from frame timing)
