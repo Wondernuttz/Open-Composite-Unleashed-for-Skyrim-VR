@@ -1084,6 +1084,9 @@ void BaseInput::CreateLegacyActions()
 		create(&ctrl.gripPoseAction, "grip-pose", "Grip Pose", XR_ACTION_TYPE_POSE_INPUT);
 		create(&ctrl.aimPoseAction, "aim-pose", "Aim Pose", XR_ACTION_TYPE_POSE_INPUT);
 	}
+
+	// Expose right thumbstick X to ASW for clean stick rotation detection
+	xr_rightStickX_action = legacyControllers[1].stickX;
 }
 
 EVRInputError BaseInput::GetActionSetHandle(const char* pchActionSetName, VRActionSetHandle_t* pHandle)

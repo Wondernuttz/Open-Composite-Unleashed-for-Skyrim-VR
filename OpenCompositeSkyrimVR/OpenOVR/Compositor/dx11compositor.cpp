@@ -3734,9 +3734,33 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 						yawDelta += 6.28318f;
 					if (fabsf(yawDelta) > 0.5f)
 						yawDelta = 0.0f;
-					if (fabsf(yawDelta) < 0.05f)
-						yawDelta = 0.0f;
-					g_aswProvider->SetLocomotionYaw(yawDelta);
+
+					// Read right thumbstick X directly from OpenXR — clean signal
+					// with zero head-yaw contamination. Non-zero = player is
+					// intentionally rotating via stick.
+					float rightStickX = 0.0f;
+					if (xr_rightStickX_action != XR_NULL_HANDLE && xr_session.get() != XR_NULL_HANDLE) {
+						XrActionStateGetInfo info = { XR_TYPE_ACTION_STATE_GET_INFO };
+						info.action = xr_rightStickX_action;
+						XrActionStateFloat state = { XR_TYPE_ACTION_STATE_FLOAT };
+						if (XR_SUCCEEDED(xrGetActionStateFloat(xr_session.get(), &info, &state)) && state.isActive)
+							rightStickX = state.currentState;
+					}
+
+					// Use actorYaw delta for the actual rotation amount (warp correction),
+					// but gate it on thumbstick deflection to avoid head-yaw contamination.
+					static constexpr float kStickDeadZone = 0.05f; // ~5% deflection
+					bool stickActive = fabsf(rightStickX) > kStickDeadZone;
+					float filteredYaw = stickActive ? yawDelta : 0.0f;
+
+					// Diagnostic: log when actorYaw changes without stick input
+					static int s_yawDiagCounter = 0;
+					if (fabsf(yawDelta) > 0.001f && !stickActive && (s_yawDiagCounter++ % 75 == 0)) {
+						OOVR_LOGF("ASW YAW_DIAG: yawDelta=%.5f stickX=%.4f stickActive=%d — yaw change without stick",
+						    yawDelta, rightStickX, stickActive ? 1 : 0);
+					}
+
+					g_aswProvider->SetLocomotionYaw(filteredYaw);
 					s_prevActorYaw = yaw;
 				}
 

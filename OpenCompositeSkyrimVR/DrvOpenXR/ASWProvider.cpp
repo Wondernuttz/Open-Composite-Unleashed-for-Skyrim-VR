@@ -1018,11 +1018,10 @@ int2 computeSplatHalf(int2 srcPixel, bool skipMV) {
     float stretchX = abs(dDx.x) + abs(dDy.x);
     float stretchY = abs(dDx.y) + abs(dDy.y);
 
-    // half=0 when stretch=1 (single pixel, no gap). Cap at 1 (3x3 max) to
-    // cover the 1x1 lattice gaps during locomotion without bringing back the
-    // much heavier 5x5 foliage thickening path.
-    int halfW = clamp((int)ceil((stretchX - 1.0) * 0.5), 0, 1);
-    int halfH = clamp((int)ceil((stretchY - 1.0) * 0.5), 0, 1);
+    // half=0 when stretch<=2 (single pixel, small gap). Cap at 1 (3x3 max) to
+    // cover the larger lattice gaps during locomotion without thickening foliage.
+    int halfW = clamp((int)ceil((stretchX - 2.0) * 0.5), 0, 1);
+    int halfH = clamp((int)ceil((stretchY - 2.0) * 0.5), 0, 1);
     return int2(halfW, halfH);
 }
 
@@ -1074,8 +1073,15 @@ void CSForwardDepthNpcOnly(uint3 tid : SV_DispatchThreadID) {
     if (any(dstUV < -0.001) || any(dstUV >= 1.001))
         return;
 
-    int2 p = clamp(int2(floor(dstPx)), int2(0, 0), int2(resolution) - 1);
-    InterlockedMin(atomicDepth[p], quantizedDepth);
+    int2 p0 = int2(floor(dstPx - 0.5));
+    for (int sy = 0; sy <= 1; sy++) {
+        for (int sx = 0; sx <= 1; sx++) {
+            int2 p = p0 + int2(sx, sy);
+            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
+                continue;
+            InterlockedMin(atomicDepth[p], quantizedDepth);
+        }
+    }
 }
 
 [numthreads(8, 8, 1)]
@@ -1095,9 +1101,16 @@ void CSForwardColorNpcOnly(uint3 tid : SV_DispatchThreadID) {
     if (any(dstUV < -0.001) || any(dstUV >= 1.001))
         return;
 
-    int2 p = clamp(int2(floor(dstPx)), int2(0, 0), int2(resolution) - 1);
-    if (atomicDepth[p] == quantizedDepth) {
-        output[p] = prevColor.SampleLevel(linearClamp, srcUV, 0);
+    float4 color = prevColor.SampleLevel(linearClamp, srcUV, 0);
+    int2 p0 = int2(floor(dstPx - 0.5));
+    for (int sy = 0; sy <= 1; sy++) {
+        for (int sx = 0; sx <= 1; sx++) {
+            int2 p = p0 + int2(sx, sy);
+            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
+                continue;
+            if (atomicDepth[p] == quantizedDepth)
+                output[p] = color;
+        }
     }
 }
 
@@ -1160,16 +1173,20 @@ void CSForwardDepth(uint3 tid : SV_DispatchThreadID) {
 
     if (any(dstUV < -0.001) || any(dstUV >= 1.001)) return;
 
-    // When frozen, force 1×1 splat — no expansion into neighbors (prevents thickening).
-    int2 half = (staticBlendFactor > 0.5) ? int2(0, 0) : computeSplatHalf((int2)tid.xy, skipMV);
-    int2 centerPx = int2(floor(dstPx));
-
-    for (int sy = -half.y; sy <= half.y; sy++) {
-        for (int sx = -half.x; sx <= half.x; sx++) {
-            int2 p = centerPx + int2(sx, sy);
-            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                continue;
-            InterlockedMin(atomicDepth[p], quantizedDepth);
+    if (staticBlendFactor > 0.5) {
+        // Frozen: exact 1x1 at source position (no gap fill needed)
+        int2 p = clamp(int2(floor(dstPx)), int2(0,0), int2(resolution) - 1);
+        InterlockedMin(atomicDepth[p], quantizedDepth);
+    } else {
+        // Moving: bilinear 2x2 splat fills sub-pixel gaps between scattered pixels
+        int2 p0 = int2(floor(dstPx - 0.5));
+        for (int sy = 0; sy <= 1; sy++) {
+            for (int sx = 0; sx <= 1; sx++) {
+                int2 p = p0 + int2(sx, sy);
+                if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
+                    continue;
+                InterlockedMin(atomicDepth[p], quantizedDepth);
+            }
         }
     }
 }
@@ -1249,17 +1266,21 @@ void CSForwardColor(uint3 tid : SV_DispatchThreadID) {
         color = prevColor.SampleLevel(linearClamp, srcUV, 0);
     }
 
-    // When frozen, force 1×1 splat — no expansion into neighbors (prevents thickening).
-    int2 half = (staticBlendFactor > 0.5) ? int2(0, 0) : computeSplatHalf((int2)tid.xy, skipMV);
-    int2 centerPx = int2(floor(dstPx));
-
-    for (int sy = -half.y; sy <= half.y; sy++) {
-        for (int sx = -half.x; sx <= half.x; sx++) {
-            int2 p = centerPx + int2(sx, sy);
-            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                continue;
-            if (quantizedDepth == atomicDepth[p]) {
-                output[p] = color;
+    if (staticBlendFactor > 0.5) {
+        // Frozen: exact 1x1
+        int2 p = clamp(int2(floor(dstPx)), int2(0,0), int2(resolution) - 1);
+        if (quantizedDepth == atomicDepth[p])
+            output[p] = color;
+    } else {
+        // Moving: bilinear 2x2 splat, depth-tested
+        int2 p0 = int2(floor(dstPx - 0.5));
+        for (int sy = 0; sy <= 1; sy++) {
+            for (int sx = 0; sx <= 1; sx++) {
+                int2 p = p0 + int2(sx, sy);
+                if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
+                    continue;
+                if (quantizedDepth == atomicDepth[p])
+                    output[p] = color;
             }
         }
     }
@@ -1297,12 +1318,11 @@ void CSForward(uint3 tid : SV_DispatchThreadID) {
 
     float4 color = prevColor.SampleLevel(linearClamp, srcUV, 0);
     uint quantizedDepth = (d >= 0.999) ? 0xFFFFFFFE : asuint(d);
-    int2 half = computeSplatHalf((int2)tid.xy, skipMV);
-    int2 centerPx = int2(floor(dstPx));
+    int2 p0 = int2(floor(dstPx - 0.5));
 
-    for (int sy = -half.y; sy <= half.y; sy++) {
-        for (int sx = -half.x; sx <= half.x; sx++) {
-            int2 p = centerPx + int2(sx, sy);
+    for (int sy = 0; sy <= 1; sy++) {
+        for (int sx = 0; sx <= 1; sx++) {
+            int2 p = p0 + int2(sx, sy);
             if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
                 continue;
             uint prevD;
@@ -3859,7 +3879,7 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	const float locoMotion = sqrtf(m_locoTransX * m_locoTransX +
 		m_locoTransY * m_locoTransY + m_locoTransZ * m_locoTransZ);
 	const float stickYawMotion = fabsf(m_locoYaw);
-	const bool useForwardScatterForMotion = (locoMotion > 0.15f || stickYawMotion > 0.05f);
+	const bool useForwardScatterForMotion = (locoMotion > 0.15f || stickYawMotion > 0.002f);
 
 	// ── D3D12 warp path ──
 	if (m_d3d12Ready && useForwardScatterForMotion) {
