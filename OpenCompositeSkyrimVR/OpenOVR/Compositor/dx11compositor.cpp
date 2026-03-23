@@ -3733,16 +3733,6 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		context->RSSetState(savedRS);
 	} else {
 		// ── Normal copy path (no FSR/CAS/DLAA) ──
-		{
-			static int s_defaultHits = 0;
-			s_defaultHits++;
-			if (s_defaultHits <= 10 || s_defaultHits % 100 == 0)
-				OOVR_LOGF("WARNING: Default copy path hit #%d — FSR3/FSR1/CAS/DLAA all skipped! "
-				          "src=%ux%u swap=%ux%u bounds=%s sourceRegion=[%u,%u,%u,%u]",
-				    s_defaultHits, srcDesc.Width, srcDesc.Height, createInfo.width, createInfo.height,
-				    bounds ? "yes" : "no",
-				    sourceRegion.left, sourceRegion.right, sourceRegion.top, sourceRegion.bottom);
-		}
 		// Clear swapchain to black when it's larger than source (FSR configured but not yet active)
 		// to avoid garbage pixels in the unused region during loading/transition
 		if (bounds && !swapchain_rtvs.empty() && createInfo.width != srcDesc.Width) {
@@ -4189,11 +4179,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 							depthRegion.bottom = depthDesc.Height;
 							depthRegion.front = 0;
 							depthRegion.back = 1;
-							static int s_log = 0;
-							if (s_log++ < 3)
-								OOVR_LOGF("ASW: Depth extracted R24G8→R32F (%ux%u) for CacheFrame",
-								    depthDesc.Width, depthDesc.Height);
-						}
+							}
 					}
 				}
 			}
@@ -4247,17 +4233,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				    static_cast<uintptr_t>(s_pBridge->actorPosPtr));
 				float posX = actorPos[0], posY = actorPos[1], posZ = actorPos[2];
 
-				{
-					static int s_actorLogCount = 0;
-					if (s_actorLogCount < 10) {
-						OOVR_LOGF("ASW actor [%d]: pos(%.2f,%.2f,%.2f) prev(%.2f,%.2f,%.2f) hasPrev=%d",
-						    s_actorLogCount, posX, posY, posZ,
-						    s_prevActorPos[0], s_prevActorPos[1], s_prevActorPos[2],
-						    s_hasPrevActor ? 1 : 0);
-						s_actorLogCount++;
-					}
-				}
-
+	
 				if (s_hasPrevActor) {
 					// World-space delta (new - old): direction of locomotion
 					float dwx = posX - s_prevActorPos[0];
@@ -4287,14 +4263,6 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 							}
 							g_aswProvider->SetLocomotionTranslation(viewX, viewY, viewZ);
 
-							static int s_locoLogCount = 0;
-							if (s_locoLogCount < 60 || s_locoLogCount % 300 == 0) {
-								OOVR_LOGF("ASW loco [%d]: actor(%.1f,%.1f,%.1f) delta(%.3f,%.3f,%.3f) "
-								          "→ viewDelta(%.4f,%.4f,%.4f)",
-								    s_locoLogCount, posX, posY, posZ,
-								    dwx, dwy, dwz, viewX, viewY, viewZ);
-							}
-							s_locoLogCount++;
 						}
 					} else {
 						// Dead zone (dist2 <= 0.0001) or teleport (dist2 >= 225):
@@ -4333,13 +4301,6 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 					static constexpr float kStickDeadZone = 0.05f; // ~5% deflection
 					bool stickActive = fabsf(rightStickX) > kStickDeadZone;
 					float filteredYaw = stickActive ? yawDelta : 0.0f;
-
-					// Diagnostic: log when actorYaw changes without stick input
-					static int s_yawDiagCounter = 0;
-					if (fabsf(yawDelta) > 0.001f && !stickActive && (s_yawDiagCounter++ % 75 == 0)) {
-						OOVR_LOGF("ASW YAW_DIAG: yawDelta=%.5f stickX=%.4f stickActive=%d — yaw change without stick",
-						    yawDelta, rightStickX, stickActive ? 1 : 0);
-					}
 
 					g_aswProvider->SetLocomotionYaw(filteredYaw);
 					s_prevActorYaw = yaw;

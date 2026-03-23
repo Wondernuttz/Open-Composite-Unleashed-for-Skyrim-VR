@@ -328,7 +328,6 @@ private:
 	// Compute shaders
 	ID3D11ComputeShader* m_warpCS = nullptr;       // CSMain (backward warp)
 	ID3D11ComputeShader* m_clearCS = nullptr;       // CSClear (clear atomicDepth + output)
-	ID3D11ComputeShader* m_forwardCS = nullptr;     // CSForward (legacy single-pass scatter)
 	ID3D11ComputeShader* m_forwardDepthCS = nullptr; // CSForwardDepth (two-pass: depth only)
 	ID3D11ComputeShader* m_forwardColorCS = nullptr; // CSForwardColor (two-pass: color with finalized depth)
 	ID3D11ComputeShader* m_forwardDepthNpcOnlyCS = nullptr; // CSForwardDepthNpcOnly
@@ -407,7 +406,7 @@ private:
 		float mvResolution[2];     // actual MV dimensions (render-res when camera MVs + upscaler)
 		int _pad_npcMask;          // removed: was hasNpcMask
 		float _pad1;               // alignment padding             — 16
-		int debugMode;             // 0=normal, 1=depth viz, 2=MV magnitude viz
+		int _pad_debugMode;        // removed: was debugMode
 		float _pad2[3];            // alignment to 16 bytes                        — 16
 		float headRotMatrix[16];       // 4x4 row-major: head rotation delta (prev→cur cached pose)
 		                               // Used to subtract head rot from camera MVs    — 64 bytes
@@ -433,7 +432,6 @@ private:
 	ID3D12RootSignature* m_d3d12RootSig = nullptr;
 	ID3D12PipelineState* m_d3d12PipelineState = nullptr;     // CSMain PSO
 	ID3D12PipelineState* m_d3d12ClearPSO = nullptr;          // CSClear PSO
-	ID3D12PipelineState* m_d3d12ForwardPSO = nullptr;        // CSForward PSO (legacy)
 	ID3D12PipelineState* m_d3d12ForwardDepthPSO = nullptr;   // CSForwardDepth PSO (two-pass)
 	ID3D12PipelineState* m_d3d12ForwardColorPSO = nullptr;   // CSForwardColor PSO (two-pass)
 	ID3D12PipelineState* m_d3d12DilatePSO = nullptr;         // CSDilate PSO
@@ -481,10 +479,6 @@ private:
 	ID3D12Resource* m_d3d12SwapchainImages[kMaxSwapchainImages] = {};
 	bool m_d3d12DirectCopy = false;  // true when swapchain images are shared to D3D12
 
-	// D3D12 debug stripe upload buffer (for aswDebugMode 51)
-	ID3D12Resource* m_d3d12StripeUpload = nullptr;
-	uint32_t m_d3d12StripeWidth = 0;   // cached from swapchain desc
-	uint32_t m_d3d12StripeH = 64;
 
 	// ── D3D12 game staging copy ──
 	// Separate command allocator/list for game staging→swapchain copies (step G2).
@@ -508,7 +502,4 @@ private:
 
 	ID3D12Resource* GetOrShareTextureD3D12(ID3D11Texture2D* d3d11Tex);
 
-	// Diagnostic capture: saves warp inputs/outputs to disk for offline iteration
-	void CaptureWarpDiagnostics(int eye, int slot, const WarpConstants& cb,
-	    ID3D11DeviceContext* ctx, bool isPreDispatch);
 };
