@@ -41,6 +41,8 @@ public:
 		float sharpness;                     ///< Post-upscale sharpness (0.0-1.0)
 		bool reset;                          ///< True on camera teleport / scene change
 		float mvScaleX, mvScaleY;            ///< UV-to-pixel conversion (renderW/H for UV-space MVs, 1.0 for pixel-space)
+		ID3D11Texture2D* biasMask;           ///< Bias current color mask (R8_UNORM, render-res). Higher = prefer current frame over history.
+		const D3D11_BOX* biasMaskSourceRegion; ///< Per-eye sub-region (nullptr = full texture)
 		int debugMode;                       ///< 0=off, 2=bypass (raw game image)
 	};
 
@@ -79,7 +81,9 @@ private:
 	ID3D11Texture2D* m_stagingColor = nullptr;
 	ID3D11Texture2D* m_stagingMV    = nullptr;
 	ID3D11Texture2D* m_stagingDepth = nullptr;
+	ID3D11Texture2D* m_stagingBias  = nullptr;
 	uint32_t m_stagingW = 0, m_stagingH = 0;
+	uint32_t m_stagingBiasW = 0, m_stagingBiasH = 0;
 	DXGI_FORMAT m_stagingColorFmt  = DXGI_FORMAT_UNKNOWN;
 	DXGI_FORMAT m_stagingMVFmt     = DXGI_FORMAT_UNKNOWN;
 	DXGI_FORMAT m_stagingDepthFmt  = DXGI_FORMAT_UNKNOWN;

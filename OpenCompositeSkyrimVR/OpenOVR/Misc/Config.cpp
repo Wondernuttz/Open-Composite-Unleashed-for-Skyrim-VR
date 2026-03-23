@@ -272,6 +272,9 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(int, dlssPreset);
 		CFGOPT(float, dlssSharpness);
 		CFGOPT(float, dlssMvScale);
+		CFGOPT(float, dlssBiasBase);
+		CFGOPT(float, dlssBiasEdgeBoost);
+		CFGOPT(float, dlssJitterScale);
 	}
 
 	// Combos are parsed separately by BaseOverlay; just skip them here

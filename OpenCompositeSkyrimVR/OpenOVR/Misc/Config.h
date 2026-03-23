@@ -104,10 +104,13 @@ public:
 	inline int Fsr3DebugMode() const { return fsr3DebugMode; }
 
 	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
-	inline bool  DlssEnabled()   const { return dlssEnabled; }
-	inline int   DlssPreset()    const { return dlssPreset; }    // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
-	inline float DlssSharpness() const { return dlssSharpness; }
-	inline float DlssMvScale()   const { return dlssMvScale; }
+	inline bool  DlssEnabled()        const { return dlssEnabled; }
+	inline int   DlssPreset()         const { return dlssPreset; }    // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
+	inline float DlssSharpness()      const { return dlssSharpness; }
+	inline float DlssMvScale()        const { return dlssMvScale; }
+	inline float DlssBiasBase()       const { return dlssBiasBase; }       // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
+	inline float DlssBiasEdgeBoost()  const { return dlssBiasEdgeBoost; }  // Extra bias at depth edges (foliage silhouettes)
+	inline float DlssJitterScale()    const { return dlssJitterScale; }    // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	inline bool MotionVectorsEnabled() const { return motionVectorsEnabled; }
@@ -287,10 +290,13 @@ private:
 	bool vrsFavorHorizontal = true;
 
 	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
-	bool  dlssEnabled   = false;
-	int   dlssPreset    = 0;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
-	float dlssSharpness = 0.0f;
-	float dlssMvScale   = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
+	bool  dlssEnabled      = false;
+	int   dlssPreset       = 0;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
+	float dlssSharpness    = 0.0f;
+	float dlssMvScale      = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
+	float dlssBiasBase     = 0.10f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
+	float dlssBiasEdgeBoost = 0.25f; // Extra bias at depth edges (foliage silhouettes)
+	float dlssJitterScale  = 1.0f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;

@@ -267,7 +267,9 @@ void DlssUpscaler::DestroyStagingTextures()
 	if (m_stagingColor) { m_stagingColor->Release(); m_stagingColor = nullptr; }
 	if (m_stagingMV)    { m_stagingMV->Release();    m_stagingMV    = nullptr; }
 	if (m_stagingDepth) { m_stagingDepth->Release(); m_stagingDepth = nullptr; }
+	if (m_stagingBias)  { m_stagingBias->Release();  m_stagingBias  = nullptr; }
 	m_stagingW = 0; m_stagingH = 0;
+	m_stagingBiasW = 0; m_stagingBiasH = 0;
 	m_stagingColorFmt = m_stagingMVFmt = m_stagingDepthFmt = DXGI_FORMAT_UNKNOWN;
 }
 
@@ -349,6 +351,7 @@ bool DlssUpscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* ctx, const Dispatch
 	ID3D11Texture2D* colorIn = params.color;
 	ID3D11Texture2D* mvIn    = params.motionVectors;
 	ID3D11Texture2D* depthIn = params.depth;
+	ID3D11Texture2D* biasIn  = params.biasMask;
 
 	if (params.colorSourceRegion || params.mvSourceRegion || params.depthSourceRegion) {
 		// Need staging textures for sub-region copies
@@ -372,6 +375,31 @@ bool DlssUpscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* ctx, const Dispatch
 			depthIn = m_stagingDepth;
 		}
 	}
+	// Bias mask sub-region copy (uses same stereo layout as depth)
+	if (biasIn && params.biasMaskSourceRegion) {
+		if (!m_stagingBias || m_stagingBiasW != params.renderWidth || m_stagingBiasH != params.renderHeight) {
+			if (m_stagingBias) { m_stagingBias->Release(); m_stagingBias = nullptr; }
+			D3D11_TEXTURE2D_DESC bd = {};
+			bd.Width = params.renderWidth; bd.Height = params.renderHeight;
+			bd.MipLevels = 1; bd.ArraySize = 1;
+			bd.Format = DXGI_FORMAT_R8_UNORM;
+			bd.SampleDesc.Count = 1;
+			bd.Usage = D3D11_USAGE_DEFAULT;
+			bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			if (FAILED(m_device->CreateTexture2D(&bd, nullptr, &m_stagingBias))) {
+				m_stagingBias = nullptr;
+				biasIn = nullptr; // Fall back to no bias
+			} else {
+				m_stagingBiasW = params.renderWidth;
+				m_stagingBiasH = params.renderHeight;
+			}
+		}
+		if (m_stagingBias) {
+			ctx->CopySubresourceRegion(m_stagingBias, 0, 0, 0, 0,
+			    biasIn, 0, params.biasMaskSourceRegion);
+			biasIn = m_stagingBias;
+		}
+	}
 
 	// Build DLSS evaluate parameters and dispatch
 	NVSDK_NGX_D3D11_DLSS_Eval_Params evalParams = {};
@@ -379,6 +407,7 @@ bool DlssUpscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* ctx, const Dispatch
 	evalParams.Feature.pInOutput        = m_output[eyeIdx];
 	evalParams.pInDepth                 = depthIn;
 	evalParams.pInMotionVectors         = mvIn;
+	evalParams.pInBiasCurrentColorMask  = biasIn;  // Reduces temporal accumulation at depth edges (foliage)
 	evalParams.InJitterOffsetX          = params.jitterX;
 	evalParams.InJitterOffsetY          = params.jitterY;
 	evalParams.InReset                  = params.reset ? 1 : 0;
@@ -400,14 +429,15 @@ bool DlssUpscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* ctx, const Dispatch
 		if (mvIn) mvIn->GetDesc(&mDesc);
 		if (depthIn) depthIn->GetDesc(&dDesc);
 		OOVR_LOGF("DLSS Eval #%d eye=%d: color=%ux%u(fmt%u) mv=%ux%u(fmt%u) depth=%ux%u(fmt%u) "
-		    "render=%ux%u output=%ux%u jitter=%.4f,%.4f mvScale=%.1f,%.1f",
+		    "render=%ux%u output=%ux%u jitter=%.4f,%.4f mvScale=%.1f,%.1f biasMask=%s",
 		    s_logCount, eyeIdx,
 		    cDesc.Width, cDesc.Height, cDesc.Format,
 		    mDesc.Width, mDesc.Height, mDesc.Format,
 		    dDesc.Width, dDesc.Height, dDesc.Format,
 		    params.renderWidth, params.renderHeight,
 		    params.outputWidth, params.outputHeight,
-		    params.jitterX, params.jitterY, params.mvScaleX, params.mvScaleY);
+		    params.jitterX, params.jitterY, params.mvScaleX, params.mvScaleY,
+		    biasIn ? "yes" : "no");
 	}}
 
 	NVSDK_NGX_Result result = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, m_handle[eyeIdx], m_params, &evalParams);

@@ -69,6 +69,9 @@ struct OCRenderTargetBridge {
 	// Actor position for stick locomotion correction (moves only with stick, not head tracking)
 	uint64_t actorPosPtr; // float* → PlayerCharacter::data.location.x (NiPoint3: x, y, z)
 	uint64_t actorYawPtr; // float* → PlayerCharacter::data.angle.z (actor heading, radians)
+
+	// Camera world position — includes actorPos + eye height + walk-cycle bob + HMD tracking
+	uint64_t cameraPosPtr; // float* → NiCamera::world.translate.x (NiPoint3: x, y, z)
 };
 #pragma pack(pop)
 
@@ -126,8 +129,10 @@ static float s_fsr3RenderJitterY = 0.0f;
 static uint32_t s_fsr3ViewportW = 0; // FSR3 output viewport (for crop when swapchain > output)
 static uint32_t s_fsr3ViewportH = 0;
 
-#ifdef OC_HAS_FSR3
-// ── Reactive mask resources (depth-edge detection for FSR3 ghosting reduction) ──
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
+// ── Reactive mask resources (depth-edge detection for FSR3/DLSS ghosting reduction) ──
+// Used as FSR3 reactive mask and DLSS pInBiasCurrentColorMask to reduce
+// temporal accumulation at depth edges (foliage silhouettes, thin geometry).
 static ID3D11ComputeShader* s_reactiveMaskCS = nullptr;
 static ID3D11Texture2D* s_reactiveMaskTex = nullptr;
 static ID3D11UnorderedAccessView* s_reactiveMaskUAV = nullptr;
@@ -163,10 +168,10 @@ void CS_DepthExtract(uint3 id : SV_DispatchThreadID)
 }
 )HLSL";
 
-#ifdef OC_HAS_FSR3
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 // ── Reactive mask compute shader ──
 // Depth-edge detection: adds reactiveness at object silhouettes (tree branches
-// against sky) to reduce FSR3 temporal ghosting on thin geometry.
+// against sky) to reduce FSR3/DLSS temporal ghosting on thin geometry.
 static constexpr char s_reactiveMaskHLSL[] = R"HLSL(
 Texture2D<float>       DepthIn     : register(t0);
 RWTexture2D<float>     ReactiveOut : register(u0);
@@ -201,7 +206,7 @@ void CS_ReactiveMask(uint3 id : SV_DispatchThreadID)
 }
 )HLSL";
 static ID3D11Buffer* s_reactiveMaskCB = nullptr;
-#endif // OC_HAS_FSR3 (reactive mask)
+#endif // OC_HAS_FSR3 || OC_HAS_DLSS (reactive mask)
 
 // ── Camera MV resources (compute per-pixel camera motion from depth + pose deltas) ──
 // Replaces Skyrim's zero-valued MVs for static geometry during character locomotion.
@@ -222,6 +227,51 @@ static bool s_hasPrevVP[2] = { false, false };
 // Per-eye previous jitter (pixel-space, for computing jitter delta in camera MVs)
 static float s_prevJitterX[2] = { 0.0f, 0.0f };
 static float s_prevJitterY[2] = { 0.0f, 0.0f };
+
+// Locomotion injection for camera MVs: world-space deltas.
+// Skyrim uses camera-relative rendering (VP origin shifts with player each frame),
+// so prevVP * inv(curVP) captures rotation but NOT camera translation.
+// We inject the delta into curVP before computing clipToClip.
+//
+// Horizontal (dx, dy): from actorPos (PlayerCharacter::data.location) — captures
+// stick locomotion. HMD horizontal tracking is small enough to ignore.
+//
+// Vertical (dz): from NiCamera::world.translate.z — the engine updates this each
+// frame with the full camera world position: actorPos + eye height + walk-cycle
+// camera bob + HMD physical tracking. Direct float read — no matrix extraction.
+static float s_cmvPrevActorPos[3] = {};
+static bool s_cmvHasPrevActorPos = false;
+static float s_cmvPrevCamZ = 0.0f;  // Previous NiCamera::world.translate.z
+static bool s_cmvHasPrevCamZ = false;
+static float s_cmvLocoDx = 0.0f, s_cmvLocoDy = 0.0f, s_cmvLocoDz = 0.0f; // Shared: computed on eye 0, reused for eye 1
+
+// Inject locomotion translation into a column-major VP matrix.
+// adjustedVP = VP * T^{-1} where T = translation by (dx, dy, dz).
+// In column-major column-vector convention, only column 3 changes:
+//   VP[12+i] -= dx*VP[0+i] + dy*VP[4+i] + dz*VP[8+i]  for i in {0,1,2,3}
+static void InjectLocoIntoVP(float vp[16], float dx, float dy, float dz)
+{
+	for (int i = 0; i < 4; i++) {
+		vp[12 + i] -= dx * vp[0 + i] + dy * vp[4 + i] + dz * vp[8 + i];
+	}
+}
+
+// Extract camera world position from NiCamera worldToCam (4x4 row-major with uniform scale).
+// worldToCam = [s·R^T | -s·R^T·pos; row3]  where s = 1/worldScale (≈2 in Skyrim VR).
+// pos[j] = -Σᵢ(M[i][j] · t[i]) / ||row0||²
+static void ExtractCamPosFromW2C(const float* w, float outPos[3])
+{
+	// w is 16 floats row-major: w[row*4+col]
+	float s2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2]; // ||row0||²
+	if (s2 < 1e-6f) {
+		outPos[0] = outPos[1] = outPos[2] = 0;
+		return;
+	}
+	for (int j = 0; j < 3; j++) {
+		// M^T column j dotted with translation column: Σᵢ M[i][j] * M[i][3]
+		outPos[j] = -(w[0 * 4 + j] * w[3] + w[1 * 4 + j] * w[7] + w[2 * 4 + j] * w[11]) / s2;
+	}
+}
 
 // Per-eye pose/fov captured in outer Invoke, consumed by camera MV in inner Invoke
 static XrPosef s_fsr3EyePose[2] = {};
@@ -282,6 +332,59 @@ void CS_CameraMV(uint3 id : SV_DispatchThreadID)
     MVOut[id.xy] = mv;
 }
 )HLSL";
+
+// ── MV Dilation shader (3x3 closest-depth) ──
+// Standard technique for temporal upscaling with alpha-tested geometry.
+// For each pixel, find the neighbor in a 3x3 kernel with the CLOSEST depth
+// (nearest to camera) and use its motion vector. This ensures:
+// - Foliage pixels with sky depth get foreground MVs from nearby bark/leaf pixels
+// - Object edges get foreground MVs (prevents background bleed-through in temporal reprojection)
+// - Depth-independent motion (head rotation) is unaffected (all neighbors have similar MVs)
+// - Depth-dependent motion (locomotion translation) is corrected for thin geometry
+static constexpr char s_mvDilateHLSL[] = R"HLSL(
+Texture2D<float2>      MVIn     : register(t0);
+Texture2D<float>       DepthIn  : register(t1);
+RWTexture2D<float2>    MVOut    : register(u0);
+
+cbuffer DilateCB : register(b0) {
+    int2 depthOffset;   // offset into stereo-combined depth texture
+    uint2 resolution;   // per-eye render resolution
+};
+
+[numthreads(8, 8, 1)]
+void CS_MVDilate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    // Find the closest (nearest-to-camera) depth in a 3x3 neighborhood.
+    // In reversed-Z: 1.0 = near, 0.0 = far. Closest = max depth value.
+    float bestDepth = 0.0;
+    int2 bestCoord = int2(id.xy);
+
+    [unroll] for (int dy = -1; dy <= 1; dy++) {
+        [unroll] for (int dx = -1; dx <= 1; dx++) {
+            int2 coord = clamp(int2(id.xy) + int2(dx, dy), int2(0,0), int2(resolution) - 1);
+            float d = DepthIn.Load(int3(coord + depthOffset, 0));
+            if (d > bestDepth) {
+                bestDepth = d;
+                bestCoord = coord;
+            }
+        }
+    }
+
+    // Use the MV from the closest-depth neighbor
+    MVOut[id.xy] = MVIn.Load(int3(bestCoord, 0));
+}
+)HLSL";
+
+static ID3D11ComputeShader* s_mvDilateCS = nullptr;
+static ID3D11Texture2D* s_mvDilateTex = nullptr;         // Dilated MV output
+static ID3D11UnorderedAccessView* s_mvDilateUAV = nullptr;
+static ID3D11ShaderResourceView* s_mvDilateMVSRV = nullptr;   // SRV for undilated MVs (s_cameraMVTex)
+static ID3D11ShaderResourceView* s_mvDilateDepthSRV = nullptr;
+static ID3D11Texture2D* s_mvDilateDepthSRVTex = nullptr;
+static ID3D11Buffer* s_mvDilateCB = nullptr;
+static uint32_t s_mvDilateW = 0, s_mvDilateH = 0;
 
 // Lazily compile the depth extraction CS and create output texture + UAV.
 // Returns true if depth extraction is available.
@@ -817,6 +920,153 @@ static bool GenerateCameraMVs(ID3D11DeviceContext* context, ID3D11ShaderResource
 		oldUAV->Release();
 	if (oldCB)
 		oldCB->Release();
+	return true;
+}
+
+// ── MV Dilation (3x3 closest-depth) ──
+
+static bool EnsureMVDilateResources(ID3D11Device* device, uint32_t w, uint32_t h)
+{
+	if (!s_mvDilateCS) {
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errors = nullptr;
+		HRESULT hr = D3DCompile(s_mvDilateHLSL, sizeof(s_mvDilateHLSL) - 1,
+		    "MVDilate", nullptr, nullptr, "CS_MVDilate", "cs_5_0", 0, 0, &blob, &errors);
+		if (FAILED(hr)) {
+			if (errors) {
+				OOVR_LOGF("MVDilate CS compile failed: %s", (char*)errors->GetBufferPointer());
+				errors->Release();
+			}
+			return false;
+		}
+		if (errors) errors->Release();
+		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_mvDilateCS);
+		blob->Release();
+		if (FAILED(hr)) return false;
+	}
+
+	if (!s_mvDilateTex || s_mvDilateW != w || s_mvDilateH != h) {
+		if (s_mvDilateUAV) { s_mvDilateUAV->Release(); s_mvDilateUAV = nullptr; }
+		if (s_mvDilateMVSRV) { s_mvDilateMVSRV->Release(); s_mvDilateMVSRV = nullptr; }
+		if (s_mvDilateTex) { s_mvDilateTex->Release(); s_mvDilateTex = nullptr; }
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w; td.Height = h;
+		td.MipLevels = 1; td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R16G16_FLOAT;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		if (FAILED(device->CreateTexture2D(&td, nullptr, &s_mvDilateTex)))
+			return false;
+
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+		uavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		if (FAILED(device->CreateUnorderedAccessView(s_mvDilateTex, &uavDesc, &s_mvDilateUAV))) {
+			s_mvDilateTex->Release(); s_mvDilateTex = nullptr;
+			return false;
+		}
+
+		s_mvDilateW = w; s_mvDilateH = h;
+	}
+
+	if (!s_mvDilateCB) {
+		D3D11_BUFFER_DESC bd = {};
+		bd.ByteWidth = 16; // int2 depthOffset + uint2 resolution
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &s_mvDilateCB)))
+			return false;
+	}
+
+	return true;
+}
+
+// Create SRV for undilated camera MVs (s_cameraMVTex) — needed as input to dilation
+static ID3D11ShaderResourceView* GetOrCreateMVDilateMVSRV(ID3D11Device* device, ID3D11Texture2D* mvTex)
+{
+	// Recreate if source texture changed
+	if (s_mvDilateMVSRV) {
+		ID3D11Resource* res = nullptr;
+		s_mvDilateMVSRV->GetResource(&res);
+		bool same = (res == mvTex);
+		if (res) res->Release();
+		if (same) return s_mvDilateMVSRV;
+		s_mvDilateMVSRV->Release();
+		s_mvDilateMVSRV = nullptr;
+	}
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+	if (FAILED(device->CreateShaderResourceView(mvTex, &srvDesc, &s_mvDilateMVSRV)))
+		return nullptr;
+	return s_mvDilateMVSRV;
+}
+
+static ID3D11ShaderResourceView* GetOrCreateMVDilateDepthSRV(ID3D11Device* device, ID3D11Texture2D* depthR32F)
+{
+	if (s_mvDilateDepthSRVTex == depthR32F && s_mvDilateDepthSRV)
+		return s_mvDilateDepthSRV;
+	if (s_mvDilateDepthSRV) { s_mvDilateDepthSRV->Release(); s_mvDilateDepthSRV = nullptr; }
+	s_mvDilateDepthSRVTex = nullptr;
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+	if (FAILED(device->CreateShaderResourceView(depthR32F, &srvDesc, &s_mvDilateDepthSRV)))
+		return nullptr;
+	s_mvDilateDepthSRVTex = depthR32F;
+	return s_mvDilateDepthSRV;
+}
+
+static bool DilateCameraMVs(ID3D11DeviceContext* context,
+    ID3D11ShaderResourceView* mvSRV, ID3D11ShaderResourceView* depthSRV,
+    uint32_t w, uint32_t h, int depthOffsetX, int depthOffsetY)
+{
+	// Update constant buffer
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (SUCCEEDED(context->Map(s_mvDilateCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+		int32_t* cb = (int32_t*)mapped.pData;
+		cb[0] = depthOffsetX;
+		cb[1] = depthOffsetY;
+		cb[2] = (int32_t)w;
+		cb[3] = (int32_t)h;
+		context->Unmap(s_mvDilateCB, 0);
+	}
+
+	// Save state
+	ID3D11ComputeShader* oldCS = nullptr;
+	ID3D11ShaderResourceView* oldSRV[2] = {};
+	ID3D11UnorderedAccessView* oldUAV = nullptr;
+	ID3D11Buffer* oldCB = nullptr;
+	context->CSGetShader(&oldCS, nullptr, nullptr);
+	context->CSGetShaderResources(0, 2, oldSRV);
+	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
+	context->CSGetConstantBuffers(0, 1, &oldCB);
+
+	// Dispatch
+	context->CSSetShader(s_mvDilateCS, nullptr, 0);
+	ID3D11ShaderResourceView* srvs[2] = { mvSRV, depthSRV };
+	context->CSSetShaderResources(0, 2, srvs);
+	context->CSSetUnorderedAccessViews(0, 1, &s_mvDilateUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &s_mvDilateCB);
+	context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+
+	// Restore state
+	context->CSSetShader(oldCS, nullptr, 0);
+	context->CSSetShaderResources(0, 2, oldSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &oldCB);
+	if (oldCS) oldCS->Release();
+	if (oldSRV[0]) oldSRV[0]->Release();
+	if (oldSRV[1]) oldSRV[1]->Release();
+	if (oldUAV) oldUAV->Release();
+	if (oldCB) oldCB->Release();
 	return true;
 }
 
@@ -1552,6 +1802,7 @@ DX11Compositor::~DX11Compositor()
 		s_fsr3ViewportW = 0;
 		s_fsr3ViewportH = 0;
 		s_hasPrevVP[0] = s_hasPrevVP[1] = false;
+		s_cmvHasPrevCamZ = false;
 	}
 #endif
 #ifdef OC_HAS_DLSS
@@ -1563,6 +1814,7 @@ DX11Compositor::~DX11Compositor()
 		s_fsr3ViewportW = 0;
 		s_fsr3ViewportH = 0;
 		s_hasPrevVP[0] = s_hasPrevVP[1] = false;
+		s_cmvHasPrevCamZ = false;
 	}
 #endif
 
@@ -1696,6 +1948,7 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 			s_fsr3ViewportW = 0;
 			s_fsr3ViewportH = 0;
 			s_hasPrevVP[0] = s_hasPrevVP[1] = false;
+			s_cmvHasPrevCamZ = false;
 		}
 #endif
 #ifdef OC_HAS_DLSS
@@ -1706,6 +1959,7 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 			s_fsr3ViewportW = 0;
 			s_fsr3ViewportH = 0;
 			s_hasPrevVP[0] = s_hasPrevVP[1] = false;
+			s_cmvHasPrevCamZ = false;
 		}
 #endif
 
@@ -2293,8 +2547,79 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 					float curVP[16];
 					memcpy(curVP, rssVPRM, sizeof(curVP));
 
+					// Store UNADJUSTED curVP for next frame BEFORE locomotion injection.
+					// prevVP must be in the unadjusted coordinate space so that next frame's
+					// locomotion delta is correctly computed from the raw RSS matrices.
+					float unadjustedCurVP[16];
+					memcpy(unadjustedCurVP, curVP, sizeof(curVP));
+
+					// ── Locomotion injection ──
+					// Skyrim uses camera-relative rendering: the VP matrix origin shifts
+					// with the FULL camera position each frame. prevVP * inv(curVP) only
+					// captures rotation — ALL camera translation is invisible.
+					//
+					// Horizontal (dx, dy): from actorPos — stick locomotion only.
+					// Vertical (dz): from NiCamera::world.translate.z — includes terrain,
+					// jumping, walk-cycle camera bob, AND HMD physical tracking. Single
+					// float read, no matrix extraction noise.
+					if (eye == 0) {
+						s_cmvLocoDx = 0.0f; s_cmvLocoDy = 0.0f; s_cmvLocoDz = 0.0f;
+
+						// Horizontal (dx,dy) from actorPos
+						if (s_pBridge->actorPosPtr) {
+							const float* actorPos = reinterpret_cast<const float*>(
+							    static_cast<uintptr_t>(s_pBridge->actorPosPtr));
+							float px = actorPos[0], py = actorPos[1];
+							if (s_cmvHasPrevActorPos) {
+								float dx = px - s_cmvPrevActorPos[0];
+								float dy = py - s_cmvPrevActorPos[1];
+								float hDist2 = dx * dx + dy * dy;
+								if (hDist2 > 0.0001f && hDist2 < 225.0f) {
+									s_cmvLocoDx = dx; s_cmvLocoDy = dy;
+								}
+							}
+							s_cmvPrevActorPos[0] = px;
+							s_cmvPrevActorPos[1] = py;
+							s_cmvHasPrevActorPos = true;
+						}
+
+						// Vertical (dz) from NiCamera world position Z.
+						// Captures terrain + jumping + walk-cycle bob + HMD tracking.
+						if (s_pBridge->cameraPosPtr) {
+							const float* camPos = reinterpret_cast<const float*>(
+							    static_cast<uintptr_t>(s_pBridge->cameraPosPtr));
+							float cz = camPos[2]; // NiCamera::world.translate.z
+							if (s_cmvHasPrevCamZ) {
+								float dz = cz - s_cmvPrevCamZ;
+								if (fabsf(dz) < 50.0f) {
+									s_cmvLocoDz = dz;
+								}
+							}
+							s_cmvPrevCamZ = cz;
+							s_cmvHasPrevCamZ = true;
+						}
+
+						{
+							static int s_locoLog = 0;
+							if ((s_locoLog < 30 || s_locoLog % 300 == 0)
+							    && (s_cmvLocoDx != 0.0f || s_cmvLocoDy != 0.0f || s_cmvLocoDz != 0.0f)) {
+								OOVR_LOGF("CameraMV LOCO: hDelta(%.4f,%.4f) vDelta(%.4f) camZ=%.2f",
+								    s_cmvLocoDx, s_cmvLocoDy, s_cmvLocoDz, s_cmvPrevCamZ);
+							}
+							s_locoLog++;
+						}
+					}
+
+					// Apply locomotion injection to curVP
+					if (s_cmvLocoDx != 0.0f || s_cmvLocoDy != 0.0f || s_cmvLocoDz != 0.0f) {
+						InjectLocoIntoVP(curVP, s_cmvLocoDx, s_cmvLocoDy, s_cmvLocoDz);
+					}
+
 					if (s_hasPrevVP[eye]) {
 						// Compute clip-to-clip M = prevVP * inv(curVP) in double precision.
+						// curVP includes horizontal locomotion (actorPos) + vertical
+						// camera delta (NiCamera Z), so clipToClip captures
+						// rotation + full 3-axis camera translation.
 						float clipToClipMat[16];
 						if (ComputeClipToClip(curVP, s_prevVP[eye], clipToClipMat)) {
 							D3D11_TEXTURE2D_DESC dDesc;
@@ -2320,11 +2645,12 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 									    depthOffX, depthOffY,
 									    jdUVx, jdUVy);
 									cameraMVTex = s_cameraMVTex;
+
 									{
 										static bool s = false;
 										if (!s) {
 											s = true;
-											OOVR_LOGF("CameraMV: RSS VP -- %ux%u eye=%d",
+											OOVR_LOGF("CameraMV: RSS VP + loco injection -- %ux%u eye=%d",
 											    perEyeRenderW, perEyeRenderH, eye);
 										}
 									}
@@ -2333,8 +2659,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 						}
 					}
 
-					// Store for next frame
-					memcpy(s_prevVP[eye], curVP, sizeof(curVP));
+					// Store UNADJUSTED VP for next frame
+					memcpy(s_prevVP[eye], unadjustedCurVP, sizeof(curVP));
 					s_prevJitterX[eye] = s_fsr3RenderJitterX;
 					s_prevJitterY[eye] = s_fsr3RenderJitterY;
 					s_hasPrevVP[eye] = true;
@@ -2932,6 +3258,66 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 				float curVP[16];
 				memcpy(curVP, rssVPRM, sizeof(curVP));
 
+				// Store UNADJUSTED curVP before locomotion injection
+				float unadjustedCurVP[16];
+				memcpy(unadjustedCurVP, curVP, sizeof(curVP));
+
+				// ── Locomotion injection (same as FSR3 path) ──
+				// Horizontal from actorPos, vertical from NiCamera::world.translate.z
+				if (eye == 0) {
+					s_cmvLocoDx = 0.0f; s_cmvLocoDy = 0.0f; s_cmvLocoDz = 0.0f;
+
+					// Horizontal (dx,dy) from actorPos
+					if (s_pBridge->actorPosPtr) {
+						const float* actorPos = reinterpret_cast<const float*>(
+						    static_cast<uintptr_t>(s_pBridge->actorPosPtr));
+						float px = actorPos[0], py = actorPos[1];
+						if (s_cmvHasPrevActorPos) {
+							float dx = px - s_cmvPrevActorPos[0];
+							float dy = py - s_cmvPrevActorPos[1];
+							float hDist2 = dx * dx + dy * dy;
+							if (hDist2 > 0.0001f && hDist2 < 225.0f) {
+								s_cmvLocoDx = dx; s_cmvLocoDy = dy;
+							}
+						}
+						s_cmvPrevActorPos[0] = px;
+						s_cmvPrevActorPos[1] = py;
+						s_cmvHasPrevActorPos = true;
+					}
+
+					// Vertical (dz) from NiCamera world position Z.
+					// Captures terrain + jumping + walk-cycle bob + HMD tracking.
+					if (s_pBridge->cameraPosPtr) {
+						const float* camPos = reinterpret_cast<const float*>(
+						    static_cast<uintptr_t>(s_pBridge->cameraPosPtr));
+						float cz = camPos[2]; // NiCamera::world.translate.z
+						if (s_cmvHasPrevCamZ) {
+							float dz = cz - s_cmvPrevCamZ;
+							if (fabsf(dz) < 50.0f) {
+								s_cmvLocoDz = dz;
+							}
+						}
+						s_cmvPrevCamZ = cz;
+						s_cmvHasPrevCamZ = true;
+					}
+
+					{
+						static int s_locoLog = 0;
+						if (s_locoLog < 50 || s_locoLog % 300 == 0) {
+							OOVR_LOGF("DLSS LOCO-DIAG: inject(%.4f,%.4f,%.4f) camZ=%.2f actorZ=%.2f",
+							    s_cmvLocoDx, s_cmvLocoDy, s_cmvLocoDz,
+							    s_cmvPrevCamZ, s_pBridge->actorPosPtr ?
+							    reinterpret_cast<const float*>(static_cast<uintptr_t>(s_pBridge->actorPosPtr))[2] : 0.0f);
+						}
+						s_locoLog++;
+					}
+				}
+
+				// Apply locomotion injection to curVP
+				if (s_cmvLocoDx != 0.0f || s_cmvLocoDy != 0.0f || s_cmvLocoDz != 0.0f) {
+					InjectLocoIntoVP(curVP, s_cmvLocoDx, s_cmvLocoDy, s_cmvLocoDz);
+				}
+
 				if (s_hasPrevVP[eye]) {
 					float clipToClipMat[16];
 					if (ComputeClipToClip(curVP, s_prevVP[eye], clipToClipMat)) {
@@ -2959,11 +3345,12 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 								    jdUVx, jdUVy,
 								    currJUVx, currJUVy);
 								dlssCameraMVTex = s_cameraMVTex;
+
 								{
 									static bool s = false;
 									if (!s) {
 										s = true;
-										OOVR_LOGF("DLSS CameraMV: RSS VP -- %ux%u eye=%d",
+										OOVR_LOGF("DLSS CameraMV: RSS VP + loco injection -- %ux%u eye=%d",
 										    dlssRenderW, dlssRenderH, eye);
 									}
 								}
@@ -2972,10 +3359,46 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 					}
 				}
 
-				memcpy(s_prevVP[eye], curVP, sizeof(curVP));
+				// Store UNADJUSTED VP for next frame
+				memcpy(s_prevVP[eye], unadjustedCurVP, sizeof(curVP));
 				s_prevJitterX[eye] = s_fsr3RenderJitterX;
 				s_prevJitterY[eye] = s_fsr3RenderJitterY;
 				s_hasPrevVP[eye] = true;
+			}
+
+			// ── Bias mask generation (depth-edge detection for DLSS ghosting reduction) ──
+			// Same algorithm as FSR3's reactive mask: detects depth discontinuities and
+			// generates per-pixel bias that tells DLSS to favor current frame over history
+			// at object silhouettes (foliage, thin geometry).
+			ID3D11Texture2D* dlssBiasMaskTex = nullptr;
+			D3D11_BOX* dlssBiasMaskRegionPtr = nullptr;
+			if (dlssDepthTex && (oovr_global_configuration.DlssBiasBase() > 0.0f
+			                  || oovr_global_configuration.DlssBiasEdgeBoost() > 0.0f)) {
+				D3D11_TEXTURE2D_DESC dDesc;
+				dlssDepthTex->GetDesc(&dDesc);
+				if (EnsureReactiveMaskResources(device, dDesc.Width, dDesc.Height)) {
+					auto* rmDepthSRV = GetOrCreateReactiveMaskDepthSRV(device, dlssDepthTex);
+					if (rmDepthSRV) {
+						GenerateReactiveMask(context, rmDepthSRV, dDesc.Width, dDesc.Height,
+						    oovr_global_configuration.DlssBiasBase(),
+						    oovr_global_configuration.DlssBiasEdgeBoost(),
+						    0.005f, // edge threshold
+						    30.0f); // edge scale
+						dlssBiasMaskTex = s_reactiveMaskTex;
+						// If depth is stereo-combined, bias mask uses same sub-region
+						dlssBiasMaskRegionPtr = dlssDepthRegionPtr;
+						{
+							static bool s = false;
+							if (!s) {
+								s = true;
+								OOVR_LOGF("DLSS BiasMask: Generated %ux%u base=%.3f edgeBoost=%.3f",
+								    dDesc.Width, dDesc.Height,
+								    oovr_global_configuration.DlssBiasBase(),
+								    oovr_global_configuration.DlssBiasEdgeBoost());
+							}
+						}
+					}
+				}
 			}
 
 			// Per-eye display resolution (same render-scale logic as FSR3)
@@ -3027,6 +3450,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			dlssParams.cameraNear = g_fsr3CameraNear;
 			dlssParams.cameraFar = g_fsr3CameraFar;
 			dlssParams.sharpness = oovr_global_configuration.DlssSharpness();
+			dlssParams.biasMask = dlssBiasMaskTex;
+			dlssParams.biasMaskSourceRegion = dlssBiasMaskRegionPtr;
 			dlssParams.reset = s_fsr3FirstDispatch;
 			dlssParams.debugMode = 0;
 			s_fsr3FirstDispatch = false;
@@ -3859,7 +4284,12 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		    g_fsr3FrameIndex, g_fsr3JitterPhaseCount);
 #endif
 		// Apply jitter scale — lower values reduce temporal instability in VR.
+		// DLSS has its own jitter scale config to allow independent tuning.
 		float jScale = oovr_global_configuration.Fsr3JitterScale();
+#ifdef OC_HAS_DLSS
+		if (oovr_global_configuration.DlssEnabled())
+			jScale = oovr_global_configuration.DlssJitterScale();
+#endif
 		g_fsr3JitterX *= jScale;
 		g_fsr3JitterY *= jScale;
 		g_fsr3FrameIndex++;
