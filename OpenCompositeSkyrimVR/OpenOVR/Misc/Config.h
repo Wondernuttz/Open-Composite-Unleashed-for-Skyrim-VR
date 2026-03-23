@@ -291,12 +291,12 @@ private:
 
 	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
 	bool  dlssEnabled      = false;
-	int   dlssPreset       = 0;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
-	float dlssSharpness    = 0.0f;
+	int   dlssPreset       = 1;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
+	float dlssSharpness    = 20.0f;
 	float dlssMvScale      = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
-	float dlssBiasBase     = 0.10f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
-	float dlssBiasEdgeBoost = 0.25f; // Extra bias at depth edges (foliage silhouettes)
-	float dlssJitterScale  = 1.0f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
+	float dlssBiasBase     = 0.20f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
+	float dlssBiasEdgeBoost = 0.50f; // Extra bias at depth edges (foliage silhouettes)
+	float dlssJitterScale  = 0.5f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;
