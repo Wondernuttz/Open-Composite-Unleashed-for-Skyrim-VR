@@ -46,6 +46,7 @@
 
 #include "../OpenOVR/Misc/Config.h"
 #include "ASWProvider.h"
+#include "SpaceWarpProvider.h"
 
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 #include <d3d11.h>
@@ -564,6 +565,12 @@ void XrBackend::ResetAswSplitFrameState()
 
 bool XrBackend::ShouldUseAswSplitPipeline() const
 {
+	// Split-frame pipeline is only for custom PC-side ASW, not Meta space warp.
+	// When g_spaceWarpProvider is active, the runtime handles reprojection —
+	// no warp frames needed from our side.
+	if (g_spaceWarpProvider && g_spaceWarpProvider->IsReady())
+		return false;
+
 	return g_aswProvider && g_aswProvider->IsReady() && g_aswProvider->HasPreviousCachedFrame()
 	    && !g_aswProvider->IsPaused()
 	    && oovr_global_configuration.ASWEnabled() && sessionActive
@@ -1055,6 +1062,23 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 			if (layer.subImage.swapchain == XR_NULL_HANDLE)
 				app_layer = nullptr;
 		}
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+		// Chain XR_FB_space_warp info to each projection view when Meta space warp is active.
+		// The SpaceWarpProvider's info structs were filled during SubmitFrame() in dx11compositor.
+		if (g_spaceWarpProvider && g_spaceWarpProvider->IsReady() && app_layer) {
+			for (int i = 0; i < 2; i++) {
+				auto* swInfo = g_spaceWarpProvider->GetLayerInfo(i);
+				// Chain space warp after any existing next (e.g. depth info set by compositor)
+				swInfo->next = projectionViews[i].next;
+				projectionViews[i].next = swInfo;
+			}
+			static int s_log = 0;
+			if (s_log++ < 5)
+				OOVR_LOG("SpaceWarp: Chained layer info to projection views");
+		}
+#endif
+
 		submittedEyeTextures = false;
 	}
 

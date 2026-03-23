@@ -211,6 +211,9 @@ add_library(DrvOpenXR STATIC
 	DrvOpenXR/ASWProvider.cpp
 	DrvOpenXR/ASWProvider.h
 
+	DrvOpenXR/SpaceWarpProvider.cpp
+	DrvOpenXR/SpaceWarpProvider.h
+
 	DrvOpenXR/tmp_gfx/TemporaryGraphics.cpp
 	DrvOpenXR/tmp_gfx/TemporaryGraphics.h
 	DrvOpenXR/tmp_gfx/TemporaryD3D11.cpp

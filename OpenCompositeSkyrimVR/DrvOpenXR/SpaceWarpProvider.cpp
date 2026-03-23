@@ -10,6 +10,7 @@
 
 // Global: set during extension registration in DrvOpenXR.cpp
 bool g_spaceWarpAvailable = false;
+SpaceWarpProvider* g_spaceWarpProvider = nullptr;
 
 SpaceWarpProvider::~SpaceWarpProvider()
 {

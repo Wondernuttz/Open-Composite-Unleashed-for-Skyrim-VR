@@ -244,6 +244,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(bool, motionVectorsEnabled);
 		CFGOPT(float, motionVectorScale);
 		CFGOPT(bool, aswEnabled);
+		CFGOPT(bool, aswForceCustom);
 		CFGOPT(float, aswWarpStrength);
 		CFGOPT(float, aswRotationScale);
 		CFGOPT(float, aswTranslationScale);

@@ -31,6 +31,7 @@
 #endif
 
 #include "../../DrvOpenXR/ASWProvider.h"
+#include "../../DrvOpenXR/SpaceWarpProvider.h"
 
 // ============================================================================
 // SKSE Render Target Bridge — shared memory for motion vectors + depth
@@ -3969,7 +3970,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 #endif
 #ifdef OC_HAS_FSR3
 				if (!upscalerActive)
-					upscalerActive = (renderScale < 0.99f && !dlssEn);
+					upscalerActive = (oovr_global_configuration.FsrEnabled() && renderScale < 0.99f && !dlssEn);
 #endif
 				OOVR_LOGF("ASW INIT_DIAG: renderScale=%.3f dlssEnabled=%d upscalerActive=%d render=%ux%u swapchain=%ux%u",
 				    renderScale, dlssEn ? 1 : 0, upscalerActive ? 1 : 0,
@@ -3984,11 +3985,33 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 					    aswEyeW, aswEyeH, renderEyeW, renderEyeH, renderScale);
 				}
 
-				g_aswProvider = new ASWProvider();
-				if (!g_aswProvider->Initialize(device, aswEyeW, aswEyeH)) {
-					OOVR_LOG("ASW: Initialization failed — disabling");
-					delete g_aswProvider;
-					g_aswProvider = nullptr;
+				// Decide: Meta runtime space warp vs custom PC-side ASW
+				bool useMetaSpaceWarp = g_spaceWarpAvailable
+				    && !oovr_global_configuration.ASWForceCustom();
+
+				if (useMetaSpaceWarp) {
+					// XR_FB_space_warp: runtime handles reprojection on headset
+					g_spaceWarpProvider = new SpaceWarpProvider();
+					if (!g_spaceWarpProvider->Initialize(aswEyeW, aswEyeH)) {
+						OOVR_LOG("ASW: Meta space warp init failed — falling back to custom ASW");
+						delete g_spaceWarpProvider;
+						g_spaceWarpProvider = nullptr;
+						useMetaSpaceWarp = false;
+					} else {
+						OOVR_LOG("ASW: Using Meta XR_FB_space_warp (runtime-side reprojection)");
+					}
+				}
+
+				if (!useMetaSpaceWarp) {
+					// Custom PC-side ASW
+					g_aswProvider = new ASWProvider();
+					if (!g_aswProvider->Initialize(device, aswEyeW, aswEyeH)) {
+						OOVR_LOG("ASW: Custom ASW initialization failed — disabling");
+						delete g_aswProvider;
+						g_aswProvider = nullptr;
+					} else {
+						OOVR_LOG("ASW: Using custom PC-side ASW");
+					}
 				}
 			}
 		}
@@ -4003,10 +4026,79 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		g_aswProvider->SetPaused(s_pBridge->isLoadingScreen != 0);
 	}
 
+	// OCU Meta Space Warp: submit MV + depth to runtime via XR_FB_space_warp.
+	// Accumulate per-eye regions; submit both eyes when eye 1 arrives.
+	layer.next = nullptr;
+	if (g_spaceWarpProvider && g_spaceWarpProvider->IsReady()
+	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
+	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen
+	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "SpaceWarp-MV")) {
+
+		static D3D11_BOX s_swMvRegions[2] = {};
+		static D3D11_BOX s_swDepthRegions[2] = {};
+		static ID3D11Texture2D* s_swMvTex = nullptr;
+		static ID3D11Texture2D* s_swDepthTex = nullptr;
+
+		int eyeIdx = s_currentEyeIdx;
+		auto* mvTex = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->mvTexture);
+		D3D11_TEXTURE2D_DESC mvDesc;
+		if (SafeGetTextureDesc(mvTex, &mvDesc)) {
+			uint32_t mvEyeW = mvDesc.Width / 2;
+
+			s_swMvRegions[eyeIdx].left = eyeIdx * mvEyeW;
+			s_swMvRegions[eyeIdx].right = s_swMvRegions[eyeIdx].left + mvEyeW;
+			s_swMvRegions[eyeIdx].top = 0;
+			s_swMvRegions[eyeIdx].bottom = mvDesc.Height;
+			s_swMvRegions[eyeIdx].front = 0;
+			s_swMvRegions[eyeIdx].back = 1;
+			s_swMvTex = mvTex;
+
+			// Extract depth to R32F (same as custom ASW path)
+			auto* depthTex = s_pBridge->depthTexture
+			    ? reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture)
+			    : nullptr;
+			if (depthTex && !ValidateBridgeTexture(depthTex, "SpaceWarp-Depth"))
+				depthTex = nullptr;
+
+			s_swDepthTex = nullptr;
+			if (depthTex) {
+				D3D11_TEXTURE2D_DESC depthDesc;
+				if (SafeGetTextureDesc(depthTex, &depthDesc)) {
+					if (EnsureDepthExtractResources(device, depthDesc.Width, depthDesc.Height)) {
+						auto* depthSRV = GetOrCreateDepthSRV(device, depthTex,
+						    depthDesc.Format, depthDesc.Width, depthDesc.Height);
+						if (depthSRV && ExtractDepthToR32F(context, depthSRV,
+						        depthDesc.Width, depthDesc.Height)) {
+							s_swDepthTex = s_depthR32F;
+							uint32_t depthEyeW = depthDesc.Width / 2;
+							s_swDepthRegions[eyeIdx].left = eyeIdx * depthEyeW;
+							s_swDepthRegions[eyeIdx].right = s_swDepthRegions[eyeIdx].left + depthEyeW;
+							s_swDepthRegions[eyeIdx].top = 0;
+							s_swDepthRegions[eyeIdx].bottom = depthDesc.Height;
+							s_swDepthRegions[eyeIdx].front = 0;
+							s_swDepthRegions[eyeIdx].back = 1;
+						}
+					}
+				}
+			}
+
+			// Submit both eyes when right eye arrives
+			if (eyeIdx == 1 && s_swMvTex) {
+				bool ok = g_spaceWarpProvider->SubmitFrame(context,
+				    s_swMvTex, s_swMvRegions,
+				    s_swDepthTex, s_swDepthRegions,
+				    g_fsr3CameraNear, g_fsr3CameraFar);
+				static int s_log = 0;
+				if (s_log++ < 5)
+					OOVR_LOGF("SpaceWarp: SubmitFrame result=%d near=%.2f far=%.1f",
+					    ok ? 1 : 0, g_fsr3CameraNear, g_fsr3CameraFar);
+			}
+		}
+	}
+
 	// OCU ASW: cache frame data (color + MV + depth + pose) for warping
 	// Skip caching during main menu / loading screen — MV and depth data are invalid,
 	// and warping menu content causes visual glitches on save load.
-	layer.next = nullptr;
 	if (g_aswProvider && g_aswProvider->IsReady()
 	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
 	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen

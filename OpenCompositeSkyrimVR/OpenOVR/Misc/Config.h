@@ -116,8 +116,9 @@ public:
 	inline bool MotionVectorsEnabled() const { return motionVectorsEnabled; }
 	inline float MotionVectorScale() const { return motionVectorScale; }
 
-	// OCU ASW — PC-side Asynchronous SpaceWarp (experimental)
+	// OCU ASW — Asynchronous SpaceWarp
 	inline bool ASWEnabled() const { return aswEnabled; }
+	inline bool ASWForceCustom() const { return aswForceCustom; } // true = always use custom ASW, false = prefer runtime (XR_FB_space_warp)
 	inline float ASWWarpStrength() const { return aswWarpStrength; }
 	inline float ASWRotationScale() const { return aswRotationScale; }
 	inline float ASWTranslationScale() const { return aswTranslationScale; }
@@ -265,6 +266,7 @@ private:
 
 	// OCU ASW — PC-side Asynchronous SpaceWarp (experimental)
 	bool aswEnabled = false;
+	bool aswForceCustom = false;           // true = always use custom PC-side ASW, false = prefer runtime XR_FB_space_warp if available
 	bool aswConcurrentFrameThread = false; // If true, dedicated XR thread owns wait/begin/end in buffered mode
 	bool aswSpeculativeTrackingLead = false; // Diagnostic default: prefer begun-slot sync over speculative +1 period lead
 	bool aswBufferEnabled = true;            // true = async warp worker thread (clean GPU queue), false = inline warp on game thread
