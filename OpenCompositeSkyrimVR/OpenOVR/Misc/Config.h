@@ -154,13 +154,13 @@ public:
 
 	// ASW tuning variables — public for hot-reload from ini file watcher
 	float aswWarpStrength = 1.0f;  // 0.0 = no warp (static copy), 1.0 = full correction
-	float aswRotationScale = 1.0f; // 0.0 = no rotation correction, 1.0 = full
+	float aswRotationScale = 0.0f; // 0.0 = no rotation correction, 1.0 = full
 	float aswTranslationScale = 1.0f; // 0.0 = no translation correction, 1.0 = full
 	float aswLocoScale = 1.0f;     // locomotion correction scale (0=off, 1=full). Multiplied by timingRatio (~0.5).
 	float aswDepthScale = 1.0f;    // multiplier on linearized depth (parallax intensity)
 	float aswEdgeFadeWidth = 3.0f;   // depth-edge fade threshold (depth ratio units)
 	float aswNearFadeDepth = 0.0f;   // parallax fades to 0 below this depth (meters); 0 = disabled
-	float aswMVConfidence = 0.5f;    // MV loco correction strength: 0.5 = half-frame (midpoint warp). 0 = off.
+	float aswMVConfidence = 1.5f;    // MV loco correction strength: 1.5 = confirmed working value for locomotion + stick rotation residual scaling. 0 = off.
 	float aswMVPixelScale = 1.0f;    // overall MV magnitude multiplier (1.0 = identity)
 	int aswDebugMode = 0;            // 0=normal, 1=depth viz, 2=linearized depth, 3=MV magnitude, 50=black warp frame, 56=stationary NPC dest-depth reject, 57=stationary NPC path overview
 	bool aswCaptureEnabled = false;  // true = capture warp diagnostics (color/depth/MV/CB) to TestWarp folder

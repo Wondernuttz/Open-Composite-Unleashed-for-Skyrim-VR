@@ -776,15 +776,6 @@ bool XrBackend::BeginAswWarpFrameForSplit()
 	LatchViewsForDisplayTime(aswEstimatedRealDisplayTime);
 	aswSplitPhase = AswSplitPhase::WarpFrameBegun;
 
-	{
-		static int s = 0;
-		if (s++ < 20 || (s % 300 == 0)) {
-			OOVR_LOGF("ASW split: warp slot begun display=%.3fms estReal=%.3fms",
-			    aswWarpFrameState.predictedDisplayTime / 1000000.0,
-			    aswEstimatedRealDisplayTime / 1000000.0);
-		}
-	}
-
 	return true;
 }
 
@@ -814,17 +805,6 @@ bool XrBackend::BeginRealFrameAfterAswWarp(float* outWaitMs)
 	OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
 	QueryPerformanceCounter(&beginFrameQpc);
 
-	double deltaMs = (double)(aswRealFrameState.predictedDisplayTime - aswEstimatedRealDisplayTime) / 1000000.0;
-	{
-		static int s = 0;
-		if (s++ < 20 || fabs(deltaMs) > 0.5 || realWaitMs > 2.0f) {
-			OOVR_LOGF("ASW split: real slot begun display=%.3fms estDelta=%.3fms wait=%.3fms",
-			    aswRealFrameState.predictedDisplayTime / 1000000.0,
-			    deltaMs,
-			    realWaitMs);
-		}
-	}
-
 	aswSplitPhase = AswSplitPhase::RealFrameBegun;
 	return true;
 }
@@ -834,33 +814,11 @@ void XrBackend::FinishAswWarpFrameAfterFirstEye(float cpuToFirstSubmitMs, float 
 	if (aswSplitPhase != AswSplitPhase::WarpFrameBegun)
 		return;
 
-	auto warpStart = std::chrono::high_resolution_clock::now();
-	bool warpSubmitted = SubmitAswWarpFrame(aswWarpFrameState, nullptr, 0);
-	auto warpEnd = std::chrono::high_resolution_clock::now();
-	float warpSubmitCpuMs = std::chrono::duration<float, std::milli>(warpEnd - warpStart).count();
-	float realWaitMs = 0.0f;
-	bool realStarted = BeginRealFrameAfterAswWarp(&realWaitMs);
+	(void)cpuToFirstSubmitMs;
+	(void)firstSubmitInvokeMs;
 
-	float budgetMs = predictedDisplayPeriodMs > 0.0f ? predictedDisplayPeriodMs : 13.33f;
-	float cpuBeforeFirstSubmitMs = cpuToFirstSubmitMs - firstSubmitInvokeMs;
-	if (cpuBeforeFirstSubmitMs < 0.0f)
-		cpuBeforeFirstSubmitMs = 0.0f;
-
-	{
-		static int s = 0;
-		float combinedCpuMs = cpuToFirstSubmitMs + warpSubmitCpuMs;
-		if (s++ < 80 || combinedCpuMs > budgetMs || realWaitMs > 1.0f || warpSubmitCpuMs > 3.0f) {
-			OOVR_LOGF("ASW split timing: preSubmitCpu=%.2fms firstSubmit=%.2fms warpSubmitCpu=%.2fms waitReal=%.2fms combined=%.2fms budget=%.2fms warp=%d real=%d",
-			    cpuBeforeFirstSubmitMs,
-			    firstSubmitInvokeMs,
-			    warpSubmitCpuMs,
-			    realWaitMs,
-			    combinedCpuMs,
-			    budgetMs,
-			    warpSubmitted ? 1 : 0,
-			    realStarted ? 1 : 0);
-		}
-	}
+	SubmitAswWarpFrame(aswWarpFrameState, nullptr, 0);
+	BeginRealFrameAfterAswWarp(nullptr);
 }
 
 #endif

@@ -2383,77 +2383,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			}
 			{ // Scoped block — goto fsr3_fallback_copy jumps past this entire scope
 
-				// Diagnostic: log MV and depth texture info + sample MV center pixel values
-				// Sample first 5 frames + every 200th frame up to 2000 to catch gameplay values
-				{
-					static int mvDiag = 0;
-					static int mvFrame = 0;
-					mvFrame++;
-					bool mvDoSample = (mvDiag < 5) || (mvFrame % 200 == 0 && mvDiag < 20);
-					if (mvDoSample) {
-						mvDiag++;
-						OOVR_LOGF("FSR3-MV: dims=%ux%u fmt=%u bindFlags=0x%X miscFlags=0x%X",
-						    mvDesc.Width, mvDesc.Height, mvDesc.Format, mvDesc.BindFlags, mvDesc.MiscFlags);
-						OOVR_LOGF("FSR3-MV: perEyeRender=%ux%u srcTex=%ux%u bounds=%s",
-						    perEyeRenderW, perEyeRenderH, fsrSrcDesc.Width, fsrSrcDesc.Height,
-						    bounds ? "yes" : "no");
-						if (depthTex) {
-							D3D11_TEXTURE2D_DESC depthDesc;
-							depthTex->GetDesc(&depthDesc);
-							OOVR_LOGF("FSR3-DEPTH: dims=%ux%u fmt=%u", depthDesc.Width, depthDesc.Height, depthDesc.Format);
-						}
-
-						// GPU readback: sample center pixel of MV texture to determine value range
-						// (pixel-space vs UV-space vs NDC). R16G16_FLOAT = two half-floats.
-						static ID3D11Texture2D* mvStaging = nullptr;
-						if (!mvStaging) {
-							D3D11_TEXTURE2D_DESC stgDesc = {};
-							stgDesc.Width = 1;
-							stgDesc.Height = 1;
-							stgDesc.MipLevels = 1;
-							stgDesc.ArraySize = 1;
-							stgDesc.Format = mvDesc.Format;
-							stgDesc.SampleDesc.Count = 1;
-							stgDesc.Usage = D3D11_USAGE_STAGING;
-							stgDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-							device->CreateTexture2D(&stgDesc, nullptr, &mvStaging);
-						}
-						if (mvStaging) {
-							// Copy a 1x1 region from center of MV texture
-							uint32_t cx = mvDesc.Width / 2;
-							uint32_t cy = mvDesc.Height / 2;
-							D3D11_BOX box = { cx, cy, 0, cx + 1, cy + 1, 1 };
-							if (!SafeCopyFromBridgeTexture(context, mvStaging, 0, 0, 0, 0, mvTex, 0, &box))
-								goto fsr3_fallback_copy;
-
-							D3D11_MAPPED_SUBRESOURCE mapped;
-							if (SUCCEEDED(context->Map(mvStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
-								uint16_t* raw = (uint16_t*)mapped.pData;
-								// Half-float to float: quick conversion
-								auto h2f = [](uint16_t h) -> float {
-									uint32_t s = (h >> 15) & 1;
-									uint32_t e = (h >> 10) & 0x1F;
-									uint32_t m = h & 0x3FF;
-									if (e == 0)
-										return (s ? -1.0f : 1.0f) * ldexpf((float)m, -24);
-									if (e == 31)
-										return s ? -INFINITY : INFINITY;
-									return (s ? -1.0f : 1.0f) * ldexpf(1.0f + m / 1024.0f, (int)e - 15);
-								};
-								float mvX = h2f(raw[0]);
-								float mvY = h2f(raw[1]);
-								OOVR_LOGF("FSR3-MV-VALUES: center pixel raw=0x%04X,0x%04X float=%.6f,%.6f "
-								          "(if pixel-space: ~%.1f,%.1fpx; if UV: ~%.1f,%.1fpx)",
-								    raw[0], raw[1], mvX, mvY,
-								    mvX, mvY,
-								    mvX * perEyeRenderW, mvY * perEyeRenderH);
-								context->Unmap(mvStaging, 0);
-							}
-						}
-					}
-				}
-
-				// ── Depth format conversion ──
+					// ── Depth format conversion ──
 				// Skyrim's depth-stencil is typically R24G8_TYPELESS (D24_UNORM_S8_UINT).
 				// CopySubresourceRegion from D24/R24G8 → R32F silently fails (incompatible format families).
 				// Extract depth via compute shader when needed, replacing depthTex with the R32F output.
@@ -2946,109 +2876,10 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 				if (fsr3Ok) {
 					ID3D11Texture2D* fsr3Output = s_fsr3Upscaler->GetOutputDX11(s_currentEyeIdx);
 
-					// Dimension verification logging
-					{
-						static int dimLog = 0;
-						if (dimLog++ < 4) {
-							D3D11_TEXTURE2D_DESC outDesc, swapDesc;
-							fsr3Output->GetDesc(&outDesc);
-							imagesHandles[currentIndex].texture->GetDesc(&swapDesc);
-							OOVR_LOGF("FSR3-OUTPUT eye=%d output=%ux%u swap=%ux%u bounds=(%.3f,%.3f,%.3f,%.3f)",
-							    s_currentEyeIdx, outDesc.Width, outDesc.Height, swapDesc.Width, swapDesc.Height,
-							    bounds ? bounds->uMin : -1.f, bounds ? bounds->vMin : -1.f,
-							    bounds ? bounds->uMax : -1.f, bounds ? bounds->vMax : -1.f);
-						}
-					}
-
-					// FSR3 output and swapchain are both per-eye display resolution.
-					// FSR3 has built-in RCAS sharpening — skip our CAS post-pass to avoid double sharpening.
-					// Our CAS checkbox only applies to the CAS-only path (native res without FSR3).
-					bool doCas = false;
-
-					if (doCas) {
-						// Create temporary SRV for FSR3 output texture
-						ID3D11ShaderResourceView* fsr3OutputSRV = nullptr;
-						device->CreateShaderResourceView(fsr3Output, nullptr, &fsr3OutputSRV);
-						if (fsr3OutputSRV) {
-							// Update constant buffer: AMD FsrRcasCon (sharpness)
-							D3D11_MAPPED_SUBRESOURCE mapped;
-							if (SUCCEEDED(context->Map(fsr_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-								AU1* con = (AU1*)mapped.pData;
-								memset(con, 0, 80);
-								float sharpLin = std::max(0.001f, std::min(1.0f, oovr_global_configuration.CasSharpness()));
-								float stops = -log2f(sharpLin);
-								FsrRcasCon(con, stops);
-								context->Unmap(fsr_cbuffer, 0);
-							}
-
-							// Save and set viewport/scissors
-							UINT numVP = 0;
-							context->RSGetViewports(&numVP, nullptr);
-							D3D11_VIEWPORT savedVP[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-							if (numVP)
-								context->RSGetViewports(&numVP, savedVP);
-							UINT numSR = 0;
-							context->RSGetScissorRects(&numSR, nullptr);
-							D3D11_RECT savedSR[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-							if (numSR)
-								context->RSGetScissorRects(&numSR, savedSR);
-							ID3D11RasterizerState* savedRS = nullptr;
-							context->RSGetState(&savedRS);
-							context->RSSetState(nullptr);
-							D3D11_PRIMITIVE_TOPOLOGY savedTopo;
-							context->IAGetPrimitiveTopology(&savedTopo);
-
-							D3D11_VIEWPORT vp = {};
-							vp.Width = (float)perEyeDisplayW;
-							vp.Height = (float)perEyeDisplayH;
-							vp.MaxDepth = 1.0f;
-							context->RSSetViewports(1, &vp);
-							D3D11_RECT sr = { 0, 0, (LONG)perEyeDisplayW, (LONG)perEyeDisplayH };
-							context->RSSetScissorRects(1, &sr);
-
-							// Render: FSR3 output → RCAS → swapchain
-							context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-							context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
-							context->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
-							context->PSSetShaderResources(0, 1, &fsr3OutputSRV);
-							context->VSSetShader(fsr_vshader, nullptr, 0);
-							context->PSSetShader(cas_pshader, nullptr, 0);
-							context->PSSetConstantBuffers(0, 1, &fsr_cbuffer);
-							context->PSSetSamplers(0, 1, &quad_sampleState);
-							context->Draw(4, 0);
-
-							// Unbind and restore
-							ID3D11ShaderResourceView* nullSRV = nullptr;
-							context->PSSetShaderResources(0, 1, &nullSRV);
-							ID3D11RenderTargetView* nullRTV = nullptr;
-							context->OMSetRenderTargets(1, &nullRTV, nullptr);
-							context->IASetPrimitiveTopology(savedTopo);
-							if (numVP)
-								context->RSSetViewports(numVP, savedVP);
-							if (numSR)
-								context->RSSetScissorRects(numSR, savedSR);
-							context->RSSetState(savedRS);
-							if (savedRS)
-								savedRS->Release();
-
-							fsr3OutputSRV->Release();
-							{
-								static bool s = false;
-								if (!s) {
-									s = true;
-									OOVR_LOG("FSR3+CAS: RCAS sharpening applied to FSR3 output");
-								}
-							}
-						} else {
-							// SRV creation failed — fall back to direct copy
-							context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
-							    0, 0, 0, fsr3Output, 0, nullptr);
-						}
-					} else {
-						// No CAS — direct copy
-						context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
-						    0, 0, 0, fsr3Output, 0, nullptr);
-					}
+	
+					// FSR3 has built-in RCAS sharpening — direct copy to swapchain.
+					context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+					    0, 0, 0, fsr3Output, 0, nullptr);
 
 					// Set viewport to display resolution — FSR3 filled the full swapchain
 					s_fsr3ViewportW = perEyeDisplayW;
@@ -3058,10 +2889,9 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 						static bool s = false;
 						if (!s) {
 							s = true;
-							OOVR_LOGF("FSR3: First output — upscale %ux%u→%ux%u, swapchain %ux%u, cas=%s",
+							OOVR_LOGF("FSR3: First output — upscale %ux%u→%ux%u, swapchain %ux%u",
 							    perEyeRenderW, perEyeRenderH, perEyeDisplayW, perEyeDisplayH,
-							    createInfo.width, createInfo.height,
-							    doCas ? "on" : "off");
+							    createInfo.width, createInfo.height);
 						}
 					}
 				} else {
@@ -3733,16 +3563,6 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		context->RSSetState(savedRS);
 	} else {
 		// ── Normal copy path (no FSR/CAS/DLAA) ──
-		{
-			static int s_defaultHits = 0;
-			s_defaultHits++;
-			if (s_defaultHits <= 10 || s_defaultHits % 100 == 0)
-				OOVR_LOGF("WARNING: Default copy path hit #%d — FSR3/FSR1/CAS/DLAA all skipped! "
-				          "src=%ux%u swap=%ux%u bounds=%s sourceRegion=[%u,%u,%u,%u]",
-				    s_defaultHits, srcDesc.Width, srcDesc.Height, createInfo.width, createInfo.height,
-				    bounds ? "yes" : "no",
-				    sourceRegion.left, sourceRegion.right, sourceRegion.top, sourceRegion.bottom);
-		}
 		// Clear swapchain to black when it's larger than source (FSR configured but not yet active)
 		// to avoid garbage pixels in the unused region during loading/transition
 		if (bounds && !swapchain_rtvs.empty() && createInfo.width != srcDesc.Width) {
@@ -3869,21 +3689,6 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			}
 		}
 
-		// Diagnostic: log bridge state periodically (left eye only)
-		if (eye == XruEyeLeft) {
-			static int s_diagFrame = 0;
-			if (s_diagFrame++ % 200 == 0) {
-				OOVR_LOGF("FSR3-DIAG frame=%d bridge=%p status=%d mainMenu=%d "
-				          "worldToCam=%llX upscaler=%s jitter=%s",
-				    s_diagFrame,
-				    (void*)s_pBridge,
-				    s_pBridge ? (int)s_pBridge->status : -1,
-				    s_pBridge ? (int)s_pBridge->isMainMenu : -1,
-				    s_pBridge ? s_pBridge->worldToCamPtr : 0ULL,
-				    s_fsr3Upscaler ? "ready" : "null",
-				    g_fsr3JitterEnabled ? "on" : "off");
-			}
-		}
 
 		// Save jitter and camera FOV on left eye (once per stereo frame).
 		// IMPORTANT: Do NOT compute next-frame jitter here — right eye's GetProjectionRaw
@@ -4096,6 +3901,12 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		}
 	}
 
+	// OCU ASW: poll for async shader compilation completion (non-blocking).
+	// Must be outside the IsReady() gate — shaders compile in background while
+	// IsReady() returns false. This check costs ~0 when not compiling.
+	if (g_aswProvider && !g_aswProvider->IsReady())
+		g_aswProvider->TryFinishShaderCompilation();
+
 	// OCU ASW: cache frame data (color + MV + depth + pose) for warping
 	// Skip caching during main menu / loading screen — MV and depth data are invalid,
 	// and warping menu content causes visual glitches on save load.
@@ -4189,11 +4000,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 							depthRegion.bottom = depthDesc.Height;
 							depthRegion.front = 0;
 							depthRegion.back = 1;
-							static int s_log = 0;
-							if (s_log++ < 3)
-								OOVR_LOGF("ASW: Depth extracted R24G8→R32F (%ux%u) for CacheFrame",
-								    depthDesc.Width, depthDesc.Height);
-						}
+							}
 					}
 				}
 			}
@@ -4247,17 +4054,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				    static_cast<uintptr_t>(s_pBridge->actorPosPtr));
 				float posX = actorPos[0], posY = actorPos[1], posZ = actorPos[2];
 
-				{
-					static int s_actorLogCount = 0;
-					if (s_actorLogCount < 10) {
-						OOVR_LOGF("ASW actor [%d]: pos(%.2f,%.2f,%.2f) prev(%.2f,%.2f,%.2f) hasPrev=%d",
-						    s_actorLogCount, posX, posY, posZ,
-						    s_prevActorPos[0], s_prevActorPos[1], s_prevActorPos[2],
-						    s_hasPrevActor ? 1 : 0);
-						s_actorLogCount++;
-					}
-				}
-
+	
 				if (s_hasPrevActor) {
 					// World-space delta (new - old): direction of locomotion
 					float dwx = posX - s_prevActorPos[0];
@@ -4287,14 +4084,6 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 							}
 							g_aswProvider->SetLocomotionTranslation(viewX, viewY, viewZ);
 
-							static int s_locoLogCount = 0;
-							if (s_locoLogCount < 60 || s_locoLogCount % 300 == 0) {
-								OOVR_LOGF("ASW loco [%d]: actor(%.1f,%.1f,%.1f) delta(%.3f,%.3f,%.3f) "
-								          "→ viewDelta(%.4f,%.4f,%.4f)",
-								    s_locoLogCount, posX, posY, posZ,
-								    dwx, dwy, dwz, viewX, viewY, viewZ);
-							}
-							s_locoLogCount++;
 						}
 					} else {
 						// Dead zone (dist2 <= 0.0001) or teleport (dist2 >= 225):
@@ -4330,16 +4119,18 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 					// Use actorYaw delta for the actual rotation amount (warp correction),
 					// but gate it on thumbstick deflection to avoid head-yaw contamination.
+					// Latch the gate for a few frames after stick release — the game actor
+					// continues rotating from physics/momentum after stick goes to zero,
+					// and dropping yawDelta immediately causes the warp to freeze while
+					// the game rotates past it (visible as a snap on stick release).
 					static constexpr float kStickDeadZone = 0.05f; // ~5% deflection
 					bool stickActive = fabsf(rightStickX) > kStickDeadZone;
-					float filteredYaw = stickActive ? yawDelta : 0.0f;
-
-					// Diagnostic: log when actorYaw changes without stick input
-					static int s_yawDiagCounter = 0;
-					if (fabsf(yawDelta) > 0.001f && !stickActive && (s_yawDiagCounter++ % 75 == 0)) {
-						OOVR_LOGF("ASW YAW_DIAG: yawDelta=%.5f stickX=%.4f stickActive=%d — yaw change without stick",
-						    yawDelta, rightStickX, stickActive ? 1 : 0);
-					}
+					static int s_stickYawLatch = 0;
+					if (stickActive)
+						s_stickYawLatch = 3; // persist yaw correction for 3 frames after release
+					float filteredYaw = (s_stickYawLatch > 0) ? yawDelta : 0.0f;
+					if (!stickActive && s_stickYawLatch > 0)
+						s_stickYawLatch--;
 
 					g_aswProvider->SetLocomotionYaw(filteredYaw);
 					s_prevActorYaw = yaw;
