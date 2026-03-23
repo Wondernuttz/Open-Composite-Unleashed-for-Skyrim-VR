@@ -423,23 +423,6 @@ bool DlssUpscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* ctx, const Dispatch
 	evalParams.InRenderSubrectDimensions.Width  = params.renderWidth;
 	evalParams.InRenderSubrectDimensions.Height = params.renderHeight;
 
-	{ static int s_logCount = 0; if (s_logCount++ < 3) {
-		D3D11_TEXTURE2D_DESC cDesc = {}, mDesc = {}, dDesc = {};
-		if (colorIn) colorIn->GetDesc(&cDesc);
-		if (mvIn) mvIn->GetDesc(&mDesc);
-		if (depthIn) depthIn->GetDesc(&dDesc);
-		OOVR_LOGF("DLSS Eval #%d eye=%d: color=%ux%u(fmt%u) mv=%ux%u(fmt%u) depth=%ux%u(fmt%u) "
-		    "render=%ux%u output=%ux%u jitter=%.4f,%.4f mvScale=%.1f,%.1f biasMask=%s",
-		    s_logCount, eyeIdx,
-		    cDesc.Width, cDesc.Height, cDesc.Format,
-		    mDesc.Width, mDesc.Height, mDesc.Format,
-		    dDesc.Width, dDesc.Height, dDesc.Format,
-		    params.renderWidth, params.renderHeight,
-		    params.outputWidth, params.outputHeight,
-		    params.jitterX, params.jitterY, params.mvScaleX, params.mvScaleY,
-		    biasIn ? "yes" : "no");
-	}}
-
 	NVSDK_NGX_Result result = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, m_handle[eyeIdx], m_params, &evalParams);
 	if (NVSDK_NGX_FAILED(result)) {
 		static int failCount = 0;

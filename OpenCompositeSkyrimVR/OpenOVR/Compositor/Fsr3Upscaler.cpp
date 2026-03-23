@@ -675,20 +675,6 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 	// SDR color as HDR PQ and breaking temporal accumulation.
 	dispatchDesc.flags = (params.debugMode == 1 ? FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW : 0);
 
-	// Diagnostic: log dispatch parameters — first 2 per eye + every 200th during gameplay
-	{ static int dispatchLog[2] = {0, 0}; static int dispatchFrame[2] = {0, 0};
-	  dispatchFrame[eyeIdx]++;
-	  bool doLog = (dispatchLog[eyeIdx] < 2)
-	      || (dispatchFrame[eyeIdx] % 200 == 0 && dispatchLog[eyeIdx] < 20);
-	  if (doLog) { dispatchLog[eyeIdx]++;
-		OOVR_LOGF("FSR3-DISPATCH eye=%d render=%ux%u output=%ux%u jitter=%.4f,%.4f dt=%.1fms flags=0x%X",
-		    eyeIdx, params.renderWidth, params.renderHeight,
-		    params.outputWidth, params.outputHeight,
-		    params.jitterX, params.jitterY, params.deltaTimeMs, dispatchDesc.flags);
-		OOVR_LOGF("FSR3-DISPATCH mvScale=%.1f,%.1f near=%.1f far=%.0f fovY=%.3f viewToM=%.5f",
-		    dispatchDesc.motionVectorScale.x, dispatchDesc.motionVectorScale.y,
-		    params.cameraNear, params.cameraFar, params.cameraFovY, params.viewToMeters);
-	}}
 
 	// Record FSR 3 commands onto our command list
 	ffxReturnCode_t rc = m_ffxDispatch(&m_fsrContext[eyeIdx], &dispatchDesc.header);
