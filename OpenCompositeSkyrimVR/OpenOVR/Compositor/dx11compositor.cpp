@@ -4119,9 +4119,18 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 					// Use actorYaw delta for the actual rotation amount (warp correction),
 					// but gate it on thumbstick deflection to avoid head-yaw contamination.
+					// Latch the gate for a few frames after stick release — the game actor
+					// continues rotating from physics/momentum after stick goes to zero,
+					// and dropping yawDelta immediately causes the warp to freeze while
+					// the game rotates past it (visible as a snap on stick release).
 					static constexpr float kStickDeadZone = 0.05f; // ~5% deflection
 					bool stickActive = fabsf(rightStickX) > kStickDeadZone;
-					float filteredYaw = stickActive ? yawDelta : 0.0f;
+					static int s_stickYawLatch = 0;
+					if (stickActive)
+						s_stickYawLatch = 3; // persist yaw correction for 3 frames after release
+					float filteredYaw = (s_stickYawLatch > 0) ? yawDelta : 0.0f;
+					if (!stickActive && s_stickYawLatch > 0)
+						s_stickYawLatch--;
 
 					g_aswProvider->SetLocomotionYaw(filteredYaw);
 					s_prevActorYaw = yaw;
