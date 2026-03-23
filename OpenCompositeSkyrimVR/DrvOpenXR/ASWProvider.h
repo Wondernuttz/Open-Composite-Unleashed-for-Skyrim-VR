@@ -2,9 +2,6 @@
 
 #include "XrDriverPrivate.h"
 #include <d3d11.h>
-#include <d3d11_4.h>
-#include <d3d12.h>
-#include <dxgi1_4.h>
 #include <vector>
 #include <chrono>
 
@@ -63,13 +60,8 @@ public:
 
 	/// Warp cached frame to new pose, write result to output texture.
 	/// Call for each eye during the injected frame.
-	/// Uses D3D12 command list internally (no D3D11 context needed).
 	/// @param slotOverride  If >= 0, force reading from this cache slot instead of m_publishedSlot.
 	bool WarpFrame(int eye, const XrPosef& newPose, int slotOverride = -1);
-
-	/// Signal that CacheFrame GPU copies are complete.
-	/// Called by game thread after CacheFrame (inserts D3D11 fence signal).
-	void SignalCacheDone(ID3D11DeviceContext* ctx);
 
 	/// Get the output XR swapchain for the warped frame (for layer assembly).
 	XrSwapchain GetOutputSwapchain() const { return m_outputSwapchain; }
@@ -83,74 +75,9 @@ public:
 	/// Get per-eye sub-image rect for the warped output (stereo-combined).
 	XrRect2Di GetOutputRect(int eye) const;
 
-	/// CPU-wait for the cache fence (D3D11 game draws + cache copies complete).
-	/// Call BEFORE xrWaitFrame(warp) so the GPU drains during the fence wait,
-	/// and xrWaitFrame returns quickly (already past target time).
-	/// WarpFrame will then skip its internal fence wait.
-	void WaitForCacheFence();
-
-	/// Close + execute the D3D12 compute command list from WarpFrame.
-	/// Signals fence but does NOT CPU-wait. GPU runs asynchronously.
-	/// Call after WarpFrame for both eyes, BEFORE xrWaitFrame(warp).
-	/// Returns the fence value to wait on later.
-	uint64_t FlushWarpComputeAsync();
-
-	/// CPU-wait for a previously flushed compute fence, then copy warped
-	/// output to swapchain and release. Call AFTER xrWaitFrame(warp).
-	bool FinishWarpCopy(uint64_t computeFenceVal);
-
 	/// Acquire output swapchain, copy warped textures, release.
 	/// Call once after WarpFrame for both eyes.
 	bool SubmitWarpedOutput(ID3D11DeviceContext* ctx);
-
-	/// Close + execute the D3D12 command list recorded by WarpFrame(),
-	/// signal fence but DO NOT CPU-wait. Call after WarpFrame() for both eyes.
-	/// The GPU work runs asynchronously; call WaitForWarpCompletion() before
-	/// reading the result (or it's called automatically by CopyPrecomputedWarpToSwapchain).
-	bool FlushWarpCommandList();
-
-	/// CPU-wait for the D3D12 warp compute to finish (fence from FlushWarpCommandList).
-	/// Called automatically by CopyPrecomputedWarpToSwapchain, but can be called
-	/// explicitly if needed. Returns true if the warp is ready.
-	bool WaitForWarpCompletion();
-
-	/// Copy the precomputed warp output (from a prior FlushWarpCommandList)
-	/// to the output swapchain. Acquire → D3D11 copy → release.
-	/// Call on a CLEAN D3D11 queue (before game signal) for zero contention.
-	bool CopyPrecomputedWarpToSwapchain(ID3D11DeviceContext* ctx, uint32_t* outSwapIdx = nullptr);
-
-	/// True when a precomputed warp is ready (or pending GPU completion) for CopyPrecomputedWarpToSwapchain.
-	bool HasPrecomputedWarp() const { return m_precomputedWarpReady || m_warpFenceWaitPending; }
-
-	/// Enable/disable GPU gap insertion. Must be enabled by the worker thread
-	/// before InsertGpuGap will do anything (prevents stall with no release).
-	void EnableGpuGap(bool enabled) { m_gpuGapEnabled.store(enabled, std::memory_order_release); }
-
-	/// Insert a GPU-side stall on the D3D11 command stream (after left eye draws).
-	/// The GPU stalls at this point until ReleaseGpuGap() is called from the worker.
-	/// CPU returns immediately — no blocking. No-op if not enabled.
-	bool InsertGpuGap(ID3D11DeviceContext* ctx);
-
-	/// Release the GPU stall by signaling the gap fence from the D3D12 queue.
-	/// Called by the worker thread when xrWaitFrame(warp) returns (~13ms).
-	/// Thread-safe (D3D12 Signal is thread-safe).
-	void ReleaseGpuGap();
-
-	/// Signal that the game thread's staging copy is GPU-submitted (called after D3D11 Flush).
-	/// The D3D12 game copy queue waits on this fence before reading the staging texture.
-	void SignalGameStagingDone(ID3D11DeviceContext* ctx);
-
-	/// Copy game staging textures to swapchain images via D3D12 (both eyes in one batch).
-	/// Bypasses D3D11 GPU queue contention (game draws don't block the copy).
-	/// @param count  Number of copies (typically 2, one per eye)
-	/// @param stagingTexs  Array of source staging textures
-	/// @param swapchainImages  Array of destination swapchain images
-	/// Returns true if D3D12 copy was used, false if fallback D3D11 copy needed.
-	bool CopyGameStagingToSwapchainD3D12(
-	    ID3D11DeviceContext* ctx,
-	    int count,
-	    ID3D11Texture2D** stagingTexs,
-	    ID3D11Texture2D** swapchainImages);
 
 	/// Acquire output swapchain, clear to black, release.
 	/// Used for debug mode 50 to submit a valid black layer (prevents runtime ATW).
@@ -164,11 +91,6 @@ public:
 	/// Get the most recently published cache slot index (-1 if none).
 	int GetPublishedSlot() const { return m_publishedSlot.load(std::memory_order_acquire); }
 
-	/// Get the latest cache slot whose D3D12 fence has completed.
-	/// Prefers preferredSlot if its fence is ready, else returns the most recent ready slot.
-	/// Returns -1 if no slot is ready.
-	int GetLatestReadySlot(int preferredSlot) const;
-
 	/// Store the predicted display time associated with a cache slot.
 	void SetSlotDisplayTime(int slot, XrTime t) {
 		if (slot >= 0 && slot < (int)kAswCacheSlotCount)
@@ -179,16 +101,6 @@ public:
 	XrTime GetSlotDisplayTime(int slot) const {
 		return (slot >= 0 && slot < (int)kAswCacheSlotCount) ? m_slotDisplayTime[slot] : 0;
 	}
-
-	/// Get the current global cache fence value (for CPU-side fence waits).
-	uint64_t GetCacheFenceValue() const { return m_cacheFenceValue.load(std::memory_order_acquire); }
-
-	/// Non-blocking check: what fence value has the GPU completed so far?
-	uint64_t GetFenceCompletedValue() const { return m_d3d12Fence ? m_d3d12Fence->GetCompletedValue() : 0; }
-
-	/// CPU-wait for a specific fence value to complete on the shared D3D11↔D3D12 fence.
-	/// Returns true if the wait succeeded, false on timeout or error.
-	bool WaitForFenceValue(uint64_t value, DWORD timeoutMs = 50);
 
 	/// Age of cached frame in milliseconds (since last CacheFrame call)
 	float GetCacheAgeMs() const {
@@ -281,16 +193,6 @@ private:
 	bool CreateStagingTextures(ID3D11Device* device);
 	bool CreateOutputSwapchain(uint32_t width, uint32_t height);
 	bool CreateDepthSwapchain(uint32_t width, uint32_t height);
-
-	// D3D12 warp pipeline setup
-	bool CreateDX12Device(IDXGIAdapter* adapter);
-	bool CreateSharedFence();
-	bool CreateDX12ComputePipeline();
-	void ShareTextureD3D11ToD3D12(ID3D11Texture2D* d3d11Tex, ID3D12Resource** outD3d12);
-
-	// D3D12 descriptor heap helpers
-	D3D12_GPU_DESCRIPTOR_HANDLE GetSrvGpuHandle(int slot, int eye) const;
-	D3D12_GPU_DESCRIPTOR_HANDLE GetUavGpuHandle(int eye) const;
 
 	int GetActiveCacheSlot() const {
 		int slot = m_warpReadSlot.load(std::memory_order_acquire);
@@ -420,86 +322,5 @@ private:
 		float staticBlendFactor;       // 1.0 when near-stationary (blend scatter→prevColor), 0.0 when moving — 4 bytes
 		float _pad4;                   // alignment                                    — 4 bytes
 	};                                 //                         total: 384 bytes
-
-	// Depth/MV data dimensions are tracked per cache slot.
-
-	// ── D3D12 warp pipeline ──
-	// Separate D3D12 command queue for warp compute, eliminates D3D11 GPU queue contention.
-	ID3D12Device* m_d3d12Device = nullptr;
-	ID3D12CommandQueue* m_d3d12CmdQueue = nullptr;
-	ID3D12CommandAllocator* m_d3d12CmdAlloc = nullptr;      // Warp compute (step P)
-	ID3D12GraphicsCommandList* m_d3d12CmdList = nullptr;   // Warp compute (step P)
-	ID3D12RootSignature* m_d3d12RootSig = nullptr;
-	ID3D12PipelineState* m_d3d12PipelineState = nullptr;     // CSMain PSO
-	ID3D12PipelineState* m_d3d12ClearPSO = nullptr;          // CSClear PSO
-	ID3D12PipelineState* m_d3d12ForwardDepthPSO = nullptr;   // CSForwardDepth PSO (two-pass)
-	ID3D12PipelineState* m_d3d12ForwardColorPSO = nullptr;   // CSForwardColor PSO (two-pass)
-	ID3D12PipelineState* m_d3d12DilatePSO = nullptr;         // CSDilate PSO
-	ID3D12DescriptorHeap* m_d3d12SrvUavHeap = nullptr;
-	ID3D12Resource* m_d3d12ConstantBuffer = nullptr;     // Upload heap, CPU-writable (2x regions, one per eye)
-	void* m_d3d12CbMappedPtr = nullptr;                  // Persistent map (base of 2-eye buffer)
-	uint32_t m_d3d12CbEyeStride = 0;                    // Byte offset between eye 0 and eye 1 CB regions
-	uint32_t m_d3d12HeapDescriptorSize = 0;              // CBV_SRV_UAV descriptor increment
-
-	// Shared fence (D3D11 ↔ D3D12 synchronization)
-	ID3D12Fence* m_d3d12Fence = nullptr;
-	ID3D11Fence* m_d3d11Fence = nullptr;
-	ID3D11Device5* m_d3d11Device5 = nullptr;
-	HANDLE m_fenceSharedHandle = nullptr;
-	HANDLE m_fenceEvent = nullptr;
-	uint64_t m_fenceValue = 0;
-	uint64_t m_warpFenceValue = 0;  // Fence value for warp dispatch completion
-	std::atomic<uint64_t> m_cacheFenceValue{ 0 };  // Latest cache-done fence value
-	uint64_t m_slotCacheFenceValue[kAswCacheSlotCount] = {};  // Per-slot cache-done fence value
-	bool m_cacheFenceWaitedEarly = false;  // Set by WaitForCacheFence(), cleared by WarpFrame
-	std::atomic<uint64_t> m_stagingFenceValue{ 0 }; // Latest staging-flush-done fence value
-
-	// ── GPU gap fence (D3D12→D3D11) ──
-	// Separate from cache fence. InsertGpuGap stalls D3D11 GPU, ReleaseGpuGap signals from D3D12.
-	ID3D12Fence* m_d3d12GapFence = nullptr;
-	ID3D11Fence* m_d3d11GapFence = nullptr;
-	HANDLE m_gapFenceSharedHandle = nullptr;
-	std::atomic<uint64_t> m_gapFenceValue{ 0 };   // monotonic counter
-	std::atomic<uint64_t> m_gapTargetValue{ 0 };   // value GPU is currently waiting for
-	std::atomic<bool> m_gpuGapEnabled{ false };     // must be enabled by worker before InsertGpuGap fires
-
-	// Shared resources (D3D11 textures opened on D3D12)
-	ID3D12Resource* m_d3d12CachedColor[kAswCacheSlotCount][2] = {};
-	ID3D12Resource* m_d3d12CachedMV[kAswCacheSlotCount][2] = {};
-	ID3D12Resource* m_d3d12CachedDepth[kAswCacheSlotCount][2] = {};
-	ID3D12Resource* m_d3d12WarpedOutput[2] = {};
-	ID3D12Resource* m_d3d12AtomicDepth[2] = {};    // forward scatter depth test (R32_UINT)
-	bool m_d3d12Ready = false;  // true when D3D12 pipeline is fully initialized
-	bool m_precomputedWarpReady = false;  // true when warp GPU work is confirmed done
-	bool m_warpFenceWaitPending = false;  // true when GPU work submitted but not yet CPU-waited
-	uint64_t m_precomputedWarpFenceValue = 0;  // fence value for precomputed warp sync
-
-	// D3D12 swapchain image sharing — bypasses D3D11 GPU queue entirely
-	static constexpr uint32_t kMaxSwapchainImages = 4;
-	ID3D12Resource* m_d3d12SwapchainImages[kMaxSwapchainImages] = {};
-	bool m_d3d12DirectCopy = false;  // true when swapchain images are shared to D3D12
-
-
-	// ── D3D12 game staging copy ──
-	// Separate command allocator/list for game staging→swapchain copies (step G2).
-	// Independent of warp compute (step P) and warp copy (step W2) allocators.
-	ID3D12CommandAllocator* m_d3d12GameCopyCmdAlloc = nullptr;
-	ID3D12GraphicsCommandList* m_d3d12GameCopyCmdList = nullptr;
-	bool m_gameCopyFenceWaitPending = false;
-	uint64_t m_gameCopyFenceValue = 0;
-	HANDLE m_gameCopyFenceEvent = nullptr;
-
-	// Cache of D3D12 handles for shared D3D11 textures (lazy-populated).
-	// Key: raw D3D11 texture pointer. Value: D3D12 resource.
-	// Used for both staging textures and game swapchain images.
-	static constexpr uint32_t kMaxGameSharedTextures = 16;
-	struct SharedTexEntry {
-		ID3D11Texture2D* d3d11Tex = nullptr;
-		ID3D12Resource* d3d12Res = nullptr;
-	};
-	SharedTexEntry m_gameSharedTexCache[kMaxGameSharedTextures] = {};
-	uint32_t m_gameSharedTexCount = 0;
-
-	ID3D12Resource* GetOrShareTextureD3D12(ID3D11Texture2D* d3d11Tex);
 
 };
