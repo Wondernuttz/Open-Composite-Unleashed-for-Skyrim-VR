@@ -41,8 +41,10 @@ public:
 	 *  called before calling either Invoke or ovr_CommitTextureSwapChain, and ResetSubmitContext after
 	 *  calling both of them.
 	 */
-	virtual void LoadSubmitContext(){};
-	virtual void ResetSubmitContext(){};
+	virtual void LoadSubmitContext() {};
+	virtual void ResetSubmitContext() {};
+
+	virtual void PreemptLeftEye() {};
 
 	// When true, skip all post-processing (FSR/DLAA/CAS) and use direct copy.
 	// Set for overlay compositors — post-processing is designed for game eye textures only.

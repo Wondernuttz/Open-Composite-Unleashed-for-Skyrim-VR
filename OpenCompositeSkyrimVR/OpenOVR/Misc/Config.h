@@ -104,26 +104,35 @@ public:
 	inline int Fsr3DebugMode() const { return fsr3DebugMode; }
 
 	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
-	inline bool  DlssEnabled()   const { return dlssEnabled; }
-	inline int   DlssPreset()    const { return dlssPreset; }    // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
-	inline float DlssSharpness() const { return dlssSharpness; }
-	inline float DlssMvScale()   const { return dlssMvScale; }
+	inline bool  DlssEnabled()        const { return dlssEnabled; }
+	inline int   DlssPreset()         const { return dlssPreset; }    // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
+	inline float DlssSharpness()      const { return dlssSharpness; }
+	inline float DlssMvScale()        const { return dlssMvScale; }
+	inline float DlssBiasBase()       const { return dlssBiasBase; }       // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
+	inline float DlssBiasEdgeBoost()  const { return dlssBiasEdgeBoost; }  // Extra bias at depth edges (foliage silhouettes)
+	inline float DlssJitterScale()    const { return dlssJitterScale; }    // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	inline bool MotionVectorsEnabled() const { return motionVectorsEnabled; }
 	inline float MotionVectorScale() const { return motionVectorScale; }
 
-	// OCU ASW — PC-side Asynchronous SpaceWarp (experimental)
+	// OCU ASW — Asynchronous SpaceWarp
 	inline bool ASWEnabled() const { return aswEnabled; }
+	inline bool ASWForceCustom() const { return aswForceCustom; } // true = always use custom ASW, false = prefer runtime (XR_FB_space_warp)
 	inline float ASWWarpStrength() const { return aswWarpStrength; }
 	inline float ASWRotationScale() const { return aswRotationScale; }
 	inline float ASWTranslationScale() const { return aswTranslationScale; }
+	inline float ASWLocoScale() const { return aswLocoScale; }
 	inline float ASWDepthScale() const { return aswDepthScale; }
 	inline float ASWEdgeFadeWidth() const { return aswEdgeFadeWidth; }
-	inline float ASWLocoScale() const { return aswLocoScale; }
 	inline float ASWNearFadeDepth() const { return aswNearFadeDepth; }
 	inline float ASWMVConfidence() const { return aswMVConfidence; }
 	inline float ASWMVPixelScale() const { return aswMVPixelScale; }
+	inline int ASWDebugMode() const { return aswDebugMode; }
+	inline bool ASWCaptureEnabled() const { return aswCaptureEnabled; }
+	inline bool ASWConcurrentFrameThread() const { return aswConcurrentFrameThread; }
+	inline bool ASWSpeculativeTrackingLead() const { return aswSpeculativeTrackingLead; }
+	inline bool ASWBufferEnabled() const { return aswBufferEnabled; }
 
 	// CAS sharpening (RCAS) — independent of FSR
 	inline bool CasEnabled() const { return casEnabled; }
@@ -147,12 +156,14 @@ public:
 	float aswWarpStrength = 1.0f;  // 0.0 = no warp (static copy), 1.0 = full correction
 	float aswRotationScale = 1.0f; // 0.0 = no rotation correction, 1.0 = full
 	float aswTranslationScale = 1.0f; // 0.0 = no translation correction, 1.0 = full
+	float aswLocoScale = 1.0f;     // locomotion correction scale (0=off, 1=full). Multiplied by timingRatio (~0.5).
 	float aswDepthScale = 1.0f;    // multiplier on linearized depth (parallax intensity)
 	float aswEdgeFadeWidth = 3.0f;   // depth-edge fade threshold (depth ratio units)
-	float aswLocoScale = 0.5f;       // stick locomotion parallax correction (0=off, 0.5=half-frame)
 	float aswNearFadeDepth = 0.0f;   // parallax fades to 0 below this depth (meters); 0 = disabled
-	float aswMVConfidence = 0.0f;    // 0=pure parallax (default off), 1=full MV object correction
+	float aswMVConfidence = 0.5f;    // MV loco correction strength: 0.5 = half-frame (midpoint warp). 0 = off.
 	float aswMVPixelScale = 1.0f;    // overall MV magnitude multiplier (1.0 = identity)
+	int aswDebugMode = 0;            // 0=normal, 1=depth viz, 2=linearized depth, 3=MV magnitude, 50=black warp frame, 56=stationary NPC dest-depth reject, 57=stationary NPC path overview
+	bool aswCaptureEnabled = false;  // true = capture warp diagnostics (color/depth/MV/CB) to TestWarp folder
 
 private:
 	static int ini_handler(
@@ -255,6 +266,10 @@ private:
 
 	// OCU ASW — PC-side Asynchronous SpaceWarp (experimental)
 	bool aswEnabled = false;
+	bool aswForceCustom = false;           // true = always use custom PC-side ASW, false = prefer runtime XR_FB_space_warp if available
+	bool aswConcurrentFrameThread = false; // If true, dedicated XR thread owns wait/begin/end in buffered mode
+	bool aswSpeculativeTrackingLead = false; // Diagnostic default: prefer begun-slot sync over speculative +1 period lead
+	bool aswBufferEnabled = true;            // true = async warp worker thread (clean GPU queue), false = inline warp on game thread
 	// NOTE: aswWarpStrength, aswRotationScale, aswTranslationScale, aswDepthScale
 	// are declared in the public section above for hot-reload access
 
@@ -277,10 +292,13 @@ private:
 	bool vrsFavorHorizontal = true;
 
 	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
-	bool  dlssEnabled   = false;
-	int   dlssPreset    = 0;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
-	float dlssSharpness = 0.0f;
-	float dlssMvScale   = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
+	bool  dlssEnabled      = false;
+	int   dlssPreset       = 1;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
+	float dlssSharpness    = 20.0f;
+	float dlssMvScale      = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
+	float dlssBiasBase     = 0.20f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
+	float dlssBiasEdgeBoost = 0.50f; // Extra bias at depth edges (foliage silhouettes)
+	float dlssJitterScale  = 0.5f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;

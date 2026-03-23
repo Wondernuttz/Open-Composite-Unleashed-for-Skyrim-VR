@@ -66,7 +66,10 @@ vr::HmdMatrix44_t XrHMD::GetProjectionMatrix(vr::EVREye eEye, float fNearZ, floa
 
 		XrViewState state = { XR_TYPE_VIEW_STATE };
 		uint32_t viewCount = 0;
-		OOVR_FAILED_XR_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
+		{
+			std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
+			OOVR_FAILED_XR_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
+		}
 		OOVR_FALSE_ABORT(viewCount == XruEyeCount);
 	}
 
@@ -156,7 +159,10 @@ void XrHMD::GetProjectionRaw(vr::EVREye eEye, float* pfLeft, float* pfRight, flo
 
 		XrViewState state = { XR_TYPE_VIEW_STATE };
 		uint32_t viewCount = 0;
-		OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
+		{
+			std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
+			OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
+		}
 		if (viewCount != XruEyeCount) {
 			OOVR_LOG_ONCEF("Eye count is incorrect: %d", viewCount);
 			return;
@@ -258,7 +264,10 @@ vr::HmdMatrix34_t XrHMD::GetEyeToHeadTransform(vr::EVREye eEye)
 			XrViewState vsState = { XR_TYPE_VIEW_STATE };
 			uint32_t vsCount = 0;
 			XrView vsViews[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
-			OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &vsLocateInfo, &vsState, XruEyeCount, &vsCount, vsViews));
+			{
+				std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
+				OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &vsLocateInfo, &vsState, XruEyeCount, &vsCount, vsViews));
+			}
 
 			if (vsCount == XruEyeCount) {
 				xr_gbl->latchedViewSpaceViews[0] = vsViews[0];
@@ -285,7 +294,10 @@ vr::HmdMatrix34_t XrHMD::GetEyeToHeadTransform(vr::EVREye eEye)
 		uint32_t viewCount = 0;
 		XrViewState viewState = { XR_TYPE_VIEW_STATE };
 		XrView _views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
-		OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &viewState, XruEyeCount, &viewCount, _views));
+		{
+			std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
+			OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &viewState, XruEyeCount, &viewCount, _views));
+		}
 
 		if (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT && viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) {
 			OOVR_FALSE_ABORT(viewCount == XruEyeCount);
@@ -338,7 +350,10 @@ vr::HiddenAreaMesh_t XrHMD::GetHiddenAreaMesh(vr::EVREye eEye, vr::EHiddenAreaMe
 	// First find out what size we need to allocate
 	// Note that this doesn't return XR_ERROR_SIZE_INSUFFICIENT, since setting one of the input counts to zero is special-cased
 	XrVisibilityMaskKHR mask = { XR_TYPE_VISIBILITY_MASK_KHR };
-	OOVR_FAILED_XR_ABORT(xr_ext->xrGetVisibilityMaskKHR(xr_session.get(), XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye, xrType, &mask));
+	{
+		std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
+		OOVR_FAILED_XR_ABORT(xr_ext->xrGetVisibilityMaskKHR(xr_session.get(), XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye, xrType, &mask));
+	}
 
 	// TODO handle cases where a mask isn't available
 
@@ -349,7 +364,10 @@ vr::HiddenAreaMesh_t XrHMD::GetHiddenAreaMesh(vr::EVREye eEye, vr::EHiddenAreaMe
 	mask.vertices = new XrVector2f[mask.vertexCapacityInput];
 
 	// Now actually request the mask data
-	OOVR_FAILED_XR_ABORT(xr_ext->xrGetVisibilityMaskKHR(xr_session.get(), XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye, xrType, &mask));
+	{
+		std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
+		OOVR_FAILED_XR_ABORT(xr_ext->xrGetVisibilityMaskKHR(xr_session.get(), XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, eye, xrType, &mask));
+	}
 
 	// Convert the data into something usable by SteamVR - it doesn't use indices
 	vr::HiddenAreaMesh_t result = {};
@@ -447,7 +465,12 @@ void XrHMD::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDevicePose_t*
 		auto baseSpace = xr_space_from_tracking_origin(origin);
 		XrSpaceVelocity velocity{ XR_TYPE_SPACE_VELOCITY };
 		XrSpaceLocation locInfo{ XR_TYPE_SPACE_LOCATION, &velocity, 0, {} };
-		if (XR_SUCCEEDED(xrLocateSpace(xr_gbl->viewSpace, baseSpace, xr_gbl->nextPredictedFrameTime, &locInfo))) {
+		XrResult locateRes = XR_ERROR_RUNTIME_FAILURE;
+		{
+			std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
+			locateRes = xrLocateSpace(xr_gbl->viewSpace, baseSpace, xr_gbl->nextPredictedFrameTime, &locInfo);
+		}
+		if (XR_SUCCEEDED(locateRes)) {
 			pose->vVelocity = X2S_v3f(velocity.linearVelocity);
 			pose->vAngularVelocity = X2S_v3f(velocity.angularVelocity);
 		} else {
@@ -478,7 +501,10 @@ float XrHMD::GetIPD()
 			XrViewState vsState = { XR_TYPE_VIEW_STATE };
 			uint32_t vsCount = 0;
 			XrView vsViews[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
-			OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &vsLocateInfo, &vsState, XruEyeCount, &vsCount, vsViews));
+			{
+				std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
+				OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &vsLocateInfo, &vsState, XruEyeCount, &vsCount, vsViews));
+			}
 
 			if (vsCount == XruEyeCount) {
 				xr_gbl->latchedViewSpaceViews[0] = vsViews[0];
@@ -507,7 +533,10 @@ float XrHMD::GetIPD()
 	uint32_t viewCount = 0;
 	XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
 
-	OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
+	{
+		std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
+		OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &state, XruEyeCount, &viewCount, views));
+	}
 	OOVR_FALSE_ABORT(viewCount == XruEyeCount);
 
 	if (state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT && state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)

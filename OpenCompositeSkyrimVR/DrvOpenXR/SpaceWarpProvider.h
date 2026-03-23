@@ -41,6 +41,9 @@ typedef struct XrSystemSpaceWarpPropertiesFB {
 // Global: set to true during extension registration if runtime supports it
 extern bool g_spaceWarpAvailable;
 
+class SpaceWarpProvider;
+extern SpaceWarpProvider* g_spaceWarpProvider;
+
 class SpaceWarpProvider {
 public:
 	SpaceWarpProvider() = default;

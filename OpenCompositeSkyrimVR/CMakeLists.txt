@@ -211,6 +211,9 @@ add_library(DrvOpenXR STATIC
 	DrvOpenXR/ASWProvider.cpp
 	DrvOpenXR/ASWProvider.h
 
+	DrvOpenXR/SpaceWarpProvider.cpp
+	DrvOpenXR/SpaceWarpProvider.h
+
 	DrvOpenXR/tmp_gfx/TemporaryGraphics.cpp
 	DrvOpenXR/tmp_gfx/TemporaryGraphics.h
 	DrvOpenXR/tmp_gfx/TemporaryD3D11.cpp
@@ -223,7 +226,7 @@ add_library(DrvOpenXR STATIC
 )
 target_include_directories(DrvOpenXR PUBLIC DrvOpenXR/pub ${CMAKE_BINARY_DIR})
 target_include_directories(DrvOpenXR PRIVATE DrvOpenXR OpenOVR)
-target_link_libraries(DrvOpenXR PUBLIC OpenVR ${XrLib} ${glmLib})
+target_link_libraries(DrvOpenXR PUBLIC OpenVR ${XrLib} ${glmLib} d3d12.lib dxgi.lib)
 target_compile_definitions(DrvOpenXR PRIVATE ${GRAPHICS_API_SUPPORT_FLAGS} -D_CRT_SECURE_NO_WARNINGS)
 source_group(Public REGULAR_EXPRESSION DrvOpenXR/pub/*)
 

@@ -188,6 +188,13 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	if (availableExtensions.contains(XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME))
 		extensions.push_back(XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME);
 
+	// XR_FB_space_warp — runtime-side ASW (Meta Quest via Link/AirLink)
+	if (availableExtensions.count("XR_FB_space_warp")) {
+		extensions.push_back("XR_FB_space_warp");
+		g_spaceWarpAvailable = true;
+		OOVR_LOG("XR_FB_space_warp extension available and enabled");
+	}
+
 	const char* const layers[] = {
 #ifdef XR_VALIDATION_LAYER_PATH
 		"XR_APILAYER_LUNARG_core_validation",

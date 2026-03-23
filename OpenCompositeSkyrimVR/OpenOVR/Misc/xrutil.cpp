@@ -8,7 +8,9 @@
 
 XrInstance xr_instance = XR_NULL_HANDLE;
 SessionWrapper xr_session;
+std::mutex xr_session_call_mutex;
 XrSystemId xr_system = XR_NULL_SYSTEM_ID;
+XrAction xr_rightStickX_action = XR_NULL_HANDLE;
 XrViewConfigurationView xr_main_views[XruEyeCount] = {};
 XrSessionGlobals* xr_gbl = nullptr;
 

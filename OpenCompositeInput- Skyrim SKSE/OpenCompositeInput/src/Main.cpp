@@ -23,6 +23,7 @@ namespace RE { class GASGlobalContext; } // Forward decl needed by GFxMovieRoot.
 #include <RE/N/NiCamera.h>
 #include <RE/N/NiRTTI.h>
 #include <RE/P/PlayerCamera.h>
+#include <RE/P/PlayerCharacter.h>
 #include <RE/R/Renderer.h>
 #include <RE/U/UI.h>
 #include <SKSE/SKSE.h>
@@ -102,7 +103,15 @@ struct OCRenderTargetBridge {
 
 	// RendererShadowState base address — compositor reads VP matrices at known offsets
 	uint64_t rssBasePtr;      // uintptr_t → BSGraphics::RendererShadowState singleton
-	uint8_t  reserved2[16];   // Future use (24 - 8 = 16 bytes)
+
+	// Actor position for stick locomotion correction (moves only with stick, not head tracking)
+	uint64_t actorPosPtr;     // float* → PlayerCharacter::data.location.x (NiPoint3: x, y, z)
+	uint64_t actorYawPtr;     // float* → PlayerCharacter::data.angle.z (actor heading, radians)
+
+	// Camera world position (NiCamera::world.translate) — includes actorPos + eye height +
+	// walk-cycle camera bob + HMD tracking. Updated by the engine each frame during scene
+	// graph update. Z delta captures ALL vertical camera motion for MV compensation.
+	uint64_t cameraPosPtr;    // float* → NiCamera::world.translate.x (NiPoint3: x, y, z)
 };
 #pragma pack(pop)
 
@@ -328,6 +337,22 @@ namespace
 			reinterpret_cast<void*>(g_pBridge->playerPosPtr),
 			reinterpret_cast<void*>(g_pBridge->playerYawPtr));
 
+		// Store PlayerCharacter actor position pointer for stick locomotion correction.
+		// Unlike PlayerCamera::pos (which includes head tracking), actor position moves
+		// only with stick locomotion and game physics — clean signal for ASW.
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (player) {
+			g_pBridge->actorPosPtr = reinterpret_cast<uint64_t>(&player->data.location.x);
+			g_pBridge->actorYawPtr = reinterpret_cast<uint64_t>(&player->data.angle.z);
+			SKSE::log::info("RT Bridge: PlayerCharacter actorPos={:p} actorYaw={:p} ({:.1f}, {:.1f}, {:.1f}) yaw={:.4f}",
+				reinterpret_cast<void*>(g_pBridge->actorPosPtr),
+				reinterpret_cast<void*>(g_pBridge->actorYawPtr),
+				player->data.location.x, player->data.location.y, player->data.location.z,
+				player->data.angle.z);
+		} else {
+			SKSE::log::warn("RT Bridge: PlayerCharacter singleton not available yet");
+		}
+
 		// Find NiCamera in scene graph via cameraRoot
 		auto* cameraRoot = playerCamera->cameraRoot.get();
 		if (!cameraRoot) {
@@ -343,12 +368,14 @@ namespace
 				auto* niCam = static_cast<RE::NiCamera*>(child);
 				auto& rtData = niCam->GetRuntimeData();
 				g_pBridge->worldToCamPtr = reinterpret_cast<uint64_t>(&rtData.worldToCam[0][0]);
+				g_pBridge->cameraPosPtr = reinterpret_cast<uint64_t>(&niCam->world.translate.x);
 				// Store viewFrustum pointer (inline frustum from RUNTIME_DATA2)
 				auto& rtData2 = niCam->GetRuntimeData2();
 				g_pBridge->viewFrustumPtr = reinterpret_cast<uint64_t>(&rtData2.viewFrustum);
-				SKSE::log::info("RT Bridge: NiCamera found at {:p}, worldToCam at {:p}, viewFrustum at {:p}",
+				SKSE::log::info("RT Bridge: NiCamera found at {:p}, worldToCam at {:p}, cameraPos at {:p}, viewFrustum at {:p}",
 					reinterpret_cast<void*>(niCam),
 					reinterpret_cast<void*>(g_pBridge->worldToCamPtr),
+					reinterpret_cast<void*>(g_pBridge->cameraPosPtr),
 					reinterpret_cast<void*>(g_pBridge->viewFrustumPtr));
 
 				// Log NiCamera world transform (pure rotation + position, no projection)
@@ -635,11 +662,11 @@ namespace
 			auto err = overlay->ShowKeyboard(
 				vr::k_EGamepadTextInputModeNormal,
 				vr::k_EGamepadTextInputLineModeSingleLine,
-				0,                                                         // flags
 				"Enter text",                                              // description
 				charLimit,                                                 // max chars (hard-capped at 31)
 				a_info->startingText ? a_info->startingText : "",          // existing text
-				0);                                                        // user value
+				false,                                                     // bUseMinimalMode
+				0);                                                        // uUserValue
 
 			if (err != vr::VROverlayError_None) {
 				SKSE::log::error("ShowKeyboard failed with error {}", static_cast<int>(err));

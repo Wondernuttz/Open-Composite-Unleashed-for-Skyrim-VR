@@ -331,11 +331,11 @@ namespace
 			auto err = overlay->ShowKeyboard(
 				vr::k_EGamepadTextInputModeNormal,
 				vr::k_EGamepadTextInputLineModeSingleLine,
-				0,                                                         // flags
 				"Enter text",                                              // description
 				charLimit,                                                 // max chars (hard-capped at 31)
 				a_info->startingText ? a_info->startingText : "",          // existing text
-				0);                                                        // user value
+				false,                                                     // bUseMinimalMode
+				0);                                                        // uUserValue
 
 			if (err != vr::VROverlayError_None) {
 				SKSE::log::error("ShowKeyboard failed with error {}", static_cast<int>(err));

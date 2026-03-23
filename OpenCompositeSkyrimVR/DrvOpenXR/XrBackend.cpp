@@ -30,8 +30,9 @@
 #include "../OpenOVR/convert.h"
 #include "generated/static_bases.gen.h"
 
-#include "generated/interfaces/IVRCompositor_018.h"
 #include "../OpenOVR/Misc/OVRPerfHook.h"
+#include "generated/interfaces/IVRCompositor_018.h"
+
 
 #include "tmp_gfx/TemporaryGraphics.h"
 
@@ -45,6 +46,7 @@
 
 #include "../OpenOVR/Misc/Config.h"
 #include "ASWProvider.h"
+#include "SpaceWarpProvider.h"
 
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 #include <d3d11.h>
@@ -68,7 +70,8 @@ struct OCAimPoseData {
 static OCAimPoseData g_aimPoses = {};
 static HWND g_aimPoseHwnd = nullptr;
 
-static BOOL CALLBACK FindGameWindowCB(HWND hwnd, LPARAM lParam) {
+static BOOL CALLBACK FindGameWindowCB(HWND hwnd, LPARAM lParam)
+{
 	DWORD pid;
 	GetWindowThreadProcessId(hwnd, &pid);
 	if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd)) {
@@ -547,11 +550,329 @@ void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
 	}
 }
 
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+namespace {
+constexpr float kAswWaitStallThresholdMs = 30.0f;
+}
+
+void XrBackend::ResetAswSplitFrameState()
+{
+	aswSplitPhase = AswSplitPhase::None;
+	aswWarpFrameState = XrFrameState{ XR_TYPE_FRAME_STATE };
+	aswRealFrameState = XrFrameState{ XR_TYPE_FRAME_STATE };
+	aswEstimatedRealDisplayTime = 0;
+}
+
+bool XrBackend::ShouldUseAswSplitPipeline() const
+{
+	// Split-frame pipeline is only for custom PC-side ASW, not Meta space warp.
+	// When g_spaceWarpProvider is active, the runtime handles reprojection —
+	// no warp frames needed from our side.
+	if (g_spaceWarpProvider && g_spaceWarpProvider->IsReady())
+		return false;
+
+	return g_aswProvider && g_aswProvider->IsReady() && g_aswProvider->HasPreviousCachedFrame()
+	    && !g_aswProvider->IsPaused()
+	    && oovr_global_configuration.ASWEnabled() && sessionActive
+	    && aswStallCount < 5;
+}
+
+void XrBackend::EndActiveFrameEmpty(XrTime displayTime)
+{
+	XrFrameEndInfo endInfo{ XR_TYPE_FRAME_END_INFO };
+	endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+	endInfo.displayTime = displayTime;
+	endInfo.layers = nullptr;
+	endInfo.layerCount = 0;
+	xrEndFrame(xr_session.get(), &endInfo);
+}
+
+void XrBackend::LatchViewsForDisplayTime(XrTime displayTime)
+{
+	xr_gbl->nextPredictedFrameTime = displayTime;
+
+	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	locateInfo.displayTime = displayTime;
+	locateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+	XrViewState viewState = { XR_TYPE_VIEW_STATE };
+	uint32_t viewCount = 0;
+	XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+	OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &viewState, XruEyeCount, &viewCount, views));
+
+	for (int eye = 0; eye < XruEyeCount; eye++) {
+		projectionViews[eye].fov = views[eye].fov;
+
+		XrPosef pose = views[eye].pose;
+		if ((viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
+			pose.orientation = XrQuaternionf{ 0, 0, 0, 1 };
+		}
+		if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0) {
+			pose.position = XrVector3f{ 0, 1.75, 0 };
+		}
+
+		projectionViews[eye].pose = pose;
+	}
+
+	xr_gbl->latchedViews[0] = views[0];
+	xr_gbl->latchedViews[1] = views[1];
+	xr_gbl->latchedViewStateFlags = viewState.viewStateFlags;
+	xr_gbl->viewSpaceViewsLatched = false;
+	xr_gbl->viewsLatched = true;
+	{
+		static bool s = false;
+		if (!s) {
+			s = true;
+			OOVR_LOGF("[diag] WaitForTrackingData: views LATCHED (viewsLatched=true)");
+#ifdef _WIN32
+			DWORD jiggleVal = 0;
+			DWORD jiggleSize = sizeof(jiggleVal);
+			LONG jiggleResult = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Virtual Desktop, Inc.\\OpenXR",
+			    L"jiggle_view_rotations", RRF_RT_REG_DWORD, nullptr, &jiggleVal, &jiggleSize);
+			if (jiggleResult == ERROR_SUCCESS)
+				OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations = %lu", jiggleVal);
+			else if (jiggleResult == ERROR_FILE_NOT_FOUND)
+				OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations NOT SET (key absent)");
+			else
+				OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations read failed (error %ld)", jiggleResult);
+#endif
+		}
+	}
+}
+
+bool XrBackend::SubmitAswWarpFrame(const XrFrameState& frameState,
+    XrCompositionLayerBaseHeader const* const* extraLayers,
+    int extraLayerCount)
+{
+	if (!g_aswProvider || !g_aswProvider->IsReady()) {
+		EndActiveFrameEmpty(frameState.predictedDisplayTime);
+		return false;
+	}
+
+	ID3D11DeviceContext* aswCtx = nullptr;
+	if (g_aswProvider->GetDevice())
+		g_aswProvider->GetDevice()->GetImmediateContext(&aswCtx);
+	if (!aswCtx) {
+		EndActiveFrameEmpty(frameState.predictedDisplayTime);
+		return false;
+	}
+
+	bool submittedWarp = false;
+
+	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	locateInfo.displayTime = frameState.predictedDisplayTime;
+	locateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+	XrViewState viewState = { XR_TYPE_VIEW_STATE };
+	uint32_t viewCount = 0;
+	XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+	xrLocateViews(xr_session.get(), &locateInfo, &viewState, XruEyeCount, &viewCount, views);
+
+	bool warpOk = true;
+	for (int eye = 0; eye < 2; eye++) {
+		if (!g_aswProvider->WarpFrame(eye, views[eye].pose)) {
+			warpOk = false;
+			break;
+		}
+	}
+
+	if (warpOk && g_aswProvider->SubmitWarpedOutput(aswCtx)) {
+		XrCompositionLayerProjectionView warpedViews[2] = {};
+		XrCompositionLayerDepthInfoKHR depthInfo[2] = {};
+		bool hasDepth = (g_aswProvider->GetDepthSwapchain() != XR_NULL_HANDLE);
+
+		for (int eye = 0; eye < 2; eye++) {
+			warpedViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+			warpedViews[eye].pose = g_aswProvider->GetPrecompPose(eye);
+			warpedViews[eye].fov = g_aswProvider->GetCachedFov(eye);
+			warpedViews[eye].subImage.swapchain = g_aswProvider->GetOutputSwapchain();
+			warpedViews[eye].subImage.imageArrayIndex = 0;
+			warpedViews[eye].subImage.imageRect = g_aswProvider->GetOutputRect(eye);
+
+			if (hasDepth) {
+				depthInfo[eye].type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR;
+				depthInfo[eye].next = nullptr;
+				depthInfo[eye].subImage.swapchain = g_aswProvider->GetDepthSwapchain();
+				depthInfo[eye].subImage.imageArrayIndex = 0;
+				depthInfo[eye].subImage.imageRect = g_aswProvider->GetOutputRect(eye);
+				depthInfo[eye].minDepth = 0.0f;
+				depthInfo[eye].maxDepth = 1.0f;
+				depthInfo[eye].nearZ = g_aswProvider->GetCachedNear();
+				depthInfo[eye].farZ = g_aswProvider->GetCachedFar();
+				warpedViews[eye].next = &depthInfo[eye];
+			}
+		}
+
+		XrCompositionLayerProjection warpedLayer{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+		warpedLayer.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+		warpedLayer.views = warpedViews;
+		warpedLayer.viewCount = 2;
+
+		std::vector<XrCompositionLayerBaseHeader const*> aswLayers;
+		aswLayers.push_back((XrCompositionLayerBaseHeader*)&warpedLayer);
+		for (int i = 1; i < extraLayerCount; i++)
+			aswLayers.push_back(extraLayers[i]);
+
+		XrFrameEndInfo endInfo{ XR_TYPE_FRAME_END_INFO };
+		endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		endInfo.displayTime = frameState.predictedDisplayTime;
+		endInfo.layers = aswLayers.data();
+		endInfo.layerCount = (uint32_t)aswLayers.size();
+		xrEndFrame(xr_session.get(), &endInfo);
+		submittedWarp = true;
+	} else {
+		EndActiveFrameEmpty(frameState.predictedDisplayTime);
+	}
+
+	aswCtx->Release();
+	return submittedWarp;
+}
+
+bool XrBackend::BeginAswWarpFrameForSplit()
+{
+	XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+	aswWarpFrameState = XrFrameState{ XR_TYPE_FRAME_STATE };
+
+	QueryPerformanceCounter(&waitFrameStart);
+	XrResult waitRes = xrWaitFrame(xr_session.get(), &waitInfo, &aswWarpFrameState);
+	QueryPerformanceCounter(&waitFrameEnd);
+	measuredWaitFrameMs = (float)(waitFrameEnd.QuadPart - waitFrameStart.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+
+	if (XR_FAILED(waitRes)) {
+		OOVR_LOGF("ASW split: xrWaitFrame(warp) failed result=%d", (int)waitRes);
+		return false;
+	}
+
+	if (aswWarpFrameState.predictedDisplayPeriod > 0)
+		predictedDisplayPeriodMs = (float)(aswWarpFrameState.predictedDisplayPeriod / 1000000.0);
+
+	if (measuredWaitFrameMs > kAswWaitStallThresholdMs) {
+		aswStallCount++;
+		OOVR_LOGF("ASW split: xrWaitFrame(warp) stalled %.1fms (stall %d/5)",
+		    measuredWaitFrameMs, aswStallCount);
+		XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+		xrBeginFrame(xr_session.get(), &beginInfo);
+		EndActiveFrameEmpty(aswWarpFrameState.predictedDisplayTime);
+		return false;
+	}
+
+	aswStallCount = 0;
+
+	XrDuration realOffset = aswWarpFrameState.predictedDisplayPeriod;
+	if (realOffset <= 0 && predictedDisplayPeriodMs > 0.0f)
+		realOffset = (XrDuration)(predictedDisplayPeriodMs * 1000000.0f);
+	if (realOffset <= 0) {
+		OOVR_LOG("ASW split: runtime gave no predicted display period; falling back to inline warp");
+		XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+		xrBeginFrame(xr_session.get(), &beginInfo);
+		EndActiveFrameEmpty(aswWarpFrameState.predictedDisplayTime);
+		return false;
+	}
+
+	XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+	OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
+
+	aswEstimatedRealDisplayTime = aswWarpFrameState.predictedDisplayTime + realOffset;
+	LatchViewsForDisplayTime(aswEstimatedRealDisplayTime);
+	aswSplitPhase = AswSplitPhase::WarpFrameBegun;
+
+	{
+		static int s = 0;
+		if (s++ < 20 || (s % 300 == 0)) {
+			OOVR_LOGF("ASW split: warp slot begun display=%.3fms estReal=%.3fms",
+			    aswWarpFrameState.predictedDisplayTime / 1000000.0,
+			    aswEstimatedRealDisplayTime / 1000000.0);
+		}
+	}
+
+	return true;
+}
+
+bool XrBackend::BeginRealFrameAfterAswWarp(float* outWaitMs)
+{
+	XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+	aswRealFrameState = XrFrameState{ XR_TYPE_FRAME_STATE };
+	auto t0 = std::chrono::high_resolution_clock::now();
+	XrResult waitRes = xrWaitFrame(xr_session.get(), &waitInfo, &aswRealFrameState);
+	auto t1 = std::chrono::high_resolution_clock::now();
+	float realWaitMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+	if (outWaitMs)
+		*outWaitMs = realWaitMs;
+
+	if (XR_FAILED(waitRes)) {
+		OOVR_LOGF("ASW split: xrWaitFrame(real) failed result=%d", (int)waitRes);
+		renderingFrame = false;
+		submittedEyeTextures = false;
+		ResetAswSplitFrameState();
+		return false;
+	}
+
+	if (aswRealFrameState.predictedDisplayPeriod > 0)
+		predictedDisplayPeriodMs = (float)(aswRealFrameState.predictedDisplayPeriod / 1000000.0);
+
+	XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+	OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
+	QueryPerformanceCounter(&beginFrameQpc);
+
+	double deltaMs = (double)(aswRealFrameState.predictedDisplayTime - aswEstimatedRealDisplayTime) / 1000000.0;
+	{
+		static int s = 0;
+		if (s++ < 20 || fabs(deltaMs) > 0.5 || realWaitMs > 2.0f) {
+			OOVR_LOGF("ASW split: real slot begun display=%.3fms estDelta=%.3fms wait=%.3fms",
+			    aswRealFrameState.predictedDisplayTime / 1000000.0,
+			    deltaMs,
+			    realWaitMs);
+		}
+	}
+
+	aswSplitPhase = AswSplitPhase::RealFrameBegun;
+	return true;
+}
+
+void XrBackend::FinishAswWarpFrameAfterFirstEye(float cpuToFirstSubmitMs, float firstSubmitInvokeMs)
+{
+	if (aswSplitPhase != AswSplitPhase::WarpFrameBegun)
+		return;
+
+	auto warpStart = std::chrono::high_resolution_clock::now();
+	bool warpSubmitted = SubmitAswWarpFrame(aswWarpFrameState, nullptr, 0);
+	auto warpEnd = std::chrono::high_resolution_clock::now();
+	float warpSubmitCpuMs = std::chrono::duration<float, std::milli>(warpEnd - warpStart).count();
+	float realWaitMs = 0.0f;
+	bool realStarted = BeginRealFrameAfterAswWarp(&realWaitMs);
+
+	float budgetMs = predictedDisplayPeriodMs > 0.0f ? predictedDisplayPeriodMs : 13.33f;
+	float cpuBeforeFirstSubmitMs = cpuToFirstSubmitMs - firstSubmitInvokeMs;
+	if (cpuBeforeFirstSubmitMs < 0.0f)
+		cpuBeforeFirstSubmitMs = 0.0f;
+
+	{
+		static int s = 0;
+		float combinedCpuMs = cpuToFirstSubmitMs + warpSubmitCpuMs;
+		if (s++ < 80 || combinedCpuMs > budgetMs || realWaitMs > 1.0f || warpSubmitCpuMs > 3.0f) {
+			OOVR_LOGF("ASW split timing: preSubmitCpu=%.2fms firstSubmit=%.2fms warpSubmitCpu=%.2fms waitReal=%.2fms combined=%.2fms budget=%.2fms warp=%d real=%d",
+			    cpuBeforeFirstSubmitMs,
+			    firstSubmitInvokeMs,
+			    warpSubmitCpuMs,
+			    realWaitMs,
+			    combinedCpuMs,
+			    budgetMs,
+			    warpSubmitted ? 1 : 0,
+			    realStarted ? 1 : 0);
+		}
+	}
+}
+
+#endif
+
 void XrBackend::WaitForTrackingData()
 {
 	// Make sure the OpenXR session is active before doing anything else, and if not then skip
 	if (!sessionActive) {
 		renderingFrame = false;
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+		ResetAswSplitFrameState();
+#endif
 		return;
 	}
 
@@ -564,13 +885,25 @@ void XrBackend::WaitForTrackingData()
 		qpcInitialized = true;
 	}
 
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	ResetAswSplitFrameState();
+#endif
+
 	{
 		auto lock = xr_session.lock_shared();
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+		if (ShouldUseAswSplitPipeline() && BeginAswWarpFrameForSplit())
+			goto wait_done;
+#endif
 
 		QueryPerformanceCounter(&waitFrameStart);
 		OOVR_FAILED_XR_ABORT(xrWaitFrame(xr_session.get(), &waitInfo, &state));
 		QueryPerformanceCounter(&waitFrameEnd);
 		measuredWaitFrameMs = (float)(waitFrameEnd.QuadPart - waitFrameStart.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+		if (measuredWaitFrameMs > 1000.0f) {
+			OOVR_LOGF("ASW FREEZE: xrWaitFrame blocked %.1fms — possible TDR or runtime stall", measuredWaitFrameMs);
+		}
 
 		xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
 
@@ -587,54 +920,8 @@ void XrBackend::WaitForTrackingData()
 		QueryPerformanceCounter(&beginFrameQpc);
 	}
 
-	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
-	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-	locateInfo.displayTime = xr_gbl->nextPredictedFrameTime;
-	locateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
-	XrViewState viewState = { XR_TYPE_VIEW_STATE };
-	uint32_t viewCount = 0;
-	XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
-	OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &viewState, XruEyeCount, &viewCount, views));
-
-	for (int eye = 0; eye < XruEyeCount; eye++) {
-		projectionViews[eye].fov = views[eye].fov;
-
-		XrPosef pose = views[eye].pose;
-
-		// Make sure we at least have halfway-sane values if the runtime isn't providing them. In particular
-		// if the runtime gives us an invalid orientation, that'd otherwise cause XR_ERROR_POSE_INVALID errors later.
-		if ((viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
-			pose.orientation = XrQuaternionf{ 0, 0, 0, 1 };
-		}
-		if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0) {
-			// About 1.75m up above the origin
-			pose.position = XrVector3f{ 0, 1.75, 0 };
-		}
-
-		projectionViews[eye].pose = pose;
-	}
-
-	// --- Pose latching: freeze xrLocateViews results for the entire frame ---
-	xr_gbl->latchedViews[0] = views[0];
-	xr_gbl->latchedViews[1] = views[1];
-	xr_gbl->latchedViewStateFlags = viewState.viewStateFlags;
-	xr_gbl->viewSpaceViewsLatched = false;
-	xr_gbl->viewsLatched = true;
-	{ static bool s = false; if (!s) { s = true; OOVR_LOGF("[diag] WaitForTrackingData: views LATCHED (viewsLatched=true)");
-#ifdef _WIN32
-		// Read VDXR's jiggle_view_rotations registry key so we can confirm its state in our log
-		DWORD jiggleVal = 0;
-		DWORD jiggleSize = sizeof(jiggleVal);
-		LONG jiggleResult = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Virtual Desktop, Inc.\\OpenXR",
-			L"jiggle_view_rotations", RRF_RT_REG_DWORD, nullptr, &jiggleVal, &jiggleSize);
-		if (jiggleResult == ERROR_SUCCESS)
-			OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations = %lu", jiggleVal);
-		else if (jiggleResult == ERROR_FILE_NOT_FOUND)
-			OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations NOT SET (key absent)");
-		else
-			OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations read failed (error %ld)", jiggleResult);
-#endif
-	} }
+	LatchViewsForDisplayTime(xr_gbl->nextPredictedFrameTime);
+wait_done:
 
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 	// GPU timing: read previous frame's results, then start new measurement
@@ -674,11 +961,33 @@ void XrBackend::StoreEyeTexture(
 	OOVR_FALSE_ABORT(compPtr.get() != nullptr);
 	Compositor& comp = *compPtr;
 
-	// If the session is inactive, we may be unable to write to the surface
-	if (sessionActive && renderingFrame)
-		comp.Invoke((XruEye)eye, texture, bounds, submitFlags, layer);
+	bool eyeStored = false;
+	float submitInvokeMs = 0.0f;
 
-	submittedEyeTextures = true;
+	// If the session is inactive, we may be unable to write to the surface
+	if (sessionActive && renderingFrame) {
+		auto invokeStart = std::chrono::high_resolution_clock::now();
+		comp.Invoke((XruEye)eye, texture, bounds, submitFlags, layer);
+		auto invokeEnd = std::chrono::high_resolution_clock::now();
+		submitInvokeMs = std::chrono::duration<float, std::milli>(invokeEnd - invokeStart).count();
+		eyeStored = true;
+	}
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	if (eyeStored && isFirstEye && aswSplitPhase == AswSplitPhase::WarpFrameBegun) {
+		float cpuToFirstSubmitMs = 0.0f;
+		if (qpcInitialized && cpuFrameStart.QuadPart > 0) {
+			LARGE_INTEGER firstSubmitQpc = {};
+			QueryPerformanceCounter(&firstSubmitQpc);
+			cpuToFirstSubmitMs = (float)(firstSubmitQpc.QuadPart - cpuFrameStart.QuadPart)
+			    * 1000.0f / (float)qpcFrequency.QuadPart;
+		}
+		FinishAswWarpFrameAfterFirstEye(cpuToFirstSubmitMs, submitInvokeMs);
+	}
+#endif
+
+	if (eyeStored && renderingFrame)
+		submittedEyeTextures = true;
 
 	// TODO store view somewhere and use it for submitting our frame
 
@@ -717,12 +1026,20 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	// Make sure the OpenXR session is active before doing anything else
 	// Note that if the session becomes ready after WaitGetTrackingPoses was called, then
 	// renderingFrame will still be false so this won't be a problem in that case.
-	if (!sessionActive)
+	if (!sessionActive) {
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+		ResetAswSplitFrameState();
+#endif
 		return;
+	}
 
 	XrFrameEndInfo info{ XR_TYPE_FRAME_END_INFO };
 	info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 	info.displayTime = xr_gbl->nextPredictedFrameTime;
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	if (aswSplitPhase == AswSplitPhase::RealFrameBegun && aswRealFrameState.predictedDisplayTime != 0)
+		info.displayTime = aswRealFrameState.predictedDisplayTime;
+#endif
 
 	XrCompositionLayerBaseHeader const* const* headers = nullptr;
 	XrCompositionLayerBaseHeader* app_layer = nullptr;
@@ -745,6 +1062,23 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 			if (layer.subImage.swapchain == XR_NULL_HANDLE)
 				app_layer = nullptr;
 		}
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+		// Chain XR_FB_space_warp info to each projection view when Meta space warp is active.
+		// The SpaceWarpProvider's info structs were filled during SubmitFrame() in dx11compositor.
+		if (g_spaceWarpProvider && g_spaceWarpProvider->IsReady() && app_layer) {
+			for (int i = 0; i < 2; i++) {
+				auto* swInfo = g_spaceWarpProvider->GetLayerInfo(i);
+				// Chain space warp after any existing next (e.g. depth info set by compositor)
+				swInfo->next = projectionViews[i].next;
+				projectionViews[i].next = swInfo;
+			}
+			static int s_log = 0;
+			if (s_log++ < 5)
+				OOVR_LOG("SpaceWarp: Chained layer info to projection views");
+		}
+#endif
+
 		submittedEyeTextures = false;
 	}
 
@@ -858,8 +1192,12 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 						char line[512];
 						bool inDefaultSection = true;
 						while (fgets(line, sizeof(line), f)) {
-							if (line[0] == '[') { inDefaultSection = false; continue; }
-							if (!inDefaultSection) continue;
+							if (line[0] == '[') {
+								inDefaultSection = false;
+								continue;
+							}
+							if (!inDefaultSection)
+								continue;
 							float fval;
 							if (sscanf(line, "aswWarpStrength=%f", &fval) == 1)
 								oovr_global_configuration.aswWarpStrength = fval;
@@ -883,6 +1221,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	// a warped version of the cached frame. This doubles the effective framerate
 	// sent to the VR runtime, eliminating the need for SSW.
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	#if 0
 	static int s_aswStallCount = 0; // consecutive frames where xrWaitFrame took too long
 	if (g_aswProvider && g_aswProvider->IsReady() && g_aswProvider->HasCachedFrame()
 	    && oovr_global_configuration.ASWEnabled() && sessionActive
@@ -941,7 +1280,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 					// 4. Warp cached frame — translation/parallax only (rotation=0, handled by runtime ATW)
 					bool warpOk = true;
 					for (int eye = 0; eye < 2; eye++) {
-						if (!g_aswProvider->WarpFrame(eye, aswCtx, views[eye].pose)) {
+						if (!g_aswProvider->WarpFrame(eye, views[eye].pose)) {
 							warpOk = false;
 							break;
 						}
@@ -958,7 +1297,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 
 						for (int eye = 0; eye < 2; eye++) {
 							warpedViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-							warpedViews[eye].pose = g_aswProvider->GetCachedPose(eye);
+							warpedViews[eye].pose = g_aswProvider->GetPrecompPose(eye);
 							warpedViews[eye].fov = g_aswProvider->GetCachedFov(eye);
 							warpedViews[eye].subImage.swapchain = g_aswProvider->GetOutputSwapchain();
 							warpedViews[eye].subImage.imageArrayIndex = 0;
@@ -998,8 +1337,10 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 						aswEndInfo.layerCount = (uint32_t)aswLayers.size();
 
 						XrResult endRes = xrEndFrame(xr_session.get(), &aswEndInfo);
-						{ static int s = 0; if (s++ < 5)
-							OOVR_LOGF("ASW: Warped frame injected (result=%d)", (int)endRes);
+						{
+							static int s = 0;
+							if (s++ < 5)
+								OOVR_LOGF("ASW: Warped frame injected (result=%d)", (int)endRes);
 						}
 					} else {
 						// Warp failed — submit empty frame to keep runtime in sync
@@ -1012,7 +1353,8 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 					}
 				}
 			} else {
-				static int s = 0; if (s++ < 3)
+				static int s = 0;
+				if (s++ < 3)
 					OOVR_LOGF("ASW: xrWaitFrame for warped slot failed result=%d", (int)res);
 			}
 			aswCtx->Release(); // GetImmediateContext adds a ref
@@ -1025,6 +1367,13 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 		}
 	}
 asw_done:
+	#endif
+	if (aswStallCount >= 5 && g_aswProvider && oovr_global_configuration.ASWEnabled()) {
+		if (!aswDisableWarned) {
+			OOVR_LOG("ASW: Disabled - xrWaitFrame stalled 5 consecutive frames. Restart game to re-enable.");
+			aswDisableWarned = true;
+		}
+	}
 #endif
 
 	BaseSystem* sys = GetUnsafeBaseSystem();
@@ -1040,6 +1389,9 @@ asw_done:
 	// Release pose latch so next frame gets fresh xrLocateViews data
 	xr_gbl->viewsLatched = false;
 	xr_gbl->viewSpaceViewsLatched = false;
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	ResetAswSplitFrameState();
+#endif
 }
 
 IBackend::openvr_enum_t XrBackend::SetSkyboxOverride(const vr::Texture_t* pTextures, uint32_t unTextureCount)
@@ -1149,8 +1501,8 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
 		}
 
 		pTiming->m_nNumDroppedFrames = ovrPerf.available
-			? (ovrPerf.appDroppedFrames + ovrPerf.compositorDroppedFrames)
-			: 0;
+		    ? (ovrPerf.appDroppedFrames + ovrPerf.compositorDroppedFrames)
+		    : 0;
 
 		// --- GPU timing ---
 		float displayPeriod = predictedDisplayPeriodMs > 0.0f ? predictedDisplayPeriodMs : 11.1f;
@@ -1162,7 +1514,7 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
 			pTiming->m_flTotalRenderGpuMs = ovrPerf.appGpuMs + measuredEndFrameMs;
 		} else
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
-		if (gpuTimingInitialized && measuredGpuTimeMs > 0.0f) {
+		    if (gpuTimingInitialized && measuredGpuTimeMs > 0.0f) {
 			pTiming->m_flPreSubmitGpuMs = measuredGpuTimeMs;
 			pTiming->m_flPostSubmitGpuMs = measuredEndFrameMs;
 			pTiming->m_flTotalRenderGpuMs = measuredGpuTimeMs + measuredEndFrameMs;
@@ -1198,8 +1550,8 @@ bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t un
 		// Reference point: waitFrameStart (beginning of the frame cycle).
 		// Convert QPC deltas to milliseconds relative to that reference.
 		float qpcToMs = (qpcInitialized && qpcFrequency.QuadPart > 0)
-			? (1000.0f / (float)qpcFrequency.QuadPart)
-			: 0.0f;
+		    ? (1000.0f / (float)qpcFrequency.QuadPart)
+		    : 0.0f;
 
 		if (qpcToMs > 0.0f && waitFrameStart.QuadPart > 0) {
 			// WaitGetPoses was called at the frame reference point (offset = 0)

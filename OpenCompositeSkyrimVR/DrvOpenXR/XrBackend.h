@@ -81,6 +81,25 @@ private:
 	void CreateInfoSet();
 	void BindInfoSet();
 
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	enum class AswSplitPhase {
+		None,
+		WarpFrameBegun,
+		RealFrameBegun,
+	};
+
+	void ResetAswSplitFrameState();
+	bool ShouldUseAswSplitPipeline() const;
+	void LatchViewsForDisplayTime(XrTime displayTime);
+	bool BeginAswWarpFrameForSplit();
+	void FinishAswWarpFrameAfterFirstEye(float cpuToFirstSubmitMs, float firstSubmitInvokeMs);
+	bool BeginRealFrameAfterAswWarp(float* outWaitMs = nullptr);
+	bool SubmitAswWarpFrame(const XrFrameState& frameState,
+	    XrCompositionLayerBaseHeader const* const* extraLayers,
+	    int extraLayerCount);
+	void EndActiveFrameEmpty(XrTime displayTime);
+#endif
+
 	// Whether we've restarted the session to use the application's rendering API yet
 	bool usingApplicationGraphicsAPI = false;
 
@@ -114,16 +133,16 @@ private:
 	LARGE_INTEGER waitFrameEnd = {};
 	LARGE_INTEGER endFrameStart = {};
 	LARGE_INTEGER endFrameEnd = {};
-	LARGE_INTEGER cpuFrameStart = {};   // set at end of WaitForTrackingData
-	LARGE_INTEGER cpuFrameEnd = {};     // set at start of SubmitFrames
+	LARGE_INTEGER cpuFrameStart = {}; // set at end of WaitForTrackingData
+	LARGE_INTEGER cpuFrameEnd = {}; // set at start of SubmitFrames
 	LARGE_INTEGER lastFrameSubmitQpc = {};
-	LARGE_INTEGER beginFrameQpc = {};    // set when xrBeginFrame is called (deferred)
-	float measuredWaitFrameMs = 0.0f;   // xrWaitFrame duration (idle/wait)
-	float measuredEndFrameMs = 0.0f;    // xrEndFrame duration (compositor)
-	float measuredCpuFrameMs = 0.0f;    // app CPU time (WaitGetPoses return → Submit call)
+	LARGE_INTEGER beginFrameQpc = {}; // set when xrBeginFrame is called (deferred)
+	float measuredWaitFrameMs = 0.0f; // xrWaitFrame duration (idle/wait)
+	float measuredEndFrameMs = 0.0f; // xrEndFrame duration (compositor)
+	float measuredCpuFrameMs = 0.0f; // app CPU time (WaitGetPoses return → Submit call)
 	float measuredFrameIntervalMs = 0.0f; // frame-to-frame interval
 	float predictedDisplayPeriodMs = 0.0f; // runtime-reported frame interval (from xrWaitFrame)
-	float compositorOverheadMs = 0.0f;  // estimated compositor GPU time (residual calculation)
+	float compositorOverheadMs = 0.0f; // estimated compositor GPU time (residual calculation)
 
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 	// GPU timing measurement via D3D11 timestamp queries
@@ -138,6 +157,16 @@ private:
 	void InitGpuTiming(ID3D11Device* device);
 	void ReadGpuTimingResults();
 	void CleanupGpuTiming();
+
+	// ASW split-frame reorder state:
+	// WaitForTrackingData claims/begins the warp slot, the first eye submit ends it
+	// and immediately waits/begins the real slot before the second eye renders.
+	AswSplitPhase aswSplitPhase = AswSplitPhase::None;
+	XrFrameState aswWarpFrameState{ XR_TYPE_FRAME_STATE };
+	XrFrameState aswRealFrameState{ XR_TYPE_FRAME_STATE };
+	XrTime aswEstimatedRealDisplayTime = 0;
+	int aswStallCount = 0;
+	bool aswDisableWarned = false;
 #endif
 
 	// Action set and action used for querying for the interaction profile
