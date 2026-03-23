@@ -149,8 +149,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float mvSearchMagPx = length(roughMV * resolution);
     bool hasLoco = length(locoScreenDir) > 0.001;
     bool stationaryNpcMode = !hasLoco;
-    float stationaryNpcMvConfidence = mvConfidence;
-    bool movingNpcMask = false;  // NPC mask removed
     if (hasLoco && mvSearchMagPx > parallaxMagPx)
         searchDir = roughMV;
     float searchMagPx = hasLoco ? max(parallaxMagPx, mvSearchMagPx) : parallaxMagPx;
@@ -169,10 +167,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     int2 npcScatterDelta = int2(0, 0);
     int2 npcScatterSrcPixel = int2(0, 0);
     float npcScatterSrcDepth = 1.0;
-    bool npcDestDepthRejected = false;
     bool npcTrailingRejected = false;
-    bool carryScatterFound = false;
-    float2 carryScatterDeltaPx = float2(0, 0);
     bool allowHeadDepthSearch = (!hasLoco && parallaxMagPx > 0.75 && origD >= 0.97);
 
 )" R"(
@@ -304,8 +299,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
                 npcExpanded = true;
                 fgPixel = npcScatterSrcPixel;
                 d = npcScatterSrcDepth;
-            } else if (!trailingEdge && depthGap > depthGapThresh) {
-                npcDestDepthRejected = true;
             }
         }
     }
@@ -374,27 +367,12 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // Recompute parallax with (possibly foreground) depth.
     // Both locomotion-found foreground and npcExpanded use fgPixel's angle for parallax
     // and uv as the base. This ensures npcExpanded pixels get the same warp as locomotion.
-    // For stationary moving-NPC pixels we want one smooth carried source across the whole
-    // local region, so only use the exact scatter source as a special-case base when there
-    // is no smoothed carry field available yet.
-    // Keep the NPC carry path active during head-only motion; dropping it as soon as
-    // staticBlendFactor falls with head turns makes outlines peel away from the body.
-    // DISABLED: stationary NPC handling causes ghost on head rotation for close NPCs.
-    bool stationaryNpcRegion = false;
-    bool stationaryNpcCarry = false;
-    float2 stationaryCarryDeltaPx = float2(0,0);
-    bool useScatterSourceAngle = false;
-    bool useFgAngle = foundForeground || useScatterSourceAngle;
-    // When the carry field is available, reuse it for boundary pixels too so the outline
-    // stays locked to the carried NPC body instead of following per-pixel scatter noise.
-    bool useFgBase = npcExpanded && !stationaryNpcCarry;
-    int2 parallaxPixel = useScatterSourceAngle ? npcScatterSrcPixel : fgPixel;
-    float2 fgUV = useFgAngle ? (float2(parallaxPixel) + 0.5) / resolution : uv;
+    bool useFgAngle = foundForeground;
+    bool useFgBase = npcExpanded;
+    float2 fgUV = useFgAngle ? (float2(fgPixel) + 0.5) / resolution : uv;
     float fgTanX = useFgAngle ? lerp(fovTanLeft, fovTanRight, fgUV.x) : tanX;
     float fgTanY = useFgAngle ? lerp(fovTanUp, fovTanDown, fgUV.y) : tanY;
-
-    float parallaxDepth = useScatterSourceAngle ? npcScatterSrcDepth : d;
-    linearDepth = LinearizeDepth(parallaxDepth, nearZ, farZ);
+    linearDepth = LinearizeDepth(d, nearZ, farZ);
     scaledDepth = linearDepth * depthScale;
     newViewPos = float3(fgTanX * scaledDepth, fgTanY * scaledDepth, scaledDepth);
     transformed = mul(poseDeltaMatrix, float4(newViewPos, 1.0));
@@ -426,18 +404,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     // Read MV
     int2 mvSourcePixel;
-    bool stationaryBodyMV = false;  // DISABLED: part of stationary NPC handling that causes ghost
-    bool usableNpcScatterForBody = (hasNpcScatter && (!hasDirectNpcScatter || npcDirectBodyAligned));
-    bool stationaryBodyScatterAssist = (stationaryBodyMV &&
-        (carryScatterFound || usableNpcScatterForBody));
     if (foundForeground) {
         mvSourcePixel = ToMVCoord(fgPixel);
-    } else if (stationaryBodyMV) {
-        // In the stationary case, silhouette/body pixels are already current-frame NPC.
-        // Sampling MV at parallaxSourceUV can step onto background right at the cached
-        // border, which leaves the old silhouette behind instead of carrying the body
-        // forward with the expanded boundary.
-        mvSourcePixel = ToMVCoord(pixel);
     } else {
         mvSourcePixel = ToMVCoord(clamp(int2(parallaxSourceUV * resolution), int2(0,0), int2(resolution) - 1));
     }
@@ -477,79 +445,22 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         }
     }
 
-    // Residuals for diagnostics
-    float2 c2cResidual = totalMV - c2cHeadMV;       // head+stick subtracted (loco only)
-    float2 headOnlyResidual = totalMV - headOnlyMV;  // head-only subtracted (stick + loco)
-
 )" R"(
-    float2 stationaryResidual = c2cResidual;
+    // MV residual: subtract head motion to isolate locomotion + stick rotation.
+    // hasLoco → use headOnlyResidual (head-only subtracted, keeps stick + loco)
+    // stationary → use c2cResidual (head+stick subtracted, keeps loco only)
     float2 mvOffset = float2(0, 0);
-    if (abs(mvConfidence) > 0.001) {
-        // npcExpanded pixels already used the residual NPC motion once in CSNpcDepthScatter
-        // to land on this output pixel. Applying it again here double-shifts the boundary
-        // sample into background.
-        if (!npcExpanded) {
-            float2 residual = hasLoco ? headOnlyResidual : stationaryResidual;
-            mvOffset = stationaryNpcMvConfidence * residual;
-        }
+    if (abs(mvConfidence) > 0.001 && !npcExpanded) {
+        float2 residual = hasLoco ? (totalMV - headOnlyMV) : (totalMV - c2cHeadMV);
+        mvOffset = mvConfidence * residual;
     }
-
-    float stationaryResidualMagPx = length(stationaryResidual * resolution);
-    float headMagPx = length(c2cHeadMV * resolution);
-    float stationaryBodyResidualThreshPx = max(0.75, 0.35 + headMagPx * 0.20);
-    bool stationaryBodyUseDirectMV = (stationaryBodyMV &&
-        stationaryResidualMagPx >= stationaryBodyResidualThreshPx);
-    bool staleDirectBody = (stationaryNpcMode && stationaryBodyMV &&
-        hasDirectNpcScatter && !npcDirectBodyAligned && !carryScatterFound);
 
     float2 sourceUV = parallaxSourceUV + mvOffset;
 
-    if (stationaryNpcCarry) {
-        sourceUV = parallaxSourceUV - stationaryCarryDeltaPx / float2(resolution);
-    } else if (stationaryBodyMV) {
-        // Only use the direct current-pixel MV path when there is real non-head residual
-        // motion at this pixel. Nearby static ground during head rotation falls into the
-        // same depth band as close NPCs, but its residual stays near zero and should remain
-        // on the original parallax path instead of following the body-MV shortcut.
-        if (stationaryBodyUseDirectMV) {
-            // Apply 1.0x head motion + stationaryNpcMvConfidence * animation residual.
-            // totalMV = headMV + residual, so: uv + headMV + conf * residual
-            //   = uv + conf * totalMV - (conf - 1) * headMV
-            sourceUV = uv + stationaryNpcMvConfidence * totalMV
-                         - (stationaryNpcMvConfidence - 1.0) * c2cHeadMV;
-        } else {
-            sourceUV = parallaxSourceUV + mvOffset;
-        }
-        if (stationaryBodyScatterAssist && (carryScatterFound || usableNpcScatterForBody)) {
-            int2 carryDelta = carryScatterFound ? int2(round(carryScatterDeltaPx)) : npcScatterDelta;
-            // Use parallaxSourceUV (cached-frame position) as base, not uv (output position).
-            // The scatter delta is in cached-frame coordinates. Without head parallax in the
-            // base, the entire NPC shifts by the head offset — creating a full-width ghost
-            // that tracks head rotation, visible at close range where parallax is large.
-            sourceUV = parallaxSourceUV - float2(carryDelta) / float2(resolution);
-        }
-    }
-
     // In locomotion mode, npcExpanded boundary pixels use fgUV for small head motion
-    // to avoid sampling background. (stationaryNpcMode disables npcExpanded entirely —
-    // the NPC forward overlay handles moving-NPC edges instead.)
-    if (npcExpanded && !stationaryNpcMode && !stationaryNpcCarry && parallaxMagPx <= 0.75) {
+    // to avoid sampling background.
+    if (npcExpanded && !stationaryNpcMode && parallaxMagPx <= 0.75) {
         sourceUV = fgUV;
-    }
-
-    // Only let the anchor mismatch fallback steer actual foreground/body pixels.
-    // Background pixels that merely sit near scattered NPC support can otherwise get
-    // pulled onto stale previous-frame limbs, which shows up as detached duplicates.
-    if (stationaryNpcMode && !npcExpanded && origD < 0.97 &&
-        stationaryBodyScatterAssist && (usableNpcScatterForBody || carryScatterFound)) {
-        float2 anchorDeltaPx = carryScatterFound ? carryScatterDeltaPx : float2(npcScatterDelta);
-        // Compare deltas in cached-frame space (relative to parallaxSourceUV, not pixel).
-        float2 chosenDeltaPx = parallaxSourceUV * float2(resolution) - sourceUV * float2(resolution);
-        float mismatch = length(chosenDeltaPx - anchorDeltaPx);
-        float mismatchThresh = max(1.5, length(anchorDeltaPx) * 0.35);
-        if (mismatch > mismatchThresh) {
-            sourceUV = parallaxSourceUV - anchorDeltaPx / float2(resolution);
-        }
     }
 
     if (any(sourceUV < -0.01) || any(sourceUV > 1.01)) {
@@ -559,9 +470,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     }
 
     // Edge depth guard: only for npcExpanded scatter pixels whose sourceUV may
-    // overshoot the NPC body. NOT for regular NPC body pixels — their MV-corrected
-    // sourceUV may land on current-frame background at trailing edges (NPC moved away),
-    // but the prevColor at that position is correct (NPC was there last frame).
+    // overshoot the NPC body.
     if (npcExpanded) {
         int2 srcPx = clamp(int2(sourceUV * float2(resolution)), int2(0,0), int2(resolution) - 1);
         float srcD = depthTex[ToDepthCoord(srcPx)];
@@ -588,69 +497,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             if (foundFg) {
                 sourceUV = (float2(bestPx) + 0.5) / float2(resolution);
             } else {
-                // Preserve head parallax on the fallback too. Dropping back to the raw
-                // cached-frame source pixel makes boundary ghosts drift outward on head
-                // turns and then snap back once the local guard recovers.
-                sourceUV = stationaryNpcCarry
-                    ? (parallaxSourceUV - stationaryCarryDeltaPx / float2(resolution))
-                    : parallaxSourceUV;
-            }
-        }
-    } else if (staleDirectBody) {
-        float bgSlack = max(0.01, origD * 0.03);
-        float2 bgSourceUV = parallaxSourceUV;
-        int2 bgSrcPx = clamp(int2(bgSourceUV * float2(resolution)), int2(0,0), int2(resolution) - 1);
-        float bestScore = 999.0;
-        int2 bestPx = bgSrcPx;
-        bool foundBg = false;
-        [unroll] for (int ry = -8; ry <= 8; ry++) {
-            [unroll] for (int rx = -8; rx <= 8; rx++) {
-                int2 tp = clamp(bgSrcPx + int2(rx, ry), int2(0,0), int2(resolution) - 1);
-                float td = depthTex[ToDepthCoord(tp)];
-                float depthErr = abs(td - origD);
-                if (depthErr > bgSlack)
-                    continue;
-                float dist = float(rx * rx + ry * ry);
-                float score = dist + depthErr * 2048.0;
-                if (score < bestScore) {
-                    bestScore = score;
-                    bestPx = tp;
-                    foundBg = true;
-                }
-            }
-        }
-        sourceUV = foundBg
-            ? ((float2(bestPx) + 0.5) / float2(resolution))
-            : bgSourceUV;
-    } else if (!stationaryNpcCarry && stationaryNpcMode && origD < 0.97 &&
-        stationaryBodyScatterAssist && (carryScatterFound || usableNpcScatterForBody)) {
-        int2 srcPx = clamp(int2(sourceUV * float2(resolution)), int2(0,0), int2(resolution) - 1);
-        float srcD = depthTex[ToDepthCoord(srcPx)];
-        float fgSlack = max(0.01, origD * 0.03);
-        if (srcD - origD > fgSlack) {
-            int2 carryDelta = carryScatterFound ? int2(round(carryScatterDeltaPx)) : npcScatterDelta;
-            float bestDist = 999.0;
-            int2 bestPx = srcPx;
-            bool foundFg = false;
-            [unroll] for (int ry = -8; ry <= 8; ry++) {
-                [unroll] for (int rx = -8; rx <= 8; rx++) {
-                    if (rx == 0 && ry == 0) continue;
-                    int2 tp = clamp(srcPx + int2(rx, ry), int2(0,0), int2(resolution) - 1);
-                    float td = depthTex[ToDepthCoord(tp)];
-                    if (td <= origD + fgSlack) {
-                        float dist = float(rx*rx + ry*ry);
-                        if (dist < bestDist) {
-                            bestDist = dist;
-                            bestPx = tp;
-                            foundFg = true;
-                        }
-                    }
-                }
-            }
-            if (foundFg) {
-                sourceUV = (float2(bestPx) + 0.5) / float2(resolution);
-            } else {
-                sourceUV = uv - float2(carryDelta) / float2(resolution);
+                sourceUV = parallaxSourceUV;
             }
         }
     }
@@ -816,10 +663,6 @@ int2 computeSplatHalf(int2 srcPixel, bool skipMV) {
     return int2(halfW, halfH);
 }
 
-float EffectiveStationaryNpcMvConfidence() {
-    return mvConfidence;
-}
-
 bool IsMovingNpcPixelForward(int2 srcPixel, float d) {
     if (d >= 0.999)
         return false;
@@ -841,7 +684,7 @@ bool IsMovingNpcPixelForward(int2 srcPixel, float d) {
 
     float2 npcMV = totalMV - c2cHMV;
     bool hasLoco = length(locoScreenDir) > 0.001;
-    float2 npcOffsetPx = -npcMV * EffectiveStationaryNpcMvConfidence() * resolution;
+    float2 npcOffsetPx = -npcMV * mvConfidence * resolution;
     float headMagPx = length(c2cHMV * resolution);
     float minResidualPx = !hasLoco ? 1.0 : 0.5;
 
@@ -1400,8 +1243,7 @@ void CSNpcDepthScatter(uint3 tid : SV_DispatchThreadID) {
 
     float2 npcMV = totalMV - c2cHMV;
     bool hasLoco = length(locoScreenDir) > 0.001;
-    float stationaryNpcMvConfidence = mvConfidence;
-    float2 npcOffsetPx = -npcMV * stationaryNpcMvConfidence * resolution;
+    float2 npcOffsetPx = -npcMV * mvConfidence * resolution;
     float headMagPx = length(c2cHMV * resolution);
     float minScatterResidualPx = 0.5;
     if (!hasLoco) {
