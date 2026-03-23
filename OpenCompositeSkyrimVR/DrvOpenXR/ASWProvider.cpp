@@ -1376,7 +1376,7 @@ ASWProvider::~ASWProvider()
 
 bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight)
 {
-	if (m_ready)
+	if (m_ready || m_compileStarted)
 		return true;
 	if (!device || eyeWidth == 0 || eyeHeight == 0)
 		return false;
@@ -1388,12 +1388,7 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 	m_device = device;
 	m_device->AddRef(); // prevent device destruction while ASW holds a reference
 
-	if (!CreateComputeShader(device)) {
-		OOVR_LOG("ASW: Failed to create compute shader");
-		Shutdown();
-		return false;
-	}
-
+	// Create textures and swapchains first (fast D3D11 calls, <100ms)
 	if (!CreateStagingTextures(device)) {
 		OOVR_LOG("ASW: Failed to create staging textures");
 		Shutdown();
@@ -1408,10 +1403,16 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 
 	if (!CreateDepthSwapchain(eyeWidth * 2, eyeHeight)) {
 		OOVR_LOG("ASW: Failed to create depth swapchain (non-fatal — depth layer disabled)");
-		// Non-fatal: ASW works without depth, just no depth attachment for the runtime
 	}
 
-	m_ready = true;
+	// Launch shader compilation in background — game continues rendering without ASW.
+	// TryFinishShaderCompilation() will poll for completion and set m_ready = true.
+	if (!LaunchAsyncShaderCompilation()) {
+		OOVR_LOG("ASW: Failed to launch shader compilation");
+		Shutdown();
+		return false;
+	}
+
 	m_publishedSlot.store(-1, std::memory_order_relaxed);
 	m_previousPublishedSlot.store(-1, std::memory_order_relaxed);
 	m_warpReadSlot.store(-1, std::memory_order_relaxed);
@@ -1420,8 +1421,9 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 	m_buildEyeReady[1] = false;
 	m_hasLastPublishedPose = false;
 	m_frameCounter = 0;
-	OOVR_LOGF("ASW: Initialized — %ux%u per eye, compute shader ready", eyeWidth, eyeHeight);
-	return true;
+
+	OOVR_LOGF("ASW: Resources created — %ux%u per eye, shaders compiling in background", eyeWidth, eyeHeight);
+	return true; // m_ready stays false until shaders are done
 }
 
 // Simple FNV-1a hash for shader cache invalidation
@@ -1513,10 +1515,14 @@ static bool CompileOrLoadCached(
 	return true;
 }
 
-bool ASWProvider::CreateComputeShader(ID3D11Device* device)
+bool ASWProvider::LaunchAsyncShaderCompilation()
 {
-	// Compile HLSL — use LEVEL0 for fast compilation (~2s total vs 20s at LEVEL1).
-	// GPU perf difference is negligible for these warp shaders.
+	// Build shader source strings (copied into the lambda captures for thread safety).
+	std::string csMainSrc     = std::string(s_warpShaderHLSL);
+	std::string fullShaderSrc = csMainSrc + s_forwardScatterHLSL;
+	std::string npcShaderSrc  = csMainSrc + s_npcScatterHLSL;
+	std::string compositeStr  = std::string(s_npcForwardCompositeHLSL);
+
 	DWORD flags = D3DCOMPILE_PACK_MATRIX_ROW_MAJOR | D3DCOMPILE_ENABLE_STRICTNESS;
 #ifdef _DEBUG
 	flags |= D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_DEBUG;
@@ -1524,113 +1530,146 @@ bool ASWProvider::CreateComputeShader(ID3D11Device* device)
 	flags |= D3DCOMPILE_OPTIMIZATION_LEVEL0;
 #endif
 
-	// Build source strings (shared across parallel jobs — read-only, thread-safe)
-	std::string csMainSrc     = std::string(s_warpShaderHLSL);
-	std::string fullShaderSrc = csMainSrc + s_forwardScatterHLSL;
-	std::string npcShaderSrc  = csMainSrc + s_npcScatterHLSL;
-	std::string compositeStr  = std::string(s_npcForwardCompositeHLSL);
-
-	// D3DCompile is thread-safe (stateless compiler). Device::CreateComputeShader is NOT
-	// thread-safe on D3D11, so we compile to blobs in parallel, then create shaders serially.
-	struct ShaderJob {
-		const char* entry;
-		const std::string* source;
-		ID3DBlob* blob = nullptr;
-		bool ok = false;
+	// Set up pending blob slots — one per shader entry point.
+	// Entry point names are string literals (static lifetime), safe to capture by pointer.
+	static const char* entryPoints[] = {
+		"CSMain", "CSClear", "CSForwardDepth", "CSForwardColor",
+		"CSForwardDepthNpcOnly", "CSForwardColorNpcOnly", "CSDilate",
+		"CSCompositeNpcForward", "CSNpcDepthScatter"
 	};
-	ShaderJob jobs[] = {
-	    {"CSMain",                 &csMainSrc},     // [0] — backward warp (required)
-	    {"CSClear",                &fullShaderSrc}, // [1]
-	    {"CSForwardDepth",         &fullShaderSrc}, // [2]
-	    {"CSForwardColor",         &fullShaderSrc}, // [3]
-	    {"CSForwardDepthNpcOnly",  &fullShaderSrc}, // [4]
-	    {"CSForwardColorNpcOnly",  &fullShaderSrc}, // [5]
-	    {"CSDilate",               &fullShaderSrc}, // [6]
-	    {"CSCompositeNpcForward",  &compositeStr},  // [7]
-	    {"CSNpcDepthScatter",      &npcShaderSrc},  // [8]
-	};
-	constexpr int kJobCount = _countof(jobs);
-
-	// Launch parallel compilation (with disk caching — first run ~20s, subsequent <1ms)
-	std::vector<std::future<void>> futures;
-	futures.reserve(kJobCount);
+	constexpr int kJobCount = _countof(entryPoints);
+	m_pendingBlobs.resize(kJobCount);
 	for (int i = 0; i < kJobCount; i++) {
-		futures.push_back(std::async(std::launch::async, [&jobs, i, flags]() {
-			jobs[i].ok = CompileOrLoadCached(
-			    *jobs[i].source, jobs[i].entry, "cs_5_0", flags,
-			    &jobs[i].blob, nullptr);
-		}));
+		m_pendingBlobs[i].entry = entryPoints[i];
+		m_pendingBlobs[i].blob = nullptr;
+		m_pendingBlobs[i].ok = false;
 	}
-	// Wait for all compilations
-	for (auto& f : futures)
-		f.get();
 
-	// Create compute shaders serially (D3D11 device is not thread-safe)
+	// Source string to use for each entry point (by index)
+	// 0=csMainSrc, 1-6=fullShaderSrc, 7=compositeStr, 8=npcShaderSrc
+	struct SourceMap { int blobIdx; const std::string* src; };
+	SourceMap srcMap[] = {
+		{0, &csMainSrc}, {1, &fullShaderSrc}, {2, &fullShaderSrc}, {3, &fullShaderSrc},
+		{4, &fullShaderSrc}, {5, &fullShaderSrc}, {6, &fullShaderSrc},
+		{7, &compositeStr}, {8, &npcShaderSrc}
+	};
+
+	// Launch a single background thread that compiles all shaders in parallel internally.
+	// D3DCompile is thread-safe. The blobs are written to m_pendingBlobs which is only
+	// read by TryFinishShaderCompilation() after the future completes.
+	m_compileFuture = std::async(std::launch::async,
+		[this, csMainSrc = std::move(csMainSrc),
+		 fullShaderSrc = std::move(fullShaderSrc),
+		 npcShaderSrc = std::move(npcShaderSrc),
+		 compositeStr = std::move(compositeStr),
+		 flags]() {
+		const std::string* sources[] = {
+			&csMainSrc, &fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
+			&fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
+			&compositeStr, &npcShaderSrc
+		};
+		constexpr int N = 9;
+
+		// Launch parallel sub-tasks for each shader
+		std::vector<std::future<void>> futures;
+		futures.reserve(N);
+		for (int i = 0; i < N; i++) {
+			futures.push_back(std::async(std::launch::async,
+				[this, i, sources, flags]() {
+				m_pendingBlobs[i].ok = CompileOrLoadCached(
+				    *sources[i], m_pendingBlobs[i].entry, "cs_5_0", flags,
+				    &m_pendingBlobs[i].blob, nullptr);
+			}));
+		}
+		for (auto& f : futures)
+			f.get();
+
+		OOVR_LOG("ASW: Background shader compilation complete");
+	});
+
+	m_compileStarted = true;
+	OOVR_LOG("ASW: Shader compilation launched in background");
+	return true;
+}
+
+void ASWProvider::TryFinishShaderCompilation()
+{
+	if (m_ready || !m_compileStarted)
+		return;
+
+	// Non-blocking check: are all shaders compiled?
+	if (m_compileFuture.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+		return;
+
+	// Harvest the future (no-op since compilation wrote directly to m_pendingBlobs)
+	m_compileFuture.get();
+
+	// Create compute shaders serially on the game thread (D3D11 device is not thread-safe)
 	ID3D11ComputeShader** targets[] = {
 	    &m_warpCS,               // [0] CSMain
 	    &m_clearCS, &m_forwardDepthCS, &m_forwardColorCS,
 	    &m_forwardDepthNpcOnlyCS, &m_forwardColorNpcOnlyCS, &m_dilateCS,
 	    &m_compositeNpcForwardCS, &m_npcDepthScatterCS,
 	};
+	const int kJobCount = (int)m_pendingBlobs.size();
 	bool csMainOk = false;
 	bool allForwardOk = true;
 	for (int i = 0; i < kJobCount; i++) {
-		if (!jobs[i].ok) {
-			OOVR_LOGF("ASW: %s compilation failed%s", jobs[i].entry,
+		if (!m_pendingBlobs[i].ok) {
+			OOVR_LOGF("ASW: %s compilation failed%s", m_pendingBlobs[i].entry,
 			    i == 0 ? " (FATAL)" : " (non-fatal)");
-			if (i == 0) return false; // CSMain is required
+			if (i == 0) { m_compileStarted = false; return; } // CSMain required
 			if (i >= 1 && i <= 6) allForwardOk = false;
 			continue;
 		}
-		HRESULT r = device->CreateComputeShader(
-		    jobs[i].blob->GetBufferPointer(), jobs[i].blob->GetBufferSize(),
+		HRESULT r = m_device->CreateComputeShader(
+		    m_pendingBlobs[i].blob->GetBufferPointer(), m_pendingBlobs[i].blob->GetBufferSize(),
 		    nullptr, targets[i]);
-		jobs[i].blob->Release();
+		m_pendingBlobs[i].blob->Release();
+		m_pendingBlobs[i].blob = nullptr;
 		if (FAILED(r)) {
-			OOVR_LOGF("ASW: CreateComputeShader(%s) failed hr=0x%08x", jobs[i].entry, (unsigned)r);
-			if (i == 0) return false;
+			OOVR_LOGF("ASW: CreateComputeShader(%s) failed hr=0x%08x", m_pendingBlobs[i].entry, (unsigned)r);
+			if (i == 0) { m_compileStarted = false; return; }
 			if (i >= 1 && i <= 6) allForwardOk = false;
 		} else if (i == 0) {
 			csMainOk = true;
 		}
 	}
+	m_pendingBlobs.clear();
+
 	if (allForwardOk) {
 		OOVR_LOG("ASW: Forward scatter shaders compiled");
 	} else {
 		OOVR_LOG("ASW: Some forward scatter shaders failed (non-fatal — backward warp still available)");
 	}
-	if (m_npcDepthScatterCS)
-		OOVR_LOG("ASW: CSNpcDepthScatter compiled for moving-NPC boundary extension");
 
 	// Constant buffer and sampler
-	HRESULT hr;
 	D3D11_BUFFER_DESC cbDesc = {};
-	cbDesc.ByteWidth = sizeof(WarpConstants);
-	// Pad to 16-byte alignment (WarpConstants is 112 bytes, already aligned)
-	cbDesc.ByteWidth = (cbDesc.ByteWidth + 15) & ~15;
+	cbDesc.ByteWidth = (sizeof(WarpConstants) + 15) & ~15;
 	cbDesc.Usage = D3D11_USAGE_DYNAMIC;
 	cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 	cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-	hr = device->CreateBuffer(&cbDesc, nullptr, &m_constantBuffer);
+	HRESULT hr = m_device->CreateBuffer(&cbDesc, nullptr, &m_constantBuffer);
 	if (FAILED(hr)) {
 		OOVR_LOGF("ASW: CreateBuffer (CB) failed hr=0x%08x", (unsigned)hr);
-		return false;
+		m_compileStarted = false;
+		return;
 	}
 
-	// Linear clamp sampler
 	D3D11_SAMPLER_DESC sampDesc = {};
 	sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
 	sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
 	sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
 	sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-	hr = device->CreateSamplerState(&sampDesc, &m_linearSampler);
+	hr = m_device->CreateSamplerState(&sampDesc, &m_linearSampler);
 	if (FAILED(hr)) {
 		OOVR_LOGF("ASW: CreateSamplerState failed hr=0x%08x", (unsigned)hr);
-		return false;
+		m_compileStarted = false;
+		return;
 	}
 
-	OOVR_LOG("ASW: Compute shader compiled and ready");
-	return true;
+	m_ready = true;
+	OOVR_LOG("ASW: Shaders compiled and ready — ASW active");
 }
 
 bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
@@ -1906,6 +1945,9 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
     const XrPosef& eyePose, const XrFovf& eyeFov,
     float nearZ, float farZ)
 {
+	// Poll for async shader compilation completion (non-blocking)
+	if (!m_ready && m_compileStarted)
+		TryFinishShaderCompilation();
 	if (!m_ready || eye < 0 || eye > 1)
 		return;
 	const int slot = m_buildSlot;
@@ -2450,6 +2492,18 @@ bool ASWProvider::SubmitBlackOutput(ID3D11DeviceContext* ctx)
 void ASWProvider::Shutdown()
 {
 	m_ready = false;
+
+	// Wait for any in-flight background shader compilation before releasing resources
+	if (m_compileStarted && m_compileFuture.valid()) {
+		m_compileFuture.get();
+		// Release any unreleased blobs
+		for (auto& b : m_pendingBlobs) {
+			if (b.blob) { b.blob->Release(); b.blob = nullptr; }
+		}
+		m_pendingBlobs.clear();
+	}
+	m_compileStarted = false;
+
 	m_publishedSlot.store(-1, std::memory_order_relaxed);
 	m_previousPublishedSlot.store(-1, std::memory_order_relaxed);
 	m_warpReadSlot.store(-1, std::memory_order_relaxed);

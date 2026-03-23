@@ -3901,6 +3901,12 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		}
 	}
 
+	// OCU ASW: poll for async shader compilation completion (non-blocking).
+	// Must be outside the IsReady() gate — shaders compile in background while
+	// IsReady() returns false. This check costs ~0 when not compiling.
+	if (g_aswProvider && !g_aswProvider->IsReady())
+		g_aswProvider->TryFinishShaderCompilation();
+
 	// OCU ASW: cache frame data (color + MV + depth + pose) for warping
 	// Skip caching during main menu / loading screen — MV and depth data are invalid,
 	// and warping menu content causes visual glitches on save load.

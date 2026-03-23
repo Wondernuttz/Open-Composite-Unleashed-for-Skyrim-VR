@@ -2,8 +2,10 @@
 
 #include "XrDriverPrivate.h"
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <vector>
 #include <chrono>
+#include <future>
 
 // Forward declaration — ASWProvider is accessed from XrBackend for frame injection
 class ASWProvider;
@@ -48,6 +50,10 @@ public:
 	bool Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight);
 	void Shutdown();
 	bool IsReady() const { return m_ready; }
+
+	/// Poll for background shader compilation completion (non-blocking).
+	/// Creates shader objects on the game thread when compilation finishes.
+	void TryFinishShaderCompilation();
 
 	/// Cache current frame's data for warping next cycle.
 	/// Call on each eye during the real frame's Invoke.
@@ -189,7 +195,7 @@ public:
 	uint32_t GetEyeHeight() const { return m_eyeHeight; }
 
 private:
-	bool CreateComputeShader(ID3D11Device* device);
+	bool LaunchAsyncShaderCompilation();
 	bool CreateStagingTextures(ID3D11Device* device);
 	bool CreateOutputSwapchain(uint32_t width, uint32_t height);
 	bool CreateDepthSwapchain(uint32_t width, uint32_t height);
@@ -226,6 +232,16 @@ private:
 	bool m_ready = false;
 	uint32_t m_eyeWidth = 0, m_eyeHeight = 0;
 	ID3D11Device* m_device = nullptr; // kept for obtaining immediate context in XrBackend
+
+	// Async shader compilation state
+	struct PendingShaderBlob {
+		const char* entry = nullptr;
+		ID3DBlob* blob = nullptr;
+		bool ok = false;
+	};
+	std::future<void> m_compileFuture;
+	std::vector<PendingShaderBlob> m_pendingBlobs;
+	bool m_compileStarted = false;
 
 	// Compute shaders
 	ID3D11ComputeShader* m_warpCS = nullptr;       // CSMain (backward warp)
