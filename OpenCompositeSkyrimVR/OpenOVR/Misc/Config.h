@@ -296,8 +296,8 @@ private:
 	int   dlssPreset       = 1;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
 	float dlssSharpness    = 20.0f;
 	float dlssMvScale      = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
-	float dlssBiasBase     = 0.20f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
-	float dlssBiasEdgeBoost = 0.50f; // Extra bias at depth edges (foliage silhouettes)
+	float dlssBiasBase     = 0.08f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
+	float dlssBiasEdgeBoost = 0.20f; // Extra bias at depth edges (foliage silhouettes)
 	float dlssJitterScale  = 0.5f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// [keyboard] section

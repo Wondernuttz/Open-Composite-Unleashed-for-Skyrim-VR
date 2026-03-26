@@ -358,15 +358,15 @@ void CS_MVDilate(uint3 id : SV_DispatchThreadID)
     if (id.x >= resolution.x || id.y >= resolution.y) return;
 
     // Find the closest (nearest-to-camera) depth in a 3x3 neighborhood.
-    // In reversed-Z: 1.0 = near, 0.0 = far. Closest = max depth value.
-    float bestDepth = 0.0;
+    // Standard-Z: 0.0 = near, 1.0 = far. Closest = min depth value.
+    float bestDepth = 1.0;
     int2 bestCoord = int2(id.xy);
 
     [unroll] for (int dy = -1; dy <= 1; dy++) {
         [unroll] for (int dx = -1; dx <= 1; dx++) {
             int2 coord = clamp(int2(id.xy) + int2(dx, dy), int2(0,0), int2(resolution) - 1);
             float d = DepthIn.Load(int3(coord + depthOffset, 0));
-            if (d > bestDepth) {
+            if (d < bestDepth) {
                 bestDepth = d;
                 bestCoord = coord;
             }
@@ -2575,13 +2575,29 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 									    clipToClipMat,
 									    depthOffX, depthOffY,
 									    jdUVx, jdUVy);
-									cameraMVTex = s_cameraMVTex;
+
+									// Dilate MVs: 3x3 closest-depth gives alpha-tested pixels
+									// (tree branches with sky depth) the foreground neighbor's MV.
+									if (EnsureMVDilateResources(device, perEyeRenderW, perEyeRenderH)) {
+										auto* mvSRV = GetOrCreateMVDilateMVSRV(device, s_cameraMVTex);
+										auto* dilDepthSRV = GetOrCreateMVDilateDepthSRV(device, depthTex);
+										if (mvSRV && dilDepthSRV) {
+											DilateCameraMVs(context, mvSRV, dilDepthSRV,
+											    perEyeRenderW, perEyeRenderH,
+											    depthOffX, depthOffY);
+											cameraMVTex = s_mvDilateTex;
+										} else {
+											cameraMVTex = s_cameraMVTex;
+										}
+									} else {
+										cameraMVTex = s_cameraMVTex;
+									}
 
 									{
 										static bool s = false;
 										if (!s) {
 											s = true;
-											OOVR_LOGF("CameraMV: RSS VP + loco injection -- %ux%u eye=%d",
+											OOVR_LOGF("CameraMV: RSS VP + loco injection + dilation -- %ux%u eye=%d",
 											    perEyeRenderW, perEyeRenderH, eye);
 										}
 									}
@@ -3175,13 +3191,28 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 								    depthOffX, depthOffY,
 								    jdUVx, jdUVy,
 								    currJUVx, currJUVy);
-								dlssCameraMVTex = s_cameraMVTex;
+								// Dilate MVs: 3x3 closest-depth gives alpha-tested pixels
+								// (tree branches with sky depth) the foreground neighbor's MV.
+								if (EnsureMVDilateResources(device, dlssRenderW, dlssRenderH)) {
+									auto* mvSRV = GetOrCreateMVDilateMVSRV(device, s_cameraMVTex);
+									auto* dilDepthSRV = GetOrCreateMVDilateDepthSRV(device, dlssDepthTex);
+									if (mvSRV && dilDepthSRV) {
+										DilateCameraMVs(context, mvSRV, dilDepthSRV,
+										    dlssRenderW, dlssRenderH,
+										    depthOffX, depthOffY);
+										dlssCameraMVTex = s_mvDilateTex;
+									} else {
+										dlssCameraMVTex = s_cameraMVTex;
+									}
+								} else {
+									dlssCameraMVTex = s_cameraMVTex;
+								}
 
 								{
 									static bool s = false;
 									if (!s) {
 										s = true;
-										OOVR_LOGF("DLSS CameraMV: RSS VP + loco injection -- %ux%u eye=%d",
+										OOVR_LOGF("DLSS CameraMV: RSS VP + loco injection + dilation -- %ux%u eye=%d",
 										    dlssRenderW, dlssRenderH, eye);
 									}
 								}
