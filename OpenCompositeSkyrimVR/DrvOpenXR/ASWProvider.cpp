@@ -45,6 +45,8 @@ static const char* s_warpShaderHLSL = R"(
 Texture2D<float4> prevColor    : register(t0);
 Texture2D<float2> mvTex        : register(t1);  // camera MVs: prevUV - uv (UV space)
 Texture2D<float>  depthTex     : register(t2);
+Texture2D<float4> frameNColor  : register(t3);  // frame N color (newer frame for disocclusion fill)
+Texture2D<float>  frameNDepth  : register(t4);  // frame N depth (newer frame)
 RWTexture2D<float4> output     : register(u0);
 RWTexture2D<uint> atomicDepth  : register(u1);  // forward scatter depth test buffer (R32_UINT)
 SamplerState linearClamp       : register(s0);
@@ -76,6 +78,9 @@ cbuffer WarpParams : register(b0) {
     float2 locoScreenDir;   // screen-space locomotion direction (from actorPos delta, not head tracking)
     float staticBlendFactor; // 1.0 = near-stationary (blend scatter→prevColor), 0.0 = moving
     float rotMVScale;       // 1.0 = rotation in residual, 0.0 = rotation suppressed (stop transition)
+    row_major float4x4 reprojClipToClip;  // warp output → frame N clip space (for disocclusion fill)
+    int hasReprojData;      // 1 if frame N data is available for reprojection
+    float3 _padReproj;
 };
 
 // LinearizeDepth: convert raw depth buffer value to linear distance in game units.
@@ -934,6 +939,68 @@ void CSDilate(uint3 tid : SV_DispatchThreadID) {
     // Case 3 only: unfilled (black) pixels. Skip sky-marked pixels entirely —
     // filling sky gaps with fg color makes distant trees/foliage look solid.
     if (myDepth != 0xFFFFFFFF) return;  // only process unfilled pixels
+
+    // ── Frame N fill with depth comparison + edge search ──
+    // The cached frame (N-1) has the foreground object at this position.
+    // If frame N's depth is deeper here, the object moved and background is revealed.
+    // If frame N still has foreground at this exact UV (tree edge), search a few pixels
+    // further away from the foreground to find background just past the edge.
+    if (hasReprojData != 0) {
+        float2 holeUV = (float2(tid.xy) + 0.5) / resolution;
+        float2 pixelSize = 1.0 / resolution;
+
+        // Read cached frame depth at this position
+        int2 depthCoord = (int2)(holeUV * depthResolution);
+        depthCoord = clamp(depthCoord, int2(0,0), int2(depthResolution) - 1);
+        float cachedDepthVal = depthTex.Load(int3(depthCoord, 0));
+        float margin = max(0.003, cachedDepthVal * 0.01);
+
+        // Try direct sample first
+        float2 sampleUV = holeUV;
+        float frameNDepthVal = frameNDepth.SampleLevel(linearClamp, sampleUV, 0);
+        bool found = (frameNDepthVal > cachedDepthVal + margin || cachedDepthVal > 0.999);
+
+        // If direct sample is foreground, search up to 8px away from the edge.
+        // Direction: use loco direction if available, else try radial from nearest filled pixel.
+        if (!found) {
+            float2 searchDir = float2(0, 0);
+            if (length(locoScreenDir) > 0.0001) {
+                // Search in locomotion direction (away from where the object came from)
+                searchDir = normalize(locoScreenDir);
+            } else {
+                // Find direction away from nearest filled pixel (foreground edge)
+                float bestDist = 999.0;
+                int2 bestFilled = (int2)tid.xy;
+                int2 np;
+                np = (int2)tid.xy + int2(-1,0); if (np.x >= 0 && atomicDepth[np] < 0xFFFFFFFEu) { bestFilled = np; bestDist = 1.0; }
+                np = (int2)tid.xy + int2(1,0); if (np.x < (int)resolution.x && atomicDepth[np] < 0xFFFFFFFEu && 1.0 < bestDist) { bestFilled = np; bestDist = 1.0; }
+                np = (int2)tid.xy + int2(0,-1); if (np.y >= 0 && atomicDepth[np] < 0xFFFFFFFEu && 1.0 < bestDist) { bestFilled = np; bestDist = 1.0; }
+                np = (int2)tid.xy + int2(0,1); if (np.y < (int)resolution.y && atomicDepth[np] < 0xFFFFFFFEu && 1.0 < bestDist) { bestFilled = np; }
+                if (bestDist < 999.0) {
+                    searchDir = normalize(float2(tid.xy) - float2(bestFilled));  // away from FG
+                }
+            }
+
+            if (length(searchDir) > 0.5) {
+                for (int step = 2; step <= 8; step += 2) {
+                    float2 offsetUV = holeUV + searchDir * pixelSize * (float)step;
+                    if (any(offsetUV < 0.001) || any(offsetUV > 0.999)) break;
+                    float dv = frameNDepth.SampleLevel(linearClamp, offsetUV, 0);
+                    if (dv > cachedDepthVal + margin) {
+                        sampleUV = offsetUV;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (found) {
+            output[tid.xy] = frameNColor.SampleLevel(linearClamp, sampleUV, 0);
+            return;
+        }
+    }
+    // Fall through to existing fill strategy if frame N fill failed
 
     // Locomotion-aligned mirror-fill with source-passthrough fallback.
     // The mirror-fill along the loco direction produces smooth, motion-aligned
@@ -2222,6 +2289,76 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	}
 	cb.rotMVScale = m_rotMVScale;
 
+	// Reprojection: compute clipToClip from warp output → frame N (published slot).
+	// Frame N was rendered at a newer pose where disoccluded background may be visible.
+	// Uses direct deltaV computation (proven correct for warp-to-warp DLSS MVs).
+	int pubSlot = m_publishedSlot.load(std::memory_order_acquire);
+	if (pubSlot >= 0 && pubSlot != slot) {
+		const auto& warpP = newPose;  // current warp pose
+		const auto& frameNP = m_slotPose[pubSlot][eye]; // frame N's pose
+
+		// deltaV = V_frameN * inv(V_warp) — maps warp view → frame N view
+		float pqx=frameNP.orientation.x, pqy=frameNP.orientation.y, pqz=frameNP.orientation.z, pqw=frameNP.orientation.w;
+		float Rn00=1-2*(pqy*pqy+pqz*pqz), Rn01=2*(pqx*pqy-pqz*pqw), Rn02=2*(pqx*pqz+pqy*pqw);
+		float Rn10=2*(pqx*pqy+pqz*pqw), Rn11=1-2*(pqx*pqx+pqz*pqz), Rn12=2*(pqy*pqz-pqx*pqw);
+		float Rn20=2*(pqx*pqz-pqy*pqw), Rn21=2*(pqy*pqz+pqx*pqw), Rn22=1-2*(pqx*pqx+pqy*pqy);
+
+		float cqx=warpP.orientation.x, cqy=warpP.orientation.y, cqz=warpP.orientation.z, cqw=warpP.orientation.w;
+		float Rw00=1-2*(cqy*cqy+cqz*cqz), Rw01=2*(cqx*cqy-cqz*cqw), Rw02=2*(cqx*cqz+cqy*cqw);
+		float Rw10=2*(cqx*cqy+cqz*cqw), Rw11=1-2*(cqx*cqx+cqz*cqz), Rw12=2*(cqy*cqz-cqx*cqw);
+		float Rw20=2*(cqx*cqz-cqy*cqw), Rw21=2*(cqy*cqz+cqx*cqw), Rw22=1-2*(cqx*cqx+cqy*cqy);
+
+		// deltaRot = Rn^T * Rw
+		float d00=Rn00*Rw00+Rn10*Rw10+Rn20*Rw20, d01=Rn00*Rw01+Rn10*Rw11+Rn20*Rw21, d02=Rn00*Rw02+Rn10*Rw12+Rn20*Rw22;
+		float d10=Rn01*Rw00+Rn11*Rw10+Rn21*Rw20, d11=Rn01*Rw01+Rn11*Rw11+Rn21*Rw21, d12=Rn01*Rw02+Rn11*Rw12+Rn21*Rw22;
+		float d20=Rn02*Rw00+Rn12*Rw10+Rn22*Rw20, d21=Rn02*Rw01+Rn12*Rw11+Rn22*Rw21, d22=Rn02*Rw02+Rn12*Rw12+Rn22*Rw22;
+
+		// deltaTrans = Rn^T * (pw - pn)
+		float dpx=warpP.position.x-frameNP.position.x, dpy=warpP.position.y-frameNP.position.y, dpz=warpP.position.z-frameNP.position.z;
+		float dt0=Rn00*dpx+Rn10*dpy+Rn20*dpz;
+		float dt1=Rn01*dpx+Rn11*dpy+Rn21*dpz;
+		float dt2=Rn02*dpx+Rn12*dpy+Rn22*dpz;
+
+		// deltaV column-major
+		float dV[16] = {};
+		dV[0]=d00; dV[4]=d01; dV[8]=d02;  dV[12]=dt0;
+		dV[1]=d10; dV[5]=d11; dV[9]=d12;  dV[13]=dt1;
+		dV[2]=d20; dV[6]=d21; dV[10]=d22; dV[14]=dt2;
+		dV[3]=0;   dV[7]=0;   dV[11]=0;   dV[15]=1;
+
+		// P and P^{-1} from FOV (right-handed, same as DLSS warp callback)
+		float tanL=cb.fovTanLeft, tanR=cb.fovTanRight, tanU=cb.fovTanUp, tanD=cb.fovTanDown;
+		float w=tanR-tanL, h=tanU-tanD, n=cb.nearZ, f=cb.farZ;
+
+		float P[16]={}, Pi[16]={};
+		P[0]=2.0f/w; P[8]=(tanR+tanL)/w;
+		P[5]=2.0f/h; P[9]=(tanU+tanD)/h;
+		P[10]=-f/(f-n); P[14]=-(f*n)/(f-n);
+		P[11]=-1.0f;
+
+		Pi[0]=w/2.0f; Pi[12]=(tanR+tanL)/2.0f;
+		Pi[5]=h/2.0f; Pi[13]=(tanU+tanD)/2.0f;
+		Pi[14]=-1.0f;
+		Pi[11]=-(f-n)/(f*n); Pi[15]=1.0f/n;
+
+		// reprojC2C = P * dV * Pi (column-major)
+		float tmp[16]={}, reproj[16]={};
+		for (int c=0; c<4; c++) for (int r=0; r<4; r++) {
+			float s=0; for (int k=0; k<4; k++) s+=dV[k*4+r]*Pi[c*4+k]; tmp[c*4+r]=s;
+		}
+		for (int c=0; c<4; c++) for (int r=0; r<4; r++) {
+			float s=0; for (int k=0; k<4; k++) s+=P[k*4+r]*tmp[c*4+k]; reproj[c*4+r]=s;
+		}
+
+		// Store as row-major for HLSL (transpose column-major → row-major)
+		for (int r=0; r<4; r++) for (int c=0; c<4; c++)
+			cb.reprojClipToClip[r*4+c] = reproj[c*4+r];
+		cb.hasReprojData = 1;
+	} else {
+		memset(cb.reprojClipToClip, 0, sizeof(cb.reprojClipToClip));
+		cb.hasReprojData = 0;
+	}
+
 	// clipToClipNoLoco: prevVP * inv(curVP_original) — head rotation + head translation,
 	// no locomotion injection. Per-eye from RSS VP matrices.
 	if (m_slotHasClipToClipNoLoco[slot] && eye >= 0 && eye < 2) {
@@ -2284,7 +2421,17 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	ctx->Unmap(m_constantBuffer, 0);
 
 	ID3D11ShaderResourceView* mvSRV = (fabsf(cb.mvConfidence) > 0.001f) ? m_srvMV[slot][eye] : nullptr;
-	ID3D11ShaderResourceView* srvs[] = { m_srvColor[slot][eye], mvSRV, m_srvDepth[slot][eye] };
+	// Bind frame N (published slot) color + depth for disocclusion reprojection fill
+	ID3D11ShaderResourceView* frameNColorSRV = nullptr;
+	ID3D11ShaderResourceView* frameNDepthSRV = nullptr;
+	if (cb.hasReprojData && pubSlot >= 0 && pubSlot != slot) {
+		frameNColorSRV = m_srvColor[pubSlot][eye];
+		frameNDepthSRV = m_srvDepth[pubSlot][eye];
+	}
+	ID3D11ShaderResourceView* srvs[] = {
+		m_srvColor[slot][eye], mvSRV, m_srvDepth[slot][eye],
+		frameNColorSRV, frameNDepthSRV
+	};
 	ctx->CSSetShaderResources(0, _countof(srvs), srvs);
 	ID3D11UnorderedAccessView* uavs2[] = { m_uavOutput[eye], m_uavAtomicDepth[eye] };
 	ctx->CSSetUnorderedAccessViews(0, 2, uavs2, nullptr);
@@ -2357,9 +2504,9 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		}
 	}
 
-	ID3D11ShaderResourceView* nullSRVs[4] = {};
+	ID3D11ShaderResourceView* nullSRVs[5] = {};
 	ID3D11UnorderedAccessView* nullUAVs[2] = {};
-	ctx->CSSetShaderResources(0, 4, nullSRVs);
+	ctx->CSSetShaderResources(0, 5, nullSRVs);
 	ctx->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
 	ctx->CSSetShader(nullptr, nullptr, 0);
 

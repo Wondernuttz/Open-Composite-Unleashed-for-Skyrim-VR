@@ -420,6 +420,9 @@ private:
 		float locoScreenDir[2];        // screen-space locomotion direction (from actorPos delta) — 8 bytes
 		float staticBlendFactor;       // 1.0 when near-stationary (blend scatter→prevColor), 0.0 when moving — 4 bytes
 		float rotMVScale;              // 1.0 = rotation in residual, 0.0 = rotation suppressed (stop transition) — 4 bytes
-	};                                 //                         total: 384 bytes
+		float reprojClipToClip[16];    // 4x4 col-major: warp output → frame N clip space          — 64 bytes
+		int hasReprojData;             // 1 if frame N data bound for disocclusion fill              — 4 bytes
+		float _padReproj[3];           // alignment                                                 — 12 bytes
+	};                                 //                         total: 464 bytes
 
 };
