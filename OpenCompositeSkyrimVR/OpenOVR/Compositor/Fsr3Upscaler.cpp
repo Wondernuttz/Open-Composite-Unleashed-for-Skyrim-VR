@@ -639,6 +639,9 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 	if (params.reactiveMask) {
 		dispatchDesc.reactive = ffxApiGetResourceDX12(
 		    eye.reactiveDX12, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+		// Also pass as transparencyAndComposition — this gives FSR3 an additional
+		// signal for disocclusion handling at alpha-tested/object edges against sky.
+		dispatchDesc.transparencyAndComposition = dispatchDesc.reactive;
 	}
 
 	// Output resource — write to the current write buffer (double-buffered)

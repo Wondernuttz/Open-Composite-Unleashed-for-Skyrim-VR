@@ -382,12 +382,14 @@ void CS_MVDilate(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= resolution.x || id.y >= resolution.y) return;
 
-    // Find the closest (nearest-to-camera) depth in a 3x3 neighborhood.
+    // Find the closest (nearest-to-camera) depth in a 5x5 neighborhood.
+    // Wider kernel propagates foreground MVs further into sky-adjacent pixels,
+    // reducing trailing edge ghosts during fast locomotion (FSR3 disocclusion).
     float bestDepth = 1.0;
     int2 bestCoord = int2(id.xy);
 
-    [unroll] for (int dy = -1; dy <= 1; dy++) {
-        [unroll] for (int dx = -1; dx <= 1; dx++) {
+    [unroll] for (int dy = -2; dy <= 2; dy++) {
+        [unroll] for (int dx = -2; dx <= 2; dx++) {
             int2 coord = clamp(int2(id.xy) + int2(dx, dy), int2(0,0), int2(resolution) - 1);
             float d = DepthIn.Load(int3(coord + depthOffset, 0));
             if (d < bestDepth) {
