@@ -73,6 +73,17 @@ struct OCRenderTargetBridge {
 
 	// Camera world position — includes actorPos + eye height + walk-cycle bob + HMD tracking
 	uint64_t cameraPosPtr; // float* → NiCamera::world.translate.x (NiPoint3: x, y, z)
+
+	// Actor MV data — pointers to NiAVObject root nodes for nearby actors.
+	// OC reads world/previousWorld transforms directly via known offsets each frame.
+	// NiAVObject offsets (VR): world.translate=+0xA0, previousWorld.translate=+0xD4,
+	// worldBound.center=+0xE4, worldBound.radius=+0xF0
+	static constexpr uint32_t MAX_ACTOR_MV = 32;
+	uint32_t actorMvCount; // Number of valid entries
+	uint32_t actorMvRefreshSeq; // Incremented on re-enumeration (SKSE writes)
+	uint64_t actorMvRootPtrs[MAX_ACTOR_MV]; // NiAVObject* root node pointers
+	uint32_t actorMvRequestRefresh; // OC sets to 1 to request SKSE re-enumerate
+	uint32_t _padActorMv;
 };
 #pragma pack(pop)
 
@@ -90,13 +101,13 @@ static void OpenRenderTargetBridge()
 		return;
 	s_bridgeTried = true;
 
-	s_hBridgeMap = OpenFileMappingW(FILE_MAP_READ, FALSE,
+	s_hBridgeMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
 	    L"Local\\OpenCompositeRenderTargets");
 	if (!s_hBridgeMap)
 		return;
 
 	s_pBridge = static_cast<OCRenderTargetBridge*>(
-	    MapViewOfFile(s_hBridgeMap, FILE_MAP_READ, 0, 0, sizeof(OCRenderTargetBridge)));
+	    MapViewOfFile(s_hBridgeMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(OCRenderTargetBridge)));
 	if (!s_pBridge) {
 		CloseHandle(s_hBridgeMap);
 		s_hBridgeMap = nullptr;
@@ -182,6 +193,9 @@ cbuffer ReactiveCB : register(b0) {
     float edgeBoost;         // Extra reactiveness at depth edges
     float edgeThreshold;     // Depth diff below which edge = 0
     float edgeScale;         // Ramp speed for edge detection
+    float depthFalloffStart; // Depth value where distance falloff begins (standard-Z)
+    float depthFalloffEnd;   // Depth value where bias reaches zero
+    float pad0, pad1;
 };
 
 [numthreads(8, 8, 1)]
@@ -203,10 +217,74 @@ void CS_ReactiveMask(uint3 id : SV_DispatchThreadID)
     }
     float edge = saturate((maxDiff - edgeThreshold) * edgeScale) * edgeBoost;
 
-    ReactiveOut[id.xy] = min(baseReactiveness + edge, 0.95);
+    // Distance falloff: reduce bias for distant pixels so the upscaler trusts
+    // history more, counteracting jitter-induced wobble on mountains/landscapes.
+    // Standard-Z: higher depth = farther. Falloff ramps from 1→0 between start..end.
+    float distFade = (depthFalloffEnd > depthFalloffStart)
+        ? 1.0 - saturate((center - depthFalloffStart) / (depthFalloffEnd - depthFalloffStart))
+        : 1.0;
+
+    ReactiveOut[id.xy] = min((baseReactiveness + edge) * distFade, 0.95);
 }
 )HLSL";
 static ID3D11Buffer* s_reactiveMaskCB = nullptr;
+
+// ── NPC motion boost shader ──
+// Compares game MVs (which include NPC animation) with our camera MVs (static world only).
+// Where the difference is significant, boosts the reactive mask so DLSS/FSR3 trusts the
+// current frame more → sharper moving NPCs. No MV modification needed.
+static constexpr char s_npcBoostHLSL[] = R"HLSL(
+Texture2D<float2>      GameMVIn  : register(t0);
+Texture2D<float>       DepthIn   : register(t1);
+RWTexture2D<float>     ReactiveOut: register(u0);
+
+cbuffer NpcBoostCB : register(b0) {
+    column_major float4x4 gameTimingC2C;  // clipToClip using game-timing VP pair
+    int2   gameMVOffset;
+    int2   depthOffset;
+    int2   reactiveOutOffset;
+    float  boostStrength;
+    float  motionThreshold;
+    uint2  eyeSize;
+    float2 currJitterUV;
+    float2 _pad;
+};
+
+[numthreads(8, 8, 1)]
+void CS_NpcMotionBoost(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= eyeSize.x || id.y >= eyeSize.y) return;
+
+    float depth = DepthIn.Load(int3(int2(id.xy) + depthOffset, 0));
+    if (depth < 0.0001) return;
+
+    // Compute game-timing camera MV from depth (matches game's VP timing)
+    float2 uv = (float2(id.xy) + 0.5) / float2(eyeSize);
+    float2 uvUnj = uv - currJitterUV;
+    float2 ndc = float2(uvUnj.x * 2.0 - 1.0, 1.0 - uvUnj.y * 2.0);
+    float4 prevClip = mul(gameTimingC2C, float4(ndc, depth, 1.0));
+    float2 prevUV = float2(prevClip.x / prevClip.w * 0.5 + 0.5,
+                           0.5 - prevClip.y / prevClip.w * 0.5);
+    float2 gtCameraMV = prevUV - uvUnj;
+
+    // Game MV (rotation + tracking + NPC animation at game's timing)
+    float2 gameMV = GameMVIn.Load(int3(int2(id.xy) + gameMVOffset, 0));
+
+    // NPC delta: only nonzero at animated pixels
+    float2 npcDelta = gameMV - gtCameraMV;
+    float npcMag = length(npcDelta);
+
+    if (npcMag > motionThreshold) {
+        float boost = saturate(npcMag * boostStrength / motionThreshold);
+        int2 outCoord = int2(id.xy) + reactiveOutOffset;
+        float existing = ReactiveOut[outCoord];
+        ReactiveOut[outCoord] = min(max(existing, boost), 0.95);
+    }
+}
+)HLSL";
+
+static ID3D11ComputeShader* s_npcBoostCS = nullptr;
+static ID3D11Buffer* s_npcBoostCB = nullptr;
 #endif // OC_HAS_FSR3 || OC_HAS_DLSS (reactive mask)
 
 // ── Camera MV resources (compute per-pixel camera motion from depth + pose deltas) ──
@@ -223,7 +301,9 @@ static uint32_t s_cameraMVW = 0, s_cameraMVH = 0;
 
 // Per-eye previous VP matrix for camera MV computation (column-major float[16])
 static float s_prevVP[2][16] = {};
+static float s_prevPrevVP[2][16] = {};  // Two frames ago — for game-timing MV comparison
 static bool s_hasPrevVP[2] = { false, false };
+static bool s_hasPrevPrevVP[2] = { false, false };
 
 // Per-eye previous jitter (pixel-space, for computing jitter delta in camera MVs)
 static float s_prevJitterX[2] = { 0.0f, 0.0f };
@@ -279,16 +359,20 @@ static XrPosef s_fsr3EyePose[2] = {};
 static XrFovf s_fsr3EyeFov[2] = {};
 
 static constexpr char s_cameraMVHLSL[] = R"HLSL(
-Texture2D<float>       DepthIn  : register(t0);
-RWTexture2D<float2>    MVOut    : register(u0);
+Texture2D<float>       DepthIn   : register(t0);
+RWTexture2D<float2>    MVOut     : register(u0);
+Texture2D<float2>      GameMVIn  : register(t1);
 
 cbuffer CameraMVCB : register(b0) {
-    column_major float4x4 clipToClip;  // prevVP * inv(curVP), computed in double on CPU
-    float2 renderSize;                  // per-eye render resolution
-    int2 depthOffset;                   // offset into stereo-combined depth texture
-    float2 jitterDeltaUV;               // (curJitter - prevJitter) / renderSize (FSR3 only)
-    float2 currJitterUV;                // current jitter in UV space (DLSS: unjitters clip coords)
-    float2 _pad0;
+    column_major float4x4 clipToClip;        // prevVP * inv(curVP) WITH loco
+    column_major float4x4 clipToClipNoLoco;  // prevVP * inv(curVP) WITHOUT loco
+    float2 renderSize;
+    int2   depthOffset;
+    float2 jitterDeltaUV;
+    float2 currJitterUV;
+    int2   gameMVOffset;
+    uint   useGameMV;
+    float  _pad;
 };
 
 [numthreads(8, 8, 1)]
@@ -300,33 +384,33 @@ void CS_CameraMV(uint3 id : SV_DispatchThreadID)
 
     float depth = DepthIn.Load(int3(int2(id.xy) + depthOffset, 0));
 
-    // Skip sky pixels (reversed-Z: depth near 0 = far plane / sky)
     if (depth < 0.0001) {
         MVOut[id.xy] = float2(0, 0);
         return;
     }
 
-    // Pixel center -> UV -> NDC
     float2 uv = (float2(id.xy) + 0.5) / renderSize;
-
-    // Remove current frame's jitter from UV before converting to NDC.
-    // The game renders with our jittered projection (from GetProjectionRaw), so pixels
-    // are displaced by sub-pixel jitter. But clipToClip uses unjittered VP matrices.
-    // Without this correction, inv(curVP_unjittered) receives jittered clip coords,
-    // causing a depth-dependent MV error through the perspective divide (close objects
-    // get larger error than far objects). For FSR3: currJitterUV=(0,0) — FSR3 handles
-    // jitter via its own cancellation framework. For DLSS: removes the mismatch.
     float2 uvUnjittered = uv - currJitterUV;
     float2 ndc = float2(uvUnjittered.x * 2.0 - 1.0, 1.0 - uvUnjittered.y * 2.0);
-
-    // Map current clip space to previous clip space via clipToClip matrix.
-    // clipToClip = prevVP * inv(curVP), computed in double precision on CPU.
     float4 clipPos = float4(ndc, depth, 1.0);
-    float4 prevClip = mul(clipToClip, clipPos);
-    float2 prevNDC = prevClip.xy / prevClip.w;
-    float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
 
-    float2 mv = prevUV - uvUnjittered;
+    // Full camera MV (rotation + head tracking + locomotion) — always correct for static world
+    float4 prevClipFull = mul(clipToClip, clipPos);
+    float2 prevUVFull = float2(prevClipFull.x / prevClipFull.w * 0.5 + 0.5,
+                               0.5 - prevClipFull.y / prevClipFull.w * 0.5);
+    float2 fullCameraMV = prevUVFull - uvUnjittered;
+
+    float2 mv = fullCameraMV;
+
+    if (useGameMV) {
+        // Use game MVs directly (rotation + head tracking + NPC animation).
+        // Locomotion will be injected in the dilation pass using foreground depth,
+        // which correctly handles alpha-tested foliage (sky-depth pixels get
+        // foreground depth from nearest neighbor → correct locomotion parallax).
+        float2 gameMV = GameMVIn.Load(int3(int2(id.xy) + gameMVOffset, 0));
+        mv = gameMV;
+    }
+
     mv.x += jitterDeltaUV.x;
     mv.y -= jitterDeltaUV.y;
 
@@ -348,8 +432,14 @@ Texture2D<float>       DepthIn  : register(t1);
 RWTexture2D<float2>    MVOut    : register(u0);
 
 cbuffer DilateCB : register(b0) {
-    int2 depthOffset;   // offset into stereo-combined depth texture
-    uint2 resolution;   // per-eye render resolution
+    int2   depthOffset;
+    uint2  resolution;
+    // Loco injection (used when input is gameMV without locomotion)
+    column_major float4x4 clipToClipLoco;    // prevVP * inv(curVP) WITH loco
+    column_major float4x4 clipToClipNoLoco;  // prevVP * inv(curVP) WITHOUT loco
+    float2 currJitterUV;
+    uint   injectLoco;  // 1 = add locoMV using foreground depth, 0 = just dilate
+    float  _pad;
 };
 
 [numthreads(8, 8, 1)]
@@ -358,7 +448,6 @@ void CS_MVDilate(uint3 id : SV_DispatchThreadID)
     if (id.x >= resolution.x || id.y >= resolution.y) return;
 
     // Find the closest (nearest-to-camera) depth in a 3x3 neighborhood.
-    // Standard-Z: 0.0 = near, 1.0 = far. Closest = min depth value.
     float bestDepth = 1.0;
     int2 bestCoord = int2(id.xy);
 
@@ -374,7 +463,30 @@ void CS_MVDilate(uint3 id : SV_DispatchThreadID)
     }
 
     // Use the MV from the closest-depth neighbor
-    MVOut[id.xy] = MVIn.Load(int3(bestCoord, 0));
+    float2 mv = MVIn.Load(int3(bestCoord, 0));
+
+    // Optionally inject locomotion using the foreground depth.
+    // When input MVs are game MVs (no loco), this adds depth-correct locomotion parallax.
+    // Using bestDepth (foreground) ensures alpha-tested foliage gets correct parallax.
+    if (injectLoco && bestDepth > 0.0001) {
+        float2 uv = (float2(id.xy) + 0.5) / float2(resolution);
+        float2 uvUnj = uv - currJitterUV;
+        float2 ndc = float2(uvUnj.x * 2.0 - 1.0, 1.0 - uvUnj.y * 2.0);
+        float4 clipPos = float4(ndc, bestDepth, 1.0);
+
+        float4 prevLoco = mul(clipToClipLoco, clipPos);
+        float2 prevUVLoco = float2(prevLoco.x / prevLoco.w * 0.5 + 0.5,
+                                   0.5 - prevLoco.y / prevLoco.w * 0.5);
+
+        float4 prevNoLoco = mul(clipToClipNoLoco, clipPos);
+        float2 prevUVNoLoco = float2(prevNoLoco.x / prevNoLoco.w * 0.5 + 0.5,
+                                     0.5 - prevNoLoco.y / prevNoLoco.w * 0.5);
+
+        float2 locoMV = prevUVLoco - prevUVNoLoco;
+        mv += locoMV;
+    }
+
+    MVOut[id.xy] = mv;
 }
 )HLSL";
 
@@ -386,6 +498,88 @@ static ID3D11ShaderResourceView* s_mvDilateDepthSRV = nullptr;
 static ID3D11Texture2D* s_mvDilateDepthSRVTex = nullptr;
 static ID3D11Buffer* s_mvDilateCB = nullptr;
 static uint32_t s_mvDilateW = 0, s_mvDilateH = 0;
+
+// ── Actor MV compute shader ──
+// Generates per-pixel motion vectors for nearby NPCs/actors by testing each pixel
+// against actor bounding spheres (depth-based world-space reconstruction) and computing
+// rigid-body displacement MVs. Runs after CS_CameraMV, overwrites actor pixels in s_cameraMVTex.
+static constexpr char s_actorMVHLSL[] = R"HLSL(
+Texture2D<float>       DepthIn  : register(t0);
+RWTexture2D<float2>    MVOut    : register(u0);
+
+struct ActorData {
+    float3 curPos;
+    float  radius;
+    float3 prevPos;
+    float  pad;
+};
+StructuredBuffer<ActorData> Actors : register(t2);
+
+cbuffer ActorMVCB : register(b0) {
+    column_major float4x4 invCurVP;
+    column_major float4x4 prevVP;
+    float2   renderSize;
+    float2   jitterDeltaUV;
+    int2     depthOffset;
+    uint     actorCount;
+    float    radiusScale;
+    uint     debugTint;
+    float    _pad2[3];
+};
+
+[numthreads(8, 8, 1)]
+void CS_ActorMV(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)renderSize.x || id.y >= (uint)renderSize.y) return;
+
+    float depth = DepthIn.Load(int3(int2(id.xy) + depthOffset, 0));
+    if (depth > 0.999) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / renderSize;
+    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    float4 worldH = mul(invCurVP, float4(ndc, depth, 1.0));
+    float3 worldPos = worldH.xyz / worldH.w;
+
+    int bestActor = -1;
+    float bestDist = 1e10;
+    for (uint i = 0; i < actorCount; i++) {
+        float3 toActor = worldPos - Actors[i].curPos;
+        float dist = length(toActor);
+        float r = Actors[i].radius * radiusScale;
+        if (dist < r && dist < bestDist) {
+            bestDist = dist;
+            bestActor = (int)i;
+        }
+    }
+
+    if (bestActor < 0) return;
+
+    if (debugTint) {
+        float sign = ((id.x / 4) % 2 == 0) ? 1.0 : -1.0;
+        MVOut[id.xy] = float2(sign * 0.5, 0.5);
+        return;
+    }
+
+    float3 delta = Actors[bestActor].curPos - Actors[bestActor].prevPos;
+    if (dot(delta, delta) < 0.0001) return;
+
+    float3 prevWorldPos = worldPos - delta;
+    float4 prevClip = mul(prevVP, float4(prevWorldPos, 1.0));
+    float2 prevNDC = prevClip.xy / prevClip.w;
+    float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
+
+    float2 mv = prevUV - uv;
+    mv.x += jitterDeltaUV.x;
+    mv.y -= jitterDeltaUV.y;
+
+    MVOut[id.xy] = mv;
+}
+)HLSL";
+
+static ID3D11ComputeShader* s_actorMVCS = nullptr;
+static ID3D11Buffer* s_actorMVCB = nullptr;
+static ID3D11Buffer* s_actorDataSB = nullptr;
+static ID3D11ShaderResourceView* s_actorDataSRV = nullptr;
 
 // Lazily compile the depth extraction CS and create output texture + UAV.
 // Returns true if depth extraction is available.
@@ -616,7 +810,7 @@ static bool EnsureReactiveMaskResources(ID3D11Device* device, uint32_t w, uint32
 
 	if (!s_reactiveMaskCB) {
 		D3D11_BUFFER_DESC bd = {};
-		bd.ByteWidth = 16;
+		bd.ByteWidth = 32;
 		bd.Usage = D3D11_USAGE_DYNAMIC;
 		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -650,7 +844,8 @@ static ID3D11ShaderResourceView* GetOrCreateReactiveMaskDepthSRV(ID3D11Device* d
 
 static bool GenerateReactiveMask(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
     uint32_t width, uint32_t height,
-    float baseReactiveness, float edgeBoost, float edgeThreshold, float edgeScale)
+    float baseReactiveness, float edgeBoost, float edgeThreshold, float edgeScale,
+    float depthFalloffStart = 0.0f, float depthFalloffEnd = 0.0f)
 {
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	if (SUCCEEDED(context->Map(s_reactiveMaskCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
@@ -659,6 +854,10 @@ static bool GenerateReactiveMask(ID3D11DeviceContext* context, ID3D11ShaderResou
 		cb[1] = edgeBoost;
 		cb[2] = edgeThreshold;
 		cb[3] = edgeScale;
+		cb[4] = depthFalloffStart;
+		cb[5] = depthFalloffEnd;
+		cb[6] = 0.0f;
+		cb[7] = 0.0f;
 		context->Unmap(s_reactiveMaskCB, 0);
 	}
 
@@ -689,6 +888,92 @@ static bool GenerateReactiveMask(ID3D11DeviceContext* context, ID3D11ShaderResou
 		oldUAV->Release();
 	if (oldCB)
 		oldCB->Release();
+	return true;
+}
+
+// Boost reactive mask where NPC motion is detected (game MV differs from game-timing camera MV)
+static bool BoostReactiveMaskForNPCs(ID3D11DeviceContext* context, ID3D11Device* device,
+    ID3D11ShaderResourceView* gameMVSRV, ID3D11ShaderResourceView* depthSRV,
+    const float gameTimingC2C[16],
+    uint32_t eyeW, uint32_t eyeH,
+    int gameMVOffX, int depthOffX, int reactiveOffX,
+    float boostStrength, float motionThreshold,
+    float currJitterUVx, float currJitterUVy)
+{
+	// Compile shader once
+	if (!s_npcBoostCS) {
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errors = nullptr;
+		HRESULT hr = D3DCompile(s_npcBoostHLSL, sizeof(s_npcBoostHLSL) - 1,
+		    "NpcBoost", nullptr, nullptr, "CS_NpcMotionBoost", "cs_5_0", 0, 0, &blob, &errors);
+		if (FAILED(hr)) {
+			if (errors) { OOVR_LOGF("NpcBoost CS compile failed: %s", (char*)errors->GetBufferPointer()); errors->Release(); }
+			return false;
+		}
+		if (errors) errors->Release();
+		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_npcBoostCS);
+		blob->Release();
+		if (FAILED(hr)) return false;
+		OOVR_LOG("NpcBoost: Compute shader compiled OK");
+	}
+	if (!s_npcBoostCB) {
+		D3D11_BUFFER_DESC bd = {};
+		bd.ByteWidth = 128;
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &s_npcBoostCB))) return false;
+	}
+
+	// Upload CB: matrix(64) + params
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (SUCCEEDED(context->Map(s_npcBoostCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+		float* cb = (float*)mapped.pData;
+		int32_t* cbi = (int32_t*)mapped.pData;
+		memcpy(cb, gameTimingC2C, 64);          // offset 0: gameTimingC2C matrix
+		cbi[16] = gameMVOffX; cbi[17] = 0;     // offset 64: gameMVOffset
+		cbi[18] = depthOffX; cbi[19] = 0;      // offset 72: depthOffset
+		cbi[20] = reactiveOffX; cbi[21] = 0;   // offset 80: reactiveOutOffset
+		cb[22] = boostStrength;                  // offset 88
+		cb[23] = motionThreshold;                // offset 92
+		((uint32_t*)cb)[24] = eyeW;             // offset 96: eyeSize
+		((uint32_t*)cb)[25] = eyeH;
+		cb[26] = currJitterUVx;                  // offset 104: currJitterUV
+		cb[27] = currJitterUVy;
+		cb[28] = 0; cb[29] = 0;                 // pad
+		context->Unmap(s_npcBoostCB, 0);
+	}
+
+	// Save/dispatch/restore
+	ID3D11ComputeShader* oldCS = nullptr;
+	ID3D11ShaderResourceView* oldSRV[2] = {};
+	ID3D11UnorderedAccessView* oldUAV = nullptr;
+	ID3D11Buffer* oldCB = nullptr;
+	context->CSGetShader(&oldCS, nullptr, nullptr);
+	context->CSGetShaderResources(0, 2, oldSRV);
+	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
+	context->CSGetConstantBuffers(0, 1, &oldCB);
+
+	context->CSSetShader(s_npcBoostCS, nullptr, 0);
+	ID3D11ShaderResourceView* srvs[2] = { gameMVSRV, depthSRV };
+	context->CSSetShaderResources(0, 2, srvs);
+	context->CSSetUnorderedAccessViews(0, 1, &s_reactiveMaskUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &s_npcBoostCB);
+	context->Dispatch((eyeW + 7) / 8, (eyeH + 7) / 8, 1);
+
+	context->CSSetShader(oldCS, nullptr, 0);
+	context->CSSetShaderResources(0, 2, oldSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &oldCB);
+	if (oldCS) oldCS->Release();
+	for (int i = 0; i < 2; i++) { if (oldSRV[i]) oldSRV[i]->Release(); }
+	if (oldUAV) oldUAV->Release();
+	if (oldCB) oldCB->Release();
+
+	{
+		static bool s = false;
+		if (!s) { s = true; OOVR_LOGF("NpcBoost: Dispatched %ux%u boost=%.2f thresh=%.4f", eyeW, eyeH, boostStrength, motionThreshold); }
+	}
 	return true;
 }
 
@@ -827,10 +1112,10 @@ static bool EnsureCameraMVResources(ID3D11Device* device, uint32_t w, uint32_t h
 		OOVR_LOGF("CameraMV: R16G16_FLOAT output %ux%u created", w, h);
 	}
 
-	// Create constant buffer once (160 bytes = 10 * 16)
+	// Create constant buffer once (192 bytes = 12 * 16)
 	if (!s_cameraMVCB) {
 		D3D11_BUFFER_DESC bd = {};
-		bd.ByteWidth = 160; // 10 * 16 bytes
+		bd.ByteWidth = 192; // clipToClip(64) + clipToClipNoLoco(64) + renderSize(8) + depthOffset(8) + jitterDelta(8) + currJitter(8) + gameMVOffset(8) + useGameMV(4) + pad(4) = 176, rounded to 192
 		bd.Usage = D3D11_USAGE_DYNAMIC;
 		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -866,62 +1151,192 @@ static ID3D11ShaderResourceView* GetOrCreateCameraMVDepthSRV(ID3D11Device* devic
 }
 
 // Generate camera-derived motion vectors from depth + clip-to-clip reprojection matrix.
-// currJitterUVx/y: current frame's jitter in UV space. For DLSS, this unjitters the clip-space
-// position to match the unjittered VP matrix. For FSR3, pass (0,0).
 static bool GenerateCameraMVs(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
-    uint32_t outputW, uint32_t outputH, const float clipToClip[16],
+    uint32_t outputW, uint32_t outputH,
+    const float clipToClip[16], const float clipToClipNoLoco[16],
     int depthOffsetX, int depthOffsetY, float jitterDeltaUVx, float jitterDeltaUVy,
-    float currJitterUVx = 0.0f, float currJitterUVy = 0.0f)
+    float currJitterUVx, float currJitterUVy,
+    ID3D11ShaderResourceView* gameMVSRV, int gameMVOffsetX, int gameMVOffsetY,
+    bool useGameMV)
 {
-	// Update constant buffer
+	// Update constant buffer: clipToClip + clipToClipNoLoco + params = 192 bytes
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	if (SUCCEEDED(context->Map(s_cameraMVCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 		float* cb = (float*)mapped.pData;
-		memcpy(cb, clipToClip, 64); // offset 0: clipToClip (16 floats = 64 bytes)
-		cb[16] = (float)outputW; // offset 64: renderSize.x
-		cb[17] = (float)outputH; // offset 68: renderSize.y
 		int32_t* cbi = (int32_t*)mapped.pData;
-		cbi[18] = depthOffsetX; // offset 72: depthOffset.x
-		cbi[19] = depthOffsetY; // offset 76: depthOffset.y
-		cb[20] = jitterDeltaUVx; // offset 80: jitterDeltaUV.x
-		cb[21] = jitterDeltaUVy; // offset 84: jitterDeltaUV.y
-		cb[22] = currJitterUVx; // offset 88: currJitterUV.x
-		cb[23] = currJitterUVy; // offset 92: currJitterUV.y
-		cb[24] = 0.0f; // offset 96: _pad0.x
-		cb[25] = 0.0f; // offset 100: _pad0.y
+		uint32_t* cbu = (uint32_t*)mapped.pData;
+		memcpy(cb, clipToClip, 64);           // offset 0: clipToClip
+		memcpy(cb + 16, clipToClipNoLoco, 64); // offset 64: clipToClipNoLoco
+		cb[32] = (float)outputW;              // offset 128: renderSize
+		cb[33] = (float)outputH;
+		cbi[34] = depthOffsetX;               // offset 136: depthOffset
+		cbi[35] = depthOffsetY;
+		cb[36] = jitterDeltaUVx;              // offset 144: jitterDeltaUV
+		cb[37] = jitterDeltaUVy;
+		cb[38] = currJitterUVx;               // offset 152: currJitterUV
+		cb[39] = currJitterUVy;
+		cbi[40] = gameMVOffsetX;              // offset 160: gameMVOffset
+		cbi[41] = gameMVOffsetY;
+		cbu[42] = useGameMV ? 1u : 0u;       // offset 168: useGameMV
+		cbu[43] = 0u;                         // offset 172: pad
 		context->Unmap(s_cameraMVCB, 0);
 	}
 
 	// Save current CS state
 	ID3D11ComputeShader* oldCS = nullptr;
-	ID3D11ShaderResourceView* oldSRV = nullptr;
+	ID3D11ShaderResourceView* oldSRVs[2] = { nullptr, nullptr };
 	ID3D11UnorderedAccessView* oldUAV = nullptr;
 	ID3D11Buffer* oldCB = nullptr;
 	context->CSGetShader(&oldCS, nullptr, nullptr);
-	context->CSGetShaderResources(0, 1, &oldSRV);
+	context->CSGetShaderResources(0, 2, oldSRVs);
 	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
 	context->CSGetConstantBuffers(0, 1, &oldCB);
 
 	context->CSSetShader(s_cameraMVCS, nullptr, 0);
-	context->CSSetShaderResources(0, 1, &depthSRV);
+	ID3D11ShaderResourceView* srvs[2] = { depthSRV, gameMVSRV };
+	context->CSSetShaderResources(0, 2, srvs);
 	context->CSSetUnorderedAccessViews(0, 1, &s_cameraMVUAV, nullptr);
 	context->CSSetConstantBuffers(0, 1, &s_cameraMVCB);
 	context->Dispatch((outputW + 7) / 8, (outputH + 7) / 8, 1);
 
 	// Restore CS state
 	context->CSSetShader(oldCS, nullptr, 0);
-	context->CSSetShaderResources(0, 1, &oldSRV);
+	context->CSSetShaderResources(0, 2, oldSRVs);
 	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
 	context->CSSetConstantBuffers(0, 1, &oldCB);
-	if (oldCS)
-		oldCS->Release();
-	if (oldSRV)
-		oldSRV->Release();
-	if (oldUAV)
-		oldUAV->Release();
-	if (oldCB)
-		oldCB->Release();
+	if (oldCS) oldCS->Release();
+	if (oldSRVs[0]) oldSRVs[0]->Release();
+	if (oldSRVs[1]) oldSRVs[1]->Release();
+	if (oldUAV) oldUAV->Release();
+	if (oldCB) oldCB->Release();
 	return true;
+}
+
+// ── MV Diagnostic: compare game MVs vs camera MVs ──
+// Reads center pixel from both textures via staging copy and logs the values.
+static ID3D11Texture2D* s_mvDiagStaging = nullptr;
+static uint32_t s_mvDiagFrame = 0;
+
+static void DiagnosticCompareMVs(ID3D11DeviceContext* context, ID3D11Device* device,
+    ID3D11Texture2D* gameMVTex, ID3D11Texture2D* cameraMVTex,
+    ID3D11Texture2D* depthTex, int depthOffX,
+    uint32_t eyeW, uint32_t eyeH, int gameMVOffX, int eye)
+{
+	// Log every 90 frames (~1.5 sec at 60fps), eye 0 only
+	if (eye != 0 || (++s_mvDiagFrame % 90) != 1) return;
+
+	// Log texture formats on first call
+	{
+		static bool s_fmtLogged = false;
+		if (!s_fmtLogged) {
+			s_fmtLogged = true;
+			D3D11_TEXTURE2D_DESC gd = {}, cd = {}, dd = {};
+			if (gameMVTex) gameMVTex->GetDesc(&gd);
+			if (cameraMVTex) cameraMVTex->GetDesc(&cd);
+			if (depthTex) depthTex->GetDesc(&dd);
+			OOVR_LOGF("MV-DIAG formats: gameMV=%u(%ux%u) cameraMV=%u(%ux%u) depth=%u(%ux%u)",
+			    gd.Format, gd.Width, gd.Height,
+			    cd.Format, cd.Width, cd.Height,
+			    dd.Format, dd.Width, dd.Height);
+		}
+	}
+
+	// Create staging textures for readback
+	static ID3D11Texture2D* s_depthDiagStaging = nullptr;
+	if (!s_mvDiagStaging) {
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = 2; td.Height = 1;
+		td.MipLevels = 1; td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R16G16_FLOAT;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(device->CreateTexture2D(&td, nullptr, &s_mvDiagStaging)))
+			return;
+		// Also create R32F staging for depth
+		td.Width = 1; td.Format = DXGI_FORMAT_R32_FLOAT;
+		device->CreateTexture2D(&td, nullptr, &s_depthDiagStaging);
+	}
+
+	// Sample 3 positions: center, quarter-left, quarter-up
+	// Sample lower portions of screen (more likely to have ground/objects, not sky)
+	struct SamplePoint { uint32_t x, y; const char* name; };
+	SamplePoint samples[] = {
+		{ eyeW / 2, eyeH * 3 / 4, "bot25" },
+		{ eyeW / 4, eyeH * 3 / 4, "botL" },
+		{ eyeW / 2, eyeH / 2, "center" },
+	};
+
+	// Flush to ensure compute dispatch is complete before staging read
+	context->Flush();
+	// Write sentinel to staging to verify CopySubresourceRegion works
+	{
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (SUCCEEDED(context->Map(s_mvDiagStaging, 0, D3D11_MAP_WRITE, 0, &m))) {
+			uint16_t* p = (uint16_t*)m.pData;
+			for (int i = 0; i < (int)(m.RowPitch/2); i++) p[i] = 0x5140; // half-float 42.0
+			context->Unmap(s_mvDiagStaging, 0);
+		}
+	}
+
+	for (auto& sp : samples) {
+		// Copy game MV pixel to staging[0,0]
+		D3D11_BOX box = {};
+		box.left = gameMVOffX + sp.x; box.right = box.left + 1;
+		box.top = sp.y; box.bottom = sp.y + 1;
+		box.front = 0; box.back = 1;
+		context->CopySubresourceRegion(s_mvDiagStaging, 0, 0, 0, 0, gameMVTex, 0, &box);
+
+		// Copy camera MV pixel to staging[1,0]
+		box.left = sp.x; box.right = sp.x + 1;
+		box.top = sp.y; box.bottom = sp.y + 1;
+		context->CopySubresourceRegion(s_mvDiagStaging, 0, 1, 0, 0, cameraMVTex, 0, &box);
+
+		// Copy depth pixel
+		float depthVal = -1.0f;
+		if (s_depthDiagStaging && depthTex) {
+			box.left = depthOffX + sp.x; box.right = box.left + 1;
+			box.top = sp.y; box.bottom = sp.y + 1;
+			context->CopySubresourceRegion(s_depthDiagStaging, 0, 0, 0, 0, depthTex, 0, &box);
+			D3D11_MAPPED_SUBRESOURCE dm;
+			if (SUCCEEDED(context->Map(s_depthDiagStaging, 0, D3D11_MAP_READ, 0, &dm))) {
+				depthVal = *(const float*)dm.pData;
+				context->Unmap(s_depthDiagStaging, 0);
+			}
+		}
+
+		// Read back MV staging
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		if (SUCCEEDED(context->Map(s_mvDiagStaging, 0, D3D11_MAP_READ, 0, &mapped))) {
+			// R16G16_FLOAT: each pixel is 4 bytes (2x half-float)
+			// Staging is 2x1: pixel 0 = gameMV at data[0..1], pixel 1 = cameraMV at data[2..3]
+			const uint16_t* data = (const uint16_t*)mapped.pData;
+
+			// Convert half-float to float (rough approximation for logging)
+			auto halfToFloat = [](uint16_t h) -> float {
+				uint32_t sign = (h >> 15) & 1;
+				uint32_t exp = (h >> 10) & 0x1F;
+				uint32_t mant = h & 0x3FF;
+				if (exp == 0) return sign ? -0.0f : 0.0f;
+				if (exp == 31) return sign ? -1e10f : 1e10f;
+				float f = ldexpf((float)(mant | 0x400) / 1024.0f, (int)exp - 15);
+				return sign ? -f : f;
+			};
+
+			float gmvX = halfToFloat(data[0]);
+			float gmvY = halfToFloat(data[1]);
+			float cmvX = halfToFloat(data[2]);
+			float cmvY = halfToFloat(data[3]);
+
+			OOVR_LOGF("MV-DIAG %s(%u,%u): depth=%.4f gameMV=(%.6f,%.6f) cameraMV=(%.6f,%.6f) ratio=(%.2f,%.2f)",
+			    sp.name, sp.x, sp.y, depthVal,
+			    gmvX, gmvY, cmvX, cmvY,
+			    (fabsf(cmvX) > 1e-6f) ? gmvX / cmvX : 0.0f,
+			    (fabsf(cmvY) > 1e-6f) ? gmvY / cmvY : 0.0f);
+
+			context->Unmap(s_mvDiagStaging, 0);
+		}
+	}
 }
 
 // ── MV Dilation (3x3 closest-depth) ──
@@ -974,7 +1389,7 @@ static bool EnsureMVDilateResources(ID3D11Device* device, uint32_t w, uint32_t h
 
 	if (!s_mvDilateCB) {
 		D3D11_BUFFER_DESC bd = {};
-		bd.ByteWidth = 16; // int2 depthOffset + uint2 resolution
+		bd.ByteWidth = 160; // depthOffset(8) + resolution(8) + 2 matrices(128) + jitter(8) + injectLoco(4) + pad(4)
 		bd.Usage = D3D11_USAGE_DYNAMIC;
 		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -1027,16 +1442,32 @@ static ID3D11ShaderResourceView* GetOrCreateMVDilateDepthSRV(ID3D11Device* devic
 
 static bool DilateCameraMVs(ID3D11DeviceContext* context,
     ID3D11ShaderResourceView* mvSRV, ID3D11ShaderResourceView* depthSRV,
-    uint32_t w, uint32_t h, int depthOffsetX, int depthOffsetY)
+    uint32_t w, uint32_t h, int depthOffsetX, int depthOffsetY,
+    const float* clipToClipLoco = nullptr, const float* clipToClipNoLoco = nullptr,
+    float currJitterUVx = 0.0f, float currJitterUVy = 0.0f)
 {
+	bool injectLoco = (clipToClipLoco != nullptr && clipToClipNoLoco != nullptr);
+
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	if (SUCCEEDED(context->Map(s_mvDilateCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+		float* cbf = (float*)mapped.pData;
 		int32_t* cb = (int32_t*)mapped.pData;
 		cb[0] = depthOffsetX;
 		cb[1] = depthOffsetY;
 		cb[2] = (int32_t)w;
 		cb[3] = (int32_t)h;
+		// Loco injection matrices (offset 16 bytes)
+		if (injectLoco) {
+			memcpy(cbf + 4, clipToClipLoco, 64);    // offset 16: clipToClipLoco
+			memcpy(cbf + 20, clipToClipNoLoco, 64);  // offset 80: clipToClipNoLoco
+		} else {
+			memset(cbf + 4, 0, 128);
+		}
+		cbf[36] = currJitterUVx;  // offset 144
+		cbf[37] = currJitterUVy;  // offset 148
+		((uint32_t*)cbf)[38] = injectLoco ? 1 : 0;  // offset 152: injectLoco flag
+		cbf[39] = 0.0f;  // pad
 		context->Unmap(s_mvDilateCB, 0);
 	}
 
@@ -1068,6 +1499,262 @@ static bool DilateCameraMVs(ID3D11DeviceContext* context,
 	if (oldSRV[1]) oldSRV[1]->Release();
 	if (oldUAV) oldUAV->Release();
 	if (oldCB) oldCB->Release();
+	return true;
+}
+
+// ── Actor MV resource creation ──
+static bool EnsureActorMVResources(ID3D11Device* device)
+{
+	if (!s_actorMVCS) {
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errors = nullptr;
+		HRESULT hr = D3DCompile(s_actorMVHLSL, sizeof(s_actorMVHLSL) - 1,
+		    "ActorMV", nullptr, nullptr, "CS_ActorMV", "cs_5_0", 0, 0, &blob, &errors);
+		if (FAILED(hr)) {
+			if (errors) {
+				OOVR_LOGF("ActorMV CS compile failed: %s", (char*)errors->GetBufferPointer());
+				errors->Release();
+			}
+			return false;
+		}
+		if (errors) errors->Release();
+		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_actorMVCS);
+		blob->Release();
+		if (FAILED(hr)) return false;
+	}
+
+	if (!s_actorMVCB) {
+		D3D11_BUFFER_DESC bd = {};
+		bd.ByteWidth = 192; // invCurVP(64) + prevVP(64) + renderSize(8) + jitterDelta(8) + depthOff(8) + actorCount(4) + radiusScale(4) + debugTint(4) + pad(28)
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &s_actorMVCB)))
+			return false;
+	}
+
+	if (!s_actorDataSB) {
+		// Structured buffer for up to 32 actors (32 bytes each)
+		D3D11_BUFFER_DESC bd = {};
+		bd.ByteWidth = 32 * 32; // MAX_ACTOR_MV * sizeof(ActorData)
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = 32; // float3 curPos(12) + radius(4) + float3 prevPos(12) + pad(4)
+		if (FAILED(device->CreateBuffer(&bd, nullptr, &s_actorDataSB)))
+			return false;
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+		srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+		srvDesc.Buffer.NumElements = 32;
+		if (FAILED(device->CreateShaderResourceView(s_actorDataSB, &srvDesc, &s_actorDataSRV))) {
+			s_actorDataSB->Release();
+			s_actorDataSB = nullptr;
+			return false;
+		}
+	}
+
+	return true;
+}
+
+// NiAVObject memory layout offsets (VR, verified from CommonLibVR-4.1.3)
+static constexpr size_t NI_WORLD_TRANSLATE_OFF = 0xA0;       // world.translate (3 floats) — root position (feet)
+static constexpr size_t NI_PREV_WORLD_TRANSLATE_OFF = 0xD4;  // previousWorld.translate (3 floats)
+static constexpr size_t NI_WORLDBOUND_CENTER_OFF = 0xE4;     // worldBound.center (3 floats) — bounding sphere center (torso)
+static constexpr size_t NI_WORLDBOUND_RADIUS_OFF = 0xF0;     // worldBound.radius (1 float)
+
+// Read actor transforms from bridge pointers, upload to GPU, dispatch actor MV shader.
+// Writes actor MVs into s_cameraMVTex (overwrites camera MVs at actor pixels).
+static bool DispatchActorMVs(ID3D11DeviceContext* context, ID3D11Device* device,
+    ID3D11ShaderResourceView* depthSRV, ID3D11UnorderedAccessView* cameraMVUAV,
+    uint32_t w, uint32_t h, int depthOffsetX, int depthOffsetY,
+    const float curVP[16], const float prevVP[16],
+    float jitterDeltaUVx, float jitterDeltaUVy,
+    float radiusScale, float minDelta, int eye)
+{
+	if (!s_pBridge)
+		return false;
+
+	// Request periodic refresh from SKSE side every ~120 frames (~2 seconds)
+	{
+		static uint32_t s_actorMvFrameCounter = 0;
+		if (++s_actorMvFrameCounter % 120 == 0) {
+			s_pBridge->actorMvRequestRefresh = 1;
+		}
+	}
+
+	if (s_pBridge->actorMvCount == 0)
+		return false;
+
+	if (!EnsureActorMVResources(device))
+		return false;
+
+	// Read posAdjust from RSS — the engine's rendering coordinate origin.
+	// inv(VP) * clipPos produces positions in rendering space (origin = posAdjust).
+	// RSS layout (VR): posAdjust at 0x3A4, EYE_POSITION<NiPoint3,2> = 2 eyes * 12 bytes
+	float posAdjX = 0, posAdjY = 0, posAdjZ = 0;
+	if (s_pBridge->rssBasePtr) {
+		const uint8_t* rssBase = reinterpret_cast<const uint8_t*>(
+		    static_cast<uintptr_t>(s_pBridge->rssBasePtr));
+		const float* pa = reinterpret_cast<const float*>(rssBase + 0x3A4 + eye * 12);
+		posAdjX = pa[0]; posAdjY = pa[1]; posAdjZ = pa[2];
+	}
+
+	struct ActorGPUData {
+		float curPos[3];
+		float radius;
+		float prevPos[3];
+		float pad;
+	};
+
+	ActorGPUData actorData[32] = {};
+	uint32_t validCount = 0;
+	uint32_t bridgeCount = s_pBridge->actorMvCount;
+	if (bridgeCount > 32) bridgeCount = 32;
+
+	for (uint32_t i = 0; i < bridgeCount; i++) {
+		uint64_t ptr = s_pBridge->actorMvRootPtrs[i];
+		if (!ptr) continue;
+
+		const uint8_t* nodeBase = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(ptr));
+
+		// Read worldBound.center (bounding sphere center — torso height)
+		float bcx = *(const float*)(nodeBase + NI_WORLDBOUND_CENTER_OFF);
+		float bcy = *(const float*)(nodeBase + NI_WORLDBOUND_CENTER_OFF + 4);
+		float bcz = *(const float*)(nodeBase + NI_WORLDBOUND_CENTER_OFF + 8);
+
+		// Read world.translate for displacement delta
+		float cx = *(const float*)(nodeBase + NI_WORLD_TRANSLATE_OFF);
+		float cy = *(const float*)(nodeBase + NI_WORLD_TRANSLATE_OFF + 4);
+		float cz = *(const float*)(nodeBase + NI_WORLD_TRANSLATE_OFF + 8);
+		float px = *(const float*)(nodeBase + NI_PREV_WORLD_TRANSLATE_OFF);
+		float py = *(const float*)(nodeBase + NI_PREV_WORLD_TRANSLATE_OFF + 4);
+		float pz = *(const float*)(nodeBase + NI_PREV_WORLD_TRANSLATE_OFF + 8);
+
+		float rad = *(const float*)(nodeBase + NI_WORLDBOUND_RADIUS_OFF);
+
+		// Skip actors with minimal displacement
+		float dx = cx - px, dy = cy - py, dz = cz - pz;
+		if (dx * dx + dy * dy + dz * dz < minDelta * minDelta)
+			continue;
+
+		// Clamp radius to reasonable humanoid size (~100 game units max).
+		// NPCs spawning from doors can have oversized default bounding spheres.
+		if (rad > 100.0f) rad = 100.0f;
+		if (rad < 1.0f) continue; // Skip degenerate bounds
+
+		// Convert worldBound.center to rendering space by subtracting posAdjust
+		auto& ad = actorData[validCount];
+		ad.curPos[0] = bcx - posAdjX;
+		ad.curPos[1] = bcy - posAdjY;
+		ad.curPos[2] = bcz - posAdjZ;
+		ad.radius = rad;
+		// Previous bound center ≈ current bound center - displacement delta
+		ad.prevPos[0] = (bcx - dx) - posAdjX;
+		ad.prevPos[1] = (bcy - dy) - posAdjY;
+		ad.prevPos[2] = (bcz - dz) - posAdjZ;
+		ad.pad = 0.0f;
+		validCount++;
+	}
+
+	if (validCount == 0) return false;
+
+	// Upload actor data to structured buffer
+	{
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		if (FAILED(context->Map(s_actorDataSB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+			return false;
+		memcpy(mapped.pData, actorData, validCount * sizeof(ActorGPUData));
+		context->Unmap(s_actorDataSB, 0);
+	}
+
+	// Compute inverse of curVP for unprojection (double precision for accuracy)
+	float invCurVP[16];
+	{
+		double m[16];
+		for (int i = 0; i < 16; i++) m[i] = curVP[i];
+		double inv[16];
+		inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+		inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+		inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+		inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+		inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+		inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+		inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+		inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+		inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+		inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+		inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+		inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+		inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+		inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+		inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+		inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+		double det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+		if (fabs(det) < 1e-12) return false;
+		double invDet = 1.0 / det;
+		for (int i = 0; i < 16; i++) invCurVP[i] = (float)(inv[i] * invDet);
+	}
+
+	// Upload constant buffer
+	{
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		if (FAILED(context->Map(s_actorMVCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+			return false;
+		float* cb = (float*)mapped.pData;
+		memcpy(cb, invCurVP, 64);       // invCurVP: 16 floats (offset 0)
+		memcpy(cb + 16, prevVP, 64);    // prevVP: 16 floats (offset 16)
+		cb[32] = (float)w;              // renderSize
+		cb[33] = (float)h;
+		cb[34] = jitterDeltaUVx;        // jitterDeltaUV
+		cb[35] = jitterDeltaUVy;
+		((int32_t*)cb)[36] = depthOffsetX; // depthOffset
+		((int32_t*)cb)[37] = depthOffsetY;
+		((uint32_t*)cb)[38] = validCount;  // actorCount
+		cb[39] = radiusScale;              // radiusScale
+		((uint32_t*)cb)[40] = oovr_global_configuration.ActorMVDebug() ? 1 : 0; // debugTint
+		cb[41] = 0; cb[42] = 0; cb[43] = 0; // pad
+		context->Unmap(s_actorMVCB, 0);
+	}
+
+	// Save CS state
+	ID3D11ComputeShader* oldCS = nullptr;
+	ID3D11ShaderResourceView* oldSRV[3] = {};
+	ID3D11UnorderedAccessView* oldUAV = nullptr;
+	ID3D11Buffer* oldCB = nullptr;
+	context->CSGetShader(&oldCS, nullptr, nullptr);
+	context->CSGetShaderResources(0, 3, oldSRV);
+	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
+	context->CSGetConstantBuffers(0, 1, &oldCB);
+
+	// Dispatch
+	context->CSSetShader(s_actorMVCS, nullptr, 0);
+	ID3D11ShaderResourceView* srvs[3] = { depthSRV, nullptr, s_actorDataSRV };
+	context->CSSetShaderResources(0, 3, srvs);
+	context->CSSetUnorderedAccessViews(0, 1, &cameraMVUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &s_actorMVCB);
+	context->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+
+	// Restore state
+	context->CSSetShader(oldCS, nullptr, 0);
+	context->CSSetShaderResources(0, 3, oldSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
+	context->CSSetConstantBuffers(0, 1, &oldCB);
+	if (oldCS) oldCS->Release();
+	for (int i = 0; i < 3; i++) { if (oldSRV[i]) oldSRV[i]->Release(); }
+	if (oldUAV) oldUAV->Release();
+	if (oldCB) oldCB->Release();
+
+	{
+		static bool s_logged = false;
+		if (!s_logged) {
+			s_logged = true;
+			OOVR_LOGF("ActorMV: Dispatched %u actors, %ux%u", validCount, w, h);
+		}
+	}
+
 	return true;
 }
 
@@ -2449,7 +3136,9 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 							    oovr_global_configuration.Fsr3ReactiveBase(),
 							    oovr_global_configuration.Fsr3ReactiveEdgeBoost(),
 							    0.005f, // edge threshold
-							    30.0f); // edge scale
+							    30.0f,  // edge scale
+							    oovr_global_configuration.Fsr3ReactiveDepthFalloffStart(),
+							    oovr_global_configuration.Fsr3ReactiveDepthFalloffEnd());
 							reactiveMaskTex = s_reactiveMaskTex;
 						}
 					}
@@ -2557,7 +3246,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 							depthTex->GetDesc(&dDesc);
 							int depthOffX = 0, depthOffY = 0;
 							bool depthIsStereo = (dDesc.Width >= perEyeRenderW * 2 - 4);
-							if (depthIsStereo && eye == 1)
+							if (depthIsStereo && s_currentEyeIdx == 1)
 								depthOffX = (int)(dDesc.Width / 2);
 
 							// Jitter delta: the game projection includes our FSR3 jitter
@@ -2567,14 +3256,25 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 							float jdUVx = (curJitterX - s_prevJitterX[eye]) / (float)perEyeRenderW;
 							float jdUVy = (curJitterY - s_prevJitterY[eye]) / (float)perEyeRenderH;
 
+							float clipToClipNoLoco[16];
+							ComputeClipToClip(unadjustedCurVP, s_prevVP[eye], clipToClipNoLoco);
+							auto* gameMVSRV = s_pBridge->mvSRV ? reinterpret_cast<ID3D11ShaderResourceView*>(s_pBridge->mvSRV) : nullptr;
+							int gameMVOffX = 0;
+							if (gameMVSRV && (mvDesc.Width >= perEyeRenderW * 2 - 4) && eye == 1)
+								gameMVOffX = (int)(mvDesc.Width / 2);
+							bool useGameMV = oovr_global_configuration.ActorMV() && gameMVSRV;
+
 							if (EnsureCameraMVResources(device, perEyeRenderW, perEyeRenderH)) {
 								auto* cmvDepthSRV = GetOrCreateCameraMVDepthSRV(device, depthTex);
 								if (cmvDepthSRV) {
 									GenerateCameraMVs(context, cmvDepthSRV,
 									    perEyeRenderW, perEyeRenderH,
-									    clipToClipMat,
+									    clipToClipMat, clipToClipNoLoco,
 									    depthOffX, depthOffY,
-									    jdUVx, jdUVy);
+									    jdUVx, jdUVy,
+									    0.0f, 0.0f,
+									    gameMVSRV, gameMVOffX, 0,
+									    useGameMV);
 
 									// Dilate MVs: 3x3 closest-depth gives alpha-tested pixels
 									// (tree branches with sky depth) the foreground neighbor's MV.
@@ -2607,6 +3307,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 					}
 
 					// Store UNADJUSTED VP for next frame
+				memcpy(s_prevPrevVP[eye], s_prevVP[eye], sizeof(curVP));
+					s_hasPrevPrevVP[eye] = s_hasPrevVP[eye];
 					memcpy(s_prevVP[eye], unadjustedCurVP, sizeof(curVP));
 					s_prevJitterX[eye] = s_fsr3RenderJitterX;
 					s_prevJitterY[eye] = s_fsr3RenderJitterY;
@@ -3172,7 +3874,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 						dlssDepthTex->GetDesc(&dDesc);
 						int depthOffX = 0, depthOffY = 0;
 						bool depthIsStereo = (dDesc.Width >= dlssRenderW * 2 - 4);
-						if (depthIsStereo && eye == 1)
+						if (depthIsStereo && s_currentEyeIdx == 1)
 							depthOffX = (int)(dDesc.Width / 2);
 
 						// No jitter delta — MVs are from unjittered RSS VP matrices.
@@ -3182,15 +3884,28 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 						float currJUVx = s_fsr3RenderJitterX / (float)dlssRenderW;
 						float currJUVy = s_fsr3RenderJitterY / (float)dlssRenderH;
 
+						float clipToClipNoLoco[16];
+						ComputeClipToClip(unadjustedCurVP, s_prevVP[eye], clipToClipNoLoco);
+						auto* gameMVSRV = s_pBridge->mvSRV ? reinterpret_cast<ID3D11ShaderResourceView*>(s_pBridge->mvSRV) : nullptr;
+						int gameMVOffX = 0;
+						if (gameMVSRV && (dlssMVDesc.Width >= dlssRenderW * 2 - 4) && eye == 1)
+							gameMVOffX = (int)(dlssMVDesc.Width / 2);
+						bool useGameMV = oovr_global_configuration.ActorMV() && gameMVSRV;
+
 						if (EnsureCameraMVResources(device, dlssRenderW, dlssRenderH)) {
 							auto* cmvDepthSRV = GetOrCreateCameraMVDepthSRV(device, dlssDepthTex);
 							if (cmvDepthSRV) {
 								GenerateCameraMVs(context, cmvDepthSRV,
 								    dlssRenderW, dlssRenderH,
-								    clipToClipMat,
+								    clipToClipMat, clipToClipNoLoco,
 								    depthOffX, depthOffY,
 								    jdUVx, jdUVy,
-								    currJUVx, currJUVy);
+								    currJUVx, currJUVy,
+								    gameMVSRV, gameMVOffX, 0,
+								    useGameMV);
+								// Diagnostic: compare game MV vs camera MV values
+								// Diagnostic moved after dilation below
+
 								// Dilate MVs: 3x3 closest-depth gives alpha-tested pixels
 								// (tree branches with sky depth) the foreground neighbor's MV.
 								if (EnsureMVDilateResources(device, dlssRenderW, dlssRenderH)) {
@@ -3216,12 +3931,21 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 										    dlssRenderW, dlssRenderH, eye);
 									}
 								}
+								// Diagnostic: compare game MV vs our dilated camera MV
+								if (dlssCameraMVTex) {
+									int gmvOffX2 = (dlssMVStereo && s_currentEyeIdx == 1) ? (int)(dlssMVDesc.Width / 2) : 0;
+									DiagnosticCompareMVs(context, device, dlssMVTex, dlssCameraMVTex,
+									    dlssDepthTex, depthOffX,
+									    dlssRenderW, dlssRenderH, gmvOffX2, eye);
+								}
 							}
 						}
 					}
 				}
 
 				// Store UNADJUSTED VP for next frame
+			memcpy(s_prevPrevVP[eye], s_prevVP[eye], sizeof(curVP));
+				s_hasPrevPrevVP[eye] = s_hasPrevVP[eye];
 				memcpy(s_prevVP[eye], unadjustedCurVP, sizeof(curVP));
 				s_prevJitterX[eye] = s_fsr3RenderJitterX;
 				s_prevJitterY[eye] = s_fsr3RenderJitterY;
@@ -3245,7 +3969,9 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 						    oovr_global_configuration.DlssBiasBase(),
 						    oovr_global_configuration.DlssBiasEdgeBoost(),
 						    0.005f, // edge threshold
-						    30.0f); // edge scale
+						    30.0f,  // edge scale
+						    oovr_global_configuration.DlssBiasDepthFalloffStart(),
+						    oovr_global_configuration.DlssBiasDepthFalloffEnd());
 						dlssBiasMaskTex = s_reactiveMaskTex;
 						// If depth is stereo-combined, bias mask uses same sub-region
 						dlssBiasMaskRegionPtr = dlssDepthRegionPtr;
@@ -3257,6 +3983,28 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 								    dDesc.Width, dDesc.Height,
 								    oovr_global_configuration.DlssBiasBase(),
 								    oovr_global_configuration.DlssBiasEdgeBoost());
+							}
+						}
+						// NPC motion boost: compare game MVs with camera MVs
+						if (oovr_global_configuration.ActorMV() && s_pBridge->mvSRV && s_hasPrevPrevVP[s_currentEyeIdx]) {
+							auto* gameMVSRV2 = reinterpret_cast<ID3D11ShaderResourceView*>(s_pBridge->mvSRV);
+							auto* npcDepthSRV = GetOrCreateCameraMVDepthSRV(device, dlssDepthTex);
+							float gameTimingC2C[16];
+							// Game-timing: prevVP as "current", prevPrevVP as "previous" (one frame behind RSS)
+							if (gameMVSRV2 && npcDepthSRV
+							    && ComputeClipToClip(s_prevVP[s_currentEyeIdx], s_prevPrevVP[s_currentEyeIdx], gameTimingC2C)) {
+								int gmvOff = (dlssMVStereo && s_currentEyeIdx == 1) ? (int)(dlssMVDesc.Width / 2) : 0;
+								int depOff = (dDesc.Width >= dlssRenderW * 2 - 4 && s_currentEyeIdx == 1) ? (int)(dDesc.Width / 2) : 0;
+								int reactOff = depOff;  // reactive mask same layout as depth
+								float currJUVx = s_fsr3RenderJitterX / (float)dlssRenderW;
+								float currJUVy = s_fsr3RenderJitterY / (float)dlssRenderH;
+								BoostReactiveMaskForNPCs(context, device,
+								    gameMVSRV2, npcDepthSRV,
+								    gameTimingC2C,
+								    dlssRenderW, dlssRenderH,
+								    gmvOff, depOff, reactOff,
+								    5.0f, 0.002f,
+								    currJUVx, currJUVy);
 							}
 						}
 					}
