@@ -143,9 +143,11 @@ extern SessionWrapper xr_session;
 extern std::mutex xr_session_call_mutex;
 extern XrSystemId xr_system;
 
-// Right thumbstick X action — used by ASW to detect stick rotation cleanly
-// (actorYaw is contaminated by head yaw). Set by BaseInput during init.
+// Thumbstick actions — used by ASW to detect stick input at warp time for
+// instant stop detection (actorYaw/actorPos only update per game frame).
 extern XrAction xr_rightStickX_action;
+extern XrAction xr_leftStickX_action;
+extern XrAction xr_leftStickY_action;
 XrViewConfigurationView& xr_main_view(XruEye view_id);
 extern XrSessionGlobals* xr_gbl;
 

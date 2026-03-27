@@ -43,11 +43,34 @@ public:
 	ASWProvider(const ASWProvider&) = delete;
 	ASWProvider& operator=(const ASWProvider&) = delete;
 
+	/// Parameters passed to the warp upscale callback.
+	struct WarpUpscaleParams {
+		int eye;
+		ID3D11DeviceContext* ctx;
+		ID3D11Texture2D* warpedColor;   ///< Render-res warped color
+		ID3D11Texture2D* cachedDepth;   ///< Render-res cached depth (R32F, per-eye)
+		uint32_t renderW, renderH;      ///< Render resolution
+		uint32_t outputW, outputH;      ///< Output (display) resolution
+		float nearZ, farZ;
+		XrPosef cachedPose;             ///< Pose the cached frame was rendered at
+		XrPosef warpPose;               ///< Pose the warp frame targets
+		XrFovf  cachedFov;              ///< FOV the cached frame was rendered at
+		float   poseDeltaMatrix[16];    ///< 4x4 view-space transform: warp view → cached view (Z-flip applied)
+	};
+
+	/// Callback type for upscaling warp output through DLSS/FSR3.
+	/// Called per-eye after WarpFrame, before copying to output swapchain.
+	/// Returns true on success, sets *outResult to the display-res upscaled texture.
+	using WarpUpscaleCallback = bool(*)(const WarpUpscaleParams& params, ID3D11Texture2D** outResult);
+
 	/// Initialize: compile compute shader, create staging textures + output swapchains.
-	/// @param device   D3D11 device (from compositor)
-	/// @param eyeWidth  Per-eye render width
-	/// @param eyeHeight Per-eye render height
-	bool Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight);
+	/// @param device       D3D11 device (from compositor)
+	/// @param renderWidth  Per-eye render resolution (for cache + warp textures)
+	/// @param renderHeight Per-eye render resolution
+	/// @param outputWidth  Per-eye output resolution (for output swapchain, may differ when upscaler active)
+	/// @param outputHeight Per-eye output resolution
+	bool Initialize(ID3D11Device* device, uint32_t renderWidth, uint32_t renderHeight,
+	    uint32_t outputWidth, uint32_t outputHeight);
 	void Shutdown();
 	bool IsReady() const { return m_ready; }
 
@@ -121,13 +144,48 @@ public:
 	bool IsPaused() const { return m_paused; }
 
 	/// Set stick yaw delta (old − new, radians) for stick turn correction.
-	void SetLocomotionYaw(float yawDelta) { m_locoYaw = yawDelta; }
+	void SetLocomotionYaw(float yawDelta) {
+		m_prevLocoYaw = m_locoYaw;
+		m_locoYaw = yawDelta;
+	}
 
 	/// Set locomotion translation delta (view-space, game units) for thumbstick movement correction.
 	/// Computed from worldToCam delta minus OpenXR head translation.
 	void SetLocomotionTranslation(float x, float y, float z) {
+		m_prevLocoMag = sqrtf(m_locoTransX * m_locoTransX +
+		    m_locoTransY * m_locoTransY + m_locoTransZ * m_locoTransZ);
 		m_locoTransX = x; m_locoTransY = y; m_locoTransZ = z;
 	}
+
+	/// Store NiCamera Z at cache time for vertical warp correction.
+	/// Called during CacheFrame to record the camera height for this slot.
+	void SetSlotCameraPosZ(float z) {
+		m_slotPrevCameraPosZ[m_buildSlot] = m_slotCameraPosZ[m_buildSlot];
+		m_slotCameraPosZ[m_buildSlot] = z;
+	}
+
+	/// Store the live cameraPosPtr so WarpFrame can read it at warp time.
+	void SetCameraPosPtr(uint64_t ptr) { m_cameraPosPtr = ptr; }
+
+	/// Store the RSS view matrix pointer for coordinate transforms at warp time.
+	void SetRSSViewMatPtr(const float* ptr) { m_rssViewMatPtr = ptr; }
+
+	/// Set a temporary scale on mvConfidence (1.0 = normal, 0.0 = ignore game MVs).
+	/// Used at warp time to decay MV influence when sticks are released, preventing
+	/// stale game MVs from causing overshoot on stop.
+	void SetMVConfidenceScale(float s) { m_mvConfidenceScale = s; }
+	float GetMVConfidenceScale() const { return m_mvConfidenceScale; }
+
+	/// Set rotation MV scale (1.0 = rotation in residual, 0.0 = rotation suppressed).
+	/// Independent from mvConfidenceScale so rotation and loco can stop separately.
+	void SetRotMVScale(float s) { m_rotMVScale = s; }
+	float GetRotMVScale() const { return m_rotMVScale; }
+
+	/// Get current loco values (for warp-time decay tracking)
+	float GetLocoTransX() const { return m_locoTransX; }
+	float GetLocoTransY() const { return m_locoTransY; }
+	float GetLocoTransZ() const { return m_locoTransZ; }
+	float GetLocoYaw() const { return m_locoYaw; }
 
 	/// Cache the clipToClip matrix for this eye (prevVP * inv(curVP), from camera MV computation).
 	void SetClipToClip(int eye, const float* mat16) {
@@ -190,9 +248,23 @@ public:
 	/// Get the D3D11 device used during initialization (for obtaining context in XrBackend)
 	ID3D11Device* GetDevice() const { return m_device; }
 
-	/// Get per-eye dimensions ASW was initialized with (for detecting upscaler resolution change)
-	uint32_t GetEyeWidth() const { return m_eyeWidth; }
-	uint32_t GetEyeHeight() const { return m_eyeHeight; }
+	/// Set a callback for upscaling warp output through DLSS (set by dx11compositor after init).
+	void SetWarpUpscaleCallback(WarpUpscaleCallback cb) { m_warpUpscaleCallback = cb; }
+
+	/// Get per-eye output dimensions (display-res when upscaler active)
+	uint32_t GetEyeWidth() const { return m_outputWidth; }
+	uint32_t GetEyeHeight() const { return m_outputHeight; }
+
+	/// Get per-eye render dimensions (for cache + warp, may be smaller than output)
+	uint32_t GetRenderWidth() const { return m_renderWidth; }
+	uint32_t GetRenderHeight() const { return m_renderHeight; }
+
+	/// Get cached depth texture for a given slot/eye (for DLSS warp dispatch)
+	ID3D11Texture2D* GetCachedDepth(int slot, int eye) const {
+		if (slot >= 0 && slot < (int)kAswCacheSlotCount && eye >= 0 && eye < 2)
+			return m_cachedDepth[slot][eye];
+		return nullptr;
+	}
 
 private:
 	bool LaunchAsyncShaderCompilation();
@@ -216,10 +288,16 @@ private:
 
 	bool m_paused = false; // true during loading screens — suppresses warp
 	float m_locoYaw   = 0.0f;  // stick yaw delta (old − new, radians)
+	float m_prevLocoYaw = 0.0f; // previous frame's yaw for stop detection
 	float m_locoTransX = 0.0f, m_locoTransY = 0.0f, m_locoTransZ = 0.0f; // loco translation (view-space, game units)
+	float m_prevLocoMag = 0.0f; // previous frame's loco magnitude for stop detection
 	float m_mvTimingRatio = 0.5f; // dynamic MV extrapolation weight (computed from frame timing)
 	float m_cachedClipToClip[2][16] = {};          // per-eye clipToClip from camera MV computation
 	bool m_hasClipToClip = false;
+	float m_mvConfidenceScale = 1.0f;              // warp-time MV confidence scale (decays on loco stop)
+	float m_rotMVScale = 1.0f;                     // rotation MV scale (decays on rotation stop)
+	uint64_t m_cameraPosPtr = 0;        // live NiCamera::world.translate pointer (for warp-time Z read)
+	const float* m_rssViewMatPtr = nullptr; // RSS view matrix pointer (for world→view transform at warp time)
 
 	// Per-slot clipToClipNoLoco: buffered with the cache slot so WarpFrame reads the
 	// matrix from the SAME frame as the cached color/MV/depth textures.
@@ -228,10 +306,13 @@ private:
 	float m_slotClipToClipNoLoco[kAswCacheSlotCount][2][16] = {};
 	bool m_slotHasClipToClipNoLoco[kAswCacheSlotCount] = {};
 	XrPosef m_precompPose[2] = {};  // predicted poses from WarpFrame (for composition layer)
+	float m_lastPoseDelta[2][16] = {}; // poseDeltaMatrix from last WarpFrame (per-eye, for DLSS callback)
 
 	bool m_ready = false;
-	uint32_t m_eyeWidth = 0, m_eyeHeight = 0;
+	uint32_t m_renderWidth = 0, m_renderHeight = 0;   // cache + warp resolution (render-res)
+	uint32_t m_outputWidth = 0, m_outputHeight = 0;   // output swapchain resolution (display-res when upscaler active)
 	ID3D11Device* m_device = nullptr; // kept for obtaining immediate context in XrBackend
+	WarpUpscaleCallback m_warpUpscaleCallback = nullptr;
 
 	// Async shader compilation state
 	struct PendingShaderBlob {
@@ -293,6 +374,8 @@ private:
 	float m_slotNear[kAswCacheSlotCount] = {};
 	float m_slotFar[kAswCacheSlotCount] = {};
 	uint64_t m_slotFrameId[kAswCacheSlotCount] = {};
+	float m_slotCameraPosZ[kAswCacheSlotCount] = {};  // NiCamera Z at cache time (for vertical warp correction)
+	float m_slotPrevCameraPosZ[kAswCacheSlotCount] = {};  // Previous frame's NiCamera Z (for cached vertical delta)
 	XrTime m_slotDisplayTime[kAswCacheSlotCount] = {};  // predicted display time at capture
 	std::chrono::steady_clock::time_point m_slotTimestamp[kAswCacheSlotCount] = {};
 	uint32_t m_slotDepthDataW[kAswCacheSlotCount] = {};
@@ -336,7 +419,7 @@ private:
 		float forwardPoseDelta[16];    // 4x4 row-major: OLD view -> NEW view (forward scatter) — 64 bytes
 		float locoScreenDir[2];        // screen-space locomotion direction (from actorPos delta) — 8 bytes
 		float staticBlendFactor;       // 1.0 when near-stationary (blend scatter→prevColor), 0.0 when moving — 4 bytes
-		float _pad4;                   // alignment                                    — 4 bytes
+		float rotMVScale;              // 1.0 = rotation in residual, 0.0 = rotation suppressed (stop transition) — 4 bytes
 	};                                 //                         total: 384 bytes
 
 };

@@ -668,9 +668,80 @@ bool XrBackend::SubmitAswWarpFrame(const XrFrameState& frameState,
 	XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
 	xrLocateViews(xr_session.get(), &locateInfo, &viewState, XruEyeCount, &viewCount, views);
 
+	// Read thumbstick state at warp time. When sticks are idle, zero out the loco
+	// direction signal so forward scatter uses the correct fill direction, and zero
+	// yaw injection so poseDeltaMatrix doesn't include stale stick rotation.
+	// The game MV residual (totalMV - c2cHeadMV) naturally handles loco deceleration.
+	{
+		static constexpr float kStickDead = 0.10f;
+		auto readStick = [](XrAction action) -> float {
+			if (action == XR_NULL_HANDLE || xr_session.get() == XR_NULL_HANDLE) return 0.0f;
+			XrActionStateGetInfo info = { XR_TYPE_ACTION_STATE_GET_INFO };
+			info.action = action;
+			XrActionStateFloat state = { XR_TYPE_ACTION_STATE_FLOAT };
+			if (XR_SUCCEEDED(xrGetActionStateFloat(xr_session.get(), &info, &state)) && state.isActive)
+				return state.currentState;
+			return 0.0f;
+		};
+
+		float leftX = readStick(xr_leftStickX_action);
+		float leftY = readStick(xr_leftStickY_action);
+		float rightX = readStick(xr_rightStickX_action);
+
+		bool locoStickIdle = (leftX * leftX + leftY * leftY) < (kStickDead * kStickDead);
+		bool rotStickIdle = fabsf(rightX) < kStickDead;
+
+		if (locoStickIdle)
+			g_aswProvider->SetLocomotionTranslation(0.0f, 0.0f, 0.0f);
+		if (rotStickIdle)
+			g_aswProvider->SetLocomotionYaw(0.0f);
+
+		// Independent stop handling for locomotion and rotation.
+		// Each has its own frame counter and confidence suppression so they
+		// can stop independently without affecting the other.
+		static int s_locoStopFrames = 0;
+		static bool s_locoWasActive = false;
+		static int s_rotStopFrames = 0;
+		static bool s_rotWasActive = false;
+
+		// Locomotion stop → suppress mvConfidenceScale (affects loco+animation residual)
+		if (!locoStickIdle) {
+			s_locoWasActive = true;
+			s_locoStopFrames = 0;
+			g_aswProvider->SetMVConfidenceScale(1.0f);
+		} else if (s_locoWasActive && s_locoStopFrames < 3) {
+			float scale = (s_locoStopFrames == 0) ? 0.33f : 0.0f;
+			g_aswProvider->SetMVConfidenceScale(scale);
+			s_locoStopFrames++;
+		} else {
+			g_aswProvider->SetMVConfidenceScale(1.0f);
+			s_locoWasActive = false;
+		}
+
+		// Rotation stop → suppress rotMVScale (affects only rotation component)
+		if (!rotStickIdle) {
+			s_rotWasActive = true;
+			s_rotStopFrames = 0;
+			g_aswProvider->SetRotMVScale(1.0f);
+		} else if (s_rotWasActive && s_rotStopFrames < 3) {
+			g_aswProvider->SetRotMVScale(0.0f);
+			s_rotStopFrames++;
+		} else {
+			g_aswProvider->SetRotMVScale(1.0f);
+			s_rotWasActive = false;
+		}
+	}
+
+	// On stop transition, use the most recent cache slot (N-0) instead of N-1.
+	// Combined with zero MV confidence, this reprojects the last game frame
+	// with head-tracking only — minimal discontinuity with the next game frame.
+	bool stopping = (g_aswProvider->GetMVConfidenceScale() < 0.5f)
+	             || (g_aswProvider->GetRotMVScale() < 0.5f);
+	int slotOverride = stopping ? g_aswProvider->GetPublishedSlot() : -1;
+
 	bool warpOk = true;
 	for (int eye = 0; eye < 2; eye++) {
-		if (!g_aswProvider->WarpFrame(eye, views[eye].pose)) {
+		if (!g_aswProvider->WarpFrame(eye, views[eye].pose, slotOverride)) {
 			warpOk = false;
 			break;
 		}

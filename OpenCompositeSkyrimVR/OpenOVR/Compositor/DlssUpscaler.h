@@ -50,8 +50,15 @@ public:
 	/// Returns false on error; GetOutputDX11() returns the upscaled result.
 	bool Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const DispatchParams& params);
 
+	/// Dispatch DLSS for ASW warp output (spatial-only, always reset=true).
+	/// Uses separate NGX handles (indices 2-3) to preserve game temporal history.
+	bool DispatchWarp(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const DispatchParams& params);
+
 	/// Get the DX11 texture containing the upscaled output for the given eye.
 	ID3D11Texture2D* GetOutputDX11(int eyeIdx) const;
+
+	/// Get the DX11 texture containing the upscaled warp output for the given eye.
+	ID3D11Texture2D* GetWarpOutputDX11(int eyeIdx) const;
 
 	// Jitter utilities — same Halton[2,3] sequence as FSR3.
 	static void GetJitterOffset(float* outX, float* outY, int frameIndex, int phaseCount);
@@ -71,11 +78,14 @@ private:
 	ID3D11Device* m_device = nullptr;   // NOT owned
 
 	// NGX handles and shared parameter block
-	NVSDK_NGX_Handle*    m_handle[2]  = {};
+	// [0-1] = game eyes (temporal accumulation), [2-3] = warp eyes (spatial-only, reset=true)
+	static constexpr int kHandleCount = 4;
+	NVSDK_NGX_Handle*    m_handle[kHandleCount]  = {};
 	NVSDK_NGX_Parameter* m_params     = nullptr;
 
 	// Per-eye output texture (display resolution, UA-bindable for DLSS write)
-	ID3D11Texture2D* m_output[2] = {};
+	// [0-1] = game output, [2-3] = warp output
+	ID3D11Texture2D* m_output[kHandleCount] = {};
 
 	// Staging textures for per-eye copy from stereo-combined inputs
 	ID3D11Texture2D* m_stagingColor = nullptr;
@@ -89,8 +99,8 @@ private:
 	DXGI_FORMAT m_stagingDepthFmt  = DXGI_FORMAT_UNKNOWN;
 
 	// Cached dimensions for lazy re-creation
-	uint32_t m_renderW[2]  = {}, m_renderH[2]  = {};
-	uint32_t m_outputW[2]  = {}, m_outputH[2]  = {};
+	uint32_t m_renderW[kHandleCount]  = {}, m_renderH[kHandleCount]  = {};
+	uint32_t m_outputW[kHandleCount]  = {}, m_outputH[kHandleCount]  = {};
 };
 
 #endif // OC_HAS_DLSS
