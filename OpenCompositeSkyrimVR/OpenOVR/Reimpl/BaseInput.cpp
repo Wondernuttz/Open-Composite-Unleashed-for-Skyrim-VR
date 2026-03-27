@@ -1085,8 +1085,10 @@ void BaseInput::CreateLegacyActions()
 		create(&ctrl.aimPoseAction, "aim-pose", "Aim Pose", XR_ACTION_TYPE_POSE_INPUT);
 	}
 
-	// Expose right thumbstick X to ASW for clean stick rotation detection
+	// Expose thumbstick actions to ASW for clean stick detection
 	xr_rightStickX_action = legacyControllers[1].stickX;
+	xr_leftStickX_action = legacyControllers[0].stickX;
+	xr_leftStickY_action = legacyControllers[0].stickY;
 }
 
 EVRInputError BaseInput::GetActionSetHandle(const char* pchActionSetName, VRActionSetHandle_t* pHandle)

@@ -121,13 +121,48 @@ public:
 	bool IsPaused() const { return m_paused; }
 
 	/// Set stick yaw delta (old − new, radians) for stick turn correction.
-	void SetLocomotionYaw(float yawDelta) { m_locoYaw = yawDelta; }
+	void SetLocomotionYaw(float yawDelta) {
+		m_prevLocoYaw = m_locoYaw;
+		m_locoYaw = yawDelta;
+	}
 
 	/// Set locomotion translation delta (view-space, game units) for thumbstick movement correction.
 	/// Computed from worldToCam delta minus OpenXR head translation.
 	void SetLocomotionTranslation(float x, float y, float z) {
+		m_prevLocoMag = sqrtf(m_locoTransX * m_locoTransX +
+		    m_locoTransY * m_locoTransY + m_locoTransZ * m_locoTransZ);
 		m_locoTransX = x; m_locoTransY = y; m_locoTransZ = z;
 	}
+
+	/// Store NiCamera Z at cache time for vertical warp correction.
+	/// Called during CacheFrame to record the camera height for this slot.
+	void SetSlotCameraPosZ(float z) {
+		m_slotPrevCameraPosZ[m_buildSlot] = m_slotCameraPosZ[m_buildSlot];
+		m_slotCameraPosZ[m_buildSlot] = z;
+	}
+
+	/// Store the live cameraPosPtr so WarpFrame can read it at warp time.
+	void SetCameraPosPtr(uint64_t ptr) { m_cameraPosPtr = ptr; }
+
+	/// Store the RSS view matrix pointer for coordinate transforms at warp time.
+	void SetRSSViewMatPtr(const float* ptr) { m_rssViewMatPtr = ptr; }
+
+	/// Set a temporary scale on mvConfidence (1.0 = normal, 0.0 = ignore game MVs).
+	/// Used at warp time to decay MV influence when sticks are released, preventing
+	/// stale game MVs from causing overshoot on stop.
+	void SetMVConfidenceScale(float s) { m_mvConfidenceScale = s; }
+	float GetMVConfidenceScale() const { return m_mvConfidenceScale; }
+
+	/// Set rotation MV scale (1.0 = rotation in residual, 0.0 = rotation suppressed).
+	/// Independent from mvConfidenceScale so rotation and loco can stop separately.
+	void SetRotMVScale(float s) { m_rotMVScale = s; }
+	float GetRotMVScale() const { return m_rotMVScale; }
+
+	/// Get current loco values (for warp-time decay tracking)
+	float GetLocoTransX() const { return m_locoTransX; }
+	float GetLocoTransY() const { return m_locoTransY; }
+	float GetLocoTransZ() const { return m_locoTransZ; }
+	float GetLocoYaw() const { return m_locoYaw; }
 
 	/// Cache the clipToClip matrix for this eye (prevVP * inv(curVP), from camera MV computation).
 	void SetClipToClip(int eye, const float* mat16) {
@@ -216,10 +251,16 @@ private:
 
 	bool m_paused = false; // true during loading screens — suppresses warp
 	float m_locoYaw   = 0.0f;  // stick yaw delta (old − new, radians)
+	float m_prevLocoYaw = 0.0f; // previous frame's yaw for stop detection
 	float m_locoTransX = 0.0f, m_locoTransY = 0.0f, m_locoTransZ = 0.0f; // loco translation (view-space, game units)
+	float m_prevLocoMag = 0.0f; // previous frame's loco magnitude for stop detection
 	float m_mvTimingRatio = 0.5f; // dynamic MV extrapolation weight (computed from frame timing)
 	float m_cachedClipToClip[2][16] = {};          // per-eye clipToClip from camera MV computation
 	bool m_hasClipToClip = false;
+	float m_mvConfidenceScale = 1.0f;              // warp-time MV confidence scale (decays on loco stop)
+	float m_rotMVScale = 1.0f;                     // rotation MV scale (decays on rotation stop)
+	uint64_t m_cameraPosPtr = 0;        // live NiCamera::world.translate pointer (for warp-time Z read)
+	const float* m_rssViewMatPtr = nullptr; // RSS view matrix pointer (for world→view transform at warp time)
 
 	// Per-slot clipToClipNoLoco: buffered with the cache slot so WarpFrame reads the
 	// matrix from the SAME frame as the cached color/MV/depth textures.
@@ -293,6 +334,8 @@ private:
 	float m_slotNear[kAswCacheSlotCount] = {};
 	float m_slotFar[kAswCacheSlotCount] = {};
 	uint64_t m_slotFrameId[kAswCacheSlotCount] = {};
+	float m_slotCameraPosZ[kAswCacheSlotCount] = {};  // NiCamera Z at cache time (for vertical warp correction)
+	float m_slotPrevCameraPosZ[kAswCacheSlotCount] = {};  // Previous frame's NiCamera Z (for cached vertical delta)
 	XrTime m_slotDisplayTime[kAswCacheSlotCount] = {};  // predicted display time at capture
 	std::chrono::steady_clock::time_point m_slotTimestamp[kAswCacheSlotCount] = {};
 	uint32_t m_slotDepthDataW[kAswCacheSlotCount] = {};
@@ -336,7 +379,7 @@ private:
 		float forwardPoseDelta[16];    // 4x4 row-major: OLD view -> NEW view (forward scatter) — 64 bytes
 		float locoScreenDir[2];        // screen-space locomotion direction (from actorPos delta) — 8 bytes
 		float staticBlendFactor;       // 1.0 when near-stationary (blend scatter→prevColor), 0.0 when moving — 4 bytes
-		float _pad4;                   // alignment                                    — 4 bytes
+		float rotMVScale;              // 1.0 = rotation in residual, 0.0 = rotation suppressed (stop transition) — 4 bytes
 	};                                 //                         total: 384 bytes
 
 };

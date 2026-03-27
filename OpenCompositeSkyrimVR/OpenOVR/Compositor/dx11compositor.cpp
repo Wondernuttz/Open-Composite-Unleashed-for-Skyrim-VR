@@ -4114,6 +4114,21 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				s_aswHasPrevVP[eyeIdx] = true;
 			}
 
+			// Store NiCamera Z for vertical warp correction (BEFORE CacheFrame)
+			if (s_pBridge->cameraPosPtr) {
+				const float* camPos = reinterpret_cast<const float*>(
+				    static_cast<uintptr_t>(s_pBridge->cameraPosPtr));
+				g_aswProvider->SetSlotCameraPosZ(camPos[2]);
+				// Pass live pointer + view matrix so WarpFrame can read at warp time
+				g_aswProvider->SetCameraPosPtr(s_pBridge->cameraPosPtr);
+				if (s_pBridge->rssBasePtr) {
+					g_aswProvider->SetRSSViewMatPtr(reinterpret_cast<const float*>(
+					    reinterpret_cast<const uint8_t*>(
+					        static_cast<uintptr_t>(s_pBridge->rssBasePtr))
+					    + 0x3E0 + 1 * 0x250 + 0x30));
+				}
+			}
+
 			g_aswProvider->CacheFrame(eyeIdx, context,
 			    colorSrc, &colorRegion,
 			    mvTex, &mvRegion,
@@ -4134,6 +4149,12 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				static float s_prevActorPos[3] = {};
 				static float s_prevActorYaw = 0.0f;
 				static bool s_hasPrevActor = false;
+				// Smoothed locomotion/yaw — exponential decay on release prevents
+				// jarring snap when player releases thumbstick.
+				static float s_smoothLocoX = 0.0f, s_smoothLocoY = 0.0f, s_smoothLocoZ = 0.0f;
+				static float s_smoothYaw = 0.0f;
+				static constexpr float kLocoDecay = 0.3f;  // Per-frame decay (0=instant, 1=no decay)
+				static constexpr float kYawDecay = 0.3f;
 
 				const float* actorPos = reinterpret_cast<const float*>(
 				    static_cast<uintptr_t>(s_pBridge->actorPosPtr));
@@ -4167,14 +4188,23 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 								viewY = 0.0f;
 								viewZ = 0.0f;
 							}
+							// Active locomotion: use raw values (responsive)
+							s_smoothLocoX = viewX;
+							s_smoothLocoY = viewY;
+							s_smoothLocoZ = viewZ;
 							g_aswProvider->SetLocomotionTranslation(viewX, viewY, viewZ);
-
 						}
 					} else {
-						// Dead zone (dist2 <= 0.0001) or teleport (dist2 >= 225):
-						// zero out locomotion so stationary frames aren't contaminated
-						// by stale loco values from the last movement.
-						g_aswProvider->SetLocomotionTranslation(0.0f, 0.0f, 0.0f);
+						// Dead zone or teleport: decay smoothly instead of snapping to zero
+						s_smoothLocoX *= kLocoDecay;
+						s_smoothLocoY *= kLocoDecay;
+						s_smoothLocoZ *= kLocoDecay;
+						// Zero out when decayed to negligible
+						if (s_smoothLocoX * s_smoothLocoX + s_smoothLocoY * s_smoothLocoY +
+						    s_smoothLocoZ * s_smoothLocoZ < 1e-8f) {
+							s_smoothLocoX = s_smoothLocoY = s_smoothLocoZ = 0.0f;
+						}
+						g_aswProvider->SetLocomotionTranslation(s_smoothLocoX, s_smoothLocoY, s_smoothLocoZ);
 					}
 
 					// Yaw delta from actorYaw (PlayerCharacter::data.angle.z)
@@ -4204,21 +4234,28 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 					// Use actorYaw delta for the actual rotation amount (warp correction),
 					// but gate it on thumbstick deflection to avoid head-yaw contamination.
-					// Latch the gate for a few frames after stick release — the game actor
-					// continues rotating from physics/momentum after stick goes to zero,
-					// and dropping yawDelta immediately causes the warp to freeze while
-					// the game rotates past it (visible as a snap on stick release).
+					// When stick is released, decay smoothly instead of snapping to zero.
 					static constexpr float kStickDeadZone = 0.05f; // ~5% deflection
 					bool stickActive = fabsf(rightStickX) > kStickDeadZone;
-					static int s_stickYawLatch = 0;
-					if (stickActive)
-						s_stickYawLatch = 3; // persist yaw correction for 3 frames after release
-					float filteredYaw = (s_stickYawLatch > 0) ? yawDelta : 0.0f;
-					if (!stickActive && s_stickYawLatch > 0)
-						s_stickYawLatch--;
+					if (stickActive) {
+						// Active rotation: use raw yaw delta (responsive)
+						s_smoothYaw = yawDelta;
+					} else if (fabsf(yawDelta) > 0.001f && fabsf(s_smoothYaw) > 0.0001f) {
+						// Stick released but game still rotating (momentum): use yaw delta
+						// but decay toward zero to smooth the transition
+						s_smoothYaw = yawDelta * kYawDecay + s_smoothYaw * (1.0f - kYawDecay);
+					} else {
+						// Fully stopped: decay residual
+						s_smoothYaw *= kYawDecay;
+						if (fabsf(s_smoothYaw) < 1e-5f)
+							s_smoothYaw = 0.0f;
+					}
 
-					g_aswProvider->SetLocomotionYaw(filteredYaw);
+					g_aswProvider->SetLocomotionYaw(s_smoothYaw);
 					s_prevActorYaw = yaw;
+
+					// Vertical camera Z is now handled at warp time via live cameraPosPtr
+					// reading (SetSlotCameraPosZ + SetCameraPosPtr set above).
 				}
 
 				s_prevActorPos[0] = posX;

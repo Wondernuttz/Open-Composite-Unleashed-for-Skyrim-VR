@@ -75,7 +75,7 @@ cbuffer WarpParams : register(b0) {
     row_major float4x4 forwardPoseDelta;  // transforms OLD view -> NEW view (forward scatter)
     float2 locoScreenDir;   // screen-space locomotion direction (from actorPos delta, not head tracking)
     float staticBlendFactor; // 1.0 = near-stationary (blend scatter→prevColor), 0.0 = moving
-    float _pad4;
+    float rotMVScale;       // 1.0 = rotation in residual, 0.0 = rotation suppressed (stop transition)
 };
 
 // LinearizeDepth: convert raw depth buffer value to linear distance in game units.
@@ -446,12 +446,21 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     }
 
 )" R"(
-    // MV residual: subtract head motion to isolate locomotion + stick rotation.
-    // hasLoco → use headOnlyResidual (head-only subtracted, keeps stick + loco)
-    // stationary → use c2cResidual (head+stick subtracted, keeps loco only)
+    // MV residual decomposition: separate rotation from loco+animation for independent stop control.
+    // headOnlyMV = head rotation only (from headRotMatrix)
+    // c2cHeadMV = head rotation + stick rotation (from clipToClipNoLoco / RSS VP)
+    // fullResidual = totalMV - headOnlyMV = rotation + loco + animation
+    // locoResidual = totalMV - c2cHeadMV = loco + animation (rotation subtracted)
+    // rotComponent = fullResidual - locoResidual = rotation only
+    // final residual = locoResidual + rotMVScale * rotComponent
+    //   → rotMVScale=1.0 during rotation, 0.0 on rotation stop (suppresses stale rotation MVs)
+    //   → mvConfidence scales the whole residual (for loco stop suppression)
     float2 mvOffset = float2(0, 0);
     if (abs(mvConfidence) > 0.001 && !npcExpanded) {
-        float2 residual = hasLoco ? (totalMV - headOnlyMV) : (totalMV - c2cHeadMV);
+        float2 fullResidual = totalMV - headOnlyMV;       // rot + loco + animation
+        float2 locoResidual = totalMV - c2cHeadMV;        // loco + animation (no rotation)
+        float2 rotComponent = fullResidual - locoResidual; // rotation only
+        float2 residual = locoResidual + rotMVScale * rotComponent;
         mvOffset = mvConfidence * residual;
     }
 
@@ -611,6 +620,7 @@ float2 computeForwardDstUV(int2 srcPixel, bool skipMVCorrection) {
         float2 rawMV = mvTex[ToMVCoord(srcPixel)];
         float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
 
+        // Subtract head rotation only — residual = stick + loco + animation from game MVs.
         float3 viewPos = float3(tanX * scaledDepth, tanY * scaledDepth, scaledDepth);
         float4 rotated = mul(headRotMatrix, float4(viewPos, 1.0));
         float2 headOnlyMV = float2(0, 0);
@@ -2114,6 +2124,7 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		cb.headRotMatrix[8]  = -cb.headRotMatrix[8];
 		cb.headRotMatrix[9]  = -cb.headRotMatrix[9];
 		cb.headRotMatrix[11] = -cb.headRotMatrix[11];
+
 	} else {
 		for (int i = 0; i < 16; i++)
 			cb.headRotMatrix[i] = 0;
@@ -2161,6 +2172,10 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		cb.forwardPoseDelta[11] *= transStr;
 	}
 
+	// Vertical camera correction: handled by game MVs through the residual path
+	// (totalMV - headOnlyMV), same as horizontal locomotion. The game MVs capture
+	// jumping, falling, stairs, and walk-cycle bob. No additional injection needed.
+
 	// Locomotion correction: handled by MV path (locoMV = totalMV - headMV) in shader.
 	// The game's per-pixel MVs already contain depth-dependent locomotion parallax.
 	// poseDeltaMatrix only handles head rotation/translation from OpenXR poses.
@@ -2186,8 +2201,17 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		float stickYaw = fabsf(m_locoYaw);
 		float totalMotion = headTrans + headRot + locoMotion + stickYaw;
 		// Ramp: 1.0 below 0.001, 0.0 above 0.005
-		cb.staticBlendFactor = 1.0f - std::min(1.0f, std::max(0.0f, (totalMotion - 0.001f) / 0.004f));
+		float targetBlend = 1.0f - std::min(1.0f, std::max(0.0f, (totalMotion - 0.001f) / 0.004f));
+		// Smooth the blend factor to avoid jarring snap between stationary/moving modes.
+		// Fast attack (quickly enter moving mode), slow release (gradually return to stationary).
+		static float s_smoothBlend = 1.0f;
+		if (targetBlend < s_smoothBlend)
+			s_smoothBlend = targetBlend; // instant attack: enter moving mode immediately
+		else
+			s_smoothBlend += (targetBlend - s_smoothBlend) * 0.15f; // slow release: ~7 frames to settle
+		cb.staticBlendFactor = s_smoothBlend;
 	}
+	cb.rotMVScale = m_rotMVScale;
 
 	// clipToClipNoLoco: prevVP * inv(curVP_original) — head rotation + head translation,
 	// no locomotion injection. Per-eye from RSS VP matrices.
@@ -2215,10 +2239,11 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	cb.edgeFadeWidth = oovr_global_configuration.ASWEdgeFadeWidth();
 	cb.nearFadeDepth = oovr_global_configuration.ASWNearFadeDepth() * 72.0f;
 	{
-		// MV correction: locoMV = totalMV - headMV isolates per-pixel locomotion
-		// from the game's MV buffer. headMV comes from clipToClipNoLoco (RSS VP).
-		// poseDeltaMatrix handles head rotation/translation only (no loco injection).
-		cb.mvConfidence = oovr_global_configuration.ASWMVConfidence();
+		// MV correction: residual = totalMV - headOnlyMV isolates stick + loco + animation
+		// from game MVs. poseDeltaMatrix handles real-time head tracking from OpenXR.
+		// m_mvConfidenceScale decays at warp time when sticks are released to prevent
+		// stale game MVs from overshooting on stop transitions.
+		cb.mvConfidence = oovr_global_configuration.ASWMVConfidence() * m_mvConfidenceScale;
 	}
 	cb.mvPixelScale = oovr_global_configuration.ASWMVPixelScale();
 	cb.depthResolution[0] = (m_slotDepthDataW[slot] > 0) ? (float)m_slotDepthDataW[slot] : (float)m_eyeWidth;
