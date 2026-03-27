@@ -1384,17 +1384,20 @@ ASWProvider::~ASWProvider()
 	Shutdown();
 }
 
-bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight)
+bool ASWProvider::Initialize(ID3D11Device* device, uint32_t renderWidth, uint32_t renderHeight,
+    uint32_t outputWidth, uint32_t outputHeight)
 {
 	if (m_ready || m_compileStarted)
 		return true;
-	if (!device || eyeWidth == 0 || eyeHeight == 0)
+	if (!device || renderWidth == 0 || renderHeight == 0 || outputWidth == 0 || outputHeight == 0)
 		return false;
 
-	OOVR_LOGF("ASW: Initializing — per-eye %ux%u", eyeWidth, eyeHeight);
+	OOVR_LOGF("ASW: Initializing — render %ux%u, output %ux%u", renderWidth, renderHeight, outputWidth, outputHeight);
 
-	m_eyeWidth = eyeWidth;
-	m_eyeHeight = eyeHeight;
+	m_renderWidth = renderWidth;
+	m_renderHeight = renderHeight;
+	m_outputWidth = outputWidth;
+	m_outputHeight = outputHeight;
 	m_device = device;
 	m_device->AddRef(); // prevent device destruction while ASW holds a reference
 
@@ -1405,13 +1408,13 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 		return false;
 	}
 
-	if (!CreateOutputSwapchain(eyeWidth * 2, eyeHeight)) {
+	if (!CreateOutputSwapchain(m_outputWidth * 2, m_outputHeight)) {
 		OOVR_LOG("ASW: Failed to create output swapchain");
 		Shutdown();
 		return false;
 	}
 
-	if (!CreateDepthSwapchain(eyeWidth * 2, eyeHeight)) {
+	if (!CreateDepthSwapchain(m_outputWidth * 2, m_outputHeight)) {
 		OOVR_LOG("ASW: Failed to create depth swapchain (non-fatal — depth layer disabled)");
 	}
 
@@ -1432,7 +1435,8 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 	m_hasLastPublishedPose = false;
 	m_frameCounter = 0;
 
-	OOVR_LOGF("ASW: Resources created — %ux%u per eye, shaders compiling in background", eyeWidth, eyeHeight);
+	OOVR_LOGF("ASW: Resources created — render %ux%u, output %ux%u per eye, shaders compiling in background",
+	    m_renderWidth, m_renderHeight, m_outputWidth, m_outputHeight);
 	return true; // m_ready stays false until shaders are done
 }
 
@@ -1684,9 +1688,11 @@ void ASWProvider::TryFinishShaderCompilation()
 
 bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 {
+	// Cache and warp textures use render resolution.
+	// Output swapchain uses output resolution (display-res when upscaler active).
 	D3D11_TEXTURE2D_DESC desc = {};
-	desc.Width = m_eyeWidth;
-	desc.Height = m_eyeHeight;
+	desc.Width = m_renderWidth;
+	desc.Height = m_renderHeight;
 	desc.MipLevels = 1;
 	desc.ArraySize = 1;
 	desc.SampleDesc.Count = 1;
@@ -1876,10 +1882,10 @@ bool ASWProvider::CreateOutputSwapchain(uint32_t width, uint32_t height)
 XrRect2Di ASWProvider::GetOutputRect(int eye) const
 {
 	XrRect2Di rect = {};
-	rect.offset.x = eye * (int32_t)m_eyeWidth;
+	rect.offset.x = eye * (int32_t)m_outputWidth;
 	rect.offset.y = 0;
-	rect.extent.width = (int32_t)m_eyeWidth;
-	rect.extent.height = (int32_t)m_eyeHeight;
+	rect.extent.width = (int32_t)m_outputWidth;
+	rect.extent.height = (int32_t)m_outputHeight;
 	return rect;
 }
 
@@ -1963,10 +1969,10 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	const int slot = m_buildSlot;
 	if (eye == 0) {
 		// Default dimensions when optional MV/depth copies are unavailable.
-		m_slotMVDataW[slot] = m_eyeWidth;
-		m_slotMVDataH[slot] = m_eyeHeight;
-		m_slotDepthDataW[slot] = m_eyeWidth;
-		m_slotDepthDataH[slot] = m_eyeHeight;
+		m_slotMVDataW[slot] = m_renderWidth;
+		m_slotMVDataH[slot] = m_renderHeight;
+		m_slotDepthDataW[slot] = m_renderWidth;
+		m_slotDepthDataH[slot] = m_renderHeight;
 	}
 
 	// Copy color (game eye texture -> cached slot)
@@ -2172,6 +2178,9 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		cb.forwardPoseDelta[11] *= transStr;
 	}
 
+	// Store final poseDeltaMatrix for DLSS warp callback (warp MV generation)
+	memcpy(m_lastPoseDelta[eye], cb.poseDeltaMatrix, sizeof(cb.poseDeltaMatrix));
+
 	// Vertical camera correction: handled by game MVs through the residual path
 	// (totalMV - headOnlyMV), same as horizontal locomotion. The game MVs capture
 	// jumping, falling, stairs, and walk-cycle bob. No additional injection needed.
@@ -2226,8 +2235,8 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		cb.hasClipToClipNoLoco = 0;
 	}
 
-	cb.resolution[0] = (float)m_eyeWidth;
-	cb.resolution[1] = (float)m_eyeHeight;
+	cb.resolution[0] = (float)m_renderWidth;
+	cb.resolution[1] = (float)m_renderHeight;
 	cb.nearZ = m_slotNear[slot];
 	cb.farZ = m_slotFar[slot];
 	cb.fovTanLeft = tanf(m_slotFov[slot][eye].angleLeft);
@@ -2246,10 +2255,10 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		cb.mvConfidence = oovr_global_configuration.ASWMVConfidence() * m_mvConfidenceScale;
 	}
 	cb.mvPixelScale = oovr_global_configuration.ASWMVPixelScale();
-	cb.depthResolution[0] = (m_slotDepthDataW[slot] > 0) ? (float)m_slotDepthDataW[slot] : (float)m_eyeWidth;
-	cb.depthResolution[1] = (m_slotDepthDataH[slot] > 0) ? (float)m_slotDepthDataH[slot] : (float)m_eyeHeight;
-	cb.mvResolution[0] = (m_slotMVDataW[slot] > 0) ? (float)m_slotMVDataW[slot] : (float)m_eyeWidth;
-	cb.mvResolution[1] = (m_slotMVDataH[slot] > 0) ? (float)m_slotMVDataH[slot] : (float)m_eyeHeight;
+	cb.depthResolution[0] = (m_slotDepthDataW[slot] > 0) ? (float)m_slotDepthDataW[slot] : (float)m_renderWidth;
+	cb.depthResolution[1] = (m_slotDepthDataH[slot] > 0) ? (float)m_slotDepthDataH[slot] : (float)m_renderHeight;
+	cb.mvResolution[0] = (m_slotMVDataW[slot] > 0) ? (float)m_slotMVDataW[slot] : (float)m_renderWidth;
+	cb.mvResolution[1] = (m_slotMVDataH[slot] > 0) ? (float)m_slotMVDataH[slot] : (float)m_renderHeight;
 	cb._pad_npcMask = 0;  // removed: was hasNpcMask
 
 
@@ -2282,8 +2291,8 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	ctx->CSSetConstantBuffers(0, 1, &m_constantBuffer);
 	ctx->CSSetSamplers(0, 1, &m_linearSampler);
 
-	uint32_t groupsX = (m_eyeWidth + 7) / 8;
-	uint32_t groupsY = (m_eyeHeight + 7) / 8;
+	uint32_t groupsX = (m_renderWidth + 7) / 8;
+	uint32_t groupsY = (m_renderHeight + 7) / 8;
 	// NPC-only forward scatter overlay: forward-scatter only pixels with significant
 	// MV residual (moving objects) on top of the backward warp output. Uses
 	// IsMovingNpcPixelForward() which detects motion via MV residual after c2c head
@@ -2408,10 +2417,51 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 	}
 	ID3D11Texture2D* target = m_outputSwapchainImages[idx];
 
-	ctx->CopySubresourceRegion(target, 0,
-	    0, 0, 0, m_warpedOutput[0], 0, nullptr);
-	ctx->CopySubresourceRegion(target, 0,
-	    m_eyeWidth, 0, 0, m_warpedOutput[1], 0, nullptr);
+	// If a warp upscale callback is set (DLSS on warp frames), upscale each eye's
+	// render-res warp output to display-res before copying to the output swapchain.
+	if (m_warpUpscaleCallback) {
+		bool upscaleOk = true;
+		ID3D11Texture2D* upscaled[2] = {};
+		for (int eye = 0; eye < 2; eye++) {
+			WarpUpscaleParams params = {};
+			params.eye = eye;
+			params.ctx = ctx;
+			params.warpedColor = m_warpedOutput[eye];
+			params.cachedDepth = m_cachedDepth[slot][eye];
+			params.renderW = m_renderWidth;
+			params.renderH = m_renderHeight;
+			params.outputW = m_outputWidth;
+			params.outputH = m_outputHeight;
+			params.nearZ = m_slotNear[slot];
+			params.farZ = m_slotFar[slot];
+			params.cachedPose = m_slotPose[slot][eye];
+			params.warpPose = m_precompPose[eye];
+			params.cachedFov = m_slotFov[slot][eye];
+			memcpy(params.poseDeltaMatrix, m_lastPoseDelta[eye], sizeof(params.poseDeltaMatrix));
+			if (!m_warpUpscaleCallback(params, &upscaled[eye])) {
+				upscaleOk = false;
+				break;
+			}
+		}
+		if (upscaleOk && upscaled[0] && upscaled[1]) {
+			ctx->CopySubresourceRegion(target, 0,
+			    0, 0, 0, upscaled[0], 0, nullptr);
+			ctx->CopySubresourceRegion(target, 0,
+			    m_outputWidth, 0, 0, upscaled[1], 0, nullptr);
+		} else {
+			// Fallback: copy render-res warp output directly (no upscaling)
+			ctx->CopySubresourceRegion(target, 0,
+			    0, 0, 0, m_warpedOutput[0], 0, nullptr);
+			ctx->CopySubresourceRegion(target, 0,
+			    m_outputWidth, 0, 0, m_warpedOutput[1], 0, nullptr);
+		}
+	} else {
+		// No upscale callback — render dims == output dims, copy directly
+		ctx->CopySubresourceRegion(target, 0,
+		    0, 0, 0, m_warpedOutput[0], 0, nullptr);
+		ctx->CopySubresourceRegion(target, 0,
+		    m_outputWidth, 0, 0, m_warpedOutput[1], 0, nullptr);
+	}
 
 	ctx->Flush();
 
@@ -2431,14 +2481,14 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 				if (depthIdx < m_depthSwapchainImages.size()) {
 					ID3D11Texture2D* depthTarget = m_depthSwapchainImages[depthIdx];
 					D3D11_BOX depthBox = {};
-					depthBox.right = m_eyeWidth;
-					depthBox.bottom = m_eyeHeight;
+					depthBox.right = m_renderWidth;
+					depthBox.bottom = m_renderHeight;
 					depthBox.front = 0;
 					depthBox.back = 1;
 					ctx->CopySubresourceRegion(depthTarget, 0,
 					    0, 0, 0, m_cachedDepth[slot][0], 0, &depthBox);
 					ctx->CopySubresourceRegion(depthTarget, 0,
-					    m_eyeWidth, 0, 0, m_cachedDepth[slot][1], 0, &depthBox);
+					    m_outputWidth, 0, 0, m_cachedDepth[slot][1], 0, &depthBox);
 					ctx->Flush();
 				}
 				XrSwapchainImageReleaseInfo depthRel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -2634,7 +2684,10 @@ void ASWProvider::Shutdown()
 		m_device = nullptr;
 	}
 
-	m_eyeWidth = 0;
-	m_eyeHeight = 0;
+	m_renderWidth = 0;
+	m_renderHeight = 0;
+	m_outputWidth = 0;
+	m_outputHeight = 0;
+	m_warpUpscaleCallback = nullptr;
 	OOVR_LOG("ASW: Shutdown");
 }

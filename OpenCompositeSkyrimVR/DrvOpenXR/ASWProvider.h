@@ -43,11 +43,34 @@ public:
 	ASWProvider(const ASWProvider&) = delete;
 	ASWProvider& operator=(const ASWProvider&) = delete;
 
+	/// Parameters passed to the warp upscale callback.
+	struct WarpUpscaleParams {
+		int eye;
+		ID3D11DeviceContext* ctx;
+		ID3D11Texture2D* warpedColor;   ///< Render-res warped color
+		ID3D11Texture2D* cachedDepth;   ///< Render-res cached depth (R32F, per-eye)
+		uint32_t renderW, renderH;      ///< Render resolution
+		uint32_t outputW, outputH;      ///< Output (display) resolution
+		float nearZ, farZ;
+		XrPosef cachedPose;             ///< Pose the cached frame was rendered at
+		XrPosef warpPose;               ///< Pose the warp frame targets
+		XrFovf  cachedFov;              ///< FOV the cached frame was rendered at
+		float   poseDeltaMatrix[16];    ///< 4x4 view-space transform: warp view → cached view (Z-flip applied)
+	};
+
+	/// Callback type for upscaling warp output through DLSS/FSR3.
+	/// Called per-eye after WarpFrame, before copying to output swapchain.
+	/// Returns true on success, sets *outResult to the display-res upscaled texture.
+	using WarpUpscaleCallback = bool(*)(const WarpUpscaleParams& params, ID3D11Texture2D** outResult);
+
 	/// Initialize: compile compute shader, create staging textures + output swapchains.
-	/// @param device   D3D11 device (from compositor)
-	/// @param eyeWidth  Per-eye render width
-	/// @param eyeHeight Per-eye render height
-	bool Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t eyeHeight);
+	/// @param device       D3D11 device (from compositor)
+	/// @param renderWidth  Per-eye render resolution (for cache + warp textures)
+	/// @param renderHeight Per-eye render resolution
+	/// @param outputWidth  Per-eye output resolution (for output swapchain, may differ when upscaler active)
+	/// @param outputHeight Per-eye output resolution
+	bool Initialize(ID3D11Device* device, uint32_t renderWidth, uint32_t renderHeight,
+	    uint32_t outputWidth, uint32_t outputHeight);
 	void Shutdown();
 	bool IsReady() const { return m_ready; }
 
@@ -225,9 +248,23 @@ public:
 	/// Get the D3D11 device used during initialization (for obtaining context in XrBackend)
 	ID3D11Device* GetDevice() const { return m_device; }
 
-	/// Get per-eye dimensions ASW was initialized with (for detecting upscaler resolution change)
-	uint32_t GetEyeWidth() const { return m_eyeWidth; }
-	uint32_t GetEyeHeight() const { return m_eyeHeight; }
+	/// Set a callback for upscaling warp output through DLSS (set by dx11compositor after init).
+	void SetWarpUpscaleCallback(WarpUpscaleCallback cb) { m_warpUpscaleCallback = cb; }
+
+	/// Get per-eye output dimensions (display-res when upscaler active)
+	uint32_t GetEyeWidth() const { return m_outputWidth; }
+	uint32_t GetEyeHeight() const { return m_outputHeight; }
+
+	/// Get per-eye render dimensions (for cache + warp, may be smaller than output)
+	uint32_t GetRenderWidth() const { return m_renderWidth; }
+	uint32_t GetRenderHeight() const { return m_renderHeight; }
+
+	/// Get cached depth texture for a given slot/eye (for DLSS warp dispatch)
+	ID3D11Texture2D* GetCachedDepth(int slot, int eye) const {
+		if (slot >= 0 && slot < (int)kAswCacheSlotCount && eye >= 0 && eye < 2)
+			return m_cachedDepth[slot][eye];
+		return nullptr;
+	}
 
 private:
 	bool LaunchAsyncShaderCompilation();
@@ -269,10 +306,13 @@ private:
 	float m_slotClipToClipNoLoco[kAswCacheSlotCount][2][16] = {};
 	bool m_slotHasClipToClipNoLoco[kAswCacheSlotCount] = {};
 	XrPosef m_precompPose[2] = {};  // predicted poses from WarpFrame (for composition layer)
+	float m_lastPoseDelta[2][16] = {}; // poseDeltaMatrix from last WarpFrame (per-eye, for DLSS callback)
 
 	bool m_ready = false;
-	uint32_t m_eyeWidth = 0, m_eyeHeight = 0;
+	uint32_t m_renderWidth = 0, m_renderHeight = 0;   // cache + warp resolution (render-res)
+	uint32_t m_outputWidth = 0, m_outputHeight = 0;   // output swapchain resolution (display-res when upscaler active)
 	ID3D11Device* m_device = nullptr; // kept for obtaining immediate context in XrBackend
+	WarpUpscaleCallback m_warpUpscaleCallback = nullptr;
 
 	// Async shader compilation state
 	struct PendingShaderBlob {

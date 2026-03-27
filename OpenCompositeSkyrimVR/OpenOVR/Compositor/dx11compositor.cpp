@@ -251,6 +251,13 @@ static bool s_hasPrevVP[2] = { false, false };
 static float s_prevJitterX[2] = { 0.0f, 0.0f };
 static float s_prevJitterY[2] = { 0.0f, 0.0f };
 
+// Per-eye previous warp pose for computing warp-to-warp MVs (separate DLSS temporal history).
+static XrPosef s_prevWarpPose[2] = {};
+static bool s_hasPrevWarpPose[2] = { false, false };
+
+// Per-eye warp DLSS jitter index (independent from game jitter)
+static int s_warpJitterIndex[2] = { 0, 0 };
+
 // Locomotion injection for camera MVs: world-space deltas.
 // Skyrim uses camera-relative rendering (VP origin shifts with player each frame),
 // so prevVP * inv(curVP) captures rotation but NOT camera translation.
@@ -1260,6 +1267,258 @@ float g_fsr3CameraFar = 100000.0f;
 
 #ifdef OC_HAS_DLSS
 static DlssUpscaler* s_dlssUpscaler = nullptr;
+
+/// Callback for ASWProvider::SubmitWarpedOutput — runs DLSS spatial upscaling on
+/// the render-res warp output so every displayed frame goes through DLSS.
+/// Uses separate warp NGX handles (indices 2-3) with reset=true to avoid
+/// corrupting the game DLSS temporal accumulation history.
+// ── Warp DLSS: VP matrix construction from OpenXR pose + FOV ──
+
+// Build a column-major 4x4 view-projection matrix from XrPosef + XrFovf.
+// Convention: clip = VP * v_world (column-major, column-vector).
+// Projection uses standard DirectX Z mapping: Z_ndc = 0 at near, 1 at far.
+static void BuildVPFromPoseFov(const XrPosef& pose, const XrFovf& fov,
+    float nearZ, float farZ, float outVP[16])
+{
+	// View matrix = inverse of the pose (world→view)
+	float qx = pose.orientation.x, qy = pose.orientation.y;
+	float qz = pose.orientation.z, qw = pose.orientation.w;
+	float px = pose.position.x, py = pose.position.y, pz = pose.position.z;
+
+	// Rotation matrix from quaternion
+	float r00 = 1-2*(qy*qy+qz*qz), r01 = 2*(qx*qy-qz*qw), r02 = 2*(qx*qz+qy*qw);
+	float r10 = 2*(qx*qy+qz*qw), r11 = 1-2*(qx*qx+qz*qz), r12 = 2*(qy*qz-qx*qw);
+	float r20 = 2*(qx*qz-qy*qw), r21 = 2*(qy*qz+qx*qw), r22 = 1-2*(qx*qx+qy*qy);
+
+	// V = [R^T | -R^T * t] (column-major storage)
+	float V[16];
+	V[0]=r00; V[4]=r01; V[8] =r02; V[12]=-(r00*px+r01*py+r02*pz);
+	V[1]=r10; V[5]=r11; V[9] =r12; V[13]=-(r10*px+r11*py+r12*pz);
+	V[2]=r20; V[6]=r21; V[10]=r22; V[14]=-(r20*px+r21*py+r22*pz);
+	V[3]=0;   V[7]=0;   V[11]=0;   V[15]=1;
+
+	// Projection from asymmetric FOV (column-major)
+	float tanL = tanf(fov.angleLeft), tanR = tanf(fov.angleRight);
+	float tanU = tanf(fov.angleUp),   tanD = tanf(fov.angleDown);
+	float w = tanR - tanL, h = tanU - tanD;
+
+	float P[16] = {};
+	P[0]  = 2.0f/w;             // P[0][0]
+	P[5]  = 2.0f/h;             // P[1][1]
+	P[8]  = (tanR+tanL)/w;      // P[2][0] — asymmetric X offset
+	P[9]  = (tanU+tanD)/h;      // P[2][1] — asymmetric Y offset
+	P[10] = -farZ/(farZ-nearZ); // P[2][2]
+	P[14] = -(farZ*nearZ)/(farZ-nearZ); // P[3][2]
+	P[11] = -1.0f;              // P[2][3] — perspective divide
+
+	// VP = P * V (column-major)
+	for (int c = 0; c < 4; c++)
+		for (int r = 0; r < 4; r++) {
+			float sum = 0;
+			for (int k = 0; k < 4; k++)
+				sum += P[k*4+r] * V[c*4+k];
+			outVP[c*4+r] = sum;
+		}
+}
+
+// General 4x4 matrix inverse (column-major). Returns false if singular.
+static bool InvertMatrix4x4(const float m[16], float inv[16])
+{
+	float A[16];
+	// Cofactor expansion
+	A[0]  =  m[5]*(m[10]*m[15]-m[11]*m[14]) - m[9]*(m[6]*m[15]-m[7]*m[14]) + m[13]*(m[6]*m[11]-m[7]*m[10]);
+	A[1]  = -(m[1]*(m[10]*m[15]-m[11]*m[14]) - m[9]*(m[2]*m[15]-m[3]*m[14]) + m[13]*(m[2]*m[11]-m[3]*m[10]));
+	A[2]  =  m[1]*(m[6]*m[15]-m[7]*m[14]) - m[5]*(m[2]*m[15]-m[3]*m[14]) + m[13]*(m[2]*m[7]-m[3]*m[6]);
+	A[3]  = -(m[1]*(m[6]*m[11]-m[7]*m[10]) - m[5]*(m[2]*m[11]-m[3]*m[10]) + m[9]*(m[2]*m[7]-m[3]*m[6]));
+	A[4]  = -(m[4]*(m[10]*m[15]-m[11]*m[14]) - m[8]*(m[6]*m[15]-m[7]*m[14]) + m[12]*(m[6]*m[11]-m[7]*m[10]));
+	A[5]  =  m[0]*(m[10]*m[15]-m[11]*m[14]) - m[8]*(m[2]*m[15]-m[3]*m[14]) + m[12]*(m[2]*m[11]-m[3]*m[10]);
+	A[6]  = -(m[0]*(m[6]*m[15]-m[7]*m[14]) - m[4]*(m[2]*m[15]-m[3]*m[14]) + m[12]*(m[2]*m[7]-m[3]*m[6]));
+	A[7]  =  m[0]*(m[6]*m[11]-m[7]*m[10]) - m[4]*(m[2]*m[11]-m[3]*m[10]) + m[8]*(m[2]*m[7]-m[3]*m[6]);
+	A[8]  =  m[4]*(m[9]*m[15]-m[11]*m[13]) - m[8]*(m[5]*m[15]-m[7]*m[13]) + m[12]*(m[5]*m[11]-m[7]*m[9]);
+	A[9]  = -(m[0]*(m[9]*m[15]-m[11]*m[13]) - m[8]*(m[1]*m[15]-m[3]*m[13]) + m[12]*(m[1]*m[11]-m[3]*m[9]));
+	A[10] =  m[0]*(m[5]*m[15]-m[7]*m[13]) - m[4]*(m[1]*m[15]-m[3]*m[13]) + m[12]*(m[1]*m[7]-m[3]*m[5]);
+	A[11] = -(m[0]*(m[5]*m[11]-m[7]*m[9]) - m[4]*(m[1]*m[11]-m[3]*m[9]) + m[8]*(m[1]*m[7]-m[3]*m[5]));
+	A[12] = -(m[4]*(m[9]*m[14]-m[10]*m[13]) - m[8]*(m[5]*m[14]-m[6]*m[13]) + m[12]*(m[5]*m[10]-m[6]*m[9]));
+	A[13] =  m[0]*(m[9]*m[14]-m[10]*m[13]) - m[8]*(m[1]*m[14]-m[2]*m[13]) + m[12]*(m[1]*m[10]-m[2]*m[9]);
+	A[14] = -(m[0]*(m[5]*m[14]-m[6]*m[13]) - m[4]*(m[1]*m[14]-m[2]*m[13]) + m[12]*(m[1]*m[6]-m[2]*m[5]));
+	A[15] =  m[0]*(m[5]*m[10]-m[6]*m[9]) - m[4]*(m[1]*m[10]-m[2]*m[9]) + m[8]*(m[1]*m[6]-m[2]*m[5]);
+
+	float det = m[0]*A[0] + m[4]*A[1] + m[8]*A[2] + m[12]*A[3];
+	if (fabsf(det) < 1e-12f) return false;
+	float invDet = 1.0f / det;
+	for (int i = 0; i < 16; i++) inv[i] = A[i] * invDet;
+	return true;
+}
+
+// Column-major 4x4 multiply: out = A * B
+static void MulMatrix4x4(const float A[16], const float B[16], float out[16])
+{
+	for (int c = 0; c < 4; c++)
+		for (int r = 0; r < 4; r++) {
+			float sum = 0;
+			for (int k = 0; k < 4; k++)
+				sum += A[k*4+r] * B[c*4+k];
+			out[c*4+r] = sum;
+		}
+}
+
+static bool DlssWarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p, ID3D11Texture2D** outResult)
+{
+	if (!s_dlssUpscaler || !s_dlssUpscaler->IsReady() || !p.warpedColor || !outResult)
+		return false;
+
+	ID3D11Device* dev = nullptr;
+	p.ctx->GetDevice(&dev);
+	if (!dev) return false;
+
+	// 1. Build clipToClip for warp-to-warp temporal alignment.
+	//    Warp DLSS has its own temporal history from previous warp frames.
+	//    MVs describe: where was each pixel of the current warp in the previous warp?
+	//    Built from OpenXR VP matrices (convention-independent for clipToClip since Z-flip cancels).
+	float clipToClip[16];
+	bool hasValidMVs = false;
+
+	if (s_hasPrevWarpPose[p.eye]) {
+		// Compute deltaV = V_prev * inv(V_cur) directly from poses.
+		// This gives a view-space transform (cur view → prev view) using only
+		// the relative pose change, avoiding large absolute positions.
+		//
+		// V = [R^T | -R^T*p; 0|1], inv(V) = [R | p; 0|1]
+		// deltaV = V_prev * inv(V_cur)
+		//        = [Rp^T * Rc | Rp^T * (pc - pp); 0|1]
+		const auto& prev = s_prevWarpPose[p.eye];
+		const auto& cur  = p.warpPose;
+
+		// Prev rotation matrix (from quaternion)
+		float pqx=prev.orientation.x, pqy=prev.orientation.y, pqz=prev.orientation.z, pqw=prev.orientation.w;
+		float Rp00=1-2*(pqy*pqy+pqz*pqz), Rp01=2*(pqx*pqy-pqz*pqw), Rp02=2*(pqx*pqz+pqy*pqw);
+		float Rp10=2*(pqx*pqy+pqz*pqw), Rp11=1-2*(pqx*pqx+pqz*pqz), Rp12=2*(pqy*pqz-pqx*pqw);
+		float Rp20=2*(pqx*pqz-pqy*pqw), Rp21=2*(pqy*pqz+pqx*pqw), Rp22=1-2*(pqx*pqx+pqy*pqy);
+
+		// Cur rotation matrix
+		float cqx=cur.orientation.x, cqy=cur.orientation.y, cqz=cur.orientation.z, cqw=cur.orientation.w;
+		float Rc00=1-2*(cqy*cqy+cqz*cqz), Rc01=2*(cqx*cqy-cqz*cqw), Rc02=2*(cqx*cqz+cqy*cqw);
+		float Rc10=2*(cqx*cqy+cqz*cqw), Rc11=1-2*(cqx*cqx+cqz*cqz), Rc12=2*(cqy*cqz-cqx*cqw);
+		float Rc20=2*(cqx*cqz-cqy*cqw), Rc21=2*(cqy*cqz+cqx*cqw), Rc22=1-2*(cqx*cqx+cqy*cqy);
+
+		// deltaRot = Rp^T * Rc (3x3)
+		float d00=Rp00*Rc00+Rp10*Rc10+Rp20*Rc20, d01=Rp00*Rc01+Rp10*Rc11+Rp20*Rc21, d02=Rp00*Rc02+Rp10*Rc12+Rp20*Rc22;
+		float d10=Rp01*Rc00+Rp11*Rc10+Rp21*Rc20, d11=Rp01*Rc01+Rp11*Rc11+Rp21*Rc21, d12=Rp01*Rc02+Rp11*Rc12+Rp21*Rc22;
+		float d20=Rp02*Rc00+Rp12*Rc10+Rp22*Rc20, d21=Rp02*Rc01+Rp12*Rc11+Rp22*Rc21, d22=Rp02*Rc02+Rp12*Rc12+Rp22*Rc22;
+
+		// deltaTranslation = Rp^T * (pc - pp)
+		float dpx=cur.position.x-prev.position.x, dpy=cur.position.y-prev.position.y, dpz=cur.position.z-prev.position.z;
+		float dt0=Rp00*dpx+Rp10*dpy+Rp20*dpz;
+		float dt1=Rp01*dpx+Rp11*dpy+Rp21*dpz;
+		float dt2=Rp02*dpx+Rp12*dpy+Rp22*dpz;
+
+		// deltaV in column-major: maps cur view → prev view
+		float dV[16] = {};
+		dV[0]=d00; dV[4]=d01; dV[8] =d02; dV[12]=dt0;
+		dV[1]=d10; dV[5]=d11; dV[9] =d12; dV[13]=dt1;
+		dV[2]=d20; dV[6]=d21; dV[10]=d22; dV[14]=dt2;
+		dV[3]=0;   dV[7]=0;   dV[11]=0;   dV[15]=1;
+
+		// clipToClip = P * deltaV * P^{-1}
+		float tanL = tanf(p.cachedFov.angleLeft), tanR = tanf(p.cachedFov.angleRight);
+		float tanU = tanf(p.cachedFov.angleUp),   tanD = tanf(p.cachedFov.angleDown);
+		float w = tanR - tanL, h = tanU - tanD;
+		float n = p.nearZ, f = p.farZ;
+
+		float P[16] = {};
+		P[0]=2.0f/w;  P[8]=(tanR+tanL)/w;
+		P[5]=2.0f/h;  P[9]=(tanU+tanD)/h;
+		P[10]=-f/(f-n); P[14]=-(f*n)/(f-n);
+		P[11]=-1.0f;
+
+		float Pi[16] = {};
+		Pi[0]=w/2.0f;  Pi[12]=(tanR+tanL)/2.0f;
+		Pi[5]=h/2.0f;  Pi[13]=(tanU+tanD)/2.0f;
+		Pi[14]=-1.0f;
+		Pi[11]=-(f-n)/(f*n); Pi[15]=1.0f/n;
+
+		float temp[16];
+		MulMatrix4x4(dV, Pi, temp);
+		MulMatrix4x4(P, temp, clipToClip);
+		hasValidMVs = true;
+	}
+
+	// First warp frame or inversion failed — use identity (zero MVs, reset DLSS)
+	if (!hasValidMVs) {
+		memset(clipToClip, 0, sizeof(clipToClip));
+		clipToClip[0] = clipToClip[5] = clipToClip[10] = clipToClip[15] = 1.0f;
+	}
+
+	// Store current warp pose for next frame's warp-to-warp MVs
+	s_prevWarpPose[p.eye] = p.warpPose;
+	s_hasPrevWarpPose[p.eye] = true;
+
+	// Warp jitter: zero. The warp shader doesn't apply sub-pixel jitter to its output,
+	// so telling DLSS about fake jitter would cause it to misalign temporal history.
+	// Warp DLSS accumulates center-sampled frames (no sub-pixel diversity, but cleaner
+	// than reset=true spatial-only since it can average noise across frames).
+	float warpJitterX = 0.0f, warpJitterY = 0.0f;
+
+	// 2. Generate warp MVs using the camera MV compute shader
+	if (!EnsureCameraMVResources(dev, p.renderW, p.renderH)) {
+		dev->Release();
+		return false;
+	}
+
+	ID3D11ShaderResourceView* depthSRV = GetOrCreateCameraMVDepthSRV(dev, p.cachedDepth);
+	if (!depthSRV) {
+		dev->Release();
+		return false;
+	}
+
+	// No jitter in warp output → zero jitter delta and zero current jitter
+	GenerateCameraMVs(p.ctx, depthSRV, p.renderW, p.renderH,
+	    clipToClip,
+	    0, 0,           // depthOffset: 0 (per-eye texture)
+	    0.0f, 0.0f,     // jitterDeltaUV: 0 (no jitter in warp)
+	    0.0f, 0.0f,     // currJitterUV: 0 (no jitter in warp)
+	    nullptr, 0, 0,  // no game MVs
+	    false);
+
+	// 3. Dispatch DLSS — warp handles, independent temporal accumulation
+	DlssUpscaler::DispatchParams params = {};
+	params.color = p.warpedColor;
+	params.colorSourceRegion = nullptr;
+	params.motionVectors = s_cameraMVTex;
+	params.mvSourceRegion = nullptr;
+	params.depth = p.cachedDepth;
+	params.depthSourceRegion = nullptr;
+	params.jitterX = warpJitterX;
+	params.jitterY = warpJitterY;
+	params.deltaTimeMs = 11.1f;
+	params.renderWidth = p.renderW;
+	params.renderHeight = p.renderH;
+	params.outputWidth = p.outputW;
+	params.outputHeight = p.outputH;
+	params.cameraNear = p.nearZ;
+	params.cameraFar = p.farZ;
+	params.sharpness = oovr_global_configuration.DlssSharpness();
+	params.reset = !hasValidMVs;  // reset on first warp frame (no previous pose), temporal after
+	params.mvScaleX = (float)p.renderW;
+	params.mvScaleY = (float)p.renderH;
+	params.biasMask = nullptr;
+	params.biasMaskSourceRegion = nullptr;
+	params.debugMode = 0;
+
+	dev->Release();
+
+	// Use separate warp DLSS handles (2-3) — independent temporal history from game.
+	if (!s_dlssUpscaler->DispatchWarp(p.eye, p.ctx, params)) {
+		static int s_warpFail = 0;
+		if (s_warpFail++ < 5)
+			OOVR_LOGF("DLSS warp: DispatchWarp failed eye=%d render=%ux%u output=%ux%u",
+			    p.eye, p.renderW, p.renderH, p.outputW, p.outputH);
+		return false;
+	}
+
+	*outResult = s_dlssUpscaler->GetWarpOutputDX11(p.eye);
+	return (*outResult != nullptr);
+}
 #endif
 
 // Shader HLSL headers are embedded as Win32 resources (avoids MSVC string literal size limits)
@@ -3895,12 +4154,21 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				if (!useMetaSpaceWarp) {
 					// Custom PC-side ASW
 					g_aswProvider = new ASWProvider();
-					if (!g_aswProvider->Initialize(device, aswEyeW, aswEyeH)) {
+					if (!g_aswProvider->Initialize(device, renderEyeW, renderEyeH, aswEyeW, aswEyeH)) {
 						OOVR_LOG("ASW: Custom ASW initialization failed — disabling");
 						delete g_aswProvider;
 						g_aswProvider = nullptr;
 					} else {
 						OOVR_LOG("ASW: Using custom PC-side ASW");
+#ifdef OC_HAS_DLSS
+						// Register DLSS warp upscale callback when DLSS is active.
+						// This makes SubmitWarpedOutput run DLSS spatial upscaling on
+						// each eye's render-res warp output before copying to the output swapchain.
+						if (dlssEn && s_dlssUpscaler && s_dlssUpscaler->IsReady()) {
+							g_aswProvider->SetWarpUpscaleCallback(&DlssWarpUpscaleCallback);
+							OOVR_LOG("ASW: DLSS warp upscale callback registered");
+						}
+#endif
 					}
 				}
 			}
@@ -4021,42 +4289,20 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			mvRegion.front = 0;
 			mvRegion.back = 1;
 
-			// Use upscaler output (display-res, single-eye) when available.
-			// ASW staging textures are sized at display-res when upscaler is active.
-			// Falls back to raw submitted texture when no upscaler.
-			ID3D11Texture2D* colorSrc = nullptr;
+			// Always cache pre-upscaler render-res color for ASW.
+			// When DLSS/FSR3 is active, warp output will be upscaled via the
+			// warp upscale callback (SubmitWarpedOutput). This ensures every
+			// displayed frame goes through the upscaler, fixing jitter shaking
+			// that occurs when alternating upscaled game frames with non-upscaled warps.
+			ID3D11Texture2D* colorSrc = (ID3D11Texture2D*)texture->handle;
 			D3D11_TEXTURE2D_DESC colorDesc;
 			D3D11_BOX colorRegion = {};
-			bool usedUpscaledColor = false;
-#ifdef OC_HAS_DLSS
-			if (!colorSrc && s_dlssUpscaler && s_dlssUpscaler->IsReady()
-			    && oovr_global_configuration.DlssEnabled()
-			    && oovr_global_configuration.FsrRenderScale() < 0.99f) {
-				ID3D11Texture2D* dlssOut = s_dlssUpscaler->GetOutputDX11(eyeIdx);
-				if (dlssOut) { colorSrc = dlssOut; usedUpscaledColor = true; }
-			}
-#endif
-#ifdef OC_HAS_FSR3
-			if (!colorSrc && s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
-			    && oovr_global_configuration.FsrRenderScale() < 0.99f) {
-				ID3D11Texture2D* fsr3Out = s_fsr3Upscaler->GetOutputDX11(eyeIdx);
-				if (fsr3Out) { colorSrc = fsr3Out; usedUpscaledColor = true; }
-			}
-#endif
-			if (!colorSrc)
-				colorSrc = (ID3D11Texture2D*)texture->handle;
 
 			if (SafeGetTextureDesc(colorSrc, &colorDesc)) {
-				if (usedUpscaledColor) {
-					// Upscaler output is single-eye, full texture
-					colorRegion.left = 0;
-					colorRegion.right = colorDesc.Width;
-				} else {
-					// Raw submitted texture may be stereo-packed
-					uint32_t colorEyeW = ptrBounds ? colorDesc.Width / 2 : colorDesc.Width;
-					colorRegion.left = ptrBounds ? eyeIdx * colorEyeW : 0;
-					colorRegion.right = colorRegion.left + colorEyeW;
-				}
+				// Raw submitted texture may be stereo-packed
+				uint32_t colorEyeW = ptrBounds ? colorDesc.Width / 2 : colorDesc.Width;
+				colorRegion.left = ptrBounds ? eyeIdx * colorEyeW : 0;
+				colorRegion.right = colorRegion.left + colorEyeW;
 				colorRegion.top = 0;
 				colorRegion.bottom = colorDesc.Height;
 				colorRegion.front = 0;

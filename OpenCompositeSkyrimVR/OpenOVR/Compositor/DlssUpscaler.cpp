@@ -137,13 +137,13 @@ void DlssUpscaler::Shutdown()
 	ID3D11DeviceContext* ctx = nullptr;
 	m_device->GetImmediateContext(&ctx);
 	if (ctx) {
-		DestroyFeature(0, ctx);
-		DestroyFeature(1, ctx);
+		for (int i = 0; i < kHandleCount; i++)
+			DestroyFeature(i, ctx);
 		ctx->Release();
 	}
 	DestroyStagingTextures();
-	DestroyOutputTexture(0);
-	DestroyOutputTexture(1);
+	for (int i = 0; i < kHandleCount; i++)
+		DestroyOutputTexture(i);
 	if (m_params) {
 		NVSDK_NGX_D3D11_DestroyParameters(m_params);
 		m_params = nullptr;
@@ -448,6 +448,17 @@ bool DlssUpscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* ctx, const Dispatch
 ID3D11Texture2D* DlssUpscaler::GetOutputDX11(int eyeIdx) const
 {
 	return m_output[eyeIdx];
+}
+
+bool DlssUpscaler::DispatchWarp(int eyeIdx, ID3D11DeviceContext* ctx, const DispatchParams& params)
+{
+	// Warp DLSS uses handles [2-3] — separate temporal history from game handles [0-1].
+	return Dispatch(eyeIdx + 2, ctx, params);
+}
+
+ID3D11Texture2D* DlssUpscaler::GetWarpOutputDX11(int eyeIdx) const
+{
+	return m_output[eyeIdx + 2];
 }
 
 #endif // OC_HAS_DLSS
