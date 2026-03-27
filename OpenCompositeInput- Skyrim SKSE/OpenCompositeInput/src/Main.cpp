@@ -22,10 +22,8 @@ namespace RE { class GASGlobalContext; } // Forward decl needed by GFxMovieRoot.
 #include <RE/M/MenuOpenCloseEvent.h>
 #include <RE/N/NiCamera.h>
 #include <RE/N/NiRTTI.h>
-#include <RE/A/Actor.h>
 #include <RE/P/PlayerCamera.h>
 #include <RE/P/PlayerCharacter.h>
-#include <RE/P/ProcessLists.h>
 #include <RE/R/Renderer.h>
 #include <RE/U/UI.h>
 #include <SKSE/SKSE.h>
@@ -429,98 +427,6 @@ namespace
 			cameraRoot->children.size());
 	}
 
-	// =========================================================================
-	// Actor MV list — enumerate nearby actors for per-actor motion vectors
-	// =========================================================================
-	uint32_t g_actorMvRefreshCounter = 0;   // Game frame counter for periodic refresh
-	static constexpr uint32_t ACTOR_MV_REFRESH_INTERVAL = 120;  // Re-enumerate every ~120 frames (~2 seconds)
-
-	void RefreshActorMVList()
-	{
-		if (!g_pBridge) return;
-
-		auto* processLists = RE::ProcessLists::GetSingleton();
-		if (!processLists) {
-			g_pBridge->actorMvCount = 0;
-			return;
-		}
-
-		uint32_t count = 0;
-		uint32_t handleCount = (uint32_t)processLists->highActorHandles.size();
-		uint32_t nullHandles = 0, nullGet = 0, isPlayer = 0, no3D = 0;
-
-		for (auto& handle : processLists->highActorHandles) {
-			if (count >= OCRenderTargetBridge::MAX_ACTOR_MV)
-				break;
-
-			if (!handle) {
-				nullHandles++;
-				continue;
-			}
-
-			auto actorPtr = handle.get();
-			if (!actorPtr) {
-				nullGet++;
-				continue;
-			}
-
-			RE::Actor* actor = actorPtr.get();
-			if (!actor) {
-				nullGet++;
-				continue;
-			}
-
-			if (actor->IsPlayerRef()) {
-				isPlayer++;
-				continue;
-			}
-
-			// Don't filter on IsDead() — Skyrim VR reports many alive NPCs as "dead".
-			// The GPU shader's minDelta check will skip truly stationary actors anyway.
-
-			// Try multiple methods to get actor 3D root
-			RE::NiAVObject* root = nullptr;
-
-			// Method 1: loadedData->data3D (direct member access)
-			if (actor->loadedData && actor->loadedData->data3D) {
-				root = actor->loadedData->data3D.get();
-			}
-			// Method 2: Get3D() virtual
-			if (!root) root = actor->Get3D();
-
-			// Log first few actors for diagnostics
-			if (count == 0 && !root && g_pBridge->actorMvRefreshSeq < 5) {
-				SKSE::log::info("  Actor {:p}: loadedData={:p}, Is3DLoaded={}, formID={:08X}",
-					(void*)actor,
-					(void*)actor->loadedData,
-					actor->Is3DLoaded(),
-					actor->GetFormID());
-			}
-
-			if (!root) {
-				no3D++;
-				continue;
-			}
-
-			g_pBridge->actorMvRootPtrs[count] = reinterpret_cast<uint64_t>(root);
-			count++;
-		}
-
-		uint32_t prevCount = g_pBridge->actorMvCount;
-		g_pBridge->actorMvCount = count;
-		g_pBridge->actorMvRefreshSeq++;
-
-		// Log when count changes or on first few refreshes
-		if (count != prevCount || g_pBridge->actorMvRefreshSeq <= 3) {
-			SKSE::log::info("Actor MV: Refreshed {} actors (was {}, seq={}, handles={}, numberHigh={}, nullH={}, nullGet={}, player={}, no3D={})",
-				count, prevCount, g_pBridge->actorMvRefreshSeq,
-				handleCount, processLists->numberHighActors,
-				nullHandles, nullGet, isPlayer, no3D);
-		}
-	}
-
-	// Actor MV refresh is driven from OC side via bridge requestRefresh flag
-
 	// Forward declaration — defined after g_activeTrackedMenus
 	void UpdateMenuTransform();
 
@@ -707,14 +613,8 @@ namespace
 				SKSE::log::info("RT Bridge: isLoadingScreen = {}", (int)g_pBridge->isLoadingScreen);
 				if (!a_event->opening) {
 					FindAndStoreNiCamera();
-					// Schedule actor MV refresh — actors may not be in process lists yet,
-					// so set counter to trigger refresh on next few menu events
-					g_actorMvRefreshCounter = 0;
-					RefreshActorMVList();  // Try immediately
 				}
 			}
-
-			// Actor MV refresh is handled by the per-frame ScheduleActorMVRefreshTask
 
 			// Set OC_MENU_ACTIVE for ALL menus (for WASD blocking in OpenComposite)
 			// IsShowingMenus() returns false in SkyrimVR — use tracked menus + GameIsPaused instead
@@ -993,12 +893,6 @@ namespace
 		// }
 		}
 
-		// Check if OC requested an actor MV refresh (set every ~2 seconds from OC side)
-		if (g_pBridge && g_pBridge->actorMvRequestRefresh) {
-			g_pBridge->actorMvRequestRefresh = 0;
-			RefreshActorMVList();
-		}
-
 		return CallWindowProcW(g_originalWndProc, a_hwnd, a_msg, a_wParam, a_lParam);
 	}
 
@@ -1178,7 +1072,6 @@ namespace
 		case SKSE::MessagingInterface::kNewGame:
 			FindAndStoreNiCamera();  // Retry after scene graph is fully loaded
 			TestRendererShadowState();  // Diagnostic: verify game VP matrices
-			RefreshActorMVList();  // Enumerate nearby actors for per-actor MVs
 			break;
 
 		case SKSE::MessagingInterface::kInputLoaded:

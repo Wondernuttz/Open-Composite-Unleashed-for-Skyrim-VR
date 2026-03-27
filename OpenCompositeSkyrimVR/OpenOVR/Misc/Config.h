@@ -122,9 +122,6 @@ public:
 
 	// Actor motion vectors (per-NPC rigid-body MVs from scene graph transforms)
 	inline bool ActorMV() const { return actorMV; }
-	inline float ActorMVRadiusScale() const { return actorMVRadiusScale; }
-	inline float ActorMVMinDelta() const { return actorMVMinDelta; }
-	inline bool ActorMVDebug() const { return actorMVDebug; }
 
 	// OCU ASW — Asynchronous SpaceWarp
 	inline bool ASWEnabled() const { return aswEnabled; }
@@ -278,9 +275,6 @@ private:
 
 	// Actor motion vectors (per-NPC rigid-body MVs from scene graph transforms)
 	bool actorMV = true;               // Enable per-actor motion vectors for nearby NPCs
-	float actorMVRadiusScale = 0.85f;  // Scale bounding sphere (< 1 = fewer false positives)
-	float actorMVMinDelta = 0.5f;      // Min world-space displacement to generate actor MV
-	bool actorMVDebug = false;         // Visually mark actor pixels with fake MVs (obvious distortion)
 
 	// OCU ASW — PC-side Asynchronous SpaceWarp (experimental)
 	bool aswEnabled = false;
