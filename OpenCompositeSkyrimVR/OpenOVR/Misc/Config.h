@@ -99,6 +99,8 @@ public:
 	inline float Fsr3MinDisocclusionAccumulation() const { return fsr3MinDisocclusionAccumulation; }
 	inline float Fsr3ReactiveBase() const { return fsr3ReactiveBase; }
 	inline float Fsr3ReactiveEdgeBoost() const { return fsr3ReactiveEdgeBoost; }
+	inline float Fsr3ReactiveDepthFalloffStart() const { return fsr3ReactiveDepthFalloffStart; }
+	inline float Fsr3ReactiveDepthFalloffEnd() const { return fsr3ReactiveDepthFalloffEnd; }
 	inline bool Fsr3CameraMV() const { return fsr3CameraMV; }
 	inline float Fsr3ViewToMeters() const { return fsr3ViewToMeters; }
 	inline int Fsr3DebugMode() const { return fsr3DebugMode; }
@@ -110,11 +112,16 @@ public:
 	inline float DlssMvScale()        const { return dlssMvScale; }
 	inline float DlssBiasBase()       const { return dlssBiasBase; }       // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
 	inline float DlssBiasEdgeBoost()  const { return dlssBiasEdgeBoost; }  // Extra bias at depth edges (foliage silhouettes)
+	inline float DlssBiasDepthFalloffStart() const { return dlssBiasDepthFalloffStart; }
+	inline float DlssBiasDepthFalloffEnd() const { return dlssBiasDepthFalloffEnd; }
 	inline float DlssJitterScale()    const { return dlssJitterScale; }    // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	inline bool MotionVectorsEnabled() const { return motionVectorsEnabled; }
 	inline float MotionVectorScale() const { return motionVectorScale; }
+
+	// Actor motion vectors (per-NPC rigid-body MVs from scene graph transforms)
+	inline bool ActorMV() const { return actorMV; }
 
 	// OCU ASW — Asynchronous SpaceWarp
 	inline bool ASWEnabled() const { return aswEnabled; }
@@ -248,14 +255,16 @@ private:
 	bool fsrEnabled = false;
 	float fsrRenderScale = 0.77f;   // 0.5 - 1.0, lower = more GPU savings
 	float fsr3Sharpness = 0.3f;     // 0.0 - 1.0, FSR3 built-in RCAS sharpness
-	float fsr3JitterScale = 0.7f;   // 0.0 - 1.0, jitter amplitude (lower = more stable, higher = better temporal AA)
+	float fsr3JitterScale = 0.3f;   // 0.0 - 1.0, jitter amplitude (lower = more stable, higher = better temporal AA)
 	bool fsr3JitterCancellation = false; // Camera MVs cancel jitter in shader; game MVs don't include jitter
-	float fsr3ShadingChangeScale = 1.5f; // Higher = more reactive to shading changes (reduces ghosting on trees)
-	float fsr3ReactivenessScale = 1.0f; // Multiplier on reactive mask values (higher = more aggressive ghosting reduction)
+	float fsr3ShadingChangeScale = 2.0f; // Higher = more reactive to shading changes (reduces ghosting on trees)
+	float fsr3ReactivenessScale = 2.0f; // Multiplier on reactive mask values (higher = more aggressive ghosting reduction)
 	float fsr3AccumulationPerFrame = 0.5f; // Lower = less ghosting but more flicker on thin geometry (0.0-1.0)
-	float fsr3MinDisocclusionAccumulation = 0.0f; // Higher = less flicker on swaying thin objects (-1.0 to 1.0)
-	float fsr3ReactiveBase = 0.08f;    // Depth-edge reactive mask baseline (reduces thin-geometry ghosting)
-	float fsr3ReactiveEdgeBoost = 0.20f; // Extra reactiveness at depth edges (tree silhouettes, thin geometry)
+	float fsr3MinDisocclusionAccumulation = -0.333f; // Higher = less flicker on swaying thin objects (-1.0 to 1.0)
+	float fsr3ReactiveBase = 0.45f;    // Depth-edge reactive mask baseline (reduces thin-geometry ghosting)
+	float fsr3ReactiveEdgeBoost = 0.90f; // Extra reactiveness at depth edges (tree silhouettes, thin geometry)
+	float fsr3ReactiveDepthFalloffStart = 0.95f; // Depth where reactive mask begins fading (standard-Z, 0=near 1=far)
+	float fsr3ReactiveDepthFalloffEnd = 0.998f;  // Depth where reactive mask reaches zero (distant mountains/sky)
 	bool fsr3CameraMV = true;          // Camera MVs from depth + view-projection deltas (captures locomotion + head tracking)
 	float fsr3ViewToMeters = 0.01428f;  // Skyrim: ~70 units = 1 meter
 	int fsr3DebugMode = 0;             // 0=off, 1=FSR3 debug overlay, 2=bypass (raw game), 3=depth viz
@@ -263,6 +272,9 @@ private:
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	bool motionVectorsEnabled = true;
 	float motionVectorScale = 1.0f;    // MV magnitude multiplier (1.0 = raw, <1 = dampen, >1 = amplify)
+
+	// Actor motion vectors (per-NPC rigid-body MVs from scene graph transforms)
+	bool actorMV = true;               // Enable per-actor motion vectors for nearby NPCs
 
 	// OCU ASW — PC-side Asynchronous SpaceWarp (experimental)
 	bool aswEnabled = false;
@@ -296,9 +308,11 @@ private:
 	int   dlssPreset       = 1;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
 	float dlssSharpness    = 20.0f;
 	float dlssMvScale      = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
-	float dlssBiasBase     = 0.08f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
+	float dlssBiasBase     = 0.05f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
 	float dlssBiasEdgeBoost = 0.20f; // Extra bias at depth edges (foliage silhouettes)
-	float dlssJitterScale  = 0.5f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
+	float dlssBiasDepthFalloffStart = 0.95f; // Depth where bias mask begins fading (standard-Z, 0=near 1=far)
+	float dlssBiasDepthFalloffEnd = 0.99f;   // Depth where bias mask reaches zero (distant mountains/sky)
+	float dlssJitterScale  = 0.3f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;

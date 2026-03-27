@@ -238,11 +238,14 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, fsr3MinDisocclusionAccumulation);
 		CFGOPT(float, fsr3ReactiveBase);
 		CFGOPT(float, fsr3ReactiveEdgeBoost);
+		CFGOPT(float, fsr3ReactiveDepthFalloffStart);
+		CFGOPT(float, fsr3ReactiveDepthFalloffEnd);
 		CFGOPT(bool, fsr3CameraMV);
 		CFGOPT(float, fsr3ViewToMeters);
 		CFGOPT(int, fsr3DebugMode);
 		CFGOPT(bool, motionVectorsEnabled);
 		CFGOPT(float, motionVectorScale);
+		CFGOPT(bool, actorMV);
 		CFGOPT(bool, aswEnabled);
 		CFGOPT(bool, aswForceCustom);
 		CFGOPT(float, aswWarpStrength);
@@ -275,6 +278,8 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, dlssMvScale);
 		CFGOPT(float, dlssBiasBase);
 		CFGOPT(float, dlssBiasEdgeBoost);
+		CFGOPT(float, dlssBiasDepthFalloffStart);
+		CFGOPT(float, dlssBiasDepthFalloffEnd);
 		CFGOPT(float, dlssJitterScale);
 	}
 

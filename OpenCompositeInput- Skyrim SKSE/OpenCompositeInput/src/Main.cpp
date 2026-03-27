@@ -112,6 +112,17 @@ struct OCRenderTargetBridge {
 	// walk-cycle camera bob + HMD tracking. Updated by the engine each frame during scene
 	// graph update. Z delta captures ALL vertical camera motion for MV compensation.
 	uint64_t cameraPosPtr;    // float* → NiCamera::world.translate.x (NiPoint3: x, y, z)
+
+	// Actor MV data — pointers to NiAVObject root nodes for nearby actors.
+	// OC reads world/previousWorld transforms directly via known offsets each frame.
+	// NiAVObject offsets (VR, verified): world.translate=+0xA0, previousWorld.translate=+0xD4,
+	// worldBound.center=+0xE4, worldBound.radius=+0xF0
+	static constexpr uint32_t MAX_ACTOR_MV = 32;
+	uint32_t actorMvCount;                          // Number of valid entries
+	uint32_t actorMvRefreshSeq;                     // Incremented on re-enumeration (SKSE writes)
+	uint64_t actorMvRootPtrs[MAX_ACTOR_MV];         // NiAVObject* root node pointers
+	uint32_t actorMvRequestRefresh;                 // OC sets to 1 to request SKSE re-enumerate
+	uint32_t _padActorMv;
 };
 #pragma pack(pop)
 
@@ -600,8 +611,9 @@ namespace
 			if (name == "Loading Menu" && g_pBridge) {
 				g_pBridge->isLoadingScreen = a_event->opening ? 1 : 0;
 				SKSE::log::info("RT Bridge: isLoadingScreen = {}", (int)g_pBridge->isLoadingScreen);
-				if (!a_event->opening)
+				if (!a_event->opening) {
 					FindAndStoreNiCamera();
+				}
 			}
 
 			// Set OC_MENU_ACTIVE for ALL menus (for WASD blocking in OpenComposite)
@@ -1053,6 +1065,7 @@ namespace
 				ui->AddEventSink<RE::MenuOpenCloseEvent>(new MenuWatcher());
 				SKSE::log::info("MenuOpenCloseEvent sink registered");
 			}
+
 			break;
 
 		case SKSE::MessagingInterface::kPostLoadGame:

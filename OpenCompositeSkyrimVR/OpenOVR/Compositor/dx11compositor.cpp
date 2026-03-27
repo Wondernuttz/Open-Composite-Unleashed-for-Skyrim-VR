@@ -73,6 +73,17 @@ struct OCRenderTargetBridge {
 
 	// Camera world position — includes actorPos + eye height + walk-cycle bob + HMD tracking
 	uint64_t cameraPosPtr; // float* → NiCamera::world.translate.x (NiPoint3: x, y, z)
+
+	// Actor MV data — pointers to NiAVObject root nodes for nearby actors.
+	// OC reads world/previousWorld transforms directly via known offsets each frame.
+	// NiAVObject offsets (VR): world.translate=+0xA0, previousWorld.translate=+0xD4,
+	// worldBound.center=+0xE4, worldBound.radius=+0xF0
+	static constexpr uint32_t MAX_ACTOR_MV = 32;
+	uint32_t actorMvCount; // Number of valid entries
+	uint32_t actorMvRefreshSeq; // Incremented on re-enumeration (SKSE writes)
+	uint64_t actorMvRootPtrs[MAX_ACTOR_MV]; // NiAVObject* root node pointers
+	uint32_t actorMvRequestRefresh; // OC sets to 1 to request SKSE re-enumerate
+	uint32_t _padActorMv;
 };
 #pragma pack(pop)
 
@@ -90,13 +101,13 @@ static void OpenRenderTargetBridge()
 		return;
 	s_bridgeTried = true;
 
-	s_hBridgeMap = OpenFileMappingW(FILE_MAP_READ, FALSE,
+	s_hBridgeMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
 	    L"Local\\OpenCompositeRenderTargets");
 	if (!s_hBridgeMap)
 		return;
 
 	s_pBridge = static_cast<OCRenderTargetBridge*>(
-	    MapViewOfFile(s_hBridgeMap, FILE_MAP_READ, 0, 0, sizeof(OCRenderTargetBridge)));
+	    MapViewOfFile(s_hBridgeMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(OCRenderTargetBridge)));
 	if (!s_pBridge) {
 		CloseHandle(s_hBridgeMap);
 		s_hBridgeMap = nullptr;
@@ -182,6 +193,9 @@ cbuffer ReactiveCB : register(b0) {
     float edgeBoost;         // Extra reactiveness at depth edges
     float edgeThreshold;     // Depth diff below which edge = 0
     float edgeScale;         // Ramp speed for edge detection
+    float depthFalloffStart; // Depth value where distance falloff begins (standard-Z)
+    float depthFalloffEnd;   // Depth value where bias reaches zero
+    float pad0, pad1;
 };
 
 [numthreads(8, 8, 1)]
@@ -203,10 +217,18 @@ void CS_ReactiveMask(uint3 id : SV_DispatchThreadID)
     }
     float edge = saturate((maxDiff - edgeThreshold) * edgeScale) * edgeBoost;
 
-    ReactiveOut[id.xy] = min(baseReactiveness + edge, 0.95);
+    // Distance falloff: reduce bias for distant pixels so the upscaler trusts
+    // history more, counteracting jitter-induced wobble on mountains/landscapes.
+    // Standard-Z: higher depth = farther. Falloff ramps from 1→0 between start..end.
+    float distFade = (depthFalloffEnd > depthFalloffStart)
+        ? 1.0 - saturate((center - depthFalloffStart) / (depthFalloffEnd - depthFalloffStart))
+        : 1.0;
+
+    ReactiveOut[id.xy] = min((baseReactiveness + edge) * distFade, 0.95);
 }
 )HLSL";
 static ID3D11Buffer* s_reactiveMaskCB = nullptr;
+
 #endif // OC_HAS_FSR3 || OC_HAS_DLSS (reactive mask)
 
 // ── Camera MV resources (compute per-pixel camera motion from depth + pose deltas) ──
@@ -279,16 +301,19 @@ static XrPosef s_fsr3EyePose[2] = {};
 static XrFovf s_fsr3EyeFov[2] = {};
 
 static constexpr char s_cameraMVHLSL[] = R"HLSL(
-Texture2D<float>       DepthIn  : register(t0);
-RWTexture2D<float2>    MVOut    : register(u0);
+Texture2D<float>       DepthIn   : register(t0);
+RWTexture2D<float2>    MVOut     : register(u0);
+Texture2D<float2>      GameMVIn  : register(t1);
 
 cbuffer CameraMVCB : register(b0) {
-    column_major float4x4 clipToClip;  // prevVP * inv(curVP), computed in double on CPU
-    float2 renderSize;                  // per-eye render resolution
-    int2 depthOffset;                   // offset into stereo-combined depth texture
-    float2 jitterDeltaUV;               // (curJitter - prevJitter) / renderSize (FSR3 only)
-    float2 currJitterUV;                // current jitter in UV space (DLSS: unjitters clip coords)
-    float2 _pad0;
+    column_major float4x4 clipToClip;        // prevVP * inv(curVP) WITH loco
+    float2 renderSize;
+    int2   depthOffset;
+    float2 jitterDeltaUV;
+    float2 currJitterUV;
+    int2   gameMVOffset;
+    uint   useGameMV;
+    float  _pad;
 };
 
 [numthreads(8, 8, 1)]
@@ -300,33 +325,33 @@ void CS_CameraMV(uint3 id : SV_DispatchThreadID)
 
     float depth = DepthIn.Load(int3(int2(id.xy) + depthOffset, 0));
 
-    // Skip sky pixels (reversed-Z: depth near 0 = far plane / sky)
     if (depth < 0.0001) {
         MVOut[id.xy] = float2(0, 0);
         return;
     }
 
-    // Pixel center -> UV -> NDC
     float2 uv = (float2(id.xy) + 0.5) / renderSize;
-
-    // Remove current frame's jitter from UV before converting to NDC.
-    // The game renders with our jittered projection (from GetProjectionRaw), so pixels
-    // are displaced by sub-pixel jitter. But clipToClip uses unjittered VP matrices.
-    // Without this correction, inv(curVP_unjittered) receives jittered clip coords,
-    // causing a depth-dependent MV error through the perspective divide (close objects
-    // get larger error than far objects). For FSR3: currJitterUV=(0,0) — FSR3 handles
-    // jitter via its own cancellation framework. For DLSS: removes the mismatch.
     float2 uvUnjittered = uv - currJitterUV;
     float2 ndc = float2(uvUnjittered.x * 2.0 - 1.0, 1.0 - uvUnjittered.y * 2.0);
-
-    // Map current clip space to previous clip space via clipToClip matrix.
-    // clipToClip = prevVP * inv(curVP), computed in double precision on CPU.
     float4 clipPos = float4(ndc, depth, 1.0);
-    float4 prevClip = mul(clipToClip, clipPos);
-    float2 prevNDC = prevClip.xy / prevClip.w;
-    float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
 
-    float2 mv = prevUV - uvUnjittered;
+    // Full camera MV (rotation + head tracking + locomotion) — always correct for static world
+    float4 prevClipFull = mul(clipToClip, clipPos);
+    float2 prevUVFull = float2(prevClipFull.x / prevClipFull.w * 0.5 + 0.5,
+                               0.5 - prevClipFull.y / prevClipFull.w * 0.5);
+    float2 fullCameraMV = prevUVFull - uvUnjittered;
+
+    float2 mv = fullCameraMV;
+
+    if (useGameMV) {
+        // Use game MVs directly (rotation + head tracking + NPC animation).
+        // Locomotion will be injected in the dilation pass using foreground depth,
+        // which correctly handles alpha-tested foliage (sky-depth pixels get
+        // foreground depth from nearest neighbor → correct locomotion parallax).
+        float2 gameMV = GameMVIn.Load(int3(int2(id.xy) + gameMVOffset, 0));
+        mv = gameMV;
+    }
+
     mv.x += jitterDeltaUV.x;
     mv.y -= jitterDeltaUV.y;
 
@@ -348,8 +373,8 @@ Texture2D<float>       DepthIn  : register(t1);
 RWTexture2D<float2>    MVOut    : register(u0);
 
 cbuffer DilateCB : register(b0) {
-    int2 depthOffset;   // offset into stereo-combined depth texture
-    uint2 resolution;   // per-eye render resolution
+    int2   depthOffset;
+    uint2  resolution;
 };
 
 [numthreads(8, 8, 1)]
@@ -357,13 +382,14 @@ void CS_MVDilate(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= resolution.x || id.y >= resolution.y) return;
 
-    // Find the closest (nearest-to-camera) depth in a 3x3 neighborhood.
-    // Standard-Z: 0.0 = near, 1.0 = far. Closest = min depth value.
+    // Find the closest (nearest-to-camera) depth in a 5x5 neighborhood.
+    // Wider kernel propagates foreground MVs further into sky-adjacent pixels,
+    // reducing trailing edge ghosts during fast locomotion (FSR3 disocclusion).
     float bestDepth = 1.0;
     int2 bestCoord = int2(id.xy);
 
-    [unroll] for (int dy = -1; dy <= 1; dy++) {
-        [unroll] for (int dx = -1; dx <= 1; dx++) {
+    [unroll] for (int dy = -2; dy <= 2; dy++) {
+        [unroll] for (int dx = -2; dx <= 2; dx++) {
             int2 coord = clamp(int2(id.xy) + int2(dx, dy), int2(0,0), int2(resolution) - 1);
             float d = DepthIn.Load(int3(coord + depthOffset, 0));
             if (d < bestDepth) {
@@ -616,7 +642,7 @@ static bool EnsureReactiveMaskResources(ID3D11Device* device, uint32_t w, uint32
 
 	if (!s_reactiveMaskCB) {
 		D3D11_BUFFER_DESC bd = {};
-		bd.ByteWidth = 16;
+		bd.ByteWidth = 32;
 		bd.Usage = D3D11_USAGE_DYNAMIC;
 		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -650,7 +676,8 @@ static ID3D11ShaderResourceView* GetOrCreateReactiveMaskDepthSRV(ID3D11Device* d
 
 static bool GenerateReactiveMask(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
     uint32_t width, uint32_t height,
-    float baseReactiveness, float edgeBoost, float edgeThreshold, float edgeScale)
+    float baseReactiveness, float edgeBoost, float edgeThreshold, float edgeScale,
+    float depthFalloffStart = 0.0f, float depthFalloffEnd = 0.0f)
 {
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	if (SUCCEEDED(context->Map(s_reactiveMaskCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
@@ -659,6 +686,10 @@ static bool GenerateReactiveMask(ID3D11DeviceContext* context, ID3D11ShaderResou
 		cb[1] = edgeBoost;
 		cb[2] = edgeThreshold;
 		cb[3] = edgeScale;
+		cb[4] = depthFalloffStart;
+		cb[5] = depthFalloffEnd;
+		cb[6] = 0.0f;
+		cb[7] = 0.0f;
 		context->Unmap(s_reactiveMaskCB, 0);
 	}
 
@@ -827,10 +858,10 @@ static bool EnsureCameraMVResources(ID3D11Device* device, uint32_t w, uint32_t h
 		OOVR_LOGF("CameraMV: R16G16_FLOAT output %ux%u created", w, h);
 	}
 
-	// Create constant buffer once (160 bytes = 10 * 16)
+	// Create constant buffer once (112 bytes = 7 * 16)
 	if (!s_cameraMVCB) {
 		D3D11_BUFFER_DESC bd = {};
-		bd.ByteWidth = 160; // 10 * 16 bytes
+		bd.ByteWidth = 112; // clipToClip(64) + renderSize(8) + depthOffset(8) + jitterDelta(8) + currJitter(8) + gameMVOffset(8) + useGameMV(4) + pad(4) = 112
 		bd.Usage = D3D11_USAGE_DYNAMIC;
 		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -866,61 +897,63 @@ static ID3D11ShaderResourceView* GetOrCreateCameraMVDepthSRV(ID3D11Device* devic
 }
 
 // Generate camera-derived motion vectors from depth + clip-to-clip reprojection matrix.
-// currJitterUVx/y: current frame's jitter in UV space. For DLSS, this unjitters the clip-space
-// position to match the unjittered VP matrix. For FSR3, pass (0,0).
 static bool GenerateCameraMVs(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
-    uint32_t outputW, uint32_t outputH, const float clipToClip[16],
+    uint32_t outputW, uint32_t outputH,
+    const float clipToClip[16],
     int depthOffsetX, int depthOffsetY, float jitterDeltaUVx, float jitterDeltaUVy,
-    float currJitterUVx = 0.0f, float currJitterUVy = 0.0f)
+    float currJitterUVx, float currJitterUVy,
+    ID3D11ShaderResourceView* gameMVSRV, int gameMVOffsetX, int gameMVOffsetY,
+    bool useGameMV)
 {
-	// Update constant buffer
+	// Update constant buffer: clipToClip + params = 112 bytes
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	if (SUCCEEDED(context->Map(s_cameraMVCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 		float* cb = (float*)mapped.pData;
-		memcpy(cb, clipToClip, 64); // offset 0: clipToClip (16 floats = 64 bytes)
-		cb[16] = (float)outputW; // offset 64: renderSize.x
-		cb[17] = (float)outputH; // offset 68: renderSize.y
 		int32_t* cbi = (int32_t*)mapped.pData;
-		cbi[18] = depthOffsetX; // offset 72: depthOffset.x
-		cbi[19] = depthOffsetY; // offset 76: depthOffset.y
-		cb[20] = jitterDeltaUVx; // offset 80: jitterDeltaUV.x
-		cb[21] = jitterDeltaUVy; // offset 84: jitterDeltaUV.y
-		cb[22] = currJitterUVx; // offset 88: currJitterUV.x
-		cb[23] = currJitterUVy; // offset 92: currJitterUV.y
-		cb[24] = 0.0f; // offset 96: _pad0.x
-		cb[25] = 0.0f; // offset 100: _pad0.y
+		uint32_t* cbu = (uint32_t*)mapped.pData;
+		memcpy(cb, clipToClip, 64);           // offset 0: clipToClip
+		cb[16] = (float)outputW;              // offset 64: renderSize
+		cb[17] = (float)outputH;
+		cbi[18] = depthOffsetX;               // offset 72: depthOffset
+		cbi[19] = depthOffsetY;
+		cb[20] = jitterDeltaUVx;              // offset 80: jitterDeltaUV
+		cb[21] = jitterDeltaUVy;
+		cb[22] = currJitterUVx;               // offset 88: currJitterUV
+		cb[23] = currJitterUVy;
+		cbi[24] = gameMVOffsetX;              // offset 96: gameMVOffset
+		cbi[25] = gameMVOffsetY;
+		cbu[26] = useGameMV ? 1u : 0u;       // offset 104: useGameMV
+		cbu[27] = 0u;                         // offset 108: pad
 		context->Unmap(s_cameraMVCB, 0);
 	}
 
 	// Save current CS state
 	ID3D11ComputeShader* oldCS = nullptr;
-	ID3D11ShaderResourceView* oldSRV = nullptr;
+	ID3D11ShaderResourceView* oldSRVs[2] = { nullptr, nullptr };
 	ID3D11UnorderedAccessView* oldUAV = nullptr;
 	ID3D11Buffer* oldCB = nullptr;
 	context->CSGetShader(&oldCS, nullptr, nullptr);
-	context->CSGetShaderResources(0, 1, &oldSRV);
+	context->CSGetShaderResources(0, 2, oldSRVs);
 	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
 	context->CSGetConstantBuffers(0, 1, &oldCB);
 
 	context->CSSetShader(s_cameraMVCS, nullptr, 0);
-	context->CSSetShaderResources(0, 1, &depthSRV);
+	ID3D11ShaderResourceView* srvs[2] = { depthSRV, gameMVSRV };
+	context->CSSetShaderResources(0, 2, srvs);
 	context->CSSetUnorderedAccessViews(0, 1, &s_cameraMVUAV, nullptr);
 	context->CSSetConstantBuffers(0, 1, &s_cameraMVCB);
 	context->Dispatch((outputW + 7) / 8, (outputH + 7) / 8, 1);
 
 	// Restore CS state
 	context->CSSetShader(oldCS, nullptr, 0);
-	context->CSSetShaderResources(0, 1, &oldSRV);
+	context->CSSetShaderResources(0, 2, oldSRVs);
 	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
 	context->CSSetConstantBuffers(0, 1, &oldCB);
-	if (oldCS)
-		oldCS->Release();
-	if (oldSRV)
-		oldSRV->Release();
-	if (oldUAV)
-		oldUAV->Release();
-	if (oldCB)
-		oldCB->Release();
+	if (oldCS) oldCS->Release();
+	if (oldSRVs[0]) oldSRVs[0]->Release();
+	if (oldSRVs[1]) oldSRVs[1]->Release();
+	if (oldUAV) oldUAV->Release();
+	if (oldCB) oldCB->Release();
 	return true;
 }
 
@@ -974,7 +1007,7 @@ static bool EnsureMVDilateResources(ID3D11Device* device, uint32_t w, uint32_t h
 
 	if (!s_mvDilateCB) {
 		D3D11_BUFFER_DESC bd = {};
-		bd.ByteWidth = 16; // int2 depthOffset + uint2 resolution
+		bd.ByteWidth = 16; // depthOffset(8) + resolution(8)
 		bd.Usage = D3D11_USAGE_DYNAMIC;
 		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -2449,7 +2482,9 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 							    oovr_global_configuration.Fsr3ReactiveBase(),
 							    oovr_global_configuration.Fsr3ReactiveEdgeBoost(),
 							    0.005f, // edge threshold
-							    30.0f); // edge scale
+							    30.0f,  // edge scale
+							    oovr_global_configuration.Fsr3ReactiveDepthFalloffStart(),
+							    oovr_global_configuration.Fsr3ReactiveDepthFalloffEnd());
 							reactiveMaskTex = s_reactiveMaskTex;
 						}
 					}
@@ -2557,7 +2592,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 							depthTex->GetDesc(&dDesc);
 							int depthOffX = 0, depthOffY = 0;
 							bool depthIsStereo = (dDesc.Width >= perEyeRenderW * 2 - 4);
-							if (depthIsStereo && eye == 1)
+							if (depthIsStereo && s_currentEyeIdx == 1)
 								depthOffX = (int)(dDesc.Width / 2);
 
 							// Jitter delta: the game projection includes our FSR3 jitter
@@ -2567,6 +2602,12 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 							float jdUVx = (curJitterX - s_prevJitterX[eye]) / (float)perEyeRenderW;
 							float jdUVy = (curJitterY - s_prevJitterY[eye]) / (float)perEyeRenderH;
 
+							auto* gameMVSRV = s_pBridge->mvSRV ? reinterpret_cast<ID3D11ShaderResourceView*>(s_pBridge->mvSRV) : nullptr;
+							int gameMVOffX = 0;
+							if (gameMVSRV && (mvDesc.Width >= perEyeRenderW * 2 - 4) && eye == 1)
+								gameMVOffX = (int)(mvDesc.Width / 2);
+							bool useGameMV = oovr_global_configuration.ActorMV() && gameMVSRV;
+
 							if (EnsureCameraMVResources(device, perEyeRenderW, perEyeRenderH)) {
 								auto* cmvDepthSRV = GetOrCreateCameraMVDepthSRV(device, depthTex);
 								if (cmvDepthSRV) {
@@ -2574,7 +2615,10 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 									    perEyeRenderW, perEyeRenderH,
 									    clipToClipMat,
 									    depthOffX, depthOffY,
-									    jdUVx, jdUVy);
+									    jdUVx, jdUVy,
+									    0.0f, 0.0f,
+									    gameMVSRV, gameMVOffX, 0,
+									    useGameMV);
 
 									// Dilate MVs: 3x3 closest-depth gives alpha-tested pixels
 									// (tree branches with sky depth) the foreground neighbor's MV.
@@ -3172,7 +3216,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 						dlssDepthTex->GetDesc(&dDesc);
 						int depthOffX = 0, depthOffY = 0;
 						bool depthIsStereo = (dDesc.Width >= dlssRenderW * 2 - 4);
-						if (depthIsStereo && eye == 1)
+						if (depthIsStereo && s_currentEyeIdx == 1)
 							depthOffX = (int)(dDesc.Width / 2);
 
 						// No jitter delta — MVs are from unjittered RSS VP matrices.
@@ -3182,6 +3226,12 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 						float currJUVx = s_fsr3RenderJitterX / (float)dlssRenderW;
 						float currJUVy = s_fsr3RenderJitterY / (float)dlssRenderH;
 
+						auto* gameMVSRV = s_pBridge->mvSRV ? reinterpret_cast<ID3D11ShaderResourceView*>(s_pBridge->mvSRV) : nullptr;
+						int gameMVOffX = 0;
+						if (gameMVSRV && (dlssMVDesc.Width >= dlssRenderW * 2 - 4) && eye == 1)
+							gameMVOffX = (int)(dlssMVDesc.Width / 2);
+						bool useGameMV = oovr_global_configuration.ActorMV() && gameMVSRV;
+
 						if (EnsureCameraMVResources(device, dlssRenderW, dlssRenderH)) {
 							auto* cmvDepthSRV = GetOrCreateCameraMVDepthSRV(device, dlssDepthTex);
 							if (cmvDepthSRV) {
@@ -3190,7 +3240,9 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 								    clipToClipMat,
 								    depthOffX, depthOffY,
 								    jdUVx, jdUVy,
-								    currJUVx, currJUVy);
+								    currJUVx, currJUVy,
+								    gameMVSRV, gameMVOffX, 0,
+								    useGameMV);
 								// Dilate MVs: 3x3 closest-depth gives alpha-tested pixels
 								// (tree branches with sky depth) the foreground neighbor's MV.
 								if (EnsureMVDilateResources(device, dlssRenderW, dlssRenderH)) {
@@ -3245,7 +3297,9 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 						    oovr_global_configuration.DlssBiasBase(),
 						    oovr_global_configuration.DlssBiasEdgeBoost(),
 						    0.005f, // edge threshold
-						    30.0f); // edge scale
+						    30.0f,  // edge scale
+						    oovr_global_configuration.DlssBiasDepthFalloffStart(),
+						    oovr_global_configuration.DlssBiasDepthFalloffEnd());
 						dlssBiasMaskTex = s_reactiveMaskTex;
 						// If depth is stereo-combined, bias mask uses same sub-region
 						dlssBiasMaskRegionPtr = dlssDepthRegionPtr;
