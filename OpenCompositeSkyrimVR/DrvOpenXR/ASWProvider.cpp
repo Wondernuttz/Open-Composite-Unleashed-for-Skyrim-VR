@@ -224,10 +224,18 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float2 fadedParallax = (parallaxUV - uv) * depthFade;
     float2 parallaxSourceUV = uv + fadedParallax;
 
-    // Read MV at foreground pixel (or source position).
+    // Read MV: prefer scatter source position (correct for leading edges where
+    // the output pixel has foreground depth but the cached frame has background).
+    // The scatter packed value encodes the source→dest offset in the lower 16 bits.
     int2 mvSourcePixel;
     if (foundForeground) {
         mvSourcePixel = ToMVCoord(fgPixel);
+    } else if (scatteredDepth != 0xFFFFFFFF) {
+        // Recover scatter source position from packed offset
+        int sdx = (int)((scatteredDepth >> 8) & 0xFFu) - 127;
+        int sdy = (int)(scatteredDepth & 0xFFu) - 127;
+        int2 scatterSrc = clamp(pixel - int2(sdx, sdy), int2(0,0), int2(resolution) - 1);
+        mvSourcePixel = ToMVCoord(scatterSrc);
     } else {
         mvSourcePixel = ToMVCoord(clamp(int2(parallaxSourceUV * resolution), int2(0,0), int2(resolution) - 1));
     }
@@ -298,7 +306,18 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             float2 depthAwareLocoOffset = locoUV - noLocoUV;
             float2 rotComponent = c2cHeadMV - headOnlyMV;
 
+            // NPC residual: totalMV includes NPC animation, c2cHeadMV captures head,
+            // depthAwareLocoOffset captures camera locomotion. What remains = NPC motion.
+            // Apply at 1.0 scale (exact MV, no extrapolation — unlike camera loco which
+            // uses mvConfidence for inter-frame prediction).
+            float2 npcMotion = totalMV - c2cHeadMV - depthAwareLocoOffset;
+            float npcMotionMag = length(npcMotion * resolution);
+
             sourceUV = parallaxSourceUV + mvConfidence * (depthAwareLocoOffset + rotMVScale * rotComponent);
+            // NPC motion: slight extrapolation (1.15x) to account for continued NPC movement
+            // between the MV measurement frame and warp output time. No threshold — even
+            // sub-pixel NPC motion should be applied to avoid flickering correction.
+            sourceUV += 1.5 * npcMotion;
         }
     }
 
@@ -313,6 +332,24 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     // Sample cached frame.
     float4 color = prevColor.SampleLevel(linearClamp, sourceUV, 0);
+
+    // Debug mode 61: skip writing disoccluded pixels (stay black from CSClear).
+    // Only during locomotion (no disocclusion when standing still).
+    if (debugMode == 61 && hasLoco) {
+        float cachedD = depthTex[depthPixel];
+        // Case 1: no scatter hit at a non-sky position = disocclusion hole
+        if (scatteredDepth == 0xFFFFFFFF && cachedD < 0.995) {
+            return;
+        }
+        // Case 2: scatter bled foreground depth into a background position (3x3 dilation artifact).
+        // The scattered depth is much closer than the cached depth = wrong depth here.
+        if (scatteredDepth != 0xFFFFFFFF && cachedD < 0.995) {
+            float scatD = (float)(scatteredDepth >> 16) / 65535.0;
+            if (cachedD - scatD > 0.02) {
+                return; // foreground depth bled into background — disocclusion border
+            }
+        }
+    }
 
     // Debug mode 60: depth scatter visualization
     // RED = scattered foreground depth read from atomicDepth
@@ -687,6 +724,12 @@ void CSDilate(uint3 tid : SV_DispatchThreadID) {
     // Case 3 only: unfilled (black) pixels. Skip sky-marked pixels entirely —
     // filling sky gaps with fg color makes distant trees/foliage look solid.
     if (myDepth != 0xFFFFFFFF) return;  // only process unfilled pixels
+
+    // DEBUG: blank out disocclusion areas (black) to isolate artifacts
+    if (debugMode == 61) {
+        output[tid.xy] = float4(0, 0, 0, 1);
+        return;
+    }
 
     // ── Frame N fill with depth comparison + edge search ──
     // The cached frame (N-1) has the foreground object at this position.
@@ -1084,19 +1127,41 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
         }
     }
 
+    // NPC motion: game MV captures everything, subtract camera components to isolate NPC animation.
+    // c2cHeadMV = head tracking from clipToClipNoLoco (same as CSMain uses).
+    float2 rawMV = mvTex[ToMVCoord(srcPixel)];
+    float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
+    float2 c2cHMV = float2(0, 0);
+    if (hasClipToClipNoLoco) {
+        float2 ndc = float2(srcUV.x * 2 - 1, 1 - srcUV.y * 2);
+        float4 clipPos = float4(ndc, d, 1.0);
+        float4 prevClip = mul(clipToClipNoLoco, clipPos);
+        if (abs(prevClip.w) > 0.0001) {
+            float2 prevNDC = prevClip.xy / prevClip.w;
+            c2cHMV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5) - srcUV;
+        }
+    }
+    float2 npcMotion = totalMV - c2cHMV - locoOffset;
+
     // Scatter to warp output position: reverse of CSMain's backward map
-    // CSMain: outputUV + headOffset + locoOffset*conf = sourceUV (in cached frame)
-    // Reverse: outputUV = sourceUV - headOffset - locoOffset*conf
-    float2 dstUV = srcUV - headOffset - mvConfidence * locoOffset;
+    // Camera: headOffset + locoOffset (same as CSMain parallax + depth-aware loco)
+    // NPC: additional motion from NPC animation (1.0 scale, no extrapolation)
+    float2 dstUV = srcUV - headOffset - mvConfidence * locoOffset - npcMotion;
 
     int2 dstPixel = int2(dstUV * resolution);
     uint depth16 = (uint)round(saturate(d) * 65535.0);
-    uint packed = (depth16 << 16) | 0xFFFF;
-    // Write to 3x3 neighborhood to cover sub-pixel gaps and MV targeting offset
+
+    // Pack depth (16 bits) + source offset (8+8 bits) so CSMain can read the MV
+    // from the correct source position (not the output position where MV is wrong).
     [unroll] for (int sy = -1; sy <= 1; sy++) {
         [unroll] for (int sx = -1; sx <= 1; sx++) {
             int2 wp = dstPixel + int2(sx, sy);
             if (all(wp >= 0) && wp.x < (int)resolution.x && wp.y < (int)resolution.y) {
+                int dx = clamp(wp.x - srcPixel.x, -127, 127);
+                int dy = clamp(wp.y - srcPixel.y, -127, 127);
+                uint packed = (depth16 << 16) |
+                    ((uint)clamp(dx + 127, 0, 255) << 8) |
+                    (uint)clamp(dy + 127, 0, 255);
                 InterlockedMin(atomicDepth[wp], packed);
             }
         }
