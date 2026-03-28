@@ -333,22 +333,13 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // Sample cached frame.
     float4 color = prevColor.SampleLevel(linearClamp, sourceUV, 0);
 
-    // Debug mode 61: skip writing disoccluded pixels (stay black from CSClear).
-    // Only during locomotion (no disocclusion when standing still).
-    if (debugMode == 61 && hasLoco) {
-        float cachedD = depthTex[depthPixel];
-        // Case 1: no scatter hit at a non-sky position = disocclusion hole
-        if (scatteredDepth == 0xFFFFFFFF && cachedD < 0.995) {
-            return;
-        }
-        // Case 2: scatter bled foreground depth into a background position (3x3 dilation artifact).
-        // The scattered depth is much closer than the cached depth = wrong depth here.
-        if (scatteredDepth != 0xFFFFFFFF && cachedD < 0.995) {
-            float scatD = (float)(scatteredDepth >> 16) / 65535.0;
-            if (cachedD - scatD > 0.02) {
-                return; // foreground depth bled into background — disocclusion border
-            }
-        }
+    // Disocclusion: proactively marked by the depth scatter as 0xFFFFFFFE.
+    // The scatter marks the vacated trailing edge (opposite to loco displacement).
+    // Interior markers are overwritten by neighbors' scatter (InterlockedMin with real depth).
+    // Only true trailing-edge disocclusion retains the marker.
+    // Skip writing — CSDilate fills with frame N data.
+    if (scatteredDepth == 0xFFFFFFFE) {
+        return;  // Explicitly marked disocclusion — CSDilate fills with frame N
     }
 
     // Debug mode 60: depth scatter visualization
@@ -723,7 +714,10 @@ void CSDilate(uint3 tid : SV_DispatchThreadID) {
 
     // Case 3 only: unfilled (black) pixels. Skip sky-marked pixels entirely —
     // filling sky gaps with fg color makes distant trees/foliage look solid.
-    if (myDepth != 0xFFFFFFFF) return;  // only process unfilled pixels
+    // Only process explicitly marked disocclusion (0xFFFFFFFE from depth scatter).
+    // 0xFFFFFFFF = scatter gap (sky, sub-pixel, head-turn edge) — CSMain handled these.
+    // Valid scatter (< 0xFFFFFFFE) — CSMain used the depth correctly.
+    if (myDepth != 0xFFFFFFFE) return;
 
     // DEBUG: blank out disocclusion areas (black) to isolate artifacts
     if (debugMode == 61) {
@@ -1143,26 +1137,46 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
     }
     float2 npcMotion = totalMV - c2cHMV - locoOffset;
 
-    // Scatter to warp output position: reverse of CSMain's backward map
-    // Camera: headOffset + locoOffset (same as CSMain parallax + depth-aware loco)
-    // NPC: additional motion from NPC animation (1.0 scale, no extrapolation)
+    // Scatter to warp output position: reverse of CSMain's backward map.
+    // Use poseDelta parallax (headOffset) for head tracking — same source as CSMain.
+    // This keeps scatter, markers, and CSMain all in the same coordinate space.
+    // Camera loco: depth-aware c2c difference, scaled by mvConfidence (matches CSMain).
+    // NPC: npcMotion at 1.0 scale.
     float2 dstUV = srcUV - headOffset - mvConfidence * locoOffset - npcMotion;
 
     int2 dstPixel = int2(dstUV * resolution);
     uint depth16 = (uint)round(saturate(d) * 65535.0);
+    // Single-pixel write for depth.
+    if (all(dstPixel >= 0) && dstPixel.x < (int)resolution.x && dstPixel.y < (int)resolution.y) {
+        int dx = clamp(dstPixel.x - srcPixel.x, -127, 127);
+        int dy = clamp(dstPixel.y - srcPixel.y, -127, 127);
+        uint packed = (depth16 << 16) |
+            ((uint)clamp(dx + 127, 0, 255) << 8) |
+            (uint)clamp(dy + 127, 0, 255);
+        InterlockedMin(atomicDepth[dstPixel], packed);
+    }
 
-    // Pack depth (16 bits) + source offset (8+8 bits) so CSMain can read the MV
-    // from the correct source position (not the output position where MV is wrong).
-    [unroll] for (int sy = -1; sy <= 1; sy++) {
-        [unroll] for (int sx = -1; sx <= 1; sx++) {
-            int2 wp = dstPixel + int2(sx, sy);
-            if (all(wp >= 0) && wp.x < (int)resolution.x && wp.y < (int)resolution.y) {
-                int dx = clamp(wp.x - srcPixel.x, -127, 127);
-                int dy = clamp(wp.y - srcPixel.y, -127, 127);
-                uint packed = (depth16 << 16) |
-                    ((uint)clamp(dx + 127, 0, 255) << 8) |
-                    (uint)clamp(dy + 127, 0, 255);
-                InterlockedMin(atomicDepth[wp], packed);
+    // Mark vacated trailing edge: ONLY at depth edges where foreground meets background.
+    // Use poseDelta parallax (same as CSMain) for the marker base position so markers
+    // stay anchored to the edge regardless of head turn.
+    float2 locoDisplacementPx = mvConfidence * locoOffset * resolution;
+    float locoMag = length(locoDisplacementPx);
+    if (locoMag > 1.0 && d < 0.99) {
+        float2 vacateDir = normalize(locoDisplacementPx);
+        // Check if this pixel is at a trailing depth edge
+        int2 trailNeighbor = clamp(srcPixel + int2(round(vacateDir)), int2(0,0), int2(resolution) - 1);
+        float neighborD = depthTex[ToDepthCoord(trailNeighbor)];
+        bool isTrailingEdge = (neighborD - d > 0.01);
+        if (isTrailingEdge) {
+            // Mark from dstPixel (scatter destination = where CSMain renders foreground).
+            // Markers start right next to the foreground edge — no gap.
+            // Both dstPixel and markers use the same c2cHMV offset → anchored together.
+            int markSteps = min((int)ceil(locoMag), 20);
+            for (int step = 1; step <= markSteps; step++) {
+                int2 markPixel = dstPixel + int2(round(vacateDir * (float)step));
+                if (all(markPixel >= 0) && markPixel.x < (int)resolution.x && markPixel.y < (int)resolution.y) {
+                    InterlockedMin(atomicDepth[markPixel], 0xFFFFFFFE);
+                }
             }
         }
     }
@@ -2379,6 +2393,13 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 
 		ctx->CSSetShader(m_warpCS, nullptr, 0);
 		ctx->Dispatch(groupsX, groupsY, 1);
+
+		// CSDilate: fill sub-pixel gaps (from single-pixel scatter) and
+		// disocclusion holes with frame N data.
+		if (m_dilateCS) {
+			ctx->CSSetShader(m_dilateCS, nullptr, 0);
+			ctx->Dispatch(groupsX, groupsY, 1);
+		}
 
 		if (useStationaryNpcForwardOverlay) {
 			ID3D11UnorderedAccessView* overlayUAVs[] = { m_uavForwardNpcOutput[eye], m_uavAtomicDepth[eye] };
