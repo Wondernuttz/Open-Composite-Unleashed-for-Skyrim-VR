@@ -66,7 +66,7 @@ cbuffer WarpParams : register(b0) {
     float2 mvResolution;        // actual MV data dimensions (render-res when camera MVs + upscaler)
     int _pad_npcMask;           // removed: was hasNpcMask
     float _pad1;                // alignment padding
-    int _pad_debugMode;         // removed: was debugMode
+    int debugMode;              // 0=normal, 60=depth scatter viz
     float3 _pad2;               // alignment to 16 bytes
     row_major float4x4 headRotMatrix;  // head rotation delta between prev/cur cached poses
                                        // used to subtract head rot from camera MVs
@@ -120,7 +120,17 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float2 uv = ((float2)tid.xy + 0.5) / resolution;
     int2 pixel = (int2)tid.xy;
     int2 depthPixel = ToDepthCoord(pixel);
-    float d = depthTex[depthPixel];
+
+    // Read warped depth from atomicDepth (forward-scattered by CSDepthPreScatter).
+    // At leading edges, this has the foreground depth that moved to this position.
+    // Fall back to cached depth if no scattered depth exists.
+    float d;
+    uint scatteredDepth = atomicDepth[pixel];
+    if (scatteredDepth != 0xFFFFFFFF) {
+        d = (float)(scatteredDepth >> 16) / 65535.0;
+    } else {
+        d = depthTex[depthPixel];
+    }
 
     float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
     float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
@@ -161,12 +171,19 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     bool allowHeadDepthSearch = (!hasLoco && parallaxMagPx > 0.75 && d >= 0.97);
 
 )" R"(
-    // Foreground search: only for head-tracking-only mode (standing still, large parallax
-    // at sky depth). During locomotion, depth-aware loco offset handles parallax correctly
-    // per-pixel — foreground search would apply wrong depth to background pixels.
-    if (allowHeadDepthSearch && searchMagPx > 0.5) {
-        int maxSearch = min(48, max(24, (int)searchMagPx + 16));
-        for (int step = 1; step <= maxSearch; step++) {
+    // Foreground search: find closer depth along search direction.
+    // During locomotion: short search (4px) to catch leading edges only — the tree that
+    // moved into this position. Longer search causes "force fields" because it applies
+    // foreground depth (and its larger loco offset) to distant background pixels.
+    // Head-only mode: longer search for large parallax at sky depth.
+    int fgSearchMax = 0;
+    if (hasLoco && searchMagPx > 0.5)
+        fgSearchMax = 4;  // leading edge only
+    else if (allowHeadDepthSearch && searchMagPx > 0.5)
+        fgSearchMax = min(48, max(24, (int)searchMagPx + 16));
+
+    if (fgSearchMax > 0) {
+        for (int step = 1; step <= fgSearchMax; step++) {
             int2 searchPx = pixel + int2(stepVec * (float)step);
             searchPx = clamp(searchPx, int2(0,0), int2(resolution) - 1);
             float searchD = depthTex[ToDepthCoord(searchPx)];
@@ -296,6 +313,22 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     // Sample cached frame.
     float4 color = prevColor.SampleLevel(linearClamp, sourceUV, 0);
+
+    // Debug mode 60: depth scatter visualization
+    // RED = scattered foreground depth read from atomicDepth
+    // GREEN = cached depth (no scatter hit at this pixel)
+    // Brightness = depth value (darker = closer)
+    if (debugMode == 60) {
+        uint sd = atomicDepth[pixel];
+        if (sd != 0xFFFFFFFF) {
+            float scatD = (float)(sd >> 16) / 65535.0;
+            color = float4(1.0 - scatD, 0, 0, 1); // RED, brighter = closer
+        } else {
+            float cachedD = depthTex[depthPixel];
+            color = float4(0, 1.0 - cachedD, 0, 1); // GREEN
+        }
+    }
+
     output[tid.xy] = color;
 }
 )";
@@ -1006,6 +1039,70 @@ void CSCompositeNpcForward(uint3 tid : SV_DispatchThreadID) {
 static const char* s_npcScatterHLSL = R"(
 // ── NPC depth scatter: forward-scatter NPC depth for backward warp boundary extension ──
 // For each pixel with significant NPC animation MV, scatter its depth to the
+// CSDepthPreScatter: scatter ALL cached pixels' depths to their WARP OUTPUT positions.
+// Uses the SAME math as CSMain's backward warp (poseDelta + c2c loco) but in reverse.
+// Closest depth wins via InterlockedMin.
+[numthreads(8, 8, 1)]
+void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    int2 srcPixel = (int2)tid.xy;
+    float d = depthTex[ToDepthCoord(srcPixel)];
+    if (d >= 0.999) return; // skip sky
+
+    float2 srcUV = (float2(srcPixel) + 0.5) / resolution;
+
+    // Head tracking: poseDelta parallax maps output→cached. Reverse ≈ -parallax.
+    float tanX = lerp(fovTanLeft, fovTanRight, srcUV.x);
+    float tanY = lerp(fovTanUp, fovTanDown, srcUV.y);
+    float linD = LinearizeDepth(d, nearZ, farZ) * depthScale;
+    float2 headOffset = float2(0, 0);
+    if (linD > 0.001) {
+        float3 viewPos = float3(tanX * linD, tanY * linD, linD);
+        float4 xformed = mul(poseDeltaMatrix, float4(viewPos, 1.0));
+        if (xformed.z > 0.001) {
+            headOffset = float2(
+                (xformed.x / xformed.z - fovTanLeft) / (fovTanRight - fovTanLeft) - srcUV.x,
+                (xformed.y / xformed.z - fovTanUp) / (fovTanDown - fovTanUp) - srcUV.y);
+        }
+    }
+
+    // Locomotion: depth-aware offset from c2c difference (same as CSMain)
+    float2 locoOffset = float2(0, 0);
+    if (hasFullWarpC2C && hasClipToClipNoLoco) {
+        float2 ndc = float2(srcUV.x * 2.0 - 1.0, 1.0 - srcUV.y * 2.0);
+        float4 clipPos = float4(ndc, d, 1.0);
+        float4 locoClip = mul(fullWarpC2C, clipPos);
+        float4 noLocoClip = mul(clipToClipNoLoco, clipPos);
+        if (abs(locoClip.w) > 0.0001 && abs(noLocoClip.w) > 0.0001) {
+            float2 locoUV = float2(locoClip.x / locoClip.w * 0.5 + 0.5,
+                                   0.5 - locoClip.y / locoClip.w * 0.5);
+            float2 noLocoUV = float2(noLocoClip.x / noLocoClip.w * 0.5 + 0.5,
+                                     0.5 - noLocoClip.y / noLocoClip.w * 0.5);
+            locoOffset = locoUV - noLocoUV;
+        }
+    }
+
+    // Scatter to warp output position: reverse of CSMain's backward map
+    // CSMain: outputUV + headOffset + locoOffset*conf = sourceUV (in cached frame)
+    // Reverse: outputUV = sourceUV - headOffset - locoOffset*conf
+    float2 dstUV = srcUV - headOffset - mvConfidence * locoOffset;
+
+    int2 dstPixel = int2(dstUV * resolution);
+    uint depth16 = (uint)round(saturate(d) * 65535.0);
+    uint packed = (depth16 << 16) | 0xFFFF;
+    // Write to 3x3 neighborhood to cover sub-pixel gaps and MV targeting offset
+    [unroll] for (int sy = -1; sy <= 1; sy++) {
+        [unroll] for (int sx = -1; sx <= 1; sx++) {
+            int2 wp = dstPixel + int2(sx, sy);
+            if (all(wp >= 0) && wp.x < (int)resolution.x && wp.y < (int)resolution.y) {
+                InterlockedMin(atomicDepth[wp], packed);
+            }
+        }
+    }
+}
+
 // predicted NPC position via InterlockedMin. The packed value stores 16 bits of
 // depth and 8 bits per axis for the source offset (signed ±127).
 [numthreads(8, 8, 1)]
@@ -1331,7 +1428,7 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	static const char* entryPoints[] = {
 		"CSMain", "CSClear", "CSForwardDepth", "CSForwardColor",
 		"CSForwardDepthNpcOnly", "CSForwardColorNpcOnly", "CSDilate",
-		"CSCompositeNpcForward", "CSNpcDepthScatter"
+		"CSCompositeNpcForward", "CSNpcDepthScatter", "CSDepthPreScatter"
 	};
 	constexpr int kJobCount = _countof(entryPoints);
 	m_pendingBlobs.resize(kJobCount);
@@ -1342,12 +1439,12 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	}
 
 	// Source string to use for each entry point (by index)
-	// 0=csMainSrc, 1-6=fullShaderSrc, 7=compositeStr, 8=npcShaderSrc
+	// 0=csMainSrc, 1-6=fullShaderSrc, 7=compositeStr, 8-9=npcShaderSrc
 	struct SourceMap { int blobIdx; const std::string* src; };
 	SourceMap srcMap[] = {
 		{0, &csMainSrc}, {1, &fullShaderSrc}, {2, &fullShaderSrc}, {3, &fullShaderSrc},
 		{4, &fullShaderSrc}, {5, &fullShaderSrc}, {6, &fullShaderSrc},
-		{7, &compositeStr}, {8, &npcShaderSrc}
+		{7, &compositeStr}, {8, &npcShaderSrc}, {9, &npcShaderSrc}
 	};
 
 	// Launch a single background thread that compiles all shaders in parallel internally.
@@ -1362,9 +1459,9 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 		const std::string* sources[] = {
 			&csMainSrc, &fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
 			&fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
-			&compositeStr, &npcShaderSrc
+			&compositeStr, &npcShaderSrc, &npcShaderSrc
 		};
-		constexpr int N = 9;
+		constexpr int N = 10;
 
 		// Launch parallel sub-tasks for each shader
 		std::vector<std::future<void>> futures;
@@ -1405,7 +1502,7 @@ void ASWProvider::TryFinishShaderCompilation()
 	    &m_warpCS,               // [0] CSMain
 	    &m_clearCS, &m_forwardDepthCS, &m_forwardColorCS,
 	    &m_forwardDepthNpcOnlyCS, &m_forwardColorNpcOnlyCS, &m_dilateCS,
-	    &m_compositeNpcForwardCS, &m_npcDepthScatterCS,
+	    &m_compositeNpcForwardCS, &m_npcDepthScatterCS, &m_depthPreScatterCS,
 	};
 	const int kJobCount = (int)m_pendingBlobs.size();
 	bool csMainOk = false;
@@ -2123,6 +2220,7 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	cb.mvResolution[0] = (m_slotMVDataW[slot] > 0) ? (float)m_slotMVDataW[slot] : (float)m_renderWidth;
 	cb.mvResolution[1] = (m_slotMVDataH[slot] > 0) ? (float)m_slotMVDataH[slot] : (float)m_renderHeight;
 	cb._pad_npcMask = 0;  // removed: was hasNpcMask
+	cb.debugMode = oovr_global_configuration.ASWDebugMode();
 
 
 
@@ -2202,9 +2300,16 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		if (m_clearCS) {
 			ctx->CSSetShader(m_clearCS, nullptr, 0);
 			ctx->Dispatch(groupsX, groupsY, 1);
+		}
 
-			// NPC depth scatter disabled — CSMain no longer reads atomicDepth for NPC handling.
-			// CSClear still runs to initialize atomicDepth for CSDilate's unfilled pixel detection.
+		// Depth pre-scatter: forward-scatter all cached depths to their warp output positions.
+		// CSMain reads warped depth from atomicDepth → correct foreground depth at leading edges.
+		if (m_depthPreScatterCS) {
+			ctx->CSSetShader(m_depthPreScatterCS, nullptr, 0);
+			ctx->Dispatch(groupsX, groupsY, 1);
+		} else {
+			static bool logged = false;
+			if (!logged) { OOVR_LOG("ASW: CSDepthPreScatter shader is NULL"); logged = true; }
 		}
 
 		ctx->CSSetShader(m_warpCS, nullptr, 0);
@@ -2549,6 +2654,7 @@ void ASWProvider::Shutdown()
 	if (m_compositeNpcForwardCS) { m_compositeNpcForwardCS->Release(); m_compositeNpcForwardCS = nullptr; }
 	if (m_dilateCS) { m_dilateCS->Release(); m_dilateCS = nullptr; }
 	if (m_npcDepthScatterCS) { m_npcDepthScatterCS->Release(); m_npcDepthScatterCS = nullptr; }
+	if (m_depthPreScatterCS) { m_depthPreScatterCS->Release(); m_depthPreScatterCS = nullptr; }
 
 	for (int e = 0; e < 2; ++e) {
 		if (m_srvAtomicDepth[e]) { m_srvAtomicDepth[e]->Release(); m_srvAtomicDepth[e] = nullptr; }

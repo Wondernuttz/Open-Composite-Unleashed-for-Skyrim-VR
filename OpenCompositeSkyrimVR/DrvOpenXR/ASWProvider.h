@@ -346,6 +346,7 @@ private:
 	ID3D11ComputeShader* m_compositeNpcForwardCS = nullptr; // CSCompositeNpcForward
 	ID3D11ComputeShader* m_dilateCS = nullptr;      // CSDilate (gap fill)
 	ID3D11ComputeShader* m_npcDepthScatterCS = nullptr; // CSNpcDepthScatter (moving-NPC boundary extension)
+	ID3D11ComputeShader* m_depthPreScatterCS = nullptr; // CSDepthPreScatter (warp depth forward for leading edges)
 	ID3D11Buffer* m_constantBuffer = nullptr;
 	ID3D11SamplerState* m_linearSampler = nullptr;
 
@@ -419,7 +420,7 @@ private:
 		float mvResolution[2];     // actual MV dimensions (render-res when camera MVs + upscaler)
 		int _pad_npcMask;          // removed: was hasNpcMask
 		float _pad1;               // alignment padding             — 16
-		int _pad_debugMode;        // removed: was debugMode
+		int debugMode;             // 0=normal, 60=depth scatter viz
 		float _pad2[3];            // alignment to 16 bytes                        — 16
 		float headRotMatrix[16];       // 4x4 row-major: head rotation delta (prev→cur cached pose)
 		                               // Used to subtract head rot from camera MVs    — 64 bytes
