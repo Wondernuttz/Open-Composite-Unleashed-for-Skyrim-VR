@@ -81,6 +81,9 @@ cbuffer WarpParams : register(b0) {
     row_major float4x4 reprojClipToClip;  // warp output → frame N clip space (for disocclusion fill)
     int hasReprojData;      // 1 if frame N data is available for reprojection
     float3 _padReproj;
+    column_major float4x4 fullWarpC2C;  // warp output → cached clip (head + locomotion, depth-aware)
+    int hasFullWarpC2C;     // 1 if fullWarpC2C is valid
+    float3 _padFullC2C;
 };
 
 // LinearizeDepth: convert raw depth buffer value to linear distance in game units.
@@ -115,20 +118,14 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         return;
 
     float2 uv = ((float2)tid.xy + 0.5) / resolution;
-
-    // 1. Read depth and search for foreground along combined parallax + locomotion direction.
-    //    At disocclusion edges (object moved, revealing background), the cached depth
-    //    is background. During locomotion, poseDeltaMatrix only captures head motion,
-    //    so we also use the raw game MV to find the correct search direction.
     int2 pixel = (int2)tid.xy;
     int2 depthPixel = ToDepthCoord(pixel);
     float d = depthTex[depthPixel];
-    float origD = d;  // save for disocclusion detection
 
     float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
     float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
 
-    // Compute parallax direction from head pose delta (may be tiny during pure locomotion).
+    // Compute parallax direction from head pose delta.
     float linearDepth = LinearizeDepth(d, nearZ, farZ);
     float scaledDepth = linearDepth * depthScale;
     float3 newViewPos = float3(tanX * scaledDepth, tanY * scaledDepth, scaledDepth);
@@ -143,9 +140,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             (oldTanY - fovTanUp) / (fovTanDown - fovTanUp) - uv.y);
     }
 
-    // Read raw MV at current pixel for locomotion-aware search direction.
-    // During pure locomotion, parallaxDir is tiny (head-only) but game MVs capture
-    // the full scene motion. MV points from current UV toward previous UV (cached frame).
+    // Search direction: use parallax or raw game MV (whichever is larger).
     float2 roughMV = mvTex[ToMVCoord(pixel)] * mvPixelScale;
     roughMV = clamp(roughMV, float2(-0.15, -0.15), float2(0.15, 0.15));
 
@@ -153,162 +148,23 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float parallaxMagPx = length(parallaxDir * resolution);
     float mvSearchMagPx = length(roughMV * resolution);
     bool hasLoco = length(locoScreenDir) > 0.001;
-    bool stationaryNpcMode = !hasLoco;
     if (hasLoco && mvSearchMagPx > parallaxMagPx)
         searchDir = roughMV;
     float searchMagPx = hasLoco ? max(parallaxMagPx, mvSearchMagPx) : parallaxMagPx;
 
-    // Convert to pixel-space stepping: normalize so dominant axis = +/-1 pixel/step.
     float2 searchDirPx = searchDir * resolution;
     float maxComp = max(abs(searchDirPx.x), abs(searchDirPx.y));
     float2 stepVec = (maxComp > 0.001) ? (searchDirPx / maxComp) : float2(0, 0);
 
     int2 fgPixel = pixel;
     bool foundForeground = false;
-    bool npcExpanded = false;
-    bool hasNpcScatter = false;
-    bool hasDirectNpcScatter = false;
-    bool npcDirectBodyAligned = false;
-    int2 npcScatterDelta = int2(0, 0);
-    int2 npcScatterSrcPixel = int2(0, 0);
-    float npcScatterSrcDepth = 1.0;
-    bool npcTrailingRejected = false;
-    bool allowHeadDepthSearch = (!hasLoco && parallaxMagPx > 0.75 && origD >= 0.97);
+    bool allowHeadDepthSearch = (!hasLoco && parallaxMagPx > 0.75 && d >= 0.97);
 
 )" R"(
-
-    if (hasClipToClipNoLoco) {
-        // CSNpcDepthScatter writes its support field in source-screen space plus the
-        // NPC residual delta. Querying it at the current output pixel makes the whole
-        // moving-NPC region lag behind head motion. Shift the lookup by the local
-        // head-only c2c offset so we read from the same space the scatter pass wrote.
-        float2 scatterQueryOffsetPx = parallaxDir * resolution;
-        {
-            float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-            float4 clipPos = float4(ndc, d, 1.0);
-            float4 prevClip = mul(clipToClipNoLoco, clipPos);
-            if (abs(prevClip.w) > 0.0001) {
-                float2 prevNDC = prevClip.xy / prevClip.w;
-                float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
-                scatterQueryOffsetPx = (prevUV - uv) * resolution;
-            }
-        }
-        int2 scatterQueryPixel = clamp(pixel + int2(round(scatterQueryOffsetPx)), int2(0,0), int2(resolution) - 1);
-
-        uint packedNpc = atomicDepth[scatterQueryPixel];
-        bool directHit = (packedNpc != 0xFFFFFFFFu);
-        int2 hitPos = scatterQueryPixel;
-        // If no direct scatter hit, search a slightly wider neighborhood so thin
-        // moving-object leading edges can still pick up the scattered support band.
-        if (!directHit) {
-            int bestDist2 = 999999;
-            [unroll] for (int sy = -6; sy <= 6; sy++) {
-                [unroll] for (int sx = -6; sx <= 6; sx++) {
-                    if (sx == 0 && sy == 0) continue;
-                    int2 sp = clamp(scatterQueryPixel + int2(sx, sy), int2(0,0), int2(resolution) - 1);
-                    uint np = atomicDepth[sp];
-                    if (np == 0xFFFFFFFFu) continue;
-                    int dist2 = sx * sx + sy * sy;
-                    if (dist2 < bestDist2 || (dist2 == bestDist2 && np < packedNpc)) {
-                        packedNpc = np;
-                        hitPos = sp;
-                        bestDist2 = dist2;
-                    }
-                }
-            }
-        }
-        if (packedNpc != 0xFFFFFFFFu) {
-            float warpedD = (float)(packedNpc >> 16) / 65535.0;
-            int sdx = (int)((packedNpc >> 8) & 0xFFu) - 127;
-            int sdy = (int)(packedNpc & 0xFFu) - 127;
-            hasNpcScatter = true;
-            hasDirectNpcScatter = directHit;
-            npcScatterDelta = int2(sdx, sdy);
-            npcScatterSrcPixel = clamp(hitPos - int2(sdx, sdy), int2(0,0), int2(resolution) - 1);
-            npcScatterSrcDepth = depthTex[ToDepthCoord(npcScatterSrcPixel)];
-            npcDirectBodyAligned = (!directHit || (origD - warpedD <= max(0.005, warpedD * 0.02)));
-            // Trailing edge rejection: for neighbor hits (not direct scatter),
-            // reject if pixel is behind the scatter direction.
-            bool trailingEdge = false;
-            float2 scatterDir = float2(sdx, sdy);
-            float scatterLen = length(scatterDir);
-            if (!directHit) {
-                float2 pixelOfs = float2(pixel - hitPos);
-                if (dot(scatterDir, pixelOfs) < -0.01) trailingEdge = true;
-            }
-            npcTrailingRejected = trailingEdge;
-            float depthGap = origD - warpedD;
-            float depthGapThresh = max(0.005, warpedD * 0.02);
-            bool supportBand = false;
-            // supportBand is only for boundary extension when a nearby scatter hit
-            // suggests this destination belongs to the same moving NPC. Direct hits
-            // already cover the body itself and should stay on the body/carry path;
-            // promoting them to npcExpanded makes the whole NPC follow the looser
-            // boundary rules and lags under head-only motion.
-            if (!trailingEdge && !directHit && scatterLen > 0.5) {
-                float2 dirNorm = scatterDir / scatterLen;
-                float deltaSlack = max(1.5, scatterLen * 0.35);
-                float bandForward = clamp(scatterLen * 0.35 + 1.0, 2.0, 6.0);
-                float bandLateral = directHit ? 2.5 : 1.75;
-                float bandDepthSlack = max(0.01, warpedD * 0.03);
-                float occluderSlack = max(0.004, warpedD * 0.015);
-                int supportCount = 0;
-                [unroll] for (int sy = -5; sy <= 5; sy++) {
-                    [unroll] for (int sx = -5; sx <= 5; sx++) {
-                        int2 sp = clamp(pixel + int2(sx, sy), int2(0,0), int2(resolution) - 1);
-                        uint np = atomicDepth[sp];
-                        if (np == 0xFFFFFFFFu) continue;
-                        float nWarpedD = (float)(np >> 16) / 65535.0;
-                        int ndx = (int)((np >> 8) & 0xFFu) - 127;
-                        int ndy = (int)(np & 0xFFu) - 127;
-                        float2 nDelta = float2(ndx, ndy);
-                        if (length(nDelta - scatterDir) > deltaSlack) continue;
-                        float2 pixelOfs = float2(pixel - sp);
-                        float along = dot(dirNorm, pixelOfs);
-                        float lateral = length(pixelOfs - dirNorm * along);
-                        if (along < -1.25 || along > bandForward) continue;
-                        if (lateral > bandLateral) continue;
-                        if (abs(nWarpedD - warpedD) > bandDepthSlack) continue;
-                        supportCount++;
-                    }
-                }
-                bool frontUnoccluded = (origD + occluderSlack >= warpedD);
-                supportBand = frontUnoccluded && (supportCount >= 3);
-            }
-            if ((depthGap > depthGapThresh || supportBand) && !trailingEdge && !stationaryNpcMode) {
-                float srcSlack = max(0.01, warpedD * 0.03);
-                if (npcScatterSrcDepth > warpedD + srcSlack) {
-                    float bestDist = 999.0;
-                    int2 bestPx = npcScatterSrcPixel;
-                    bool foundSrc = false;
-                    [unroll] for (int ry = -6; ry <= 6; ry++) {
-                        [unroll] for (int rx = -6; rx <= 6; rx++) {
-                            int2 tp = clamp(npcScatterSrcPixel + int2(rx, ry), int2(0,0), int2(resolution) - 1);
-                            float td = depthTex[ToDepthCoord(tp)];
-                            if (td <= warpedD + srcSlack) {
-                                float dist = float(rx * rx + ry * ry);
-                                if (dist < bestDist) {
-                                    bestDist = dist;
-                                    bestPx = tp;
-                                    foundSrc = true;
-                                }
-                            }
-                        }
-                    }
-                    if (foundSrc) {
-                        npcScatterSrcPixel = bestPx;
-                        npcScatterSrcDepth = depthTex[ToDepthCoord(bestPx)];
-                    }
-                }
-                foundForeground = true;
-                npcExpanded = true;
-                fgPixel = npcScatterSrcPixel;
-                d = npcScatterSrcDepth;
-            }
-        }
-    }
-
-    if (!foundForeground && (hasLoco || allowHeadDepthSearch) && searchMagPx > 0.5) {
+    // Foreground search: only for head-tracking-only mode (standing still, large parallax
+    // at sky depth). During locomotion, depth-aware loco offset handles parallax correctly
+    // per-pixel — foreground search would apply wrong depth to background pixels.
+    if (allowHeadDepthSearch && searchMagPx > 0.5) {
         int maxSearch = min(48, max(24, (int)searchMagPx + 16));
         for (int step = 1; step <= maxSearch; step++) {
             int2 searchPx = pixel + int2(stepVec * (float)step);
@@ -325,55 +181,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         }
     }
 
-    // Cardinal search fallback
-    if (hasLoco && !foundForeground && origD > 0.50 && searchMagPx > 0.5) {
-        int bestDist = 49;
-        int2 dirs[8] = {
-            int2(1,0), int2(-1,0), int2(0,1), int2(0,-1),
-            int2(1,1), int2(1,-1), int2(-1,1), int2(-1,-1)
-        };
-        [unroll]
-        for (int dir = 0; dir < 8; dir++) {
-            for (int step = 2; step < bestDist; step += 2) {
-                int2 sp = pixel + dirs[dir] * step;
-                if (any(sp < 0) || sp.x >= (int)resolution.x || sp.y >= (int)resolution.y)
-                    break;
-                float sd = depthTex[ToDepthCoord(sp)];
-                if (origD - sd > 0.01) {
-                    bestDist = step;
-                    d = sd;
-                    fgPixel = sp;
-                    foundForeground = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Step into foreground interior for cleaner MV
-    if (foundForeground) {
-        float2 stepInDir = float2(fgPixel - pixel);
-        float stepInLen = length(stepInDir);
-        if (stepInLen > 0.5) {
-            stepInDir /= stepInLen;
-            for (int extra = 1; extra <= 4; extra++) {
-                int2 deepPx = fgPixel + int2(round(stepInDir * (float)extra));
-                deepPx = clamp(deepPx, int2(0,0), int2(resolution) - 1);
-                float deepD = depthTex[ToDepthCoord(deepPx)];
-                if (abs(deepD - d) < 0.02) {
-                    fgPixel = deepPx;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    // Recompute parallax with (possibly foreground) depth.
-    // Both locomotion-found foreground and npcExpanded use fgPixel's angle for parallax
-    // and uv as the base. This ensures npcExpanded pixels get the same warp as locomotion.
+    // Recompute parallax with foreground depth if found.
     bool useFgAngle = foundForeground;
-    bool useFgBase = npcExpanded;
     float2 fgUV = useFgAngle ? (float2(fgPixel) + 0.5) / resolution : uv;
     float fgTanX = useFgAngle ? lerp(fovTanLeft, fovTanRight, fgUV.x) : tanX;
     float fgTanY = useFgAngle ? lerp(fovTanUp, fovTanDown, fgUV.y) : tanY;
@@ -387,27 +196,18 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (scaledDepth > 0.001 && oldViewPos.z > 0.001) {
         float oldTanX = oldViewPos.x / oldViewPos.z;
         float oldTanY = oldViewPos.y / oldViewPos.z;
-        // Compute where fgPixel's surface projects in the cached frame, then express
-        // as an offset relative to the OUTPUT pixel so parallax is a warp displacement.
         float2 cachedUV = float2(
             (oldTanX - fovTanLeft) / (fovTanRight - fovTanLeft),
             (oldTanY - fovTanUp) / (fovTanDown - fovTanUp));
         parallaxUV = uv + (cachedUV - fgUV);
     }
 
-    // Near-field depth fade
+    // Near-field depth fade.
     float depthFade = (nearFadeDepth > 0.0) ? saturate((linearDepth - nearFadeDepth) / nearFadeDepth) : 1.0;
+    float2 fadedParallax = (parallaxUV - uv) * depthFade;
+    float2 parallaxSourceUV = uv + fadedParallax;
 
-    float2 parallaxOffset = parallaxUV - uv;
-
-    // 3. Combine: parallax (faded at near-field only) to get source position in cached frame.
-    float2 fadedParallax = parallaxOffset * depthFade;
-    // BG npcExpanded: uv base (body MV redirects to NPC body, continuous with neighbors).
-    // FG npcExpanded: fgUV base (samples from NPC interior, prevents leading-edge holes).
-    // Locomotion search: uv base (original behavior).
-    float2 parallaxSourceUV = (useFgBase ? fgUV : uv) + fadedParallax;
-
-    // Read MV
+    // Read MV at foreground pixel (or source position).
     int2 mvSourcePixel;
     if (foundForeground) {
         mvSourcePixel = ToMVCoord(fgPixel);
@@ -419,9 +219,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     totalMV = clamp(totalMV, float2(-0.15, -0.15), float2(0.15, 0.15));
 
 )" R"(
-    // headOnlyMV from headRotMatrix (OpenXR frame-to-frame, NO stick rotation).
-    // Use fgPixel's angle when foreground found — game MV at fgPixel is relative to fgPixel's
-    // position, so headOnlyMV must match to get a clean residual (loco component).
+    // headOnlyMV from headRotMatrix (OpenXR pose delta, NO stick rotation).
     float2 headOnlyMV = float2(0, 0);
     {
         float3 viewPos = float3(fgTanX * scaledDepth, fgTanY * scaledDepth, scaledDepth);
@@ -436,8 +234,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         }
     }
 
-    // c2cHeadMV from clipToClipNoLoco: subtracts full head motion and matches fgPixel
-    // when foreground was found.
+    // c2cHeadMV from clipToClipNoLoco (head rotation + stick rotation, no locomotion).
     float2 c2cHeadMV = float2(0, 0);
     if (hasClipToClipNoLoco) {
         float2 c2cBaseUV = useFgAngle ? fgUV : uv;
@@ -451,136 +248,54 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     }
 
 )" R"(
-    // MV residual decomposition: separate rotation from loco+animation for independent stop control.
-    // headOnlyMV = head rotation only (from headRotMatrix)
-    // c2cHeadMV = head rotation + stick rotation (from clipToClipNoLoco / RSS VP)
-    // fullResidual = totalMV - headOnlyMV = rotation + loco + animation
-    // locoResidual = totalMV - c2cHeadMV = loco + animation (rotation subtracted)
-    // rotComponent = fullResidual - locoResidual = rotation only
-    // final residual = locoResidual + rotMVScale * rotComponent
-    //   → rotMVScale=1.0 during rotation, 0.0 on rotation stop (suppresses stale rotation MVs)
-    //   → mvConfidence scales the whole residual (for loco stop suppression)
+    // MV residual decomposition.
+    // Rotation = c2cHeadMV - headOnlyMV (stick rotation only, not depth-dependent).
+    // Locomotion = depth-aware from c2c difference (when available) or flat from MV residual.
     float2 mvOffset = float2(0, 0);
-    if (abs(mvConfidence) > 0.001 && !npcExpanded) {
-        float2 fullResidual = totalMV - headOnlyMV;       // rot + loco + animation
-        float2 locoResidual = totalMV - c2cHeadMV;        // loco + animation (no rotation)
-        float2 rotComponent = fullResidual - locoResidual; // rotation only
+    if (abs(mvConfidence) > 0.001) {
+        float2 fullResidual = totalMV - headOnlyMV;
+        float2 locoResidual = totalMV - c2cHeadMV;
+        float2 rotComponent = fullResidual - locoResidual;
         float2 residual = locoResidual + rotMVScale * rotComponent;
         mvOffset = mvConfidence * residual;
     }
 
     float2 sourceUV = parallaxSourceUV + mvOffset;
 
-    // In locomotion mode, npcExpanded boundary pixels use fgUV for small head motion
-    // to avoid sampling background.
-    if (npcExpanded && !stationaryNpcMode && parallaxMagPx <= 0.75) {
-        sourceUV = fgUV;
+    // Depth-aware locomotion offset: replaces flat loco MV residual with depth-correct
+    // parallax from the difference between c2c_with_loco and c2c_no_loco.
+    if (hasFullWarpC2C && hasClipToClipNoLoco && abs(mvConfidence) > 0.001) {
+        float2 baseUV = useFgAngle ? fgUV : uv;
+        float2 ndc = float2(baseUV.x * 2.0 - 1.0, 1.0 - baseUV.y * 2.0);
+        float4 clipPos = float4(ndc, d, 1.0);
+
+        float4 locoClip = mul(fullWarpC2C, clipPos);
+        float4 noLocoClip = mul(clipToClipNoLoco, clipPos);
+
+        if (abs(locoClip.w) > 0.0001 && abs(noLocoClip.w) > 0.0001) {
+            float2 locoUV = float2(locoClip.x / locoClip.w * 0.5 + 0.5,
+                                   0.5 - locoClip.y / locoClip.w * 0.5);
+            float2 noLocoUV = float2(noLocoClip.x / noLocoClip.w * 0.5 + 0.5,
+                                     0.5 - noLocoClip.y / noLocoClip.w * 0.5);
+
+            float2 depthAwareLocoOffset = locoUV - noLocoUV;
+            float2 rotComponent = c2cHeadMV - headOnlyMV;
+
+            sourceUV = parallaxSourceUV + mvConfidence * (depthAwareLocoOffset + rotMVScale * rotComponent);
+        }
     }
 
+    // Clamp fallback.
     if (any(sourceUV < -0.01) || any(sourceUV > 1.01)) {
         sourceUV = uv + mvOffset;
         if (any(sourceUV < -0.01) || any(sourceUV > 1.01))
             sourceUV = uv;
     }
 
-    // Edge depth guard: only for npcExpanded scatter pixels whose sourceUV may
-    // overshoot the NPC body.
-    if (npcExpanded) {
-        int2 srcPx = clamp(int2(sourceUV * float2(resolution)), int2(0,0), int2(resolution) - 1);
-        float srcD = depthTex[ToDepthCoord(srcPx)];
-        float fgSlack = max(0.01, d * 0.03);
-        if (srcD - d > fgSlack) {
-            float bestDist = 999.0;
-            int2 bestPx = srcPx;
-            bool foundFg = false;
-            [unroll] for (int ry = -8; ry <= 8; ry++) {
-                [unroll] for (int rx = -8; rx <= 8; rx++) {
-                    if (rx == 0 && ry == 0) continue;
-                    int2 tp = clamp(srcPx + int2(rx, ry), int2(0,0), int2(resolution) - 1);
-                    float td = depthTex[ToDepthCoord(tp)];
-                    if (td <= d + fgSlack) {
-                        float dist = float(rx*rx + ry*ry);
-                        if (dist < bestDist) {
-                            bestDist = dist;
-                            bestPx = tp;
-                            foundFg = true;
-                        }
-                    }
-                }
-            }
-            if (foundFg) {
-                sourceUV = (float2(bestPx) + 0.5) / float2(resolution);
-            } else {
-                sourceUV = parallaxSourceUV;
-            }
-        }
-    }
-
-    // Ghost suppression: when stationary, detect backward-warp pixels that are
-    // moving NPC content (significant MV residual). Replace with background by
-    // searching along the residual direction for deeper depth. The NPC forward
-    // overlay then composites the correctly-positioned NPC on top.
-    if (stationaryNpcMode && origD < 0.97) {
-        int2 ghostSrcPx = clamp(int2(sourceUV * float2(resolution)), int2(0,0), int2(resolution) - 1);
-        float2 ghostMV = mvTex[ToMVCoord(ghostSrcPx)] * mvPixelScale;
-        // Compute accurate head MV at the source pixel position and depth,
-        // not the output pixel. For close objects with large parallax, the source
-        // is many pixels from the output — head MV differs significantly, causing
-        // false negatives in the residual check.
-        float2 ghostSrcUV = (float2(ghostSrcPx) + 0.5) / float2(resolution);
-        float ghostSrcD = depthTex[ToDepthCoord(ghostSrcPx)];
-        float2 ghostHeadMV = c2cHeadMV; // fallback
-        if (hasClipToClipNoLoco) {
-            float2 gNdc = float2(ghostSrcUV.x * 2.0 - 1.0, 1.0 - ghostSrcUV.y * 2.0);
-            float4 gClip = float4(gNdc, ghostSrcD, 1.0);
-            float4 gPrev = mul(clipToClipNoLoco, gClip);
-            if (abs(gPrev.w) > 0.0001) {
-                float2 gPrevNDC = gPrev.xy / gPrev.w;
-                ghostHeadMV = float2(gPrevNDC.x * 0.5 + 0.5, 0.5 - gPrevNDC.y * 0.5) - ghostSrcUV;
-            }
-        }
-        float2 ghostResidual = ghostMV - ghostHeadMV;
-        float ghostResidualPx = length(ghostResidual * resolution);
-        float ghostThreshold = 1.5;
-
-        if (ghostResidualPx > ghostThreshold) {
-            // Source is a moving object that has departed. Search along the
-            // residual direction (toward trailing edge) for background depth.
-            float2 searchDir = normalize(ghostResidual * resolution);
-            float ghostD = depthTex[ToDepthCoord(ghostSrcPx)];
-            float bgSlack = max(0.005, ghostD * 0.02);
-            bool foundBg = false;
-            for (int step = 1; step <= 32; step++) {
-                int2 tp = clamp(ghostSrcPx + int2(round(searchDir * float(step))),
-                    int2(0,0), int2(resolution) - 1);
-                float td = depthTex[ToDepthCoord(tp)];
-                if (td - ghostD > bgSlack) {
-                    sourceUV = (float2(tp) + 0.5) / float2(resolution);
-                    foundBg = true;
-                    break;
-                }
-            }
-            if (!foundBg) {
-                // Try opposite direction (leading edge background)
-                for (int step = 1; step <= 32; step++) {
-                    int2 tp = clamp(ghostSrcPx - int2(round(searchDir * float(step))),
-                        int2(0,0), int2(resolution) - 1);
-                    float td = depthTex[ToDepthCoord(tp)];
-                    if (td - ghostD > bgSlack) {
-                        sourceUV = (float2(tp) + 0.5) / float2(resolution);
-                        foundBg = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     sourceUV = saturate(sourceUV);
 
-    // Sample cached frame
+    // Sample cached frame.
     float4 color = prevColor.SampleLevel(linearClamp, sourceUV, 0);
-
     output[tid.xy] = color;
 }
 )";
@@ -2135,7 +1850,7 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 			slot = slotOverride;
 		} else {
 			// N-1 warping: use the PREVIOUS frame's cache slot.
-			// Its fence was signaled last cycle (~27ms ago) — zero wait.
+			// Locomotion/rotation deltas are calibrated for N-2→N-1 step.
 			slot = m_previousPublishedSlot.load(std::memory_order_acquire);
 		}
 		if (slot < 0)
@@ -2372,6 +2087,17 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		cb.hasClipToClipNoLoco = 0;
 	}
 
+	// fullWarpC2C: pass through the raw c2c_with_loco (N-1→N-2, with locomotion injection).
+	// In the shader, the DIFFERENCE between this and clipToClipNoLoco at each pixel's depth
+	// gives the depth-aware locomotion offset. This avoids composing matrices from different
+	// frameworks (RSS vs OpenXR) which causes clip space mismatches.
+	if (m_slotHasClipToClipWithLoco[slot] && eye >= 0 && eye < 2) {
+		memcpy(cb.fullWarpC2C, m_slotClipToClipWithLoco[slot][eye], sizeof(cb.fullWarpC2C));
+		cb.hasFullWarpC2C = 1;
+	} else {
+		cb.hasFullWarpC2C = 0;
+	}
+
 	cb.resolution[0] = (float)m_renderWidth;
 	cb.resolution[1] = (float)m_renderHeight;
 	cb.nearZ = m_slotNear[slot];
@@ -2403,7 +2129,12 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	const float locoMotion = sqrtf(m_locoTransX * m_locoTransX +
 		m_locoTransY * m_locoTransY + m_locoTransZ * m_locoTransZ);
 	const float stickYawMotion = fabsf(m_locoYaw);
-	const bool useForwardScatterForMotion = (locoMotion > 0.15f || stickYawMotion > 0.002f);
+	// Always use backward warp + NPC overlay. Forward scatter during locomotion is disabled
+	// because: (1) we now warp the most recent frame (locomotion baked in, only head tracking delta),
+	// (2) forward scatter requires dilation which thickens foliage noticeably,
+	// (3) the mode switch on start/stop locomotion causes a visible jerk.
+	// NPC-only forward scatter overlay handles moving NPCs with correct depth ordering.
+	const bool useForwardScatterForMotion = false;
 
 	// ── D3D11 warp path ──
 	ID3D11DeviceContext* ctx = nullptr;
@@ -2444,7 +2175,9 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	// MV residual (moving objects) on top of the backward warp output. Uses
 	// IsMovingNpcPixelForward() which detects motion via MV residual after c2c head
 	// subtraction, with a threshold that scales with head motion magnitude.
-	const bool useStationaryNpcForwardOverlay = !useForwardScatterForMotion;
+	// Disabled during locomotion testing — NPC detection can't distinguish NPCs from
+	// static objects when locomotion is in gameMV but not clipToClipNoLoco.
+	const bool useStationaryNpcForwardOverlay = false;
 
 	// Forward scatter pipeline: each SOURCE pixel projects to its destination.
 	// Depth test via InterlockedMin ensures closest pixel wins (tree over sky).
@@ -2470,10 +2203,8 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 			ctx->CSSetShader(m_clearCS, nullptr, 0);
 			ctx->Dispatch(groupsX, groupsY, 1);
 
-			if (m_npcDepthScatterCS) {
-				ctx->CSSetShader(m_npcDepthScatterCS, nullptr, 0);
-				ctx->Dispatch(groupsX, groupsY, 1);
-			}
+			// NPC depth scatter disabled — CSMain no longer reads atomicDepth for NPC handling.
+			// CSClear still runs to initialize atomicDepth for CSDilate's unfilled pixel detection.
 		}
 
 		ctx->CSSetShader(m_warpCS, nullptr, 0);

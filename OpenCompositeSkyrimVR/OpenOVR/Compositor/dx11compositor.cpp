@@ -4351,9 +4351,22 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				memcpy(curVP, rssVPRM, sizeof(curVP));
 
 				if (s_aswHasPrevVP[eyeIdx]) {
+					// No-loco c2c: head rotation + head translation only
 					float c2cNoLoco[16];
 					if (ComputeClipToClip(curVP, s_aswPrevVP[eyeIdx], c2cNoLoco)) {
 						g_aswProvider->SetClipToClipNoLoco(eyeIdx, c2cNoLoco);
+					}
+
+					// Full c2c WITH locomotion: inject actorPos delta into curVP
+					// (same as camera MV code), giving depth-aware locomotion parallax.
+					float curVPWithLoco[16];
+					memcpy(curVPWithLoco, curVP, sizeof(curVPWithLoco));
+					if (s_cmvLocoDx != 0.0f || s_cmvLocoDy != 0.0f || s_cmvLocoDz != 0.0f) {
+						InjectLocoIntoVP(curVPWithLoco, s_cmvLocoDx, s_cmvLocoDy, s_cmvLocoDz);
+					}
+					float c2cWithLoco[16];
+					if (ComputeClipToClip(curVPWithLoco, s_aswPrevVP[eyeIdx], c2cWithLoco)) {
+						g_aswProvider->SetClipToClipWithLoco(eyeIdx, c2cWithLoco);
 					}
 				}
 				memcpy(s_aswPrevVP[eyeIdx], curVP, sizeof(curVP));

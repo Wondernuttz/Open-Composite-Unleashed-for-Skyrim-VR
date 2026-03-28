@@ -205,6 +205,16 @@ public:
 		}
 	}
 
+	/// Cache the FULL clipToClip (WITH locomotion injection) for this eye.
+	/// prevVP * inv(curVP_adjusted) — captures head rot + head trans + locomotion parallax.
+	/// Writes to the CURRENT BUILD SLOT (same timing as SetClipToClipNoLoco — BEFORE CacheFrame).
+	void SetClipToClipWithLoco(int eye, const float* mat16) {
+		if (eye >= 0 && eye < 2 && mat16) {
+			memcpy(m_slotClipToClipWithLoco[m_buildSlot][eye], mat16, 16 * sizeof(float));
+			m_slotHasClipToClipWithLoco[m_buildSlot] = true;
+		}
+	}
+
 	/// Set the MV timing ratio for this injected frame.
 	/// ratio = (T_inject - T_realFrame) / (T_realFrame - T_prevRealFrame)
 	/// Gives the exact interpolation weight (0.5 at half-refresh).
@@ -305,6 +315,8 @@ private:
 	// data before the worker reads it (race condition in the P-after-S pipeline order).
 	float m_slotClipToClipNoLoco[kAswCacheSlotCount][2][16] = {};
 	bool m_slotHasClipToClipNoLoco[kAswCacheSlotCount] = {};
+	float m_slotClipToClipWithLoco[kAswCacheSlotCount][2][16] = {};
+	bool m_slotHasClipToClipWithLoco[kAswCacheSlotCount] = {};
 	XrPosef m_precompPose[2] = {};  // predicted poses from WarpFrame (for composition layer)
 	float m_lastPoseDelta[2][16] = {}; // poseDeltaMatrix from last WarpFrame (per-eye, for DLSS callback)
 
@@ -423,6 +435,9 @@ private:
 		float reprojClipToClip[16];    // 4x4 col-major: warp output → frame N clip space          — 64 bytes
 		int hasReprojData;             // 1 if frame N data bound for disocclusion fill              — 4 bytes
 		float _padReproj[3];           // alignment                                                 — 12 bytes
-	};                                 //                         total: 464 bytes
+		float fullWarpC2C[16];         // 4x4 col-major: warp output → cached clip (head + loco)    — 64 bytes
+		int hasFullWarpC2C;            // 1 if fullWarpC2C is valid                                  — 4 bytes
+		float _padFullC2C[3];          // alignment                                                 — 12 bytes
+	};                                 //                         total: 544 bytes
 
 };
