@@ -355,6 +355,12 @@ private:
 	ID3D11UnorderedAccessView* m_uavAtomicDepth[2] = {};
 	ID3D11ShaderResourceView* m_srvAtomicDepth[2] = {};
 
+	// Forward map: stores scatter destination per source pixel (R32_UINT: x16|y16)
+	// For forward-backward consistency check — guaranteed disocclusion detection
+	ID3D11Texture2D* m_forwardMap[2] = {};
+	ID3D11UnorderedAccessView* m_uavForwardMap[2] = {};
+	ID3D11ShaderResourceView* m_srvForwardMap[2] = {};
+
 	// Triple-buffered cached textures:
 	// game writes build slot while warp reads published slot.
 	ID3D11Texture2D* m_cachedColor[kAswCacheSlotCount][2] = {};

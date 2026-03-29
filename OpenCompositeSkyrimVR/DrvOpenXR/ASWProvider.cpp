@@ -49,6 +49,7 @@ Texture2D<float4> frameNColor  : register(t3);  // frame N color (newer frame fo
 Texture2D<float>  frameNDepth  : register(t4);  // frame N depth (newer frame)
 RWTexture2D<float4> output     : register(u0);
 RWTexture2D<uint> atomicDepth  : register(u1);  // forward scatter depth test buffer (R32_UINT)
+RWTexture2D<uint> disocclusionMap : register(u2);  // 0=normal, 1=disoccluded (proactive marking)
 SamplerState linearClamp       : register(s0);
 
 cbuffer WarpParams : register(b0) {
@@ -121,9 +122,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     int2 pixel = (int2)tid.xy;
     int2 depthPixel = ToDepthCoord(pixel);
 
-    // Read warped depth from atomicDepth (forward-scattered by CSDepthPreScatter).
-    // At leading edges, this has the foreground depth that moved to this position.
-    // Fall back to cached depth if no scattered depth exists.
+    // Read scattered depth at output pixel position (scatter targets output space).
     float d;
     uint scatteredDepth = atomicDepth[pixel];
     if (scatteredDepth != 0xFFFFFFFF) {
@@ -134,6 +133,46 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
     float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
+
+    // Disocclusion detection via forward-scatter gaps.
+    // CSDepthPreScatter forward-scatters every cached pixel to its warp output position
+    // using forwardPoseDelta + MV residual with 2x2 bilinear splats. After the scatter,
+    // output pixels with atomicDepth == 0xFFFFFFFF received NO source pixel — this IS
+    // the disocclusion. No detection heuristics needed; forward scatter naturally reveals
+    // voids where the cached frame has no content (occluded background, trailing edges).
+    // This is how Oculus ASW and similar systems identify disocclusion zones.
+    bool hasLoco = length(locoScreenDir) > 0.001;
+    if (scatteredDepth == 0xFFFFFFFF && hasLoco) {
+        // Confirm it's a real gap, not a rare sub-pixel scatter miss:
+        // check if 2+ cardinal neighbors also have no scatter.
+        int gapNeighbors = 0;
+        if (pixel.x > 0 && atomicDepth[pixel + int2(-1,0)] == 0xFFFFFFFF) gapNeighbors++;
+        if (pixel.x < (int)resolution.x-1 && atomicDepth[pixel + int2(1,0)] == 0xFFFFFFFF) gapNeighbors++;
+        if (pixel.y > 0 && atomicDepth[pixel + int2(0,-1)] == 0xFFFFFFFF) gapNeighbors++;
+        if (pixel.y < (int)resolution.y-1 && atomicDepth[pixel + int2(0,1)] == 0xFFFFFFFF) gapNeighbors++;
+
+        if (gapNeighbors >= 2) {
+            disocclusionMap[tid.xy] = 1;
+            if (debugMode == 61) {
+                output[tid.xy] = float4(1, 0, 0, 1);
+                return;
+            }
+            return;  // Skip color write → CSDilate fills with frame N
+        }
+    }
+
+    // Debug mode 62: scatter coverage visualization
+    // GREEN=scatter hit, BLACK=no scatter (0xFFFFFFFF gap).
+    // Gaps during locomotion = disocclusion zones.
+    if (debugMode == 62) {
+        if (scatteredDepth == 0xFFFFFFFF) {
+            output[tid.xy] = float4(0, 0, 0, 1);
+        } else {
+            float sd = (float)(scatteredDepth >> 16) / 65535.0;
+            output[tid.xy] = float4(0, 1.0 - sd, 0, 1);
+        }
+        return;
+    }
 
     // Compute parallax direction from head pose delta.
     float linearDepth = LinearizeDepth(d, nearZ, farZ);
@@ -157,7 +196,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float2 searchDir = parallaxDir;
     float parallaxMagPx = length(parallaxDir * resolution);
     float mvSearchMagPx = length(roughMV * resolution);
-    bool hasLoco = length(locoScreenDir) > 0.001;
     if (hasLoco && mvSearchMagPx > parallaxMagPx)
         searchDir = roughMV;
     float searchMagPx = hasLoco ? max(parallaxMagPx, mvSearchMagPx) : parallaxMagPx;
@@ -231,7 +269,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (foundForeground) {
         mvSourcePixel = ToMVCoord(fgPixel);
     } else if (scatteredDepth != 0xFFFFFFFF) {
-        // Recover scatter source position from packed offset
+        // Recover scatter source position from packed offset (relative to scatter write position)
         int sdx = (int)((scatteredDepth >> 8) & 0xFFu) - 127;
         int sdy = (int)(scatteredDepth & 0xFFu) - 127;
         int2 scatterSrc = clamp(pixel - int2(sdx, sdy), int2(0,0), int2(resolution) - 1);
@@ -333,15 +371,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // Sample cached frame.
     float4 color = prevColor.SampleLevel(linearClamp, sourceUV, 0);
 
-    // Disocclusion: proactively marked by the depth scatter as 0xFFFFFFFE.
-    // The scatter marks the vacated trailing edge (opposite to loco displacement).
-    // Interior markers are overwritten by neighbors' scatter (InterlockedMin with real depth).
-    // Only true trailing-edge disocclusion retains the marker.
-    // Skip writing — CSDilate fills with frame N data.
-    if (scatteredDepth == 0xFFFFFFFE) {
-        return;  // Explicitly marked disocclusion — CSDilate fills with frame N
-    }
-
     // Debug mode 60: depth scatter visualization
     // RED = scattered foreground depth read from atomicDepth
     // GREEN = cached depth (no scatter hit at this pixel)
@@ -371,6 +400,7 @@ void CSClear(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
         return;
     atomicDepth[tid.xy] = 0xFFFFFFFF;   // clear to max for InterlockedMin (smaller depth = closer = wins)
+    disocclusionMap[tid.xy] = 0;       // clear disocclusion map (0=normal)
     output[tid.xy] = float4(0, 0, 0, 1);
 }
 
@@ -703,25 +733,13 @@ void CSDilate(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
         return;
 
-    uint myDepth = atomicDepth[tid.xy];
+    // Only process pixels marked as disoccluded by CSDepthPreScatter.
+    // The disocclusionMap is proactively filled at trailing depth edges during scatter.
+    if (disocclusionMap[tid.xy] == 0) return;
 
-    // Case 1: DISABLED — the two-pass pipeline handles depth-edge correctness
-    // by finalizing depth before writing color. Case 1 was creating visible
-    // streak artifacts by replacing background pixels at depth edges.
-    if (myDepth < 0xFFFFFFFE) {
-        return;
-    }
-
-    // Case 3 only: unfilled (black) pixels. Skip sky-marked pixels entirely —
-    // filling sky gaps with fg color makes distant trees/foliage look solid.
-    // Only process explicitly marked disocclusion (0xFFFFFFFE from depth scatter).
-    // 0xFFFFFFFF = scatter gap (sky, sub-pixel, head-turn edge) — CSMain handled these.
-    // Valid scatter (< 0xFFFFFFFE) — CSMain used the depth correctly.
-    if (myDepth != 0xFFFFFFFE) return;
-
-    // DEBUG: blank out disocclusion areas (black) to isolate artifacts
+    // DEBUG: visualize disocclusion areas
     if (debugMode == 61) {
-        output[tid.xy] = float4(0, 0, 0, 1);
+        output[tid.xy] = float4(1, 0, 0, 1); // bright red
         return;
     }
 
@@ -1074,11 +1092,11 @@ void CSCompositeNpcForward(uint3 tid : SV_DispatchThreadID) {
 )";
 
 static const char* s_npcScatterHLSL = R"(
-// ── NPC depth scatter: forward-scatter NPC depth for backward warp boundary extension ──
-// For each pixel with significant NPC animation MV, scatter its depth to the
-// CSDepthPreScatter: scatter ALL cached pixels' depths to their WARP OUTPUT positions.
-// Uses the SAME math as CSMain's backward warp (poseDelta + c2c loco) but in reverse.
-// Closest depth wins via InterlockedMin.
+// ── CSDepthPreScatter: scatter ALL cached pixels' depths to their WARP OUTPUT positions ──
+// Uses forwardPoseDelta (cached→warp head delta) + MV residual (loco/stick/NPC)
+// to place scatter in WARP OUTPUT space. The old approach (srcUV - totalMV) placed
+// scatter in game-frame space, misaligned with the output by the cached→warp head
+// delta — causing the scatter buffer to shift ~7-14px with head turns.
 [numthreads(8, 8, 1)]
 void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
@@ -1086,97 +1104,61 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
 
     int2 srcPixel = (int2)tid.xy;
     float d = depthTex[ToDepthCoord(srcPixel)];
-    if (d >= 0.999) return; // skip sky
+    // Sky pixels ARE scattered (not skipped) so that sky areas fill atomicDepth
+    // with valid depth values. Without this, sky positions remain 0xFFFFFFFF and
+    // are falsely detected as disocclusion gaps. Only true voids (behind foreground
+    // where nothing was rendered in the cached frame) should remain as 0xFFFFFFFF.
 
     float2 srcUV = (float2(srcPixel) + 0.5) / resolution;
 
-    // Head tracking: poseDelta parallax maps output→cached. Reverse ≈ -parallax.
-    float tanX = lerp(fovTanLeft, fovTanRight, srcUV.x);
-    float tanY = lerp(fovTanUp, fovTanDown, srcUV.y);
-    float linD = LinearizeDepth(d, nearZ, farZ) * depthScale;
-    float2 headOffset = float2(0, 0);
-    if (linD > 0.001) {
-        float3 viewPos = float3(tanX * linD, tanY * linD, linD);
-        float4 xformed = mul(poseDeltaMatrix, float4(viewPos, 1.0));
-        if (xformed.z > 0.001) {
-            headOffset = float2(
-                (xformed.x / xformed.z - fovTanLeft) / (fovTanRight - fovTanLeft) - srcUV.x,
-                (xformed.y / xformed.z - fovTanUp) / (fovTanDown - fovTanUp) - srcUV.y);
+    // Step 1: Forward transform via forwardPoseDelta (cached view → warp view).
+    // This handles the head tracking delta from cached pose to warp predicted pose.
+    float linearDepth = LinearizeDepth(d, nearZ, farZ);
+    float scaledDepth = linearDepth * depthScale;
+    float srcTanX = lerp(fovTanLeft, fovTanRight, srcUV.x);
+    float srcTanY = lerp(fovTanUp, fovTanDown, srcUV.y);
+    float3 viewPos = float3(srcTanX * scaledDepth, srcTanY * scaledDepth, scaledDepth);
+    float4 xformed = mul(forwardPoseDelta, float4(viewPos, 1.0));
+    float2 dstUV = srcUV;
+    if (scaledDepth > 0.001 && xformed.z > 0.001) {
+        dstUV = float2(
+            (xformed.x / xformed.z - fovTanLeft) / (fovTanRight - fovTanLeft),
+            (xformed.y / xformed.z - fovTanUp) / (fovTanDown - fovTanUp));
+    }
+    float depthFade = (nearFadeDepth > 0.0) ? saturate((linearDepth - nearFadeDepth) / nearFadeDepth) : 1.0;
+    dstUV = lerp(srcUV, dstUV, depthFade);
+
+    // Step 2: Add MV residual (loco + stick rotation + NPC animation).
+    // Subtract head-only MV (inter-game-frame head motion already in forwardPoseDelta).
+    if (abs(mvConfidence) > 0.001) {
+        float2 rawMV = mvTex[ToMVCoord(srcPixel)];
+        float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
+        float4 rotated = mul(headRotMatrix, float4(viewPos, 1.0));
+        float2 headOnlyMV = float2(0, 0);
+        if (scaledDepth > 0.001 && rotated.z > 0.001) {
+            headOnlyMV = float2(
+                (rotated.x / rotated.z - fovTanLeft) / (fovTanRight - fovTanLeft),
+                (rotated.y / rotated.z - fovTanUp) / (fovTanDown - fovTanUp)) - srcUV;
         }
+        dstUV -= mvConfidence * (totalMV - headOnlyMV);
     }
 
-    // Locomotion: depth-aware offset from c2c difference (same as CSMain)
-    float2 locoOffset = float2(0, 0);
-    if (hasFullWarpC2C && hasClipToClipNoLoco) {
-        float2 ndc = float2(srcUV.x * 2.0 - 1.0, 1.0 - srcUV.y * 2.0);
-        float4 clipPos = float4(ndc, d, 1.0);
-        float4 locoClip = mul(fullWarpC2C, clipPos);
-        float4 noLocoClip = mul(clipToClipNoLoco, clipPos);
-        if (abs(locoClip.w) > 0.0001 && abs(noLocoClip.w) > 0.0001) {
-            float2 locoUV = float2(locoClip.x / locoClip.w * 0.5 + 0.5,
-                                   0.5 - locoClip.y / locoClip.w * 0.5);
-            float2 noLocoUV = float2(noLocoClip.x / noLocoClip.w * 0.5 + 0.5,
-                                     0.5 - noLocoClip.y / noLocoClip.w * 0.5);
-            locoOffset = locoUV - noLocoUV;
-        }
-    }
-
-    // NPC motion: game MV captures everything, subtract camera components to isolate NPC animation.
-    // c2cHeadMV = head tracking from clipToClipNoLoco (same as CSMain uses).
-    float2 rawMV = mvTex[ToMVCoord(srcPixel)];
-    float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
-    float2 c2cHMV = float2(0, 0);
-    if (hasClipToClipNoLoco) {
-        float2 ndc = float2(srcUV.x * 2 - 1, 1 - srcUV.y * 2);
-        float4 clipPos = float4(ndc, d, 1.0);
-        float4 prevClip = mul(clipToClipNoLoco, clipPos);
-        if (abs(prevClip.w) > 0.0001) {
-            float2 prevNDC = prevClip.xy / prevClip.w;
-            c2cHMV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5) - srcUV;
-        }
-    }
-    float2 npcMotion = totalMV - c2cHMV - locoOffset;
-
-    // Scatter to warp output position: reverse of CSMain's backward map.
-    // Use poseDelta parallax (headOffset) for head tracking — same source as CSMain.
-    // This keeps scatter, markers, and CSMain all in the same coordinate space.
-    // Camera loco: depth-aware c2c difference, scaled by mvConfidence (matches CSMain).
-    // NPC: npcMotion at 1.0 scale.
-    float2 dstUV = srcUV - headOffset - mvConfidence * locoOffset - npcMotion;
-
-    int2 dstPixel = int2(dstUV * resolution);
+    float2 dstPx = dstUV * resolution;
     uint depth16 = (uint)round(saturate(d) * 65535.0);
-    // Single-pixel write for depth.
-    if (all(dstPixel >= 0) && dstPixel.x < (int)resolution.x && dstPixel.y < (int)resolution.y) {
-        int dx = clamp(dstPixel.x - srcPixel.x, -127, 127);
-        int dy = clamp(dstPixel.y - srcPixel.y, -127, 127);
-        uint packed = (depth16 << 16) |
-            ((uint)clamp(dx + 127, 0, 255) << 8) |
-            (uint)clamp(dy + 127, 0, 255);
-        InterlockedMin(atomicDepth[dstPixel], packed);
-    }
 
-    // Mark vacated trailing edge: ONLY at depth edges where foreground meets background.
-    // Use poseDelta parallax (same as CSMain) for the marker base position so markers
-    // stay anchored to the edge regardless of head turn.
-    float2 locoDisplacementPx = mvConfidence * locoOffset * resolution;
-    float locoMag = length(locoDisplacementPx);
-    if (locoMag > 1.0 && d < 0.99) {
-        float2 vacateDir = normalize(locoDisplacementPx);
-        // Check if this pixel is at a trailing depth edge
-        int2 trailNeighbor = clamp(srcPixel + int2(round(vacateDir)), int2(0,0), int2(resolution) - 1);
-        float neighborD = depthTex[ToDepthCoord(trailNeighbor)];
-        bool isTrailingEdge = (neighborD - d > 0.01);
-        if (isTrailingEdge) {
-            // Mark from dstPixel (scatter destination = where CSMain renders foreground).
-            // Markers start right next to the foreground edge — no gap.
-            // Both dstPixel and markers use the same c2cHMV offset → anchored together.
-            int markSteps = min((int)ceil(locoMag), 20);
-            for (int step = 1; step <= markSteps; step++) {
-                int2 markPixel = dstPixel + int2(round(vacateDir * (float)step));
-                if (all(markPixel >= 0) && markPixel.x < (int)resolution.x && markPixel.y < (int)resolution.y) {
-                    InterlockedMin(atomicDepth[markPixel], 0xFFFFFFFE);
-                }
+    // 2x2 bilinear splat: better coverage than single-pixel write, reduces scatter gaps
+    // that would cause false-positive disocclusion detection in CSMain.
+    int2 p0 = int2(floor(dstPx - 0.5));
+    for (int sy = 0; sy <= 1; sy++) {
+        for (int sx = 0; sx <= 1; sx++) {
+            int2 p = p0 + int2(sx, sy);
+            if (all(p >= 0) && p.x < (int)resolution.x && p.y < (int)resolution.y) {
+                int dx = clamp(p.x - srcPixel.x, -127, 127);
+                int dy = clamp(p.y - srcPixel.y, -127, 127);
+                uint packed = (depth16 << 16) |
+                    ((uint)clamp(dx + 127, 0, 255) << 8) |
+                    (uint)clamp(dy + 127, 0, 255);
+                InterlockedMin(atomicDepth[p], packed);
             }
         }
     }
@@ -1792,6 +1774,35 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 
 	}
 
+	// Forward map: R32_UINT per source pixel, stores scatter destination (x16|y16)
+	for (int eye = 0; eye < 2; eye++) {
+		desc.Format = DXGI_FORMAT_R32_UINT;
+		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+		desc.MiscFlags = 0;
+		HRESULT hr = device->CreateTexture2D(&desc, nullptr, &m_forwardMap[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateTexture2D forwardMap[%d] failed hr=0x%08X", eye, hr);
+			return false;
+		}
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+		uavDesc.Format = DXGI_FORMAT_R32_UINT;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		hr = device->CreateUnorderedAccessView(m_forwardMap[eye], &uavDesc, &m_uavForwardMap[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateUAV forwardMap[%d] failed", eye);
+			return false;
+		}
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+		srvDesc.Format = DXGI_FORMAT_R32_UINT;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+		hr = device->CreateShaderResourceView(m_forwardMap[eye], &srvDesc, &m_srvForwardMap[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateSRV forwardMap[%d] failed", eye);
+			return false;
+		}
+	}
+
 	OOVR_LOGF("ASW: Cache textures created (%u slots x 2 eyes)", kAswCacheSlotCount);
 	return true;
 }
@@ -2341,8 +2352,8 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		frameNColorSRV, frameNDepthSRV
 	};
 	ctx->CSSetShaderResources(0, _countof(srvs), srvs);
-	ID3D11UnorderedAccessView* uavs2[] = { m_uavOutput[eye], m_uavAtomicDepth[eye] };
-	ctx->CSSetUnorderedAccessViews(0, 2, uavs2, nullptr);
+	ID3D11UnorderedAccessView* uavs3[] = { m_uavOutput[eye], m_uavAtomicDepth[eye], m_uavForwardMap[eye] };
+	ctx->CSSetUnorderedAccessViews(0, 3, uavs3, nullptr);
 	ctx->CSSetConstantBuffers(0, 1, &m_constantBuffer);
 	ctx->CSSetSamplers(0, 1, &m_linearSampler);
 
@@ -2427,9 +2438,9 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	}
 
 	ID3D11ShaderResourceView* nullSRVs[5] = {};
-	ID3D11UnorderedAccessView* nullUAVs[2] = {};
+	ID3D11UnorderedAccessView* nullUAVs[3] = {};
 	ctx->CSSetShaderResources(0, 5, nullSRVs);
-	ctx->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+	ctx->CSSetUnorderedAccessViews(0, 3, nullUAVs, nullptr);
 	ctx->CSSetShader(nullptr, nullptr, 0);
 
 	ctx->Release();
