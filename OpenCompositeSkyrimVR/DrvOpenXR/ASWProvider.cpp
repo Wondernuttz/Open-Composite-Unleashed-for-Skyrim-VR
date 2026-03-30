@@ -123,8 +123,12 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     int2 depthPixel = ToDepthCoord(pixel);
 
     // Read scattered depth at output pixel position (scatter targets output space).
+    // With 1x1 scatter (no 2x2 splat), foreground depth can't bleed into background
+    // positions — eliminating the trailing-edge contamination that caused sections 1 & 3.
     float d;
     uint scatteredDepth = atomicDepth[pixel];
+    bool hasLoco = length(locoScreenDir) > 0.001;
+
     if (scatteredDepth != 0xFFFFFFFF) {
         d = (float)(scatteredDepth >> 16) / 65535.0;
     } else {
@@ -135,29 +139,85 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
 
     // Disocclusion detection via forward-scatter gaps.
-    // CSDepthPreScatter forward-scatters every cached pixel to its warp output position
-    // using forwardPoseDelta + MV residual with 2x2 bilinear splats. After the scatter,
-    // output pixels with atomicDepth == 0xFFFFFFFF received NO source pixel — this IS
-    // the disocclusion. No detection heuristics needed; forward scatter naturally reveals
-    // voids where the cached frame has no content (occluded background, trailing edges).
-    // This is how Oculus ASW and similar systems identify disocclusion zones.
-    bool hasLoco = length(locoScreenDir) > 0.001;
-    if (scatteredDepth == 0xFFFFFFFF && hasLoco) {
-        // Confirm it's a real gap, not a rare sub-pixel scatter miss:
-        // check if 2+ cardinal neighbors also have no scatter.
+    // Simple: atomicDepth == 0xFFFFFFFF with 2+ gap neighbors = real gap → CSDilate fills.
+    // No expanded zone needed now that gap-adjacent pixels use cached depth (section 1 fix).
+    // Gap detection + gap-adjacent flagging for CSDilate fill.
+    // With 2x2 scatter, gaps (0xFFFFFFFF) only appear at real disocclusion zones.
+    // Gap-ADJACENT pixels (valid scatter but neighbor is a gap) may have foreground
+    // depth from the 2x2 splat bleed → wrong scatter source → flag for CSDilate too.
+    if (hasLoco) {
+        bool isGap = (scatteredDepth == 0xFFFFFFFF);
+        bool adjacentToGap = false;
+
+        // Check cardinal neighbors for gaps
         int gapNeighbors = 0;
         if (pixel.x > 0 && atomicDepth[pixel + int2(-1,0)] == 0xFFFFFFFF) gapNeighbors++;
         if (pixel.x < (int)resolution.x-1 && atomicDepth[pixel + int2(1,0)] == 0xFFFFFFFF) gapNeighbors++;
         if (pixel.y > 0 && atomicDepth[pixel + int2(0,-1)] == 0xFFFFFFFF) gapNeighbors++;
         if (pixel.y < (int)resolution.y-1 && atomicDepth[pixel + int2(0,1)] == 0xFFFFFFFF) gapNeighbors++;
 
-        if (gapNeighbors >= 2) {
+        if (isGap && gapNeighbors >= 2) {
+            // Real gap: 2+ gap neighbors confirms multi-pixel disocclusion zone
             disocclusionMap[tid.xy] = 1;
-            if (debugMode == 61) {
-                output[tid.xy] = float4(1, 0, 0, 1);
+            if (debugMode == 61) { output[tid.xy] = float4(1, 0, 0, 1); return; }
+            return;
+        }
+
+        if (!isGap && scatteredDepth != 0xFFFFFFFF) {
+            float scatD = (float)(scatteredDepth >> 16) / 65535.0;
+            // Use the foreground depth from the anti-loco side to set the threshold.
+            float2 locoDirPx = normalize(locoScreenDir * resolution);
+            float locoMaxComp = max(abs(locoDirPx.x), abs(locoDirPx.y));
+            int2 antiLocoStep = -int2(round(locoDirPx / locoMaxComp));
+            float fgRef = 0.0;
+            for (int fs = 1; fs <= 30; fs++) {
+                int2 fnp = pixel + antiLocoStep * fs;
+                if (any(fnp < 0) || fnp.x >= (int)resolution.x || fnp.y >= (int)resolution.y) break;
+                uint fnd = atomicDepth[fnp];
+                if (fnd != 0xFFFFFFFF && disocclusionMap[fnp] == 0) {
+                    fgRef = (float)(fnd >> 16) / 65535.0;
+                    break;
+                }
+            }
+            bool isBgScatter = (fgRef > 0.001 && scatD > fgRef + 0.02);
+
+            // Dual-radius nearGap check:
+            // FOREGROUND scatter: 1px — don't eat into objects.
+            // BACKGROUND scatter (deeper than foreground + margin): 10px — catch the wide
+            // contamination zone where background scatter filled positions but backward
+            // warp will sample foreground from the cached frame.
+            int searchRadius = isBgScatter ? 14 : 1;
+            bool nearGap = false;
+            for (int r = 1; r <= searchRadius && !nearGap; r++) {
+                if (pixel.x >= r && atomicDepth[pixel + int2(-r,0)] == 0xFFFFFFFF) nearGap = true;
+                if (pixel.x < (int)resolution.x-r && atomicDepth[pixel + int2(r,0)] == 0xFFFFFFFF) nearGap = true;
+                if (pixel.y >= r && atomicDepth[pixel + int2(0,-r)] == 0xFFFFFFFF) nearGap = true;
+                if (pixel.y < (int)resolution.y-r && atomicDepth[pixel + int2(0,r)] == 0xFFFFFFFF) nearGap = true;
+            }
+
+            if (nearGap) {
+                disocclusionMap[tid.xy] = 1;
+                if (debugMode == 61) {
+                    output[tid.xy] = isBgScatter ? float4(0, 1, 0, 1) : float4(1, 1, 0, 1);
+                    return; // GREEN=bg contamination, YELLOW=fg near-gap
+                }
                 return;
             }
-            return;  // Skip color write → CSDilate fills with frame N
+        }
+    }
+
+    // Depth-mismatch catch: scatter says far (sky) but cached says close (branch/pole).
+    // Catches thin features too small for gap detection (1-2px branches where the 2x2
+    // scatter fills the gap entirely → no 0xFFFFFFFF → no gap detected).
+    // Large threshold (0.05) is head-turn-stable: adjacent-pixel depth variation from
+    // head turn is typically < 0.02, so 0.05 avoids false positives.
+    if (hasLoco && scatteredDepth != 0xFFFFFFFF && disocclusionMap[tid.xy] == 0) {
+        float scatD = (float)(scatteredDepth >> 16) / 65535.0;
+        float cachedD = depthTex[depthPixel];
+        if (cachedD < scatD - 0.05) {
+            disocclusionMap[tid.xy] = 1;
+            if (debugMode == 61) { output[tid.xy] = float4(0, 0, 1, 1); return; } // BLUE
+            return;
         }
     }
 
@@ -224,6 +284,10 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         for (int step = 1; step <= fgSearchMax; step++) {
             int2 searchPx = pixel + int2(stepVec * (float)step);
             searchPx = clamp(searchPx, int2(0,0), int2(resolution) - 1);
+            // Stop at disocclusion gaps — foreground on the other side has moved away.
+            // At leading edges there are NO gaps between us and the foreground (it moved here).
+            // At trailing edges there ARE gaps (it moved away) — must not reach across.
+            if (atomicDepth[searchPx] == 0xFFFFFFFF) break;
             float searchD = depthTex[ToDepthCoord(searchPx)];
             if (d - searchD > 0.01) {
                 d = searchD;
@@ -346,16 +410,21 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
             // NPC residual: totalMV includes NPC animation, c2cHeadMV captures head,
             // depthAwareLocoOffset captures camera locomotion. What remains = NPC motion.
-            // Apply at 1.0 scale (exact MV, no extrapolation — unlike camera loco which
-            // uses mvConfidence for inter-frame prediction).
             float2 npcMotion = totalMV - c2cHeadMV - depthAwareLocoOffset;
             float npcMotionMag = length(npcMotion * resolution);
 
             sourceUV = parallaxSourceUV + mvConfidence * (depthAwareLocoOffset + rotMVScale * rotComponent);
-            // NPC motion: slight extrapolation (1.15x) to account for continued NPC movement
-            // between the MV measurement frame and warp output time. No threshold — even
-            // sub-pixel NPC motion should be applied to avoid flickering correction.
-            sourceUV += 1.5 * npcMotion;
+            // NPC motion correction: only apply when the residual is reasonable.
+            // At background pixels near NPCs, the 2x2 depth scatter splat can bleed
+            // foreground depth, causing depthAwareLocoOffset to be computed at WRONG
+            // (foreground) depth — much larger than the actual background loco offset.
+            // This creates a large spurious npcMotion residual (20-50+ px) that shifts
+            // sourceUV to completely wrong positions, causing "warped background in NPC
+            // outline shape" artifacts. Real NPC animation at 1.5x extrapolation is
+            // rarely > 15px. Clamping eliminates the contamination artifacts.
+            if (npcMotionMag < 6.0) {
+                sourceUV += 1.5 * npcMotion;
+            }
         }
     }
 
@@ -365,6 +434,16 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         if (any(sourceUV < -0.01) || any(sourceUV > 1.01))
             sourceUV = uv;
     }
+
+    // At scatter-covered pixels, override sourceUV with the scatter source position.
+    // The scatter source directly encodes WHERE this pixel's content lives in the cached
+    // frame — the actual position where the content was visible (not occluded).
+    //
+    // Backward warp sourceUV used for ALL pixels. No scatter-source override.
+    // The override was tried but caused dilation/thickening at depth edges —
+    // the 2x2 splat's integer-precision offsets and foreground-winning InterlockedMin
+    // degraded visual quality across the entire scene during both locomotion and
+    // head-tracking. Disocclusion zones are handled purely by gap detection + CSDilate.
 
     sourceUV = saturate(sourceUV);
 
@@ -738,336 +817,172 @@ void CSDilate(uint3 tid : SV_DispatchThreadID) {
     if (disocclusionMap[tid.xy] == 0) return;
 
     // DEBUG: visualize disocclusion areas
+    // Don't overwrite — CSMain already wrote the detection source color:
+    // RED=gap, YELLOW=near-gap, GREEN=depth-mismatch
     if (debugMode == 61) {
-        output[tid.xy] = float4(1, 0, 0, 1); // bright red
+        return; // keep CSMain's debug color
+    }
+    // DEBUG 64: solid cyan fill — confirms CSDilate processes ALL void pixels.
+    // If any void pixel shows foreground instead of cyan, it's NOT being processed
+    // by CSDilate (CSMain handled it instead — detection gap).
+    if (debugMode == 64) {
+        output[tid.xy] = float4(0, 1, 1, 1); // CYAN
         return;
     }
 
-    // ── Frame N fill with depth comparison + edge search ──
-    // The cached frame (N-1) has the foreground object at this position.
-    // If frame N's depth is deeper here, the object moved and background is revealed.
-    // If frame N still has foreground at this exact UV (tree edge), search a few pixels
-    // further away from the foreground to find background just past the edge.
-    if (hasReprojData != 0) {
-        float2 holeUV = (float2(tid.xy) + 0.5) / resolution;
-        float2 pixelSize = 1.0 / resolution;
+    // ── Loco-direction background extension with perpendicular smoothing ──
+    // Walk in the LOCO direction past the gap to find actual background content.
+    // Then sample a perpendicular strip at that position for smooth fill.
+    //
+    // Why loco-only: Isotropic blur samples from ALL directions including the
+    // foreground edge, creating angled geometric artifacts where different parts
+    // of the foreground silhouette contaminate the fill at different angles.
+    // By ONLY extending from the loco side, the fill is pure background — the
+    // same approach Oculus ASW uses ("stretching nearby background pixels").
+    int2 pixel = (int2)tid.xy;
+    bool hasLoco = length(locoScreenDir) > 0.001;
 
-        // Read cached frame depth at this position
-        int2 depthCoord = (int2)(holeUV * depthResolution);
-        depthCoord = clamp(depthCoord, int2(0,0), int2(depthResolution) - 1);
-        float cachedDepthVal = depthTex.Load(int3(depthCoord, 0));
-        float margin = max(0.003, cachedDepthVal * 0.01);
+    if (hasLoco) {
+        float2 locoDirPx = normalize(locoScreenDir * resolution);
+        float maxComp = max(abs(locoDirPx.x), abs(locoDirPx.y));
+        int2 locoStep = int2(round(locoDirPx / maxComp));
+        int2 antiLocoStep = -locoStep;
 
-        // Try direct sample first
-        float2 sampleUV = holeUV;
-        float frameNDepthVal = frameNDepth.SampleLevel(linearClamp, sampleUV, 0);
-        bool found = (frameNDepthVal > cachedDepthVal + margin || cachedDepthVal > 0.999);
+        // 8-direction nearest-neighbor, background-preferring fill.
+        // Phase 1: find nearest valid pixel + its depth in each direction.
+        // Phase 2: find the max depth (most background) across all candidates.
+        // Phase 3: average only candidates within 0.02 of max depth.
+        //   - Trailing edges: max=sky/wall, foreground excluded → pure background fill
+        //   - Inner gaps: max=NPC, all NPC candidates included → NPC fill
+        int2 dirs8[8] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1),
+                          int2(-1,-1), int2(1,-1), int2(-1,1), int2(1,1) };
+        int2 candPixel[8];
+        float candDepth[8];
+        int candDist[8];
+        bool candFound[8];
 
-        // If direct sample is foreground, search up to 8px away from the edge.
-        // Direction: use loco direction if available, else try radial from nearest filled pixel.
-        if (!found) {
-            float2 searchDir = float2(0, 0);
-            if (length(locoScreenDir) > 0.0001) {
-                // Search in locomotion direction (away from where the object came from)
-                searchDir = normalize(locoScreenDir);
-            } else {
-                // Find direction away from nearest filled pixel (foreground edge)
-                float bestDist = 999.0;
-                int2 bestFilled = (int2)tid.xy;
-                int2 np;
-                np = (int2)tid.xy + int2(-1,0); if (np.x >= 0 && atomicDepth[np] < 0xFFFFFFFEu) { bestFilled = np; bestDist = 1.0; }
-                np = (int2)tid.xy + int2(1,0); if (np.x < (int)resolution.x && atomicDepth[np] < 0xFFFFFFFEu && 1.0 < bestDist) { bestFilled = np; bestDist = 1.0; }
-                np = (int2)tid.xy + int2(0,-1); if (np.y >= 0 && atomicDepth[np] < 0xFFFFFFFEu && 1.0 < bestDist) { bestFilled = np; bestDist = 1.0; }
-                np = (int2)tid.xy + int2(0,1); if (np.y < (int)resolution.y && atomicDepth[np] < 0xFFFFFFFEu && 1.0 < bestDist) { bestFilled = np; }
-                if (bestDist < 999.0) {
-                    searchDir = normalize(float2(tid.xy) - float2(bestFilled));  // away from FG
-                }
-            }
+        [unroll] for (int i = 0; i < 8; i++) {
+            candFound[i] = false; candDepth[i] = 0; candDist[i] = 999;
+        }
 
-            if (length(searchDir) > 0.5) {
-                for (int step = 2; step <= 8; step += 2) {
-                    float2 offsetUV = holeUV + searchDir * pixelSize * (float)step;
-                    if (any(offsetUV < 0.001) || any(offsetUV > 0.999)) break;
-                    float dv = frameNDepth.SampleLevel(linearClamp, offsetUV, 0);
-                    if (dv > cachedDepthVal + margin) {
-                        sampleUV = offsetUV;
-                        found = true;
-                        break;
-                    }
-                }
+        [unroll] for (int dir = 0; dir < 8; dir++) {
+            for (int step = 1; step <= 60; step++) {
+                int2 np = pixel + dirs8[dir] * step;
+                if (any(np < 0) || np.x >= (int)resolution.x || np.y >= (int)resolution.y) break;
+                uint nd = atomicDepth[np];
+                if (nd == 0xFFFFFFFF) continue;
+                if (disocclusionMap[np] != 0) continue;
+                candPixel[dir] = np;
+                candDepth[dir] = (float)(nd >> 16) / 65535.0;
+                candDist[dir] = step;
+                candFound[dir] = true;
+                break;
             }
         }
 
-        if (found) {
-            output[tid.xy] = frameNColor.SampleLevel(linearClamp, sampleUV, 0);
+        // Find max depth (background)
+        float maxD = 0;
+        [unroll] for (int i = 0; i < 8; i++) {
+            if (candFound[i] && candDepth[i] > maxD) maxD = candDepth[i];
+        }
+
+        // Find foreground depth from anti-loco to set the background threshold.
+        float fgRef = 0.0;
+        for (int fs = 1; fs <= 30; fs++) {
+            int2 fnp = pixel + antiLocoStep * fs;
+            if (any(fnp < 0) || fnp.x >= (int)resolution.x || fnp.y >= (int)resolution.y) break;
+            if (atomicDepth[fnp] != 0xFFFFFFFF && disocclusionMap[fnp] == 0) {
+                fgRef = (float)(atomicDepth[fnp] >> 16) / 65535.0;
+                break;
+            }
+        }
+        float bgThreshold = fgRef + 0.02;
+
+        // Find best background candidate.
+        // When fgRef found: closest candidate deeper than fgRef+0.02 (contextual bg).
+        // When fgRef NOT found (all-void anti-loco): deepest candidate (avoids
+        // picking nearby branch over distant sky when threshold is meaningless).
+        int bestDir = -1;
+        if (fgRef > 0.001) {
+            // Closest background deeper than foreground
+            int bestDist = 999;
+            [unroll] for (int i = 0; i < 8; i++) {
+                if (candFound[i] && candDepth[i] > bgThreshold && candDist[i] < bestDist) {
+                    bestDist = candDist[i];
+                    bestDir = i;
+                }
+            }
+        }
+        // Fallback: deepest overall (also used when fgRef not found)
+        if (bestDir < 0) {
+            [unroll] for (int i = 0; i < 8; i++) {
+                if (candFound[i] && (bestDir < 0 || candDepth[i] > candDepth[bestDir]))
+                    bestDir = i;
+            }
+        }
+
+        // Single scatter-source pixel fill — clean background color, no foreground.
+        if (bestDir >= 0) {
+            uint cnd = atomicDepth[candPixel[bestDir]];
+            int cdx = (int)((cnd >> 8) & 0xFFu) - 127;
+            int cdy = (int)(cnd & 0xFFu) - 127;
+            int2 src = clamp(candPixel[bestDir] - int2(cdx, cdy), int2(0,0), int2(resolution) - 1);
+            float2 srcUV = (float2(src) + 0.5) / resolution;
+            output[tid.xy] = prevColor.SampleLevel(linearClamp, srcUV, 0);
             return;
         }
     }
-    // Fall through to existing fill strategy if frame N fill failed
 
-    // Locomotion-aligned mirror-fill with source-passthrough fallback.
-    // The mirror-fill along the loco direction produces smooth, motion-aligned
-    // content for trailing-edge disocclusion. When no background is found in the
-    // loco direction, fall back to source frame passthrough (previous frame's
-    // content at this screen position) instead of nearest-pixel search, which
-    // pulls in wrong content (ground, other fg) and creates streak artifacts.
+    // Final fallback
+    output[tid.xy] = float4(0.3, 0.3, 0.3, 1);
+}
 
-    int maxSearch = 128;
-
-    int2 dirs[8] = {
-        int2(-1,0), int2(1,0), int2(0,-1), int2(0,1),
-        int2(-1,-1), int2(1,-1), int2(-1,1), int2(1,1)
-    };
-
-    // locoScreenDir is pre-computed from actorPos delta (thumbstick locomotion),
-    // NOT from forwardPoseDelta (which is head-only tracking translation).
-    // This ensures CSDilate searches along the actual locomotion direction.
-
-    // Find which of the 8 directions best aligns with locomotion
-    float bestAlign = -2.0;
-    int primaryDir = 0;
-    if (length(locoScreenDir) > 0.0001) {
-        float2 locoNorm = normalize(locoScreenDir);
-        [unroll]
-        for (int i = 0; i < 8; i++) {
-            float2 d = normalize(float2(dirs[i]));
-            float alignment = dot(d, locoNorm);
-            if (alignment > bestAlign) {
-                bestAlign = alignment;
-                primaryDir = i;
-            }
+// ── Post-fill blur: smooth ONLY the void-zone pixels among themselves ──
+// Dispatched AFTER CSDilate. Reads the filled output values and averages
+// each void pixel with its void-pixel neighbors. Non-void pixels are excluded.
+// This adds natural blur without introducing any foreground contamination.
+[numthreads(8, 8, 1)]
+void CSBlurVoids(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y) return;
+    // Process void pixels AND pixels 1-2px outside the void boundary.
+    // The border pixels (non-void, next to void) may have dark foreground
+    // from CSMain's backward warp — blurring smooths them out.
+    if (disocclusionMap[tid.xy] == 0) {
+        bool nearVoid = false;
+        [unroll] for (int r = 1; r <= 2 && !nearVoid; r++) {
+            int2 np;
+            np = (int2)tid.xy + int2(-r, 0); if (np.x >= 0 && disocclusionMap[np] != 0) nearVoid = true;
+            np = (int2)tid.xy + int2(r, 0); if (np.x < (int)resolution.x && disocclusionMap[np] != 0) nearVoid = true;
+            np = (int2)tid.xy + int2(0, -r); if (np.y >= 0 && disocclusionMap[np] != 0) nearVoid = true;
+            np = (int2)tid.xy + int2(0, r); if (np.y < (int)resolution.y && disocclusionMap[np] != 0) nearVoid = true;
         }
+        if (!nearVoid) return;
     }
 
-    bool useLocoDir = (length(locoScreenDir) > 0.0001 && bestAlign > 0.3);
-
-    // --- Direction-agnostic mirror fill ---
-    // Search BOTH loco and opposite directions with contig>=3 filter.
-    // Assign fg/bg by depth (closer=fg, farther=bg). Mirror from bg side.
-    // Farthest-depth-edge fallback for intra-object gaps (similar depth).
-
-    int2 oppDirVec = -dirs[primaryDir];
-
-    // Search direction A (loco direction) — skip isolated scattered pixels
-    int distA = 0;
-    uint depthA = 0xFFFFFFFF;
-    bool foundA = false;
-
-    if (useLocoDir) {
-        for (int step = 1; step <= maxSearch; step++) {
-            int2 p = (int2)tid.xy + dirs[primaryDir] * step;
-            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                break;
-            uint nd = atomicDepth[p];
-            if (nd == 0xFFFFFFFF) continue;
-
-            int contig = 1;
-            for (int c = 1; c <= 3; c++) {
-                int2 cp = p + dirs[primaryDir] * c;
-                if (any(cp < 0) || cp.x >= (int)resolution.x || cp.y >= (int)resolution.y)
-                    break;
-                if (atomicDepth[cp] == 0xFFFFFFFF) break;
-                contig++;
+    // Void neighbors: always included.
+    // Non-void neighbors: only if background scatter depth (deeper than foreground).
+    // This smooths the void↔background border without pulling in foreground.
+    float4 blurred = float4(0, 0, 0, 0);
+    float weight = 0;
+    [unroll] for (int dy = -3; dy <= 3; dy++) {
+        [unroll] for (int dx = -3; dx <= 3; dx++) {
+            int2 np = (int2)tid.xy + int2(dx, dy);
+            if (any(np < 0) || np.x >= (int)resolution.x || np.y >= (int)resolution.y)
+                continue;
+            if (disocclusionMap[np] == 0) {
+                // Non-void: only include if background scatter depth
+                uint nd = atomicDepth[np];
+                if (nd == 0xFFFFFFFF) continue;
+                float ndd = (float)(nd >> 16) / 65535.0;
+                if (ndd < 0.95) continue; // foreground — skip
             }
-
-            if (contig >= 3) {
-                distA = step;
-                depthA = nd;
-                foundA = true;
-                break;
-            }
+            float w = exp(-(float)(dx*dx + dy*dy) / 8.0);
+            blurred += output[np] * w;
+            weight += w;
         }
     }
-
-    // Search direction B (opposite to loco) — skip isolated scattered pixels
-    int distB = 0;
-    uint depthB = 0xFFFFFFFF;
-    bool foundB = false;
-
-    if (useLocoDir) {
-        for (int step = 1; step <= maxSearch; step++) {
-            int2 p = (int2)tid.xy + oppDirVec * step;
-            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                break;
-            uint nd = atomicDepth[p];
-            if (nd == 0xFFFFFFFF) continue;
-
-            int contig = 1;
-            for (int c = 1; c <= 3; c++) {
-                int2 cp = p + oppDirVec * c;
-                if (any(cp < 0) || cp.x >= (int)resolution.x || cp.y >= (int)resolution.y)
-                    break;
-                if (atomicDepth[cp] == 0xFFFFFFFF) break;
-                contig++;
-            }
-
-            if (contig >= 3) {
-                distB = step;
-                depthB = nd;
-                foundB = true;
-                break;
-            }
-        }
-    }
-
-    // Assign fg/bg by depth. Mirror from bg side.
-    bool useMirror = false;
-    int bgDist = 0;
-    int2 bgDirVec = oppDirVec;
-
-    if (foundA && foundB) {
-        if (depthA >= 0xFFFFFFFE || depthB >= 0xFFFFFFFE) {
-            useMirror = true;
-            if (depthA >= 0xFFFFFFFE) {
-                bgDist = distA; bgDirVec = dirs[primaryDir];
-            } else {
-                bgDist = distB; bgDirVec = oppDirVec;
-            }
-        } else {
-            float dA = asfloat(depthA);
-            float dB = asfloat(depthB);
-
-            float fgD, bgD;
-            if (dA > dB) {
-                bgD = dA; fgD = dB;
-                bgDist = distA; bgDirVec = dirs[primaryDir];
-            } else {
-                bgD = dB; fgD = dA;
-                bgDist = distB; bgDirVec = oppDirVec;
-            }
-
-            bool realDisocclusion = (bgD > fgD * 1.01);
-
-            if (realDisocclusion) {
-                // Real disocclusion confirmed — always mirror from bg side.
-                useMirror = true;
-            } else {
-                // Both edges at similar depth — second-pass search skipping
-                // content at the found depth to find real background.
-                float skipD = min(dA, dB);
-
-                [unroll]
-                for (int dir = 0; dir < 2; dir++) {
-                    if (useMirror) break;
-                    int2 searchDir = (dir == 0) ? dirs[primaryDir] : oppDirVec;
-                    int startStep = (dir == 0) ? distA + 1 : distB + 1;
-
-                    for (int step = startStep; step <= maxSearch; step++) {
-                        int2 p = (int2)tid.xy + searchDir * step;
-                        if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                            break;
-                        uint nd = atomicDepth[p];
-                        if (nd == 0xFFFFFFFF) continue;
-                        if (nd >= 0xFFFFFFFE) {
-                            bgDist = step; bgDirVec = searchDir;
-                            useMirror = true;
-                            break;
-                        }
-                        float d = asfloat(nd);
-                        if (d <= skipD * 1.01) continue;
-                        int contig = 1;
-                        for (int c = 1; c <= 3; c++) {
-                            int2 cp = p + searchDir * c;
-                            if (any(cp < 0) || cp.x >= (int)resolution.x || cp.y >= (int)resolution.y)
-                                break;
-                            if (atomicDepth[cp] == 0xFFFFFFFF) break;
-                            contig++;
-                        }
-                        if (contig >= 3) {
-                            bgDist = step; bgDirVec = searchDir;
-                            useMirror = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    } else if (foundA && !foundB) {
-        bgDist = distA; bgDirVec = dirs[primaryDir];
-        useMirror = true;
-    } else if (foundB && !foundA) {
-        bgDist = distB; bgDirVec = oppDirVec;
-        useMirror = true;
-    }
-
-    if (useMirror) {
-        // Locomotion mirror fill: sample from background surface past the bg edge.
-        // Cap the mirror offset to prevent body-shape echo — when bgDist varies
-        // along a foreground object's outline, uncapped 2x mirror traces the outline
-        // into the background, creating visible outline-shaped fill. Capping to a
-        // small fixed offset (8px) makes fill content uniform across the gap.
-        int2 bgEdge = (int2)tid.xy + bgDirVec * bgDist;
-        int mirrorOffset = min(bgDist, 8);
-        int2 mirrorPos = bgEdge + bgDirVec * mirrorOffset;
-        mirrorPos = clamp(mirrorPos, int2(0, 0),
-                          int2((int)resolution.x - 1, (int)resolution.y - 1));
-        uint mirrorDepth = atomicDepth[mirrorPos];
-        if (mirrorDepth != 0xFFFFFFFF) {
-            output[tid.xy] = output[mirrorPos];
-        } else {
-            output[tid.xy] = output[bgEdge];
-        }
-    } else if (useLocoDir) {
-        // Locomotion active but mirror rejected (intra-object gap).
-        // Use farthest-depth edge found (most likely background).
-        bool fallbackFilled = false;
-        if (foundA || foundB) {
-            int2 bestEdge;
-            if (foundA && foundB) {
-                float dAf = (depthA >= 0xFFFFFFFE) ? 1.0 : asfloat(depthA);
-                float dBf = (depthB >= 0xFFFFFFFE) ? 1.0 : asfloat(depthB);
-                if (dAf >= dBf) {
-                    bestEdge = (int2)tid.xy + dirs[primaryDir] * distA;
-                } else {
-                    bestEdge = (int2)tid.xy + oppDirVec * distB;
-                }
-            } else if (foundA) {
-                bestEdge = (int2)tid.xy + dirs[primaryDir] * distA;
-            } else {
-                bestEdge = (int2)tid.xy + oppDirVec * distB;
-            }
-            bestEdge = clamp(bestEdge, int2(0, 0),
-                             int2((int)resolution.x - 1, (int)resolution.y - 1));
-            output[tid.xy] = output[bestEdge];
-            fallbackFilled = true;
-        }
-        if (!fallbackFilled) {
-            float2 srcUV = (float2(tid.xy) + 0.5) / resolution;
-            output[tid.xy] = prevColor.SampleLevel(linearClamp, srcUV, 0);
-        }
-    } else {
-        // No locomotion: minimal fill for immediate scatter seams only.
-        // Head tracking creates sub-pixel to 1px displacement, so scatter gaps
-        // are tiny. Search only 2 steps (immediate neighbors) to seal 1px seams.
-        // Anything farther is natural foliage transparency — prevColor passthrough
-        // preserves thin geometry (flowers, grass) without thickening.
-        uint bestDepth = 0;
-        int2 bestPos = (int2)tid.xy;
-        bool found = false;
-        [unroll]
-        for (int d = 0; d < 8; d++) {
-            for (int step = 1; step <= 2; step++) {
-                int2 p = (int2)tid.xy + dirs[d] * step;
-                if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                    break;
-                uint nd = atomicDepth[p];
-                if (nd != 0xFFFFFFFF) {
-                    if (!found || nd > bestDepth) {
-                        bestDepth = nd;
-                        bestPos = p;
-                        found = true;
-                    }
-                    break;
-                }
-            }
-        }
-        if (found) {
-            output[tid.xy] = output[bestPos];
-        } else {
-            float2 srcUV = (float2(tid.xy) + 0.5) / resolution;
-            output[tid.xy] = prevColor.SampleLevel(linearClamp, srcUV, 0);
-        }
-    }
+    if (weight > 0.001)
+        output[tid.xy] = blurred / weight;
 }
 
 )";
@@ -1146,8 +1061,12 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
     float2 dstPx = dstUV * resolution;
     uint depth16 = (uint)round(saturate(d) * 65535.0);
 
-    // 2x2 bilinear splat: better coverage than single-pixel write, reduces scatter gaps
-    // that would cause false-positive disocclusion detection in CSMain.
+    // 2x2 bilinear splat: provides full scatter coverage on surfaces with non-uniform MVs
+    // (NPC animation, cloth folds). 1x1 scatter created systematic gaps on NPC surfaces
+    // that were falsely detected as disocclusion → grid lines filled with background.
+    // The 2x2 splat's foreground contamination at gap edges is handled by flagging
+    // gap-adjacent pixels for CSDilate fill (adjacentToGap check in CSMain).
+    // The scatter-source color override in CSMain handles non-adjacent pixels correctly.
     int2 p0 = int2(floor(dstPx - 0.5));
     for (int sy = 0; sy <= 1; sy++) {
         for (int sx = 0; sx <= 1; sx++) {
@@ -1489,7 +1408,7 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	static const char* entryPoints[] = {
 		"CSMain", "CSClear", "CSForwardDepth", "CSForwardColor",
 		"CSForwardDepthNpcOnly", "CSForwardColorNpcOnly", "CSDilate",
-		"CSCompositeNpcForward", "CSNpcDepthScatter", "CSDepthPreScatter"
+		"CSCompositeNpcForward", "CSNpcDepthScatter", "CSDepthPreScatter", "CSBlurVoids"
 	};
 	constexpr int kJobCount = _countof(entryPoints);
 	m_pendingBlobs.resize(kJobCount);
@@ -1500,12 +1419,12 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	}
 
 	// Source string to use for each entry point (by index)
-	// 0=csMainSrc, 1-6=fullShaderSrc, 7=compositeStr, 8-9=npcShaderSrc
+	// 0=csMainSrc, 1-6=fullShaderSrc, 7=compositeStr, 8-9=npcShaderSrc, 10=fullShaderSrc
 	struct SourceMap { int blobIdx; const std::string* src; };
 	SourceMap srcMap[] = {
 		{0, &csMainSrc}, {1, &fullShaderSrc}, {2, &fullShaderSrc}, {3, &fullShaderSrc},
 		{4, &fullShaderSrc}, {5, &fullShaderSrc}, {6, &fullShaderSrc},
-		{7, &compositeStr}, {8, &npcShaderSrc}, {9, &npcShaderSrc}
+		{7, &compositeStr}, {8, &npcShaderSrc}, {9, &npcShaderSrc}, {10, &fullShaderSrc}
 	};
 
 	// Launch a single background thread that compiles all shaders in parallel internally.
@@ -1520,9 +1439,9 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 		const std::string* sources[] = {
 			&csMainSrc, &fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
 			&fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
-			&compositeStr, &npcShaderSrc, &npcShaderSrc
+			&compositeStr, &npcShaderSrc, &npcShaderSrc, &fullShaderSrc
 		};
-		constexpr int N = 10;
+		constexpr int N = 11;
 
 		// Launch parallel sub-tasks for each shader
 		std::vector<std::future<void>> futures;
@@ -1563,7 +1482,7 @@ void ASWProvider::TryFinishShaderCompilation()
 	    &m_warpCS,               // [0] CSMain
 	    &m_clearCS, &m_forwardDepthCS, &m_forwardColorCS,
 	    &m_forwardDepthNpcOnlyCS, &m_forwardColorNpcOnlyCS, &m_dilateCS,
-	    &m_compositeNpcForwardCS, &m_npcDepthScatterCS, &m_depthPreScatterCS,
+	    &m_compositeNpcForwardCS, &m_npcDepthScatterCS, &m_depthPreScatterCS, &m_blurVoidsCS,
 	};
 	const int kJobCount = (int)m_pendingBlobs.size();
 	bool csMainOk = false;
@@ -2405,10 +2324,17 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		ctx->CSSetShader(m_warpCS, nullptr, 0);
 		ctx->Dispatch(groupsX, groupsY, 1);
 
-		// CSDilate: fill sub-pixel gaps (from single-pixel scatter) and
-		// disocclusion holes with frame N data.
+		// CSDilate: fill disocclusion holes with background content.
 		if (m_dilateCS) {
 			ctx->CSSetShader(m_dilateCS, nullptr, 0);
+			ctx->Dispatch(groupsX, groupsY, 1);
+		}
+
+		// CSBlurVoids: post-fill blur within void zones only.
+		// Averages filled void pixels with their void-pixel neighbors.
+		// No non-void pixels are introduced — purely smooths the fill.
+		if (m_blurVoidsCS) {
+			ctx->CSSetShader(m_blurVoidsCS, nullptr, 0);
 			ctx->Dispatch(groupsX, groupsY, 1);
 		}
 
@@ -2752,6 +2678,7 @@ void ASWProvider::Shutdown()
 	if (m_dilateCS) { m_dilateCS->Release(); m_dilateCS = nullptr; }
 	if (m_npcDepthScatterCS) { m_npcDepthScatterCS->Release(); m_npcDepthScatterCS = nullptr; }
 	if (m_depthPreScatterCS) { m_depthPreScatterCS->Release(); m_depthPreScatterCS = nullptr; }
+	if (m_blurVoidsCS) { m_blurVoidsCS->Release(); m_blurVoidsCS = nullptr; }
 
 	for (int e = 0; e < 2; ++e) {
 		if (m_srvAtomicDepth[e]) { m_srvAtomicDepth[e]->Release(); m_srvAtomicDepth[e] = nullptr; }

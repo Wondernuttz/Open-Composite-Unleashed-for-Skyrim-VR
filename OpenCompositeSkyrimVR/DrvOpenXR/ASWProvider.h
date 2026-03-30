@@ -347,6 +347,7 @@ private:
 	ID3D11ComputeShader* m_dilateCS = nullptr;      // CSDilate (gap fill)
 	ID3D11ComputeShader* m_npcDepthScatterCS = nullptr; // CSNpcDepthScatter (moving-NPC boundary extension)
 	ID3D11ComputeShader* m_depthPreScatterCS = nullptr; // CSDepthPreScatter (warp depth forward for leading edges)
+	ID3D11ComputeShader* m_blurVoidsCS = nullptr;      // CSBlurVoids (post-fill blur within void zones)
 	ID3D11Buffer* m_constantBuffer = nullptr;
 	ID3D11SamplerState* m_linearSampler = nullptr;
 
