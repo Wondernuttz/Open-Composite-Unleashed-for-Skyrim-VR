@@ -138,14 +138,49 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
     float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
 
+    // Skip disocclusion detection near very close geometry (hands, weapons).
+    // Check if any nearby SCATTER pixel has close depth — hands scatter with close
+    // depth even when the gap pixel itself has no scatter. During movement, the
+    // cached depth at the output position is background (hand shifted) → can't use
+    // cached depth. The scatter buffer's close-depth neighbors reliably detect hands.
+    bool isCloseGeometry = false;
+    {
+        int2 cOffsets[4] = { int2(-3,0), int2(3,0), int2(0,-3), int2(0,3) };
+        for (int ci = 0; ci < 4; ci++) {
+            int2 np = clamp(pixel + cOffsets[ci], int2(0,0), int2(resolution) - 1);
+            uint nd = atomicDepth[np];
+            if (nd != 0xFFFFFFFF && (float)(nd >> 16) / 65535.0 < 0.87) {
+                isCloseGeometry = true;
+                break;
+            }
+        }
+    }
+
     // Disocclusion detection via forward-scatter gaps.
-    // Simple: atomicDepth == 0xFFFFFFFF with 2+ gap neighbors = real gap → CSDilate fills.
-    // No expanded zone needed now that gap-adjacent pixels use cached depth (section 1 fix).
-    // Gap detection + gap-adjacent flagging for CSDilate fill.
-    // With 2x2 scatter, gaps (0xFFFFFFFF) only appear at real disocclusion zones.
-    // Gap-ADJACENT pixels (valid scatter but neighbor is a gap) may have foreground
-    // depth from the 2x2 splat bleed → wrong scatter source → flag for CSDilate too.
-    if (hasLoco) {
+    // NPC animation disocclusion (simple gap detection, no nearGap complexity)
+    // with special MVs that don't match world scatter, creating false gaps.
+    if (!hasLoco && !isCloseGeometry && scatteredDepth == 0xFFFFFFFF) {
+        // Check if gap is near very close geometry (hands) — skip if so
+        float nearestD = 1.0;
+        int gapN = 0;
+        int2 cardinals[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };
+        for (int ci = 0; ci < 4; ci++) {
+            int2 np = pixel + cardinals[ci];
+            if (np.x >= 0 && np.x < (int)resolution.x && np.y >= 0 && np.y < (int)resolution.y) {
+                uint nd = atomicDepth[np];
+                if (nd == 0xFFFFFFFF) { gapN++; }
+                else { nearestD = min(nearestD, (float)(nd >> 16) / 65535.0); }
+            }
+        }
+        if (gapN >= 2) {
+            disocclusionMap[tid.xy] = 1;
+            if (debugMode == 61) { output[tid.xy] = float4(1, 0, 0, 1); return; }
+            return;
+        }
+    }
+
+    // Locomotion disocclusion (full detection with nearGap contamination handling)
+    if (hasLoco && !isCloseGeometry) {
         bool isGap = (scatteredDepth == 0xFFFFFFFF);
         bool adjacentToGap = false;
 
@@ -163,7 +198,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             return;
         }
 
-        if (!isGap && scatteredDepth != 0xFFFFFFFF) {
+        if (!isGap && scatteredDepth != 0xFFFFFFFF && hasLoco) {
             float scatD = (float)(scatteredDepth >> 16) / 65535.0;
             // Use the foreground depth from the anti-loco side to set the threshold.
             float2 locoDirPx = normalize(locoScreenDir * resolution);
@@ -186,13 +221,21 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             // BACKGROUND scatter (deeper than foreground + margin): 10px — catch the wide
             // contamination zone where background scatter filled positions but backward
             // warp will sample foreground from the cached frame.
-            int searchRadius = isBgScatter ? 14 : 1;
+            // Check 1px always (foreground near-gap)
             bool nearGap = false;
-            for (int r = 1; r <= searchRadius && !nearGap; r++) {
-                if (pixel.x >= r && atomicDepth[pixel + int2(-r,0)] == 0xFFFFFFFF) nearGap = true;
-                if (pixel.x < (int)resolution.x-r && atomicDepth[pixel + int2(r,0)] == 0xFFFFFFFF) nearGap = true;
-                if (pixel.y >= r && atomicDepth[pixel + int2(0,-r)] == 0xFFFFFFFF) nearGap = true;
-                if (pixel.y < (int)resolution.y-r && atomicDepth[pixel + int2(0,r)] == 0xFFFFFFFF) nearGap = true;
+            if (pixel.x >= 1 && atomicDepth[pixel + int2(-1,0)] == 0xFFFFFFFF) nearGap = true;
+            if (pixel.x < (int)resolution.x-1 && atomicDepth[pixel + int2(1,0)] == 0xFFFFFFFF) nearGap = true;
+            if (pixel.y >= 1 && atomicDepth[pixel + int2(0,-1)] == 0xFFFFFFFF) nearGap = true;
+            if (pixel.y < (int)resolution.y-1 && atomicDepth[pixel + int2(0,1)] == 0xFFFFFFFF) nearGap = true;
+            // Extended check for background scatter (14px)
+            if (!nearGap && isBgScatter) {
+                for (int r = 2; r <= 14; r++) {
+                    if (nearGap) break;
+                    if (pixel.x >= r && atomicDepth[pixel + int2(-r,0)] == 0xFFFFFFFF) nearGap = true;
+                    if (pixel.x < (int)resolution.x-r && atomicDepth[pixel + int2(r,0)] == 0xFFFFFFFF) nearGap = true;
+                    if (pixel.y >= r && atomicDepth[pixel + int2(0,-r)] == 0xFFFFFFFF) nearGap = true;
+                    if (pixel.y < (int)resolution.y-r && atomicDepth[pixel + int2(0,r)] == 0xFFFFFFFF) nearGap = true;
+                }
             }
 
             if (nearGap) {
@@ -376,22 +419,26 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
 )" R"(
     // MV residual decomposition.
-    // Rotation = c2cHeadMV - headOnlyMV (stick rotation only, not depth-dependent).
-    // Locomotion = depth-aware from c2c difference (when available) or flat from MV residual.
+    // Skip ALL MV corrections for very close geometry (hands/weapons, d < 0.87).
+    // Hands are camera-relative — they move with the head, not with the world.
+    // The game MVs capture world motion (loco) but hands should use ONLY parallax
+    // from poseDelta (head tracking). Applying loco MV to close pixels creates huge
+    // offsets that shift sourceUV far away → wrong content → hands invisible.
     float2 mvOffset = float2(0, 0);
-    if (abs(mvConfidence) > 0.001) {
+    float2 sourceUV = parallaxSourceUV;
+
+    if (d >= 0.87 && abs(mvConfidence) > 0.001) {
         float2 fullResidual = totalMV - headOnlyMV;
         float2 locoResidual = totalMV - c2cHeadMV;
         float2 rotComponent = fullResidual - locoResidual;
         float2 residual = locoResidual + rotMVScale * rotComponent;
         mvOffset = mvConfidence * residual;
+        sourceUV = parallaxSourceUV + mvOffset;
     }
-
-    float2 sourceUV = parallaxSourceUV + mvOffset;
 
     // Depth-aware locomotion offset: replaces flat loco MV residual with depth-correct
     // parallax from the difference between c2c_with_loco and c2c_no_loco.
-    if (hasFullWarpC2C && hasClipToClipNoLoco && abs(mvConfidence) > 0.001) {
+    if (d >= 0.87 && hasFullWarpC2C && hasClipToClipNoLoco && abs(mvConfidence) > 0.001) {
         float2 baseUV = useFgAngle ? fgUV : uv;
         float2 ndc = float2(baseUV.x * 2.0 - 1.0, 1.0 - baseUV.y * 2.0);
         float4 clipPos = float4(ndc, d, 1.0);
@@ -422,7 +469,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             // sourceUV to completely wrong positions, causing "warped background in NPC
             // outline shape" artifacts. Real NPC animation at 1.5x extrapolation is
             // rarely > 15px. Clamping eliminates the contamination artifacts.
-            if (npcMotionMag < 6.0) {
+            if (npcMotionMag < 15.0) {
                 sourceUV += 1.5 * npcMotion;
             }
         }
@@ -842,13 +889,9 @@ void CSDilate(uint3 tid : SV_DispatchThreadID) {
     int2 pixel = (int2)tid.xy;
     bool hasLoco = length(locoScreenDir) > 0.001;
 
-    if (hasLoco) {
-        float2 locoDirPx = normalize(locoScreenDir * resolution);
-        float maxComp = max(abs(locoDirPx.x), abs(locoDirPx.y));
-        int2 locoStep = int2(round(locoDirPx / maxComp));
-        int2 antiLocoStep = -locoStep;
-
+    {
         // 8-direction nearest-neighbor, background-preferring fill.
+        // Works for BOTH locomotion disocclusion AND NPC animation disocclusion.
         // Phase 1: find nearest valid pixel + its depth in each direction.
         // Phase 2: find the max depth (most background) across all candidates.
         // Phase 3: average only candidates within 0.02 of max depth.
@@ -886,14 +929,14 @@ void CSDilate(uint3 tid : SV_DispatchThreadID) {
             if (candFound[i] && candDepth[i] > maxD) maxD = candDepth[i];
         }
 
-        // Find foreground depth from anti-loco to set the background threshold.
+        // Find foreground depth to set the background threshold.
+        // Use the SHALLOWEST (closest) candidate from the 8-direction search as fgRef.
+        // During loco: this is the NPC/tree that created the trailing edge.
+        // During NPC animation: this is the NPC body part that moved.
         float fgRef = 0.0;
-        for (int fs = 1; fs <= 30; fs++) {
-            int2 fnp = pixel + antiLocoStep * fs;
-            if (any(fnp < 0) || fnp.x >= (int)resolution.x || fnp.y >= (int)resolution.y) break;
-            if (atomicDepth[fnp] != 0xFFFFFFFF && disocclusionMap[fnp] == 0) {
-                fgRef = (float)(atomicDepth[fnp] >> 16) / 65535.0;
-                break;
+        [unroll] for (int i = 0; i < 8; i++) {
+            if (candFound[i] && (fgRef < 0.001 || candDepth[i] < fgRef)) {
+                fgRef = candDepth[i];
             }
         }
         float bgThreshold = fgRef + 0.02;
@@ -1044,8 +1087,12 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
     dstUV = lerp(srcUV, dstUV, depthFade);
 
     // Step 2: Add MV residual (loco + stick rotation + NPC animation).
-    // Subtract head-only MV (inter-game-frame head motion already in forwardPoseDelta).
-    if (abs(mvConfidence) > 0.001) {
+    // Skip for very close geometry (hands/weapons, d < 0.87): they're camera-relative
+    // and don't move on screen during loco/rotation. The game MVs at hand positions
+    // capture world motion (loco) but hands should only use forwardPoseDelta (head tracking).
+    // Hands DO move when physically tracked (head turn, controller movement) — forwardPoseDelta
+    // handles that. The MV residual would incorrectly shift them by the loco amount.
+    if (abs(mvConfidence) > 0.001 && d >= 0.87) {
         float2 rawMV = mvTex[ToMVCoord(srcPixel)];
         float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
         float4 rotated = mul(headRotMatrix, float4(viewPos, 1.0));
