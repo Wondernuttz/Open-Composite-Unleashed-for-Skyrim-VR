@@ -130,6 +130,7 @@ public:
 	inline float ASWRotationScale() const { return aswRotationScale; }
 	inline float ASWTranslationScale() const { return aswTranslationScale; }
 	inline float ASWLocoScale() const { return aswLocoScale; }
+	inline float ASWFPControllerScale() const { return aswFPControllerScale; }
 	inline float ASWDepthScale() const { return aswDepthScale; }
 	inline float ASWEdgeFadeWidth() const { return aswEdgeFadeWidth; }
 	inline float ASWNearFadeDepth() const { return aswNearFadeDepth; }
@@ -164,6 +165,7 @@ public:
 	float aswRotationScale = 0.0f; // 0.0 = no rotation correction, 1.0 = full
 	float aswTranslationScale = 1.0f; // 0.0 = no translation correction, 1.0 = full
 	float aswLocoScale = 1.0f;     // locomotion correction scale (0=off, 1=full). Multiplied by timingRatio (~0.5).
+	float aswFPControllerScale = 0.63f; // FP hand/weapon controller delta scale (0=off, 0.63=tuned, 1=raw)
 	float aswDepthScale = 1.0f;    // multiplier on linearized depth (parallax intensity)
 	float aswEdgeFadeWidth = 3.0f;   // depth-edge fade threshold (depth ratio units)
 	float aswNearFadeDepth = 0.0f;   // parallax fades to 0 below this depth (meters); 0 = disabled

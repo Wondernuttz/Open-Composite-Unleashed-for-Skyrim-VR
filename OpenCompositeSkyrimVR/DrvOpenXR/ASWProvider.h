@@ -7,6 +7,80 @@
 #include <chrono>
 #include <future>
 
+// ── FP Draw Replay: captured D3D11 state for re-rendering hands on warp frames ──
+// These structs are allocated in SKSE (game thread) and read by OC (submit thread).
+// COM pointers are valid cross-thread since both DLLs are in the same process.
+
+struct FPDrawCapture {
+	bool valid = false;
+	// IA state
+	ID3D11Buffer* ib = nullptr;
+	DXGI_FORMAT ibFmt = DXGI_FORMAT_UNKNOWN;
+	UINT ibOff = 0;
+	ID3D11Buffer* vb = nullptr;
+	UINT vbStride = 0, vbOff = 0;
+	ID3D11InputLayout* il = nullptr;
+	D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+	UINT indexCount = 0, startIndex = 0;
+	INT baseVertex = 0;
+	UINT instanceCount = 1;
+	// Shaders
+	ID3D11VertexShader* vs = nullptr;
+	ID3D11PixelShader* ps = nullptr;
+	// PS resources
+	ID3D11ShaderResourceView* psSRVs[8] = {};
+	ID3D11SamplerState* psSamplers[4] = {};
+	// OM
+	ID3D11BlendState* blendState = nullptr;
+	float blendFactor[4] = {};
+	UINT sampleMask = 0xFFFFFFFF;
+	ID3D11DepthStencilState* dss = nullptr;
+	UINT stencilRef = 0;
+	// RS
+	ID3D11RasterizerState* rs = nullptr;
+	// VS CB byte snapshots (sizes from VP-DIAG during FP draws)
+	uint8_t cb0[80] = {};    bool hasCB0 = false;   // per-draw constants
+	uint8_t cb1[48] = {};    bool hasCB1 = false;
+	uint8_t cb2[400] = {};   bool hasCB2 = false;   // per-geometry (world transform)
+	uint8_t cb9[3840] = {};  bool hasCB9 = false;   // bone matrices
+	uint8_t cb10[3840] = {}; bool hasCB10 = false;  // prev bones
+	uint8_t cb13[48] = {};   bool hasCB13 = false;  // VR stereo params
+	// PS CB byte snapshots
+	uint8_t psCB0[256] = {}; UINT psCB0Size = 0; bool hasPSCB0 = false;
+	uint8_t psCB1[256] = {}; UINT psCB1Size = 0; bool hasPSCB1 = false;
+	uint8_t psCB2[256] = {}; UINT psCB2Size = 0; bool hasPSCB2 = false;
+};
+
+struct FPReplayData {
+	static constexpr int MAX_DRAWS = 16;
+	static constexpr int NUM_BUFS = 2;
+
+	struct CaptureSet {
+		FPDrawCapture draws[MAX_DRAWS] = {};
+		int drawCount = 0;
+		// Shared CB[12] snapshot (1408 bytes — same for all FP draws in a batch)
+		uint8_t cb12[1408] = {};
+		bool hasCB12 = false;
+		// Viewport from first FP draw
+		D3D11_VIEWPORT viewport = {};
+	};
+
+	CaptureSet sets[NUM_BUFS] = {};
+	std::atomic<int> readyIdx{ -1 };  // which set has valid data (-1 = none)
+	int writeIdx = 0;                  // SKSE-only: which set to write next
+};
+
+// Hand composite CB layout (must match HLSL HandCompositeCB, 16-byte aligned)
+struct HandCompositeConstants {
+	float controllerDeltaL[2];
+	float controllerDeltaR[2];
+	float controllerUV_L[2];
+	float controllerUV_R[2];
+	float controllerRadius;
+	float resolution[2];
+	float _pad;
+};
+
 // Forward declaration — ASWProvider is accessed from XrBackend for frame injection
 class ASWProvider;
 extern ASWProvider* g_aswProvider;
@@ -87,6 +161,11 @@ public:
 	    const XrPosef& eyePose, const XrFovf& eyeFov,
 	    float nearZ, float farZ);
 
+	/// Cache stencil buffer for this eye (R8_UINT, extracted from depth-stencil).
+	/// Call after CacheFrame for each eye. Writes to the current build slot.
+	void CacheStencil(int eye, ID3D11DeviceContext* ctx,
+	    ID3D11Texture2D* stencilTex, const D3D11_BOX* stencilRegion);
+
 	/// Warp cached frame to new pose, write result to output texture.
 	/// Call for each eye during the injected frame.
 	/// @param slotOverride  If >= 0, force reading from this cache slot instead of m_publishedSlot.
@@ -166,6 +245,48 @@ public:
 
 	/// Store the live cameraPosPtr so WarpFrame can read it at warp time.
 	void SetCameraPosPtr(uint64_t ptr) { m_cameraPosPtr = ptr; }
+
+	/// Store the first-person root NiAVObject pointer for hand bounding sphere detection.
+	void SetFirstPersonRootPtr(uint64_t ptr) { m_firstPersonRootPtr = ptr; }
+
+	/// Store the FP depth-stencil texture (separate from main DS, rendered with zNear=1).
+	/// The warp shader reads this to identify player character pixels.
+	void SetFPDepthTex(ID3D11Texture2D* tex) { m_fpDepthTex = tex; }
+	void SetFPGeomPointers(const uint64_t* ptrs, uint32_t count) {
+		if (count > 16) count = 16;
+		m_fpGeomCount = count;
+		if (count > 0) memcpy(m_fpGeomPointers, ptrs, count * sizeof(uint64_t));
+	}
+	void CachePreFPDepth(int eye, ID3D11DeviceContext* ctx,
+	    ID3D11Texture2D* preFPR32F, const D3D11_BOX* region);
+
+	/// Store pointer to FP replay data (heap-allocated in SKSE, same process).
+	/// Called once from dx11compositor when bridge provides the pointer.
+	void SetFPReplayPtr(FPReplayData* ptr) { m_fpReplayPtr = ptr; }
+
+	/// Store VR controller positions in tracking space (from GetDeviceToAbsoluteTrackingPose).
+	/// Called each frame from XrBackend. [0]=left, [1]=right.
+	void SetControllerPos(int hand, float x, float y, float z, bool valid) {
+		if (hand >= 0 && hand < 2) {
+			m_controllerPos[hand][0] = x;
+			m_controllerPos[hand][1] = y;
+			m_controllerPos[hand][2] = z;
+			m_controllerValid[hand] = valid;
+		}
+	}
+	bool GetControllerValid(int hand) const { return hand >= 0 && hand < 2 && m_controllerValid[hand]; }
+	const float* GetControllerPos(int hand) const { return (hand >= 0 && hand < 2) ? m_controllerPos[hand] : nullptr; }
+
+	/// Store projected controller UV positions for hand detection (current build slot, per-eye).
+	void SetSlotControllerUV(int eye, float luv[2], float ruv[2], float radius) {
+		if (eye < 0 || eye > 1) return;
+		m_slotControllerUV[m_buildSlot][eye][0][0] = luv[0];
+		m_slotControllerUV[m_buildSlot][eye][0][1] = luv[1];
+		m_slotControllerUV[m_buildSlot][eye][1][0] = ruv[0];
+		m_slotControllerUV[m_buildSlot][eye][1][1] = ruv[1];
+		m_slotControllerRadius[m_buildSlot] = radius;
+		m_slotHasControllerUV[m_buildSlot][eye] = true;
+	}
 
 	/// Store the RSS view matrix pointer for coordinate transforms at warp time.
 	void SetRSSViewMatPtr(const float* ptr) { m_rssViewMatPtr = ptr; }
@@ -281,6 +402,9 @@ private:
 	bool CreateStagingTextures(ID3D11Device* device);
 	bool CreateOutputSwapchain(uint32_t width, uint32_t height);
 	bool CreateDepthSwapchain(uint32_t width, uint32_t height);
+	bool CreateHandRenderTargets(ID3D11Device* device, uint32_t w, uint32_t h);
+	bool ReplayFPHands(int eye, ID3D11DeviceContext* ctx,
+	    const float* forwardPoseDelta, const HandCompositeConstants& hcc);
 
 	int GetActiveCacheSlot() const {
 		int slot = m_warpReadSlot.load(std::memory_order_acquire);
@@ -308,6 +432,26 @@ private:
 	float m_rotMVScale = 1.0f;                     // rotation MV scale (decays on rotation stop)
 	uint64_t m_cameraPosPtr = 0;        // live NiCamera::world.translate pointer (for warp-time Z read)
 	const float* m_rssViewMatPtr = nullptr; // RSS view matrix pointer (for world→view transform at warp time)
+	uint64_t m_firstPersonRootPtr = 0; // NiAVObject* for player 1st-person skeleton root
+	ID3D11Texture2D* m_fpDepthTex = nullptr; // FP depth-stencil (game's live texture, NOT owned)
+	ID3D11ShaderResourceView* m_fpDepthSRV = nullptr; // R24_UNORM_X8_TYPELESS SRV on FP DS
+	ID3D11Texture2D* m_fpDepthSRVTex = nullptr; // Cached: which tex the SRV was created for
+
+	// Pre-FP depth: depth snapshot BEFORE first-person geometry renders.
+	// Compared against post-FP cached depth to identify FP pixels (where depth got closer).
+	ID3D11Texture2D* m_cachedPreFPDepth[kAswCacheSlotCount][2] = {};
+	ID3D11ShaderResourceView* m_srvPreFPDepth[kAswCacheSlotCount][2] = {};
+	ID3D11Texture2D* m_preFPDepthSrcTex = nullptr; // bridge preFPDepthTexture (NOT owned)
+
+	// FP geometry pointers from bridge — read worldBound LIVE at WarpFrame time
+	uint64_t m_fpGeomPointers[16] = {};
+	uint32_t m_fpGeomCount = 0;
+
+	float m_controllerPos[2][3] = {}; // tracking-space positions [hand][xyz]
+	bool m_controllerValid[2] = {};
+	float m_slotControllerUV[kAswCacheSlotCount][2][2][2] = {}; // [slot][eye][hand][u,v]
+	float m_slotControllerRadius[kAswCacheSlotCount] = {};
+	bool m_slotHasControllerUV[kAswCacheSlotCount][2] = {}; // [slot][eye]
 
 	// Per-slot clipToClipNoLoco: buffered with the cache slot so WarpFrame reads the
 	// matrix from the SAME frame as the cached color/MV/depth textures.
@@ -367,9 +511,11 @@ private:
 	ID3D11Texture2D* m_cachedColor[kAswCacheSlotCount][2] = {};
 	ID3D11Texture2D* m_cachedMV[kAswCacheSlotCount][2] = {};
 	ID3D11Texture2D* m_cachedDepth[kAswCacheSlotCount][2] = {};
+	ID3D11Texture2D* m_cachedStencil[kAswCacheSlotCount][2] = {};
 	ID3D11ShaderResourceView* m_srvColor[kAswCacheSlotCount][2] = {};
 	ID3D11ShaderResourceView* m_srvMV[kAswCacheSlotCount][2] = {};
 	ID3D11ShaderResourceView* m_srvDepth[kAswCacheSlotCount][2] = {};
+	ID3D11ShaderResourceView* m_srvStencil[kAswCacheSlotCount][2] = {};
 
 	// Per-eye warped output (compute shader writes here)
 	ID3D11Texture2D* m_warpedOutput[2] = {};
@@ -411,6 +557,23 @@ private:
 	bool m_hasLastPublishedPose = false;
 	uint64_t m_frameCounter = 0;
 
+	// FP hand replay state
+	FPReplayData* m_fpReplayPtr = nullptr;          // SKSE-allocated, same process
+	ID3D11Texture2D* m_handColor[2] = {};           // RGBA8 per-eye hand color RT
+	ID3D11RenderTargetView* m_handRTV[2] = {};
+	ID3D11ShaderResourceView* m_srvHandColor[2] = {};
+	ID3D11Texture2D* m_handDepthTex[2] = {};        // D32_FLOAT per-eye hand depth
+	ID3D11DepthStencilView* m_handDSV[2] = {};
+	ID3D11ShaderResourceView* m_srvHandDepth[2] = {};  // R32_FLOAT SRV on D32_FLOAT
+	ID3D11DepthStencilState* m_handDSS = nullptr;   // LESS_EQUAL, depth write enabled
+	ID3D11ComputeShader* m_handCompositeCS = nullptr;
+	// Pre-allocated replay constant buffers (reused each frame via UpdateSubresource)
+	static constexpr UINT kReplayCBSizes[7] = { 80, 48, 400, 3840, 3840, 1408, 48 };
+	static constexpr int kReplayCBSlots[7] = { 0, 1, 2, 9, 10, 12, 13 };
+	ID3D11Buffer* m_replayCB[7] = {};               // VS CBs: [0]=cb0, [1]=cb1, ..., [5]=cb12, [6]=cb13
+	ID3D11Buffer* m_replayPSCB[3] = {};             // PS CBs: slots 0-2 (256 bytes each)
+	ID3D11Buffer* m_handCompositeCB = nullptr;      // CB for CSHandComposite (controller deltas)
+
 	// Constant buffer layout (must match HLSL, 16-byte aligned)
 	struct WarpConstants {
 		float poseDeltaMatrix[16]; // 4x4 row-major               — 64 bytes
@@ -446,6 +609,21 @@ private:
 		float fullWarpC2C[16];         // 4x4 col-major: warp output → cached clip (head + loco)    — 64 bytes
 		int hasFullWarpC2C;            // 1 if fullWarpC2C is valid                                  — 4 bytes
 		float _padFullC2C[3];          // alignment                                                 — 12 bytes
-	};                                 //                         total: 544 bytes
+		float controllerUV_LR[4];      // [Lu, Lv, Ru, Rv] — projected controller positions in UV       — 16 bytes
+		float controllerRadius;        // screen-space radius in UV units for hand detection circle  — 4 bytes
+		int hasControllerPose;         // 1 if controllerUV is valid (both hands)                    — 4 bytes
+		float controllerDeltaL[2];     // warp-time UV - cached-frame UV for left hand               — 8 bytes
+		float controllerDeltaR[2];     // warp-time UV - cached-frame UV for right hand              — 8 bytes
+		float fpControllerScale;       // controller delta multiplier (ini: aswFPControllerScale)    — 4 bytes
+		int hasFPSphere;               // 1 if fpSphere* is valid                                   — 4 bytes
+		float fpSphereRadius;          // FP bounding sphere radius                                 — 4 bytes
+		float _padCtrl;                // alignment                                                 — 4 bytes
+		float fpSphereCenter[4];       // [x,y,z,pad] FP sphere center in rendering space           — 16 bytes
+		int hasPreFPDepth;             // 1 if preFPDepth texture has valid data                  — 4 bytes
+		float _padPreFP[3];            // alignment to 16 bytes                                  — 12 bytes
+		float fpScreenBoxes[16 * 4];   // Up to 16 AABBs: [minU, minV, maxU, maxV] × 16         — 256 bytes
+		int fpBoxCount;                // Number of valid screen-space FP bounding boxes          — 4 bytes
+		float _padBoxes[3];            // alignment to 16 bytes                                  — 12 bytes
+	};                                 //                         total: 880 bytes
 
 };

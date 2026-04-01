@@ -63,11 +63,12 @@ using namespace vr;
 // ── Aim pose data shared with PrismaVR via window property ──
 // PrismaVR reads OC_AIM_POSES to get controller pointing direction
 // without per-controller calibration constants.
+// Also used by ASW to project controller positions for hand detection.
 struct OCAimPoseData {
 	vr::HmdMatrix34_t matrix[2]; // [0]=left, [1]=right
 	bool valid[2];
 };
-static OCAimPoseData g_aimPoses = {};
+OCAimPoseData g_aimPoses = {}; // non-static: accessed from dx11compositor for ASW hand detection
 static HWND g_aimPoseHwnd = nullptr;
 
 static BOOL CALLBACK FindGameWindowCB(HWND hwnd, LPARAM lParam)
@@ -301,7 +302,34 @@ void XrBackend::GetDeviceToAbsoluteTrackingPose(
 		}
 	}
 
-	// ── Aim pose: locate aim spaces for PrismaVR laser pointing ──
+	// ── Controller pose caching: used by ASW for hand detection + PrismaVR ──
+	// Read from poseArray (populated above for ALL games via legacy or action API).
+	// Device indices: 1 = left controller, 2 = right controller.
+	{
+		static int s_ctrlDbg = 0;
+		for (int h = 0; h < 2; h++) {
+			uint32_t devIdx = (h == 0) ? 1 : 2; // left=1, right=2
+			if (devIdx < poseArrayCount && poseArray[devIdx].bPoseIsValid) {
+				g_aimPoses.valid[h] = true;
+				g_aimPoses.matrix[h] = poseArray[devIdx].mDeviceToAbsoluteTracking;
+				if (g_aswProvider) {
+					auto& m = poseArray[devIdx].mDeviceToAbsoluteTracking;
+					g_aswProvider->SetControllerPos(h, m.m[0][3], m.m[1][3], m.m[2][3], true);
+				}
+			} else {
+				g_aimPoses.valid[h] = false;
+				if (g_aswProvider) g_aswProvider->SetControllerPos(h, 0, 0, 0, false);
+			}
+		}
+		if (s_ctrlDbg++ < 3) {
+			OOVR_LOGF("CtrlPose: count=%u asw=%p L_valid=%d R_valid=%d L=(%.3f,%.3f,%.3f)",
+			    poseArrayCount, (void*)g_aswProvider,
+			    (int)g_aimPoses.valid[0], (int)g_aimPoses.valid[1],
+			    g_aimPoses.matrix[0].m[0][3], g_aimPoses.matrix[0].m[1][3], g_aimPoses.matrix[0].m[2][3]);
+		}
+	}
+
+	// Action-based aim poses (PrismaVR laser pointing) — only when actions are loaded.
 	BaseInput* input = GetUnsafeBaseInput();
 	if (input && input->AreActionsLoaded()) {
 		for (int h = 0; h < 2; h++) {
@@ -738,6 +766,23 @@ bool XrBackend::SubmitAswWarpFrame(const XrFrameState& frameState,
 	bool stopping = (g_aswProvider->GetMVConfidenceScale() < 0.5f)
 	             || (g_aswProvider->GetRotMVScale() < 0.5f);
 	int slotOverride = stopping ? g_aswProvider->GetPublishedSlot() : -1;
+
+	// Fetch FRESH controller positions at warp time using the same coordinate path
+	// as CacheFrame (GetDeviceToAbsoluteTrackingPose → g_aimPoses → SetControllerPos).
+	// This ensures the warp-time positions are in the same space as the cached UVs.
+	{
+		vr::TrackedDevicePose_t warpPoses[3] = {};
+		GetDeviceToAbsoluteTrackingPose(
+		    vr::TrackingUniverseStanding, 0.0f, warpPoses, 3);
+		// Device 1 = left, 2 = right (same as CacheFrame path)
+		for (int h = 0; h < 2; h++) {
+			uint32_t devIdx = (h == 0) ? 1 : 2;
+			if (warpPoses[devIdx].bPoseIsValid) {
+				auto& m = warpPoses[devIdx].mDeviceToAbsoluteTracking;
+				g_aswProvider->SetControllerPos(h, m.m[0][3], m.m[1][3], m.m[2][3], true);
+			}
+		}
+	}
 
 	bool warpOk = true;
 	for (int eye = 0; eye < 2; eye++) {

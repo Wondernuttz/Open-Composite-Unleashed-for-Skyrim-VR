@@ -47,6 +47,7 @@ Texture2D<float2> mvTex        : register(t1);  // camera MVs: prevUV - uv (UV s
 Texture2D<float>  depthTex     : register(t2);
 Texture2D<float4> frameNColor  : register(t3);  // frame N color (newer frame for disocclusion fill)
 Texture2D<float>  frameNDepth  : register(t4);  // frame N depth (newer frame)
+Texture2D<uint>   fpMask       : register(t5);  // R8_UINT FP mask from SKSE DS->DS depth comparison
 RWTexture2D<float4> output     : register(u0);
 RWTexture2D<uint> atomicDepth  : register(u1);  // forward scatter depth test buffer (R32_UINT)
 RWTexture2D<uint> disocclusionMap : register(u2);  // 0=normal, 1=disoccluded (proactive marking)
@@ -85,6 +86,21 @@ cbuffer WarpParams : register(b0) {
     column_major float4x4 fullWarpC2C;  // warp output → cached clip (head + locomotion, depth-aware)
     int hasFullWarpC2C;     // 1 if fullWarpC2C is valid
     float3 _padFullC2C;
+    float4 controllerUV_LR; // xy=left hand UV, zw=right hand UV (cached frame)
+    float controllerRadius; // screen-space radius in UV units for hand detection
+    int hasControllerPose;  // 1 if controllerUV is valid
+    float2 controllerDeltaL; // warp-time UV - cached-frame UV for left hand
+    float2 controllerDeltaR; // warp-time UV - cached-frame UV for right hand
+    float fpControllerScale; // controller delta multiplier (ini: aswFPControllerScale)
+    int hasFPSphere;        // 1 if fpSphere* is valid
+    float fpSphereRadius;   // FP bounding sphere radius
+    float _padCtrl;
+    float4 fpSphereCenter;  // xyz = center in rendering space, w unused
+    int hasPreFPDepth;      // 1 if preFPDepth texture has valid data
+    float3 _padPreFP;
+    float4 fpScreenBoxes[16]; // Up to 16 AABBs: [minU, minV, maxU, maxV]
+    int fpBoxCount;           // Number of valid screen-space FP bounding boxes
+    float3 _padBoxes;
 };
 
 // LinearizeDepth: convert raw depth buffer value to linear distance in game units.
@@ -111,6 +127,41 @@ int2 ToDepthCoord(int2 colorPixel) {
     float2 uv = (float2(colorPixel) + 0.5) / resolution;
     int2 dp = int2(uv * depthResolution);
     return clamp(dp, int2(0,0), int2(depthResolution) - 1);
+}
+
+// First-person pixel classification: depth threshold + AABB bounding boxes.
+// Returns true if this pixel is likely first-person geometry (hands/weapons).
+// Uses depth < 0.87 (near camera) AND inside at least one FP bounding box AABB.
+// Bounding boxes are projected from BSGeometry::worldBound each frame — they track
+// weapon swings, bow draws, etc. Combining with depth eliminates distant world geometry
+// that might fall inside a box (e.g., looking down from a cliff).
+)" R"(
+// IsFirstPerson: classifies pixel for MV skip (no locomotion/rotation correction).
+// Uses depth + AABB bounding boxes — covers full weapons.
+bool IsFirstPerson(float2 pixelUV, float depth) {
+    if (depth >= 0.87)
+        return false;
+    if (fpBoxCount <= 0)
+        return true; // Fallback: depth-only when no boxes available
+    for (int i = 0; i < fpBoxCount && i < 16; i++) {
+        float4 box = fpScreenBoxes[i]; // minU, minV, maxU, maxV
+        if (pixelUV.x >= box.x && pixelUV.x <= box.z &&
+            pixelUV.y >= box.y && pixelUV.y <= box.w)
+            return true;
+    }
+    return false;
+}
+
+// GetControllerDelta: returns UV shift for controller motion prediction.
+// Uses the nearest controller's FULL delta — no distance fade.
+// Every FP pixel (hand, arm, weapon) shifts uniformly so the whole mesh
+// moves as a rigid unit. Nearest-controller selection ensures left/right
+// hand items track their respective controllers.
+float2 GetControllerDelta(float2 pixelUV) {
+    if (!hasControllerPose) return float2(0, 0);
+    float distL = length(pixelUV - controllerUV_LR.xy);
+    float distR = length(pixelUV - controllerUV_LR.zw);
+    return fpControllerScale * ((distL < distR) ? controllerDeltaL : controllerDeltaR);
 }
 
 [numthreads(8, 8, 1)]
@@ -419,15 +470,37 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
 )" R"(
     // MV residual decomposition.
-    // Skip ALL MV corrections for very close geometry (hands/weapons, d < 0.87).
+    // Skip ALL MV corrections for first-person geometry (hands/weapons).
     // Hands are camera-relative — they move with the head, not with the world.
     // The game MVs capture world motion (loco) but hands should use ONLY parallax
     // from poseDelta (head tracking). Applying loco MV to close pixels creates huge
     // offsets that shift sourceUV far away → wrong content → hands invisible.
+    //
+    // Detection: depth threshold + FP bounding box AABBs (projected from worldBound each frame).
+    float2 pixelUV = (float2(tid.xy) + 0.5) / resolution;
+    bool isWorldPixel = !IsFirstPerson(pixelUV, d);
+
     float2 mvOffset = float2(0, 0);
     float2 sourceUV = parallaxSourceUV;
 
-    if (d >= 0.87 && abs(mvConfidence) > 0.001) {
+    // For FP pixels: extract controller-only motion from game MVs.
+    // FP is camera-relative → game MVs contain ONLY head tracking + controller motion
+    // (no locomotion, no stick rotation). Subtract head-only motion (headRotMatrix)
+    // to isolate pure controller tracking. Extrapolate 1.5x.
+    if (!isWorldPixel && scatteredDepth != 0xFFFFFFFF) {
+        // FP pixels: use forward scatter source color directly.
+        // The scatter (CSDepthPreScatter) already computed the correct destination using
+        // forwardPoseDelta (head+stick) + game MV residual (controller+bone). The packed
+        // offset in atomicDepth encodes source→destination. Sampling prevColor at the
+        // scatter source gives the exact cached content with zero MV subtraction errors.
+        // No c2c, no head subtraction, no stick rotation issues.
+        int sdx = (int)((scatteredDepth >> 8) & 0xFF) - 127;
+        int sdy = (int)(scatteredDepth & 0xFF) - 127;
+        int2 scatterSrc = pixel - int2(sdx, sdy);
+        sourceUV = saturate((float2(scatterSrc) + 0.5) / resolution);
+    }
+
+    if (isWorldPixel && abs(mvConfidence) > 0.001) {
         float2 fullResidual = totalMV - headOnlyMV;
         float2 locoResidual = totalMV - c2cHeadMV;
         float2 rotComponent = fullResidual - locoResidual;
@@ -438,7 +511,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     // Depth-aware locomotion offset: replaces flat loco MV residual with depth-correct
     // parallax from the difference between c2c_with_loco and c2c_no_loco.
-    if (d >= 0.87 && hasFullWarpC2C && hasClipToClipNoLoco && abs(mvConfidence) > 0.001) {
+    if (isWorldPixel && hasFullWarpC2C && hasClipToClipNoLoco && abs(mvConfidence) > 0.001) {
         float2 baseUV = useFgAngle ? fgUV : uv;
         float2 ndc = float2(baseUV.x * 2.0 - 1.0, 1.0 - baseUV.y * 2.0);
         float4 clipPos = float4(ndc, d, 1.0);
@@ -509,6 +582,47 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         } else {
             float cachedD = depthTex[depthPixel];
             color = float4(0, 1.0 - cachedD, 0, 1); // GREEN
+        }
+    }
+
+    // Debug mode 65: first-person bounding sphere detection.
+    // Unproject pixel to rendering space, check distance to FP sphere center.
+    // RED = inside FP sphere (player model), dimmed = world.
+    if (debugMode == 65 && hasFPSphere) {
+        // Unproject pixel to view/rendering space using depth + FOV tangents
+        float linearD = LinearizeDepth(d, nearZ, farZ);
+        float scaledD = linearD * depthScale;
+        float3 viewPos = float3(tanX * scaledD, tanY * scaledD, scaledD);
+        float dist = length(viewPos - fpSphereCenter.xyz);
+        bool isFirstPerson = (dist < fpSphereRadius && d < 0.87);
+        if (isFirstPerson)
+            color = float4(1.0, color.g * 0.3, color.b * 0.3, 1); // RED = first-person
+        else
+            color = float4(color.rgb * 0.5, 1); // dimmed = world
+    }
+
+    // Debug mode 68: FP detection via depth + AABB bounding boxes.
+    if (debugMode == 68) {
+        float2 dbgUV = (float2(tid.xy) + 0.5) / resolution;
+        if (IsFirstPerson(dbgUV, d))
+            color = float4(1.0, color.g * 0.3, color.b * 0.3, 1); // RED = first-person
+        else
+            color = float4(color.rgb * 0.5, 1); // dimmed = world
+    }
+
+    // Debug mode 67: VR controller hand detection circles.
+    if (debugMode == 67 && hasControllerPose) {
+        float2 ctrls[2] = { controllerUV_LR.xy, controllerUV_LR.zw };
+        for (int h = 0; h < 2; h++) {
+            float rawDist = length(uv - ctrls[h]);
+            bool inside = rawDist < controllerRadius;
+            bool onRing = abs(rawDist - controllerRadius) < (2.0 / resolution.y);
+            if (onRing)
+                color = (h == 0) ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
+            else if (inside && d < 0.87)
+                color = float4(color.r * 0.5 + 0.25, color.g * 0.5 + 0.25, color.b * 0.5, 1);
+            else if (inside)
+                color = float4(color.r * 0.7, color.g * 0.7, color.b * 0.7 + 0.3, 1);
         }
     }
 
@@ -1007,8 +1121,9 @@ void CSBlurVoids(uint3 tid : SV_DispatchThreadID) {
     // This smooths the void↔background border without pulling in foreground.
     float4 blurred = float4(0, 0, 0, 0);
     float weight = 0;
-    [unroll] for (int dy = -3; dy <= 3; dy++) {
-        [unroll] for (int dx = -3; dx <= 3; dx++) {
+    [unroll] for (int dy = -6; dy <= 6; dy++) {
+        [unroll] for (int dx = -6; dx <= 6; dx++) {
+            if (dx*dx + dy*dy > 36) continue; // circular kernel
             int2 np = (int2)tid.xy + int2(dx, dy);
             if (any(np < 0) || np.x >= (int)resolution.x || np.y >= (int)resolution.y)
                 continue;
@@ -1019,7 +1134,7 @@ void CSBlurVoids(uint3 tid : SV_DispatchThreadID) {
                 float ndd = (float)(nd >> 16) / 65535.0;
                 if (ndd < 0.95) continue; // foreground — skip
             }
-            float w = exp(-(float)(dx*dx + dy*dy) / 8.0);
+            float w = exp(-(float)(dx*dx + dy*dy) / 24.0);
             blurred += output[np] * w;
             weight += w;
         }
@@ -1046,6 +1161,50 @@ void CSCompositeNpcForward(uint3 tid : SV_DispatchThreadID) {
         return;
 
     output[tid.xy] = npcForwardTex[tid.xy];
+}
+)";
+
+// Hand composite: overlay re-rendered FP hand pixels onto warp output.
+// Hand RT was cleared to depth=1.0 — any pixel with depth < 0.999 is a hand pixel.
+// Controller delta shifts the hand RT sampling to the warp-time controller position.
+// Since the hand RT has a transparent background, trailing-edge gaps just show through
+// to the warp output beneath — no disocclusion artifacts.
+static const char* s_handCompositeHLSL = R"(
+Texture2D<float4> handColor : register(t0);
+Texture2D<float>  handDepth : register(t1);
+RWTexture2D<float4> output  : register(u0);
+
+cbuffer HandCompositeCB : register(b0) {
+    float2 controllerDeltaL;  // UV shift for left hand (warp_UV - cached_UV)
+    float2 controllerDeltaR;  // UV shift for right hand
+    float2 controllerUV_L;    // cached-frame left controller UV
+    float2 controllerUV_R;    // cached-frame right controller UV
+    float  controllerRadius;  // hand detection radius in UV
+    float2 resolution;        // output resolution
+    float  _pad;
+};
+
+[numthreads(8, 8, 1)]
+void CSHandComposite(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    float2 uv = (float2(tid.xy) + 0.5) / resolution;
+
+    // Per-pixel controller delta: blend between L/R based on proximity
+    float distL = length(uv - (controllerUV_L + controllerDeltaL));
+    float distR = length(uv - (controllerUV_R + controllerDeltaR));
+    float2 delta = (distL < distR) ? controllerDeltaL : controllerDeltaR;
+
+    // Source pixel in hand RT (shift backward by controller delta)
+    int2 srcPx = int2((uv - delta) * resolution);
+    if (srcPx.x < 0 || srcPx.y < 0 || srcPx.x >= (int)resolution.x || srcPx.y >= (int)resolution.y)
+        return;
+
+    float hd = handDepth[srcPx];
+    if (hd < 0.999) {
+        output[tid.xy] = handColor[srcPx];
+    }
 }
 )";
 
@@ -1086,13 +1245,12 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
     float depthFade = (nearFadeDepth > 0.0) ? saturate((linearDepth - nearFadeDepth) / nearFadeDepth) : 1.0;
     dstUV = lerp(srcUV, dstUV, depthFade);
 
-    // Step 2: Add MV residual (loco + stick rotation + NPC animation).
-    // Skip for very close geometry (hands/weapons, d < 0.87): they're camera-relative
-    // and don't move on screen during loco/rotation. The game MVs at hand positions
-    // capture world motion (loco) but hands should only use forwardPoseDelta (head tracking).
-    // Hands DO move when physically tracked (head turn, controller movement) — forwardPoseDelta
-    // handles that. The MV residual would incorrectly shift them by the loco amount.
-    if (abs(mvConfidence) > 0.001 && d >= 0.87) {
+    // Step 2: Add MV residual for scatter destination.
+    // FP pixels: per-pixel game MV residual (totalMV - headOnlyMV) captures controller
+    // motion + bone animation. Scatter to predicted position so CSMain has depth coverage.
+    // World pixels: loco + stick rotation + NPC animation as before.
+    bool isFPScatter = IsFirstPerson(srcUV, d);
+    if (abs(mvConfidence) > 0.001) {
         float2 rawMV = mvTex[ToMVCoord(srcPixel)];
         float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
         float4 rotated = mul(headRotMatrix, float4(viewPos, 1.0));
@@ -1102,7 +1260,12 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
                 (rotated.x / rotated.z - fovTanLeft) / (fovTanRight - fovTanLeft),
                 (rotated.y / rotated.z - fovTanUp) / (fovTanDown - fovTanUp)) - srcUV;
         }
-        dstUV -= mvConfidence * (totalMV - headOnlyMV);
+        if (isFPScatter) {
+            float2 fpResidual = totalMV - headOnlyMV;
+            dstUV -= 1.5 * fpResidual;
+        } else {
+            dstUV -= mvConfidence * (totalMV - headOnlyMV);
+        }
     }
 
     float2 dstPx = dstUV * resolution;
@@ -1442,6 +1605,7 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	std::string fullShaderSrc = csMainSrc + s_forwardScatterHLSL;
 	std::string npcShaderSrc  = csMainSrc + s_npcScatterHLSL;
 	std::string compositeStr  = std::string(s_npcForwardCompositeHLSL);
+	std::string handCompStr   = std::string(s_handCompositeHLSL);
 
 	DWORD flags = D3DCOMPILE_PACK_MATRIX_ROW_MAJOR | D3DCOMPILE_ENABLE_STRICTNESS;
 #ifdef _DEBUG
@@ -1455,7 +1619,8 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	static const char* entryPoints[] = {
 		"CSMain", "CSClear", "CSForwardDepth", "CSForwardColor",
 		"CSForwardDepthNpcOnly", "CSForwardColorNpcOnly", "CSDilate",
-		"CSCompositeNpcForward", "CSNpcDepthScatter", "CSDepthPreScatter", "CSBlurVoids"
+		"CSCompositeNpcForward", "CSNpcDepthScatter", "CSDepthPreScatter", "CSBlurVoids",
+		"CSHandComposite"
 	};
 	constexpr int kJobCount = _countof(entryPoints);
 	m_pendingBlobs.resize(kJobCount);
@@ -1466,12 +1631,13 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	}
 
 	// Source string to use for each entry point (by index)
-	// 0=csMainSrc, 1-6=fullShaderSrc, 7=compositeStr, 8-9=npcShaderSrc, 10=fullShaderSrc
+	// 0=csMainSrc, 1-6=fullShaderSrc, 7=compositeStr, 8-9=npcShaderSrc, 10=fullShaderSrc, 11=handCompStr
 	struct SourceMap { int blobIdx; const std::string* src; };
 	SourceMap srcMap[] = {
 		{0, &csMainSrc}, {1, &fullShaderSrc}, {2, &fullShaderSrc}, {3, &fullShaderSrc},
 		{4, &fullShaderSrc}, {5, &fullShaderSrc}, {6, &fullShaderSrc},
-		{7, &compositeStr}, {8, &npcShaderSrc}, {9, &npcShaderSrc}, {10, &fullShaderSrc}
+		{7, &compositeStr}, {8, &npcShaderSrc}, {9, &npcShaderSrc}, {10, &fullShaderSrc},
+		{11, &handCompStr}
 	};
 
 	// Launch a single background thread that compiles all shaders in parallel internally.
@@ -1482,13 +1648,15 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 		 fullShaderSrc = std::move(fullShaderSrc),
 		 npcShaderSrc = std::move(npcShaderSrc),
 		 compositeStr = std::move(compositeStr),
+		 handCompStr = std::move(handCompStr),
 		 flags]() {
 		const std::string* sources[] = {
 			&csMainSrc, &fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
 			&fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
-			&compositeStr, &npcShaderSrc, &npcShaderSrc, &fullShaderSrc
+			&compositeStr, &npcShaderSrc, &npcShaderSrc, &fullShaderSrc,
+			&handCompStr
 		};
-		constexpr int N = 11;
+		constexpr int N = 12;
 
 		// Launch parallel sub-tasks for each shader
 		std::vector<std::future<void>> futures;
@@ -1530,6 +1698,7 @@ void ASWProvider::TryFinishShaderCompilation()
 	    &m_clearCS, &m_forwardDepthCS, &m_forwardColorCS,
 	    &m_forwardDepthNpcOnlyCS, &m_forwardColorNpcOnlyCS, &m_dilateCS,
 	    &m_compositeNpcForwardCS, &m_npcDepthScatterCS, &m_depthPreScatterCS, &m_blurVoidsCS,
+	    &m_handCompositeCS,      // [11] CSHandComposite
 	};
 	const int kJobCount = (int)m_pendingBlobs.size();
 	bool csMainOk = false;
@@ -1588,8 +1757,120 @@ void ASWProvider::TryFinishShaderCompilation()
 		return;
 	}
 
+	// Create hand render targets + replay CBs for FP hand re-rendering
+	if (!CreateHandRenderTargets(m_device, m_renderWidth, m_renderHeight)) {
+		OOVR_LOG("ASW: Hand render targets failed (non-fatal — FP replay disabled)");
+	}
+
 	m_ready = true;
 	OOVR_LOG("ASW: Shaders compiled and ready — ASW active");
+}
+
+bool ASWProvider::CreateHandRenderTargets(ID3D11Device* device, uint32_t w, uint32_t h)
+{
+	HRESULT hr;
+
+	// Per-eye hand color RT (RGBA8)
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w; td.Height = h;
+	td.MipLevels = 1; td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+	D3D11_TEXTURE2D_DESC dd = {};
+	dd.Width = w; dd.Height = h;
+	dd.MipLevels = 1; dd.ArraySize = 1;
+	dd.Format = DXGI_FORMAT_R32_TYPELESS; // TYPELESS allows both D32_FLOAT DSV and R32_FLOAT SRV
+	dd.SampleDesc.Count = 1; dd.Usage = D3D11_USAGE_DEFAULT;
+	dd.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+
+	for (int eye = 0; eye < 2; eye++) {
+		hr = device->CreateTexture2D(&td, nullptr, &m_handColor[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand color RT failed hr=0x%08x", (unsigned)hr); return false; }
+
+		D3D11_RENDER_TARGET_VIEW_DESC rtvd = {};
+		rtvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		hr = device->CreateRenderTargetView(m_handColor[eye], &rtvd, &m_handRTV[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand RTV failed hr=0x%08x", (unsigned)hr); return false; }
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+		srvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvd.Texture2D.MipLevels = 1;
+		hr = device->CreateShaderResourceView(m_handColor[eye], &srvd, &m_srvHandColor[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand color SRV failed hr=0x%08x", (unsigned)hr); return false; }
+
+		hr = device->CreateTexture2D(&dd, nullptr, &m_handDepthTex[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand depth tex failed hr=0x%08x", (unsigned)hr); return false; }
+
+		D3D11_DEPTH_STENCIL_VIEW_DESC dsvd = {};
+		dsvd.Format = DXGI_FORMAT_D32_FLOAT;
+		dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+		hr = device->CreateDepthStencilView(m_handDepthTex[eye], &dsvd, &m_handDSV[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand DSV failed hr=0x%08x", (unsigned)hr); return false; }
+
+		// SRV on D32_FLOAT (read as R32_FLOAT)
+		D3D11_SHADER_RESOURCE_VIEW_DESC dsrvd = {};
+		dsrvd.Format = DXGI_FORMAT_R32_FLOAT;
+		dsrvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		dsrvd.Texture2D.MipLevels = 1;
+		hr = device->CreateShaderResourceView(m_handDepthTex[eye], &dsrvd, &m_srvHandDepth[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand depth SRV failed hr=0x%08x", (unsigned)hr); return false; }
+	}
+
+	// Depth stencil state for hand replay: LESS_EQUAL, depth write enabled
+	D3D11_DEPTH_STENCIL_DESC dssd = {};
+	dssd.DepthEnable = TRUE;
+	dssd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+	dssd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+	dssd.StencilEnable = FALSE;
+	hr = device->CreateDepthStencilState(&dssd, &m_handDSS);
+	if (FAILED(hr)) { OOVR_LOGF("ASW: hand DSS failed hr=0x%08x", (unsigned)hr); return false; }
+
+	// Pre-allocate replay constant buffers
+	for (int i = 0; i < 7; i++) {
+		D3D11_BUFFER_DESC cbd = {};
+		cbd.ByteWidth = (kReplayCBSizes[i] + 15) & ~15; // 16-byte aligned
+		cbd.Usage = D3D11_USAGE_DEFAULT;
+		cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		hr = device->CreateBuffer(&cbd, nullptr, &m_replayCB[i]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: replay CB[%d] (slot %d, %u bytes) failed hr=0x%08x",
+				i, kReplayCBSlots[i], kReplayCBSizes[i], (unsigned)hr);
+			return false;
+		}
+	}
+	// PS replay CBs (256 bytes each)
+	for (int i = 0; i < 3; i++) {
+		D3D11_BUFFER_DESC cbd = {};
+		cbd.ByteWidth = 256;
+		cbd.Usage = D3D11_USAGE_DEFAULT;
+		cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		hr = device->CreateBuffer(&cbd, nullptr, &m_replayPSCB[i]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: replay PSCB[%d] failed hr=0x%08x", i, (unsigned)hr);
+			return false;
+		}
+	}
+
+	// Hand composite CB
+	{
+		D3D11_BUFFER_DESC cbd = {};
+		cbd.ByteWidth = (sizeof(HandCompositeConstants) + 15) & ~15;
+		cbd.Usage = D3D11_USAGE_DYNAMIC;
+		cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		hr = device->CreateBuffer(&cbd, nullptr, &m_handCompositeCB);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: hand composite CB failed hr=0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	OOVR_LOGF("ASW: Hand render targets created (%ux%u per eye)", w, h);
+	return true;
 }
 
 bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
@@ -1657,6 +1938,37 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 			}
 			if (FAILED(hr)) {
 				OOVR_LOGF("ASW: CreateSRV depth[%u][%d] failed", slot, eye);
+				return false;
+			}
+
+			// Cached stencil (R8_UINT — extracted from R24G8 depth-stencil)
+			desc.Format = DXGI_FORMAT_R8_UINT;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			desc.MiscFlags = 0;
+			hr = device->CreateTexture2D(&desc, nullptr, &m_cachedStencil[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateTexture2D stencil[%u][%d] R8_UINT failed hr=0x%08X", slot, eye, hr);
+				return false;
+			}
+			srvDesc.Format = DXGI_FORMAT_R8_UINT;
+			hr = device->CreateShaderResourceView(m_cachedStencil[slot][eye], &srvDesc, &m_srvStencil[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateSRV stencil[%u][%d] failed", slot, eye);
+				return false;
+			}
+
+			// Cached FP mask (R8_UINT from SKSE DS→DS depth comparison)
+			desc.Format = DXGI_FORMAT_R8_UINT;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			hr = device->CreateTexture2D(&desc, nullptr, &m_cachedPreFPDepth[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateTexture2D fpMask[%u][%d] failed hr=0x%08X", slot, eye, hr);
+				return false;
+			}
+			srvDesc.Format = DXGI_FORMAT_R8_UINT;
+			hr = device->CreateShaderResourceView(m_cachedPreFPDepth[slot][eye], &srvDesc, &m_srvPreFPDepth[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateSRV fpMask[%u][%d] failed", slot, eye);
 				return false;
 			}
 
@@ -1889,6 +2201,19 @@ static bool SafeBridgeCopy(ID3D11DeviceContext* ctx,
 	}
 }
 
+void ASWProvider::CachePreFPDepth(int eye, ID3D11DeviceContext* ctx,
+    ID3D11Texture2D* preFPR32F, const D3D11_BOX* region)
+{
+	if (!m_ready || eye < 0 || eye > 1 || !preFPR32F || !region) return;
+	const int slot = m_buildSlot;
+	if (!m_cachedPreFPDepth[slot][eye]) return;
+
+	if (!SafeBridgeCopy(ctx, m_cachedPreFPDepth[slot][eye], 0, 0, 0, 0,
+	        preFPR32F, 0, region)) {
+		OOVR_LOG("ASW: TOCTOU - preFPDepth texture freed during copy");
+	}
+}
+
 void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
     ID3D11Texture2D* colorTex, const D3D11_BOX* colorRegion,
     ID3D11Texture2D* mvTex, const D3D11_BOX* mvRegion,
@@ -1991,6 +2316,250 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	}
 }
 
+void ASWProvider::CacheStencil(int eye, ID3D11DeviceContext* ctx,
+    ID3D11Texture2D* stencilTex, const D3D11_BOX* stencilRegion)
+{
+	if (!m_ready || eye < 0 || eye > 1 || !stencilTex || !stencilRegion)
+		return;
+	// CacheStencil is called AFTER CacheFrame. For eye 0, the build slot hasn't
+	// advanced yet (CacheFrame only advances on eye 1). For eye 1, we've already
+	// advanced — use the PREVIOUS slot (which is the just-published slot).
+	int slot = (eye == 1)
+	    ? m_publishedSlot.load(std::memory_order_acquire)
+	    : m_buildSlot;
+	if (slot < 0 || slot >= (int)kAswCacheSlotCount)
+		return;
+	if (!SafeBridgeCopy(ctx, m_cachedStencil[slot][eye], 0, 0, 0, 0,
+	        stencilTex, 0, stencilRegion)) {
+		static int s_count = 0;
+		if (s_count++ < 3)
+			OOVR_LOG("ASW: stencil copy failed");
+	}
+}
+
+// ── FP Hand Replay: re-render captured FP draws with updated View matrix ──
+// Called per-eye from WarpFrame after the main warp dispatches.
+// Renders to m_handColor/m_handDepth, then composites onto m_warpedOutput.
+bool ASWProvider::ReplayFPHands(int eye, ID3D11DeviceContext* ctx,
+    const float* forwardPoseDelta, const HandCompositeConstants& hcc)
+{
+	if (!m_fpReplayPtr || !m_handRTV[eye] || !m_handDSV[eye] || !m_handCompositeCS)
+		return false;
+
+	int readIdx = m_fpReplayPtr->readyIdx.load(std::memory_order_acquire);
+	if (readIdx < 0 || readIdx >= FPReplayData::NUM_BUFS)
+		return false;
+
+	auto& cs = m_fpReplayPtr->sets[readIdx];
+	if (cs.drawCount <= 0 || !cs.hasCB12)
+		return false;
+
+	static int s_replayLog = 0;
+	bool doLog = (s_replayLog < 20 && eye == 0);
+
+	// Build patched CB[12]: overwrite CameraView[0] with new View for this eye.
+	//
+	// CB[12] (FrameBufferVR) layout — column-major float4x3 (4 rows × 3 cols = 48 bytes each):
+	//   CameraView[0]: bytes 0-47   (12 floats) — column-major 4x3
+	//   CameraView[1]: bytes 48-95  (12 floats)
+	//   CameraProj[0]: bytes 96-143 (12 floats)
+	//   CameraProj[1]: bytes 144-191 (12 floats)
+	//
+	// Column-major float4x3 memory layout (3 columns of float4):
+	//   Col 0: [R00, R10, R20, Tx]  — rotation column 0 + translation X
+	//   Col 1: [R01, R11, R21, Ty]  — rotation column 1 + translation Y
+	//   Col 2: [R02, R12, R22, Tz]  — rotation column 2 + translation Z
+	//
+	// Row-vector shader convention: viewPos = mul(float4(worldPos,1), CameraView)
+	// = float3(dot(col0, wp4), dot(col1, wp4), dot(col2, wp4))
+	static constexpr int kViewBytes = 48;   // 12 floats per View matrix
+	static constexpr int kProjOffset = 96;  // CameraProj[0] starts at byte 96
+
+	uint8_t patchedCB12[1408];
+	memcpy(patchedCB12, cs.cb12, 1408);
+
+	const float* cachedView = reinterpret_cast<const float*>(&cs.cb12[eye * kViewBytes]);
+	const float* cachedProj = reinterpret_cast<const float*>(&cs.cb12[kProjOffset + eye * kViewBytes]);
+
+	// Apply forwardPoseDelta to compute newView for warp-time head pose.
+	//
+	// forwardPoseDelta (4×4 row-major) transforms cached eye → new eye:
+	//   p_new = delta * p_cached  (column-vector, our internal convention)
+	//
+	// CameraView is column-major float4x3 used with row-vector mul:
+	//   viewPos = mul(float4(worldPos, 1), CameraView)
+	//   = float3(dot(col0, wp4), dot(col1, wp4), dot(col2, wp4))
+	//
+	// The View matrix V maps world → eye.  We want V_new = delta * V_cached.
+	// But V is 4×3 (column-major). Expand to 4×4 by adding row [0,0,0,1]:
+	//   V_4x4 = | col0  col1  col2  [0,0,0,1]^T |
+	// Then V_new_4x4 = delta * V_4x4 and extract first 3 columns.
+	//
+	// For each output column j (j=0,1,2):
+	//   newCol_j[i] = sum_k delta[i][k] * cachedCol_j[k]   for i=0..3
+	// where delta is row-major: delta[i][k] = forwardPoseDelta[i*4+k]
+	// and cachedCol_j = cachedView[j*4 .. j*4+3]
+	float newView[12]; // 3 columns of float4
+	for (int col = 0; col < 3; col++) {
+		for (int row = 0; row < 4; row++) {
+			float sum = 0.0f;
+			for (int k = 0; k < 4; k++)
+				sum += forwardPoseDelta[row * 4 + k] * cachedView[col * 4 + k];
+			newView[col * 4 + row] = sum;
+		}
+	}
+
+	// Write newView into CameraView[0] (bytes 0-47)
+	memcpy(&patchedCB12[0], newView, kViewBytes);
+	// Write this eye's Proj into CameraProj[0] (bytes 96-143)
+	memcpy(&patchedCB12[kProjOffset], cachedProj, kViewBytes);
+
+	if (doLog) {
+		const float* cv = cachedView;
+		const float* nv = newView;
+		OOVR_LOGF("FPReplay[%d]: cachedView col0=[%.3f %.3f %.3f %.1f] col1=[%.3f %.3f %.3f %.1f] col2=[%.3f %.3f %.3f %.1f]",
+			eye, cv[0],cv[1],cv[2],cv[3], cv[4],cv[5],cv[6],cv[7], cv[8],cv[9],cv[10],cv[11]);
+		OOVR_LOGF("FPReplay[%d]: newView    col0=[%.3f %.3f %.3f %.1f] col1=[%.3f %.3f %.3f %.1f] col2=[%.3f %.3f %.3f %.1f]",
+			eye, nv[0],nv[1],nv[2],nv[3], nv[4],nv[5],nv[6],nv[7], nv[8],nv[9],nv[10],nv[11]);
+		OOVR_LOGF("FPReplay[%d]: fwdDelta row0=[%.5f %.5f %.5f %.5f]",
+			eye, forwardPoseDelta[0], forwardPoseDelta[1], forwardPoseDelta[2], forwardPoseDelta[3]);
+		OOVR_LOGF("FPReplay[%d]: replaying %d draws", eye, cs.drawCount);
+	}
+
+	// Upload patched CB[12] to replay buffer
+	ctx->UpdateSubresource(m_replayCB[5], 0, nullptr, patchedCB12, 0, 0); // index 5 = CB[12]
+
+	// Clear hand RT
+	FLOAT clearColor[4] = { 0, 0, 0, 0 };
+	ctx->ClearRenderTargetView(m_handRTV[eye], clearColor);
+	ctx->ClearDepthStencilView(m_handDSV[eye], D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+	// Set viewport
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)m_renderWidth;
+	vp.Height = (float)m_renderHeight;
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &vp);
+
+	// Bind hand RT + DSV
+	ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	rtvs[0] = m_handRTV[eye];
+	ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, m_handDSV[eye]);
+
+	// Replay each captured FP draw
+	int replayed = 0;
+	for (int i = 0; i < cs.drawCount && i < FPReplayData::MAX_DRAWS; i++) {
+		const auto& draw = cs.draws[i];
+		if (!draw.valid || draw.indexCount == 0)
+			continue;
+
+		// IA state
+		ctx->IASetIndexBuffer(draw.ib, draw.ibFmt, draw.ibOff);
+		ctx->IASetVertexBuffers(0, 1, const_cast<ID3D11Buffer* const*>(&draw.vb),
+			&draw.vbStride, &draw.vbOff);
+		ctx->IASetInputLayout(draw.il);
+		ctx->IASetPrimitiveTopology(draw.topo);
+
+		// VS + PS shaders
+		ctx->VSSetShader(draw.vs, nullptr, 0);
+		ctx->PSSetShader(draw.ps, nullptr, 0);
+
+		// Per-draw VS CBs: upload byte snapshots to pre-allocated buffers
+		if (draw.hasCB0) ctx->UpdateSubresource(m_replayCB[0], 0, nullptr, draw.cb0, 0, 0);
+		if (draw.hasCB1) ctx->UpdateSubresource(m_replayCB[1], 0, nullptr, draw.cb1, 0, 0);
+		if (draw.hasCB2) ctx->UpdateSubresource(m_replayCB[2], 0, nullptr, draw.cb2, 0, 0);
+		if (draw.hasCB9) ctx->UpdateSubresource(m_replayCB[3], 0, nullptr, draw.cb9, 0, 0);
+		if (draw.hasCB10) ctx->UpdateSubresource(m_replayCB[4], 0, nullptr, draw.cb10, 0, 0);
+		if (draw.hasCB13) ctx->UpdateSubresource(m_replayCB[6], 0, nullptr, draw.cb13, 0, 0);
+
+		// Bind VS CBs to proper slots
+		// Slots: 0, 1, 2, 9, 10, 12, 13
+		ID3D11Buffer* vsCBBinds[14] = {};
+		if (draw.hasCB0) vsCBBinds[0] = m_replayCB[0];
+		if (draw.hasCB1) vsCBBinds[1] = m_replayCB[1];
+		if (draw.hasCB2) vsCBBinds[2] = m_replayCB[2];
+		if (draw.hasCB9) vsCBBinds[9] = m_replayCB[3];
+		if (draw.hasCB10) vsCBBinds[10] = m_replayCB[4];
+		vsCBBinds[12] = m_replayCB[5]; // always bind patched CB[12]
+		if (draw.hasCB13) vsCBBinds[13] = m_replayCB[6];
+		ctx->VSSetConstantBuffers(0, 14, vsCBBinds);
+
+		// PS SRVs + samplers
+		ctx->PSSetShaderResources(0, 8, const_cast<ID3D11ShaderResourceView* const*>(draw.psSRVs));
+		ctx->PSSetSamplers(0, 4, const_cast<ID3D11SamplerState* const*>(draw.psSamplers));
+
+		// PS CBs
+		if (draw.hasPSCB0) ctx->UpdateSubresource(m_replayPSCB[0], 0, nullptr, draw.psCB0, 0, 0);
+		if (draw.hasPSCB1) ctx->UpdateSubresource(m_replayPSCB[1], 0, nullptr, draw.psCB1, 0, 0);
+		if (draw.hasPSCB2) ctx->UpdateSubresource(m_replayPSCB[2], 0, nullptr, draw.psCB2, 0, 0);
+		ID3D11Buffer* psCBBinds[3] = {};
+		if (draw.hasPSCB0) psCBBinds[0] = m_replayPSCB[0];
+		if (draw.hasPSCB1) psCBBinds[1] = m_replayPSCB[1];
+		if (draw.hasPSCB2) psCBBinds[2] = m_replayPSCB[2];
+		ctx->PSSetConstantBuffers(0, 3, psCBBinds);
+
+		// OM: our own DSS for depth testing, capture's blend state
+		ctx->OMSetDepthStencilState(m_handDSS, 0);
+		if (draw.blendState)
+			ctx->OMSetBlendState(draw.blendState, draw.blendFactor, draw.sampleMask);
+
+		// RS
+		if (draw.rs)
+			ctx->RSSetState(draw.rs);
+
+		// Draw (instanceCount=1 for single-eye)
+		ctx->DrawIndexed(draw.indexCount, draw.startIndex, draw.baseVertex);
+		replayed++;
+	}
+
+	// Unbind hand RT
+	ID3D11RenderTargetView* nullRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullRTVs, nullptr);
+
+	if (replayed == 0)
+		return false;
+
+	// Composite hand pixels onto warp output via CS, with controller delta shift
+	{
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		if (SUCCEEDED(ctx->Map(m_handCompositeCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+			memcpy(mapped.pData, &hcc, sizeof(hcc));
+			ctx->Unmap(m_handCompositeCB, 0);
+		}
+
+		ID3D11ShaderResourceView* handSRVs[] = { m_srvHandColor[eye], m_srvHandDepth[eye] };
+		ctx->CSSetShaderResources(0, 2, handSRVs);
+		ID3D11UnorderedAccessView* compUAV[] = { m_uavOutput[eye] };
+		ctx->CSSetUnorderedAccessViews(0, 1, compUAV, nullptr);
+		ID3D11Buffer* cbs[] = { m_handCompositeCB };
+		ctx->CSSetConstantBuffers(0, 1, cbs);
+		ctx->CSSetShader(m_handCompositeCS, nullptr, 0);
+
+		uint32_t groupsX = (m_renderWidth + 7) / 8;
+		uint32_t groupsY = (m_renderHeight + 7) / 8;
+		ctx->Dispatch(groupsX, groupsY, 1);
+
+		// Unbind
+		ID3D11ShaderResourceView* nullSRVs[2] = {};
+		ID3D11UnorderedAccessView* nullUAVs[1] = {};
+		ID3D11Buffer* nullCBs[1] = {};
+		ctx->CSSetShaderResources(0, 2, nullSRVs);
+		ctx->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
+		ctx->CSSetConstantBuffers(0, 1, nullCBs);
+		ctx->CSSetShader(nullptr, nullptr, 0);
+	}
+
+	if (doLog) {
+		s_replayLog++;
+		OOVR_LOGF("FPReplay[%d]: replayed %d draws, composite dispatched (%ux%u) ctrlDelta L=(%.4f,%.4f) R=(%.4f,%.4f)",
+			eye, replayed, m_renderWidth, m_renderHeight,
+			hcc.controllerDeltaL[0], hcc.controllerDeltaL[1],
+			hcc.controllerDeltaR[0], hcc.controllerDeltaR[1]);
+	}
+
+	return true;
+}
 
 bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 {
@@ -2290,11 +2859,243 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	// NPC-only forward scatter overlay handles moving NPCs with correct depth ordering.
 	const bool useForwardScatterForMotion = false;
 
+	// ── Controller hand detection (pre-projected at CacheFrame time) ──
+	cb.hasControllerPose = 0;
+	if (m_slotHasControllerUV[slot][eye]) {
+		cb.controllerUV_LR[0] = m_slotControllerUV[slot][eye][0][0];
+		cb.controllerUV_LR[1] = m_slotControllerUV[slot][eye][0][1];
+		cb.controllerUV_LR[2] = m_slotControllerUV[slot][eye][1][0];
+		cb.controllerUV_LR[3] = m_slotControllerUV[slot][eye][1][1];
+		cb.controllerRadius = m_slotControllerRadius[slot];
+		cb.hasControllerPose = 1;
+	}
+	// Compute controller UV delta for FP hand prediction.
+	// Project current controller positions using the CACHED-FRAME head pose, not warp-time.
+	// This way the delta captures ONLY controller movement relative to head —
+	// head rotation/translation is already handled by parallaxSourceUV (poseDeltaMatrix).
+	cb.controllerDeltaL[0] = cb.controllerDeltaL[1] = 0.0f;
+	cb.controllerDeltaR[0] = cb.controllerDeltaR[1] = 0.0f;
+
+	// Compute FP controller scale from timing.
+	// Controller delta spans cache_time → now (warp read time).
+	// With N-1 warping, cache is ~1 period old, so delta ≈ 1 period of motion.
+	// The warp frame displays at the midpoint between game frames = 0.5 periods
+	// after the latest game frame = (cacheAge - 0.5*period) from cache time.
+	// Since cacheAge ≈ period: display offset ≈ 0.5 * cacheAge.
+	// Scale = displayOffset / cacheAge = 0.5 * (cacheAge + jitter) / cacheAge.
+	// The autoScale term captures the timing jitter (typically 1.0-1.2).
+	{
+		auto now = std::chrono::steady_clock::now();
+		float cacheAgeMs = std::chrono::duration<float, std::milli>(now - m_slotTimestamp[slot]).count();
+		// previousPublished is N-1; the published slot (N) is one period newer.
+		// Display time is 0.5 periods after slot N = cacheAge - 0.5*period from cache.
+		// Estimate period from the gap between published and previousPublished timestamps.
+		int pubSlot = m_publishedSlot.load(std::memory_order_acquire);
+		float periodMs = cacheAgeMs; // fallback: assume cacheAge ≈ period
+		if (pubSlot >= 0 && pubSlot != slot) {
+			float pubAgeMs = std::chrono::duration<float, std::milli>(now - m_slotTimestamp[pubSlot]).count();
+			periodMs = cacheAgeMs - pubAgeMs; // time between N-1 and N
+			if (periodMs < 5.0f) periodMs = cacheAgeMs; // fallback
+		}
+		float displayOffsetMs = cacheAgeMs - 0.5f * periodMs;
+		float scale = (cacheAgeMs > 1.0f) ? (displayOffsetMs / cacheAgeMs) : 0.5f;
+		scale = (scale < 0.2f) ? 0.2f : (scale > 1.0f) ? 1.0f : scale; // clamp
+		cb.fpControllerScale = scale;
+	}
+	if (cb.hasControllerPose && m_controllerValid[0] && m_controllerValid[1]) {
+		const XrPosef& cachedPose = m_slotPose[slot][eye];
+		// Log cached vs current controller positions to verify delta
+		{
+			static int s_deltaLog = 0;
+			if (s_deltaLog++ < 20 && eye == 0) {
+				// Cached controller positions were stored via SetSlotControllerUV at CacheFrame time.
+				// m_controllerPos is from the LATEST WaitGetPoses call.
+				OOVR_LOGF("CtrlDelta: slot=%d cachedUV_L=(%.4f,%.4f) cachedUV_R=(%.4f,%.4f) "
+				    "ctrlPos_L=(%.3f,%.3f,%.3f) ctrlPos_R=(%.3f,%.3f,%.3f) "
+				    "cachedHead=(%.3f,%.3f,%.3f)",
+				    slot,
+				    cb.controllerUV_LR[0], cb.controllerUV_LR[1],
+				    cb.controllerUV_LR[2], cb.controllerUV_LR[3],
+				    m_controllerPos[0][0], m_controllerPos[0][1], m_controllerPos[0][2],
+				    m_controllerPos[1][0], m_controllerPos[1][1], m_controllerPos[1][2],
+				    cachedPose.position.x, cachedPose.position.y, cachedPose.position.z);
+			}
+		}
+		XrQuaternionf qi = { -cachedPose.orientation.x, -cachedPose.orientation.y,
+		    -cachedPose.orientation.z, cachedPose.orientation.w };
+		float fovL = cb.fovTanLeft, fovR = cb.fovTanRight;
+		float fovU = cb.fovTanUp, fovD = cb.fovTanDown;
+		float vOffset = 0.07f;
+		for (int h = 0; h < 2; h++) {
+			float cx = m_controllerPos[h][0], cy = m_controllerPos[h][1], cz = m_controllerPos[h][2];
+			// Relative to CACHED head position (same frame as controllerUV_LR)
+			float rx = cx - cachedPose.position.x;
+			float ry = cy - cachedPose.position.y;
+			float rz = cz - cachedPose.position.z;
+			// Rotate by inverse CACHED head orientation → view space
+			float qx = qi.x, qy = qi.y, qz = qi.z, qw = qi.w;
+			float tx = 2.0f * (qy * rz - qz * ry);
+			float ty = 2.0f * (qz * rx - qx * rz);
+			float tz = 2.0f * (qx * ry - qy * rx);
+			float vx = rx + qw * tx + (qy * tz - qz * ty);
+			float vy = ry + qw * ty + (qz * tx - qx * tz);
+			float vz = rz + qw * tz + (qx * ty - qy * tx);
+			if (vz > -0.01f) continue;
+			float tanX = vx / (-vz);
+			float tanY = vy / (-vz);
+			float nowU = (tanX - fovL) / (fovR - fovL);
+			float nowV = (tanY - fovU) / (fovD - fovU) + vOffset;
+			// Delta = current controller UV (in cached head space) - cached-frame UV
+			// This is purely controller-relative-to-head motion.
+			if (h == 0) {
+				cb.controllerDeltaL[0] = nowU - cb.controllerUV_LR[0];
+				cb.controllerDeltaL[1] = nowV - cb.controllerUV_LR[1];
+			} else {
+				cb.controllerDeltaR[0] = nowU - cb.controllerUV_LR[2];
+				cb.controllerDeltaR[1] = nowV - cb.controllerUV_LR[3];
+			}
+		}
+		{
+			static int s_deltaLog2 = 0;
+			if (s_deltaLog2++ < 20 && eye == 0) {
+				OOVR_LOGF("CtrlDeltaUV: dL=(%.5f,%.5f) dR=(%.5f,%.5f) px_dL=(%.1f,%.1f) px_dR=(%.1f,%.1f)",
+				    cb.controllerDeltaL[0], cb.controllerDeltaL[1],
+				    cb.controllerDeltaR[0], cb.controllerDeltaR[1],
+				    cb.controllerDeltaL[0] * cb.resolution[0], cb.controllerDeltaL[1] * cb.resolution[1],
+				    cb.controllerDeltaR[0] * cb.resolution[0], cb.controllerDeltaR[1] * cb.resolution[1]);
+			}
+		}
+	}
+
+	// ── First-person bounding sphere (world-space distance test) ──
+	// Read worldBound from FP root NiAVObject, subtract posAdjust for rendering space.
+	// posAdjust is at RSS base + 0x3A4 (EYE_POSITION<NiPoint3, 2>).
+	cb.hasFPSphere = 0;
+	if (m_firstPersonRootPtr && m_rssViewMatPtr) {
+		const uint8_t* fpNode = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(m_firstPersonRootPtr));
+		const float* bc = reinterpret_cast<const float*>(fpNode + 0xE4); // worldBound.center
+		float br = *reinterpret_cast<const float*>(fpNode + 0xF0);       // worldBound.radius
+
+		// posAdjust: rssViewMatPtr = rssBase + 0x3E0 + 1*0x250 + 0x30
+		// posAdjust for eye 0 = rssBase + 0x3A4
+		// offset from rssViewMatPtr: 0x3A4 - (0x3E0 + 0x250 + 0x30) = 0x3A4 - 0x660 = -0x2BC
+		const float* posAdj = reinterpret_cast<const float*>(
+		    reinterpret_cast<const uint8_t*>(m_rssViewMatPtr) - 0x2BC + eye * 12);
+
+		if (br > 0.1f && br < 500.0f) {
+			cb.fpSphereCenter[0] = bc[0] - posAdj[0];
+			cb.fpSphereCenter[1] = bc[1] - posAdj[1];
+			cb.fpSphereCenter[2] = bc[2] - posAdj[2];
+			cb.fpSphereCenter[3] = 0.0f; // padding
+			cb.fpSphereRadius = br * 1.5f; // scale up to cover fully extended arms + weapons
+			cb.hasFPSphere = 1;
+
+			static int s_fpLog = 0;
+			if (s_fpLog++ < 5 && eye == 0) {
+				OOVR_LOGF("FPSphere: center=(%.1f,%.1f,%.1f) r=%.1f posAdj=(%.1f,%.1f,%.1f)",
+				    cb.fpSphereCenter[0], cb.fpSphereCenter[1], cb.fpSphereCenter[2], br,
+				    posAdj[0], posAdj[1], posAdj[2]);
+			}
+		}
+	}
+
+	// ── Pre-FP depth availability ──
+	cb.hasPreFPDepth = (m_srvPreFPDepth[slot][eye] != nullptr &&
+	                    m_cachedPreFPDepth[slot][eye] != nullptr) ? 1 : 0;
+
+	// ── FP bounding box projection (world spheres → screen AABBs) ──
+	cb.fpBoxCount = 0;
+	// Project per-geometry FP bounds to screen-space AABBs — read LIVE from game memory
+	if (m_rssViewMatPtr && m_fpGeomCount > 0) {
+		const float* posAdj = reinterpret_cast<const float*>(
+		    reinterpret_cast<const uint8_t*>(m_rssViewMatPtr) - 0x2BC + eye * 12);
+		// RSS VP: row-major, row-vector convention (clip = v * M)
+		// m_rssViewMatPtr = rssBase + 0x3E0 + 1*0x250 + 0x30 (eye 1 view matrix)
+		// VP for eye e = rssBase + 0x3E0 + e*0x250 + 0x130
+		// offset from m_rssViewMatPtr: (e-1)*0x250 + (0x130-0x30) = (e-1)*0x250 + 0x100
+		float vp[16];
+		memcpy(vp, reinterpret_cast<const uint8_t*>(m_rssViewMatPtr) + (eye - 1) * 0x250 + 0x100, sizeof(vp));
+		// vp is now row-major (RSS convention). For v*M: clip = [x,y,z,1] * vp
+
+		int boxCount = 0;
+		for (uint32_t i = 0; i < m_fpGeomCount && i < 16; i++) {
+			// Read worldBound LIVE from BSGeometry pointer (NiAVObject::worldBound at +0xE4)
+			const uint8_t* geom = reinterpret_cast<const uint8_t*>(
+			    static_cast<uintptr_t>(m_fpGeomPointers[i]));
+			if (!geom) continue;
+			const float* bc = reinterpret_cast<const float*>(geom + 0xE4);
+			float r = *reinterpret_cast<const float*>(geom + 0xF0);
+			if (r < 0.01f || r > 500.0f) continue;
+			float cx = bc[0] - posAdj[0];
+			float cy = bc[1] - posAdj[1];
+			float cz = bc[2] - posAdj[2];
+
+			// Transform center by VP (row-major, row-vector: clip = v * M)
+			float clipX = cx * vp[0] + cy * vp[4] + cz * vp[8]  + vp[12];
+			float clipY = cx * vp[1] + cy * vp[5] + cz * vp[9]  + vp[13];
+			float clipW = cx * vp[3] + cy * vp[7] + cz * vp[11] + vp[15];
+
+			if (clipW <= 0.01f) continue; // Behind camera
+
+			// NDC
+			float ndcX = clipX / clipW;
+			float ndcY = clipY / clipW;
+
+			// Screen-space radius: approximate as r / distance (clipW ≈ view-space Z)
+			float screenR = r / clipW;
+			// Scale by projection (approximate: use average of fovTanLeft/Right)
+			float projScale = 0.5f * (fabsf(cb.fovTanLeft) + fabsf(cb.fovTanRight));
+			if (projScale > 0.01f) screenR /= projScale;
+			screenR *= 1.3f; // Conservative margin
+
+			// NDC to UV: u = (ndcX + 1) * 0.5, v = (1 - ndcY) * 0.5
+			float u = (ndcX + 1.0f) * 0.5f;
+			float v = (1.0f - ndcY) * 0.5f;
+
+			float minU = u - screenR;
+			float minV = v - screenR;
+			float maxU = u + screenR;
+			float maxV = v + screenR;
+
+			// Clamp to [0,1] and skip if entirely off-screen
+			if (maxU < 0.0f || minU > 1.0f || maxV < 0.0f || minV > 1.0f) continue;
+			if (minU < 0.0f) minU = 0.0f;
+			if (minV < 0.0f) minV = 0.0f;
+			if (maxU > 1.0f) maxU = 1.0f;
+			if (maxV > 1.0f) maxV = 1.0f;
+
+			cb.fpScreenBoxes[boxCount * 4 + 0] = minU;
+			cb.fpScreenBoxes[boxCount * 4 + 1] = minV;
+			cb.fpScreenBoxes[boxCount * 4 + 2] = maxU;
+			cb.fpScreenBoxes[boxCount * 4 + 3] = maxV;
+			boxCount++;
+		}
+		cb.fpBoxCount = boxCount;
+
+		static int s_boxLog = 0;
+		if (s_boxLog++ < 10 && eye == 0 && boxCount > 0) {
+			OOVR_LOGF("FPBox: %d boxes from %u geoms (LIVE). box[0]=(%.3f,%.3f)-(%.3f,%.3f)",
+				boxCount, m_fpGeomCount,
+				cb.fpScreenBoxes[0], cb.fpScreenBoxes[1],
+				cb.fpScreenBoxes[2], cb.fpScreenBoxes[3]);
+		}
+	}
+
 	// ── D3D11 warp path ──
 	ID3D11DeviceContext* ctx = nullptr;
 	m_device->GetImmediateContext(&ctx);
 	if (!ctx)
 		return false;
+
+	ID3D11ShaderResourceView* mvSRV = (fabsf(cb.mvConfidence) > 0.001f) ? m_srvMV[slot][eye] : nullptr;
+	// Bind frame N (published slot) color + depth for disocclusion reprojection fill
+	ID3D11ShaderResourceView* frameNColorSRV = nullptr;
+	ID3D11ShaderResourceView* frameNDepthSRV = nullptr;
+	if (cb.hasReprojData && pubSlot >= 0 && pubSlot != slot) {
+		frameNColorSRV = m_srvColor[pubSlot][eye];
+		frameNDepthSRV = m_srvDepth[pubSlot][eye];
+	}
+	// FP depth texture SRV no longer used — replaced by world-space sphere test.
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = ctx->Map(m_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -2305,17 +3106,10 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	memcpy(mapped.pData, &cb, sizeof(cb));
 	ctx->Unmap(m_constantBuffer, 0);
 
-	ID3D11ShaderResourceView* mvSRV = (fabsf(cb.mvConfidence) > 0.001f) ? m_srvMV[slot][eye] : nullptr;
-	// Bind frame N (published slot) color + depth for disocclusion reprojection fill
-	ID3D11ShaderResourceView* frameNColorSRV = nullptr;
-	ID3D11ShaderResourceView* frameNDepthSRV = nullptr;
-	if (cb.hasReprojData && pubSlot >= 0 && pubSlot != slot) {
-		frameNColorSRV = m_srvColor[pubSlot][eye];
-		frameNDepthSRV = m_srvDepth[pubSlot][eye];
-	}
 	ID3D11ShaderResourceView* srvs[] = {
 		m_srvColor[slot][eye], mvSRV, m_srvDepth[slot][eye],
-		frameNColorSRV, frameNDepthSRV
+		frameNColorSRV, frameNDepthSRV,
+		m_srvPreFPDepth[slot][eye]  // t5: pre-FP depth (depth before first-person geometry)
 	};
 	ctx->CSSetShaderResources(0, _countof(srvs), srvs);
 	ID3D11UnorderedAccessView* uavs3[] = { m_uavOutput[eye], m_uavAtomicDepth[eye], m_uavForwardMap[eye] };
@@ -2410,11 +3204,16 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		}
 	}
 
-	ID3D11ShaderResourceView* nullSRVs[5] = {};
+	ID3D11ShaderResourceView* nullSRVs[6] = {};
 	ID3D11UnorderedAccessView* nullUAVs[3] = {};
-	ctx->CSSetShaderResources(0, 5, nullSRVs);
+	ctx->CSSetShaderResources(0, 6, nullSRVs);
 	ctx->CSSetUnorderedAccessViews(0, 3, nullUAVs, nullptr);
 	ctx->CSSetShader(nullptr, nullptr, 0);
+
+	// FP Hand Replay disabled — captures are stale (frame 1 only, game's main FP render
+	// bypasses all hooks on frame 2+). Controller motion is now handled by the warp shader
+	// via GetControllerDelta() UV shift on FP pixels.
+	// ReplayFPHands(eye, ctx, cb.forwardPoseDelta, hcc);
 
 	ctx->Release();
 	return true;
@@ -2693,6 +3492,22 @@ void ASWProvider::Shutdown()
 				m_cachedDepth[slot][eye]->Release();
 				m_cachedDepth[slot][eye] = nullptr;
 			}
+			if (m_srvStencil[slot][eye]) {
+				m_srvStencil[slot][eye]->Release();
+				m_srvStencil[slot][eye] = nullptr;
+			}
+			if (m_cachedStencil[slot][eye]) {
+				m_cachedStencil[slot][eye]->Release();
+				m_cachedStencil[slot][eye] = nullptr;
+			}
+			if (m_srvPreFPDepth[slot][eye]) {
+				m_srvPreFPDepth[slot][eye]->Release();
+				m_srvPreFPDepth[slot][eye] = nullptr;
+			}
+			if (m_cachedPreFPDepth[slot][eye]) {
+				m_cachedPreFPDepth[slot][eye]->Release();
+				m_cachedPreFPDepth[slot][eye] = nullptr;
+			}
 			if (m_cachedMV[slot][eye]) {
 				m_cachedMV[slot][eye]->Release();
 				m_cachedMV[slot][eye] = nullptr;
@@ -2726,6 +3541,26 @@ void ASWProvider::Shutdown()
 	if (m_npcDepthScatterCS) { m_npcDepthScatterCS->Release(); m_npcDepthScatterCS = nullptr; }
 	if (m_depthPreScatterCS) { m_depthPreScatterCS->Release(); m_depthPreScatterCS = nullptr; }
 	if (m_blurVoidsCS) { m_blurVoidsCS->Release(); m_blurVoidsCS = nullptr; }
+	if (m_handCompositeCS) { m_handCompositeCS->Release(); m_handCompositeCS = nullptr; }
+
+	// Hand render targets
+	for (int e = 0; e < 2; e++) {
+		if (m_srvHandColor[e]) { m_srvHandColor[e]->Release(); m_srvHandColor[e] = nullptr; }
+		if (m_handRTV[e]) { m_handRTV[e]->Release(); m_handRTV[e] = nullptr; }
+		if (m_handColor[e]) { m_handColor[e]->Release(); m_handColor[e] = nullptr; }
+		if (m_srvHandDepth[e]) { m_srvHandDepth[e]->Release(); m_srvHandDepth[e] = nullptr; }
+		if (m_handDSV[e]) { m_handDSV[e]->Release(); m_handDSV[e] = nullptr; }
+		if (m_handDepthTex[e]) { m_handDepthTex[e]->Release(); m_handDepthTex[e] = nullptr; }
+	}
+	if (m_handDSS) { m_handDSS->Release(); m_handDSS = nullptr; }
+	if (m_handCompositeCB) { m_handCompositeCB->Release(); m_handCompositeCB = nullptr; }
+	for (int i = 0; i < 7; i++) {
+		if (m_replayCB[i]) { m_replayCB[i]->Release(); m_replayCB[i] = nullptr; }
+	}
+	for (int i = 0; i < 3; i++) {
+		if (m_replayPSCB[i]) { m_replayPSCB[i]->Release(); m_replayPSCB[i] = nullptr; }
+	}
+	m_fpReplayPtr = nullptr;
 
 	for (int e = 0; e < 2; ++e) {
 		if (m_srvAtomicDepth[e]) { m_srvAtomicDepth[e]->Release(); m_srvAtomicDepth[e] = nullptr; }
