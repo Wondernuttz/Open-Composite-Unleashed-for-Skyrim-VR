@@ -1091,7 +1091,7 @@ void CSDilate(uint3 tid : SV_DispatchThreadID) {
     }
 
     // Final fallback
-    output[tid.xy] = float4(0.3, 0.3, 0.3, 1);
+    output[tid.xy] = float4(0, 0, 0, 1);
 }
 
 // ── Post-fill blur: smooth ONLY the void-zone pixels among themselves ──
