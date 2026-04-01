@@ -12,9 +12,79 @@
 #include <cmath>
 #include <d3dcompiler.h> // For compiling shaders! D3DCompile
 #include <string>
+#include <filesystem>
+#include <fstream>
 
 
 #pragma comment(lib, "d3dcompiler.lib")
+
+// ── Shader disk cache (same as ASWProvider) ──
+static uint64_t FnvHash(const void* data, size_t len)
+{
+	uint64_t h = 14695981039346656037ULL;
+	for (size_t i = 0; i < len; i++) {
+		h ^= ((const uint8_t*)data)[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static bool CompileOrLoadCached(
+    const char* source, size_t sourceLen, const char* entry, const char* target,
+    DWORD flags, ID3DBlob** outBlob)
+{
+	uint64_t srcHash = FnvHash(source, sourceLen);
+	uint64_t entryHash = FnvHash(entry, strlen(entry));
+	uint64_t flagsHash = FnvHash(&flags, sizeof(flags));
+	uint64_t cacheKey = srcHash ^ (entryHash * 31) ^ (flagsHash * 997);
+
+	namespace fs = std::filesystem;
+	wchar_t dllPath[MAX_PATH] = {};
+	HMODULE hm = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	    (LPCWSTR)&CompileOrLoadCached, &hm);
+	GetModuleFileNameW(hm, dllPath, MAX_PATH);
+	fs::path cacheDir = fs::path(dllPath).parent_path() / ".shader_cache";
+	char cacheName[64];
+	snprintf(cacheName, sizeof(cacheName), "%s_%016llx.cso", entry, (unsigned long long)cacheKey);
+	fs::path cachePath = cacheDir / cacheName;
+
+	if (fs::exists(cachePath)) {
+		std::ifstream f(cachePath, std::ios::binary | std::ios::ate);
+		if (f.is_open()) {
+			auto sz = f.tellg();
+			if (sz > 0) {
+				f.seekg(0);
+				if (SUCCEEDED(D3DCreateBlob((SIZE_T)sz, outBlob))) {
+					f.read((char*)(*outBlob)->GetBufferPointer(), sz);
+					if (f.good())
+						return true;
+					(*outBlob)->Release();
+					*outBlob = nullptr;
+				}
+			}
+		}
+	}
+
+	ID3DBlob* errs = nullptr;
+	HRESULT hr = D3DCompile(source, sourceLen, entry, nullptr, nullptr, entry, target, flags, 0, outBlob, &errs);
+	if (FAILED(hr)) {
+		if (errs) {
+			OOVR_LOGF("Shader compile error (%s): %s", entry, (char*)errs->GetBufferPointer());
+			errs->Release();
+		}
+		return false;
+	}
+	if (errs) errs->Release();
+
+	try {
+		fs::create_directories(cacheDir);
+		std::ofstream f(cachePath, std::ios::binary);
+		if (f.is_open())
+			f.write((const char*)(*outBlob)->GetBufferPointer(), (*outBlob)->GetBufferSize());
+	} catch (...) {}
+	return true;
+}
 
 // AMD FidelityFX FSR 1.0 — CPU-side constant setup functions (FsrEasuCon, FsrRcasCon)
 #define A_CPU
@@ -236,24 +306,19 @@ float4 PS(float4 pos : SV_Position) : SV_Target { return 1.0; }
 static bool EnsureStencilTestResources(ID3D11Device* device, uint32_t w, uint32_t h)
 {
 	if (!s_fullscreenVS) {
-		ID3DBlob* blob = nullptr, *err = nullptr;
-		D3DCompile(s_stencilTestShaderSrc, sizeof(s_stencilTestShaderSrc) - 1,
-		    "StencilTest", nullptr, nullptr, "VS", "vs_5_0", 0, 0, &blob, &err);
-		if (blob) {
+		ID3DBlob* blob = nullptr;
+		if (CompileOrLoadCached(s_stencilTestShaderSrc, sizeof(s_stencilTestShaderSrc) - 1,
+		        "VS", "vs_5_0", 0, &blob)) {
 			device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(),
 			    nullptr, &s_fullscreenVS);
 			blob->Release();
 		}
-		if (err) { OOVR_LOGF("FPMask VS compile: %s", (char*)err->GetBufferPointer()); err->Release(); }
-
-		D3DCompile(s_stencilTestShaderSrc, sizeof(s_stencilTestShaderSrc) - 1,
-		    "StencilTest", nullptr, nullptr, "PS", "ps_5_0", 0, 0, &blob, &err);
-		if (blob) {
+		if (CompileOrLoadCached(s_stencilTestShaderSrc, sizeof(s_stencilTestShaderSrc) - 1,
+		        "PS", "ps_5_0", 0, &blob)) {
 			device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
 			    nullptr, &s_stencilTestPS);
 			blob->Release();
 		}
-		if (err) { OOVR_LOGF("FPMask PS compile: %s", (char*)err->GetBufferPointer()); err->Release(); }
 	}
 
 	if (!s_stencilTestDSS) {
@@ -1247,25 +1312,15 @@ static bool EnsureDepthExtractResources(ID3D11Device* device, uint32_t depthW, u
 	// Compile CS once
 	if (!s_depthExtractCS) {
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(s_depthExtractHLSL, sizeof(s_depthExtractHLSL) - 1,
-		    "DepthExtract", nullptr, nullptr, "CS_DepthExtract", "cs_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("DepthExtract CS compile failed: %s", (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(s_depthExtractHLSL, sizeof(s_depthExtractHLSL) - 1,
+		        "CS_DepthExtract", "cs_5_0", 0, &blob))
 			return false;
-		}
-		if (errors)
-			errors->Release();
-		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_depthExtractCS);
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_depthExtractCS);
 		blob->Release();
 		if (FAILED(hr)) {
 			OOVR_LOGF("DepthExtract: CreateComputeShader failed (hr=0x%08X)", hr);
 			return false;
 		}
-		OOVR_LOG("DepthExtract: Compute shader compiled OK");
 	}
 
 	// Create/recreate R32F output texture if dimensions changed
@@ -1411,25 +1466,15 @@ static bool EnsureStencilExtractResources(ID3D11Device* device, uint32_t w, uint
 {
 	if (!s_stencilExtractCS) {
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(s_stencilExtractHLSL, sizeof(s_stencilExtractHLSL) - 1,
-		    "StencilExtract", nullptr, nullptr, "CS_StencilExtract", "cs_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("StencilExtract CS compile failed: %s", (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(s_stencilExtractHLSL, sizeof(s_stencilExtractHLSL) - 1,
+		        "CS_StencilExtract", "cs_5_0", 0, &blob))
 			return false;
-		}
-		if (errors)
-			errors->Release();
-		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_stencilExtractCS);
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_stencilExtractCS);
 		blob->Release();
 		if (FAILED(hr)) {
 			OOVR_LOGF("StencilExtract: CreateComputeShader failed (hr=0x%08X)", hr);
 			return false;
 		}
-		OOVR_LOG("StencilExtract: Compute shader compiled OK");
 	}
 
 	if (!s_stencilR8 || s_stencilR8Width != w || s_stencilR8Height != h) {
@@ -1569,19 +1614,10 @@ static bool EnsureReactiveMaskResources(ID3D11Device* device, uint32_t w, uint32
 {
 	if (!s_reactiveMaskCS) {
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(s_reactiveMaskHLSL, sizeof(s_reactiveMaskHLSL) - 1,
-		    "ReactiveMask", nullptr, nullptr, "CS_ReactiveMask", "cs_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("ReactiveMask CS compile failed: %s", (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(s_reactiveMaskHLSL, sizeof(s_reactiveMaskHLSL) - 1,
+		        "CS_ReactiveMask", "cs_5_0", 0, &blob))
 			return false;
-		}
-		if (errors)
-			errors->Release();
-		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_reactiveMaskCS);
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_reactiveMaskCS);
 		blob->Release();
 		if (FAILED(hr)) {
 			OOVR_LOGF("ReactiveMask: CreateComputeShader failed (hr=0x%08X)", hr);
@@ -1783,25 +1819,15 @@ static bool EnsureCameraMVResources(ID3D11Device* device, uint32_t w, uint32_t h
 	// Compile CS once
 	if (!s_cameraMVCS) {
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(s_cameraMVHLSL, sizeof(s_cameraMVHLSL) - 1,
-		    "CameraMV", nullptr, nullptr, "CS_CameraMV", "cs_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("CameraMV CS compile failed: %s", (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(s_cameraMVHLSL, sizeof(s_cameraMVHLSL) - 1,
+		        "CS_CameraMV", "cs_5_0", 0, &blob))
 			return false;
-		}
-		if (errors)
-			errors->Release();
-		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_cameraMVCS);
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_cameraMVCS);
 		blob->Release();
 		if (FAILED(hr)) {
 			OOVR_LOGF("CameraMV: CreateComputeShader failed (hr=0x%08X)", hr);
 			return false;
 		}
-		OOVR_LOG("CameraMV: Compute shader compiled OK");
 	}
 
 	// Create/recreate R16G16_FLOAT output texture if dimensions changed
@@ -1950,18 +1976,10 @@ static bool EnsureMVDilateResources(ID3D11Device* device, uint32_t w, uint32_t h
 {
 	if (!s_mvDilateCS) {
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(s_mvDilateHLSL, sizeof(s_mvDilateHLSL) - 1,
-		    "MVDilate", nullptr, nullptr, "CS_MVDilate", "cs_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("MVDilate CS compile failed: %s", (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(s_mvDilateHLSL, sizeof(s_mvDilateHLSL) - 1,
+		        "CS_MVDilate", "cs_5_0", 0, &blob))
 			return false;
-		}
-		if (errors) errors->Release();
-		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_mvDilateCS);
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_mvDilateCS);
 		blob->Release();
 		if (FAILED(hr)) return false;
 	}
@@ -2149,17 +2167,8 @@ static void EnsureDebugShaders(ID3D11Device* device)
 		if (*out)
 			return;
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(src, len, entry, nullptr, nullptr, entry, "ps_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("Debug %s compile failed: %s", entry, (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(src, len, entry, "ps_5_0", 0, &blob))
 			return;
-		}
-		if (errors)
-			errors->Release();
 		device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, out);
 		blob->Release();
 	};
@@ -2802,12 +2811,9 @@ ID3DBlob* d3d_compile_shader(const char* hlsl, const char* entrypoint, const cha
 	flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
 #endif
 
-	ID3DBlob *compiled, *errors;
-	if (FAILED(D3DCompile(hlsl, strlen(hlsl), nullptr, nullptr, nullptr, entrypoint, target, flags, 0, &compiled, &errors)))
-		OOVR_ABORTF("Error: D3DCompile failed %s", (char*)errors->GetBufferPointer());
-	if (errors)
-		errors->Release();
-
+	ID3DBlob *compiled = nullptr;
+	if (!CompileOrLoadCached(hlsl, strlen(hlsl), entrypoint, target, flags, &compiled))
+		OOVR_ABORTF("Error: Shader compile failed for %s", entrypoint);
 	return compiled;
 }
 
