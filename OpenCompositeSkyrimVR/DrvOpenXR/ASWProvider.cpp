@@ -45,8 +45,12 @@ static const char* s_warpShaderHLSL = R"(
 Texture2D<float4> prevColor    : register(t0);
 Texture2D<float2> mvTex        : register(t1);  // camera MVs: prevUV - uv (UV space)
 Texture2D<float>  depthTex     : register(t2);
+Texture2D<float4> frameNColor  : register(t3);  // frame N color (newer frame for disocclusion fill)
+Texture2D<float>  frameNDepth  : register(t4);  // frame N depth (newer frame)
+Texture2D<uint>   fpMask       : register(t5);  // R8_UINT FP mask (reserved)
 RWTexture2D<float4> output     : register(u0);
 RWTexture2D<uint> atomicDepth  : register(u1);  // forward scatter depth test buffer (R32_UINT)
+RWTexture2D<uint> disocclusionMap : register(u2);  // 0=normal, 1=disoccluded (proactive marking)
 SamplerState linearClamp       : register(s0);
 
 cbuffer WarpParams : register(b0) {
@@ -64,7 +68,7 @@ cbuffer WarpParams : register(b0) {
     float2 mvResolution;        // actual MV data dimensions (render-res when camera MVs + upscaler)
     int _pad_npcMask;           // removed: was hasNpcMask
     float _pad1;                // alignment padding
-    int _pad_debugMode;         // removed: was debugMode
+    int debugMode;              // 0=normal, 60=depth scatter viz
     float3 _pad2;               // alignment to 16 bytes
     row_major float4x4 headRotMatrix;  // head rotation delta between prev/cur cached poses
                                        // used to subtract head rot from camera MVs
@@ -76,6 +80,28 @@ cbuffer WarpParams : register(b0) {
     float2 locoScreenDir;   // screen-space locomotion direction (from actorPos delta, not head tracking)
     float staticBlendFactor; // 1.0 = near-stationary (blend scatter→prevColor), 0.0 = moving
     float rotMVScale;       // 1.0 = rotation in residual, 0.0 = rotation suppressed (stop transition)
+    row_major float4x4 reprojClipToClip;  // warp output → frame N clip space (for disocclusion fill)
+    int hasReprojData;      // 1 if frame N data is available for reprojection
+    float3 _padReproj;
+    column_major float4x4 fullWarpC2C;  // warp output → cached clip (head + locomotion, depth-aware)
+    int hasFullWarpC2C;     // 1 if fullWarpC2C is valid
+    float3 _padFullC2C;
+    float4 controllerUV_LR; // xy=left hand UV, zw=right hand UV (cached frame)
+    float controllerRadius; // screen-space radius in UV units for hand detection
+    int hasControllerPose;  // 1 if controllerUV is valid
+    float2 controllerDeltaL; // warp-time UV - cached-frame UV for left hand
+    float2 controllerDeltaR; // warp-time UV - cached-frame UV for right hand
+    float fpControllerScale; // controller delta multiplier (ini: aswFPControllerScale)
+    int hasFPSphere;        // 1 if fpSphere* is valid
+    float fpSphereRadius;   // FP bounding sphere radius
+    float _padCtrl;
+    float4 fpSphereCenter;  // xyz = center in rendering space, w unused
+    int isMenuOpen;         // 1 if a gameplay menu is open (skip MV corrections)
+    int isLegacyMode;       // 1 = legacy ASW (parallax only, no MV/scatter)
+    float2 _padPreFP;
+    float4 fpScreenBoxes[16]; // Up to 16 AABBs: [minU, minV, maxU, maxV]
+    int fpBoxCount;           // Number of valid screen-space FP bounding boxes
+    float3 _padBoxes;
 };
 
 // LinearizeDepth: convert raw depth buffer value to linear distance in game units.
@@ -104,26 +130,206 @@ int2 ToDepthCoord(int2 colorPixel) {
     return clamp(dp, int2(0,0), int2(depthResolution) - 1);
 }
 
+// First-person pixel classification: depth threshold + AABB bounding boxes.
+// Returns true if this pixel is likely first-person geometry (hands/weapons).
+// Uses depth < 0.87 (near camera) AND inside at least one FP bounding box AABB.
+// Bounding boxes are projected from BSGeometry::worldBound each frame — they track
+// weapon swings, bow draws, etc. Combining with depth eliminates distant world geometry
+// that might fall inside a box (e.g., looking down from a cliff).
+)" R"(
+// IsFirstPerson: classifies pixel for MV skip (no locomotion/rotation correction).
+// Uses depth + AABB bounding boxes — covers full weapons.
+bool IsFirstPerson(float2 pixelUV, float depth) {
+    if (depth >= 0.87)
+        return false;
+    if (fpBoxCount <= 0)
+        return true; // Fallback: depth-only when no boxes available
+    for (int i = 0; i < fpBoxCount && i < 16; i++) {
+        float4 box = fpScreenBoxes[i]; // minU, minV, maxU, maxV
+        if (pixelUV.x >= box.x && pixelUV.x <= box.z &&
+            pixelUV.y >= box.y && pixelUV.y <= box.w)
+            return true;
+    }
+    return false;
+}
+
+// GetControllerDelta: returns UV shift for controller motion prediction.
+// Uses the nearest controller's FULL delta — no distance fade.
+// Every FP pixel (hand, arm, weapon) shifts uniformly so the whole mesh
+// moves as a rigid unit. Nearest-controller selection ensures left/right
+// hand items track their respective controllers.
+float2 GetControllerDelta(float2 pixelUV) {
+    if (!hasControllerPose) return float2(0, 0);
+    float distL = length(pixelUV - controllerUV_LR.xy);
+    float distR = length(pixelUV - controllerUV_LR.zw);
+    return fpControllerScale * ((distL < distR) ? controllerDeltaL : controllerDeltaR);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
         return;
 
     float2 uv = ((float2)tid.xy + 0.5) / resolution;
-
-    // 1. Read depth and search for foreground along combined parallax + locomotion direction.
-    //    At disocclusion edges (object moved, revealing background), the cached depth
-    //    is background. During locomotion, poseDeltaMatrix only captures head motion,
-    //    so we also use the raw game MV to find the correct search direction.
     int2 pixel = (int2)tid.xy;
     int2 depthPixel = ToDepthCoord(pixel);
-    float d = depthTex[depthPixel];
-    float origD = d;  // save for disocclusion detection
+
+    // Read scattered depth at output pixel position (scatter targets output space).
+    // With 1x1 scatter (no 2x2 splat), foreground depth can't bleed into background
+    // positions — eliminating the trailing-edge contamination that caused sections 1 & 3.
+    float d;
+    uint scatteredDepth = atomicDepth[pixel];
+    bool hasLoco = length(locoScreenDir) > 0.001;
+
+    if (scatteredDepth != 0xFFFFFFFF) {
+        d = (float)(scatteredDepth >> 16) / 65535.0;
+    } else {
+        d = depthTex[depthPixel];
+    }
 
     float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
     float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
 
-    // Compute parallax direction from head pose delta (may be tiny during pure locomotion).
+    // Skip disocclusion detection near very close geometry (hands, weapons).
+    // Check if any nearby SCATTER pixel has close depth — hands scatter with close
+    // depth even when the gap pixel itself has no scatter. During movement, the
+    // cached depth at the output position is background (hand shifted) → can't use
+    // cached depth. The scatter buffer's close-depth neighbors reliably detect hands.
+    bool isCloseGeometry = false;
+    {
+        int2 cOffsets[4] = { int2(-3,0), int2(3,0), int2(0,-3), int2(0,3) };
+        for (int ci = 0; ci < 4; ci++) {
+            int2 np = clamp(pixel + cOffsets[ci], int2(0,0), int2(resolution) - 1);
+            uint nd = atomicDepth[np];
+            if (nd != 0xFFFFFFFF && (float)(nd >> 16) / 65535.0 < 0.87) {
+                isCloseGeometry = true;
+                break;
+            }
+        }
+    }
+
+    // Disocclusion detection via forward-scatter gaps.
+    // NPC animation disocclusion (simple gap detection, no nearGap complexity)
+    // with special MVs that don't match world scatter, creating false gaps.
+    if (!isLegacyMode && !hasLoco && !isCloseGeometry && scatteredDepth == 0xFFFFFFFF) {
+        // Check if gap is near very close geometry (hands) — skip if so
+        float nearestD = 1.0;
+        int gapN = 0;
+        int2 cardinals[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };
+        for (int ci = 0; ci < 4; ci++) {
+            int2 np = pixel + cardinals[ci];
+            if (np.x >= 0 && np.x < (int)resolution.x && np.y >= 0 && np.y < (int)resolution.y) {
+                uint nd = atomicDepth[np];
+                if (nd == 0xFFFFFFFF) { gapN++; }
+                else { nearestD = min(nearestD, (float)(nd >> 16) / 65535.0); }
+            }
+        }
+        if (gapN >= 2) {
+            disocclusionMap[tid.xy] = 1;
+            if (debugMode == 61) { output[tid.xy] = float4(1, 0, 0, 1); return; }
+            return;
+        }
+    }
+
+    // Locomotion disocclusion (full detection with nearGap contamination handling)
+    if (!isLegacyMode && hasLoco && !isCloseGeometry) {
+        bool isGap = (scatteredDepth == 0xFFFFFFFF);
+        bool adjacentToGap = false;
+
+        // Check cardinal neighbors for gaps
+        int gapNeighbors = 0;
+        if (pixel.x > 0 && atomicDepth[pixel + int2(-1,0)] == 0xFFFFFFFF) gapNeighbors++;
+        if (pixel.x < (int)resolution.x-1 && atomicDepth[pixel + int2(1,0)] == 0xFFFFFFFF) gapNeighbors++;
+        if (pixel.y > 0 && atomicDepth[pixel + int2(0,-1)] == 0xFFFFFFFF) gapNeighbors++;
+        if (pixel.y < (int)resolution.y-1 && atomicDepth[pixel + int2(0,1)] == 0xFFFFFFFF) gapNeighbors++;
+
+        if (isGap && gapNeighbors >= 2) {
+            // Real gap: 2+ gap neighbors confirms multi-pixel disocclusion zone
+            disocclusionMap[tid.xy] = 1;
+            if (debugMode == 61) { output[tid.xy] = float4(1, 0, 0, 1); return; }
+            return;
+        }
+
+        if (!isGap && scatteredDepth != 0xFFFFFFFF && hasLoco) {
+            float scatD = (float)(scatteredDepth >> 16) / 65535.0;
+            // Use the foreground depth from the anti-loco side to set the threshold.
+            float2 locoDirPx = normalize(locoScreenDir * resolution);
+            float locoMaxComp = max(abs(locoDirPx.x), abs(locoDirPx.y));
+            int2 antiLocoStep = -int2(round(locoDirPx / locoMaxComp));
+            float fgRef = 0.0;
+            for (int fs = 1; fs <= 30; fs++) {
+                int2 fnp = pixel + antiLocoStep * fs;
+                if (any(fnp < 0) || fnp.x >= (int)resolution.x || fnp.y >= (int)resolution.y) break;
+                uint fnd = atomicDepth[fnp];
+                if (fnd != 0xFFFFFFFF && disocclusionMap[fnp] == 0) {
+                    fgRef = (float)(fnd >> 16) / 65535.0;
+                    break;
+                }
+            }
+            bool isBgScatter = (fgRef > 0.001 && scatD > fgRef + 0.02);
+
+            // Dual-radius nearGap check:
+            // FOREGROUND scatter: 1px — don't eat into objects.
+            // BACKGROUND scatter (deeper than foreground + margin): 10px — catch the wide
+            // contamination zone where background scatter filled positions but backward
+            // warp will sample foreground from the cached frame.
+            // Check 1px always (foreground near-gap)
+            bool nearGap = false;
+            if (pixel.x >= 1 && atomicDepth[pixel + int2(-1,0)] == 0xFFFFFFFF) nearGap = true;
+            if (pixel.x < (int)resolution.x-1 && atomicDepth[pixel + int2(1,0)] == 0xFFFFFFFF) nearGap = true;
+            if (pixel.y >= 1 && atomicDepth[pixel + int2(0,-1)] == 0xFFFFFFFF) nearGap = true;
+            if (pixel.y < (int)resolution.y-1 && atomicDepth[pixel + int2(0,1)] == 0xFFFFFFFF) nearGap = true;
+            // Extended check for background scatter (14px)
+            if (!nearGap && isBgScatter) {
+                for (int r = 2; r <= 14; r++) {
+                    if (nearGap) break;
+                    if (pixel.x >= r && atomicDepth[pixel + int2(-r,0)] == 0xFFFFFFFF) nearGap = true;
+                    if (pixel.x < (int)resolution.x-r && atomicDepth[pixel + int2(r,0)] == 0xFFFFFFFF) nearGap = true;
+                    if (pixel.y >= r && atomicDepth[pixel + int2(0,-r)] == 0xFFFFFFFF) nearGap = true;
+                    if (pixel.y < (int)resolution.y-r && atomicDepth[pixel + int2(0,r)] == 0xFFFFFFFF) nearGap = true;
+                }
+            }
+
+            if (nearGap) {
+                disocclusionMap[tid.xy] = 1;
+                if (debugMode == 61) {
+                    output[tid.xy] = isBgScatter ? float4(0, 1, 0, 1) : float4(1, 1, 0, 1);
+                    return; // GREEN=bg contamination, YELLOW=fg near-gap
+                }
+                return;
+            }
+        }
+    }
+
+    // Depth-mismatch catch: scatter says far (sky) but cached says close (branch/pole).
+    // Catches thin features too small for gap detection (1-2px branches where the 2x2
+    // scatter fills the gap entirely → no 0xFFFFFFFF → no gap detected).
+    // Large threshold (0.05) is head-turn-stable: adjacent-pixel depth variation from
+    // head turn is typically < 0.02, so 0.05 avoids false positives.
+    if (hasLoco && scatteredDepth != 0xFFFFFFFF && disocclusionMap[tid.xy] == 0) {
+        float scatD = (float)(scatteredDepth >> 16) / 65535.0;
+        float cachedD = depthTex[depthPixel];
+        if (cachedD < scatD - 0.05) {
+            disocclusionMap[tid.xy] = 1;
+            if (debugMode == 61) { output[tid.xy] = float4(0, 0, 1, 1); return; } // BLUE
+            return;
+        }
+    }
+
+    // Debug mode 62: scatter coverage visualization
+    // GREEN=scatter hit, BLACK=no scatter (0xFFFFFFFF gap).
+    // Gaps during locomotion = disocclusion zones.
+    if (debugMode == 62) {
+        if (scatteredDepth == 0xFFFFFFFF) {
+            output[tid.xy] = float4(0, 0, 0, 1);
+        } else {
+            float sd = (float)(scatteredDepth >> 16) / 65535.0;
+            output[tid.xy] = float4(0, 1.0 - sd, 0, 1);
+        }
+        return;
+    }
+
+    // Compute parallax direction from head pose delta.
     float linearDepth = LinearizeDepth(d, nearZ, farZ);
     float scaledDepth = linearDepth * depthScale;
     float3 newViewPos = float3(tanX * scaledDepth, tanY * scaledDepth, scaledDepth);
@@ -138,176 +344,45 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
             (oldTanY - fovTanUp) / (fovTanDown - fovTanUp) - uv.y);
     }
 
-    // Read raw MV at current pixel for locomotion-aware search direction.
-    // During pure locomotion, parallaxDir is tiny (head-only) but game MVs capture
-    // the full scene motion. MV points from current UV toward previous UV (cached frame).
+    // Search direction: use parallax or raw game MV (whichever is larger).
     float2 roughMV = mvTex[ToMVCoord(pixel)] * mvPixelScale;
     roughMV = clamp(roughMV, float2(-0.15, -0.15), float2(0.15, 0.15));
 
     float2 searchDir = parallaxDir;
     float parallaxMagPx = length(parallaxDir * resolution);
     float mvSearchMagPx = length(roughMV * resolution);
-    bool hasLoco = length(locoScreenDir) > 0.001;
-    bool stationaryNpcMode = !hasLoco;
     if (hasLoco && mvSearchMagPx > parallaxMagPx)
         searchDir = roughMV;
     float searchMagPx = hasLoco ? max(parallaxMagPx, mvSearchMagPx) : parallaxMagPx;
 
-    // Convert to pixel-space stepping: normalize so dominant axis = +/-1 pixel/step.
     float2 searchDirPx = searchDir * resolution;
     float maxComp = max(abs(searchDirPx.x), abs(searchDirPx.y));
     float2 stepVec = (maxComp > 0.001) ? (searchDirPx / maxComp) : float2(0, 0);
 
     int2 fgPixel = pixel;
     bool foundForeground = false;
-    bool npcExpanded = false;
-    bool hasNpcScatter = false;
-    bool hasDirectNpcScatter = false;
-    bool npcDirectBodyAligned = false;
-    int2 npcScatterDelta = int2(0, 0);
-    int2 npcScatterSrcPixel = int2(0, 0);
-    float npcScatterSrcDepth = 1.0;
-    bool npcTrailingRejected = false;
-    bool allowHeadDepthSearch = (!hasLoco && parallaxMagPx > 0.75 && origD >= 0.97);
+    bool allowHeadDepthSearch = (!hasLoco && parallaxMagPx > 0.75 && d >= 0.97);
 
 )" R"(
+    // Foreground search: find closer depth along search direction.
+    // During locomotion: short search (4px) to catch leading edges only — the tree that
+    // moved into this position. Longer search causes "force fields" because it applies
+    // foreground depth (and its larger loco offset) to distant background pixels.
+    // Head-only mode: longer search for large parallax at sky depth.
+    int fgSearchMax = 0;
+    if (hasLoco && searchMagPx > 0.5)
+        fgSearchMax = 4;  // leading edge only
+    else if (allowHeadDepthSearch && searchMagPx > 0.5)
+        fgSearchMax = min(48, max(24, (int)searchMagPx + 16));
 
-    if (hasClipToClipNoLoco) {
-        // CSNpcDepthScatter writes its support field in source-screen space plus the
-        // NPC residual delta. Querying it at the current output pixel makes the whole
-        // moving-NPC region lag behind head motion. Shift the lookup by the local
-        // head-only c2c offset so we read from the same space the scatter pass wrote.
-        float2 scatterQueryOffsetPx = parallaxDir * resolution;
-        {
-            float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-            float4 clipPos = float4(ndc, d, 1.0);
-            float4 prevClip = mul(clipToClipNoLoco, clipPos);
-            if (abs(prevClip.w) > 0.0001) {
-                float2 prevNDC = prevClip.xy / prevClip.w;
-                float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
-                scatterQueryOffsetPx = (prevUV - uv) * resolution;
-            }
-        }
-        int2 scatterQueryPixel = clamp(pixel + int2(round(scatterQueryOffsetPx)), int2(0,0), int2(resolution) - 1);
-
-        uint packedNpc = atomicDepth[scatterQueryPixel];
-        bool directHit = (packedNpc != 0xFFFFFFFFu);
-        int2 hitPos = scatterQueryPixel;
-        // If no direct scatter hit, search a slightly wider neighborhood so thin
-        // moving-object leading edges can still pick up the scattered support band.
-        if (!directHit) {
-            int bestDist2 = 999999;
-            [unroll] for (int sy = -6; sy <= 6; sy++) {
-                [unroll] for (int sx = -6; sx <= 6; sx++) {
-                    if (sx == 0 && sy == 0) continue;
-                    int2 sp = clamp(scatterQueryPixel + int2(sx, sy), int2(0,0), int2(resolution) - 1);
-                    uint np = atomicDepth[sp];
-                    if (np == 0xFFFFFFFFu) continue;
-                    int dist2 = sx * sx + sy * sy;
-                    if (dist2 < bestDist2 || (dist2 == bestDist2 && np < packedNpc)) {
-                        packedNpc = np;
-                        hitPos = sp;
-                        bestDist2 = dist2;
-                    }
-                }
-            }
-        }
-        if (packedNpc != 0xFFFFFFFFu) {
-            float warpedD = (float)(packedNpc >> 16) / 65535.0;
-            int sdx = (int)((packedNpc >> 8) & 0xFFu) - 127;
-            int sdy = (int)(packedNpc & 0xFFu) - 127;
-            hasNpcScatter = true;
-            hasDirectNpcScatter = directHit;
-            npcScatterDelta = int2(sdx, sdy);
-            npcScatterSrcPixel = clamp(hitPos - int2(sdx, sdy), int2(0,0), int2(resolution) - 1);
-            npcScatterSrcDepth = depthTex[ToDepthCoord(npcScatterSrcPixel)];
-            npcDirectBodyAligned = (!directHit || (origD - warpedD <= max(0.005, warpedD * 0.02)));
-            // Trailing edge rejection: for neighbor hits (not direct scatter),
-            // reject if pixel is behind the scatter direction.
-            bool trailingEdge = false;
-            float2 scatterDir = float2(sdx, sdy);
-            float scatterLen = length(scatterDir);
-            if (!directHit) {
-                float2 pixelOfs = float2(pixel - hitPos);
-                if (dot(scatterDir, pixelOfs) < -0.01) trailingEdge = true;
-            }
-            npcTrailingRejected = trailingEdge;
-            float depthGap = origD - warpedD;
-            float depthGapThresh = max(0.005, warpedD * 0.02);
-            bool supportBand = false;
-            // supportBand is only for boundary extension when a nearby scatter hit
-            // suggests this destination belongs to the same moving NPC. Direct hits
-            // already cover the body itself and should stay on the body/carry path;
-            // promoting them to npcExpanded makes the whole NPC follow the looser
-            // boundary rules and lags under head-only motion.
-            if (!trailingEdge && !directHit && scatterLen > 0.5) {
-                float2 dirNorm = scatterDir / scatterLen;
-                float deltaSlack = max(1.5, scatterLen * 0.35);
-                float bandForward = clamp(scatterLen * 0.35 + 1.0, 2.0, 6.0);
-                float bandLateral = directHit ? 2.5 : 1.75;
-                float bandDepthSlack = max(0.01, warpedD * 0.03);
-                float occluderSlack = max(0.004, warpedD * 0.015);
-                int supportCount = 0;
-                [unroll] for (int sy = -5; sy <= 5; sy++) {
-                    [unroll] for (int sx = -5; sx <= 5; sx++) {
-                        int2 sp = clamp(pixel + int2(sx, sy), int2(0,0), int2(resolution) - 1);
-                        uint np = atomicDepth[sp];
-                        if (np == 0xFFFFFFFFu) continue;
-                        float nWarpedD = (float)(np >> 16) / 65535.0;
-                        int ndx = (int)((np >> 8) & 0xFFu) - 127;
-                        int ndy = (int)(np & 0xFFu) - 127;
-                        float2 nDelta = float2(ndx, ndy);
-                        if (length(nDelta - scatterDir) > deltaSlack) continue;
-                        float2 pixelOfs = float2(pixel - sp);
-                        float along = dot(dirNorm, pixelOfs);
-                        float lateral = length(pixelOfs - dirNorm * along);
-                        if (along < -1.25 || along > bandForward) continue;
-                        if (lateral > bandLateral) continue;
-                        if (abs(nWarpedD - warpedD) > bandDepthSlack) continue;
-                        supportCount++;
-                    }
-                }
-                bool frontUnoccluded = (origD + occluderSlack >= warpedD);
-                supportBand = frontUnoccluded && (supportCount >= 3);
-            }
-            if ((depthGap > depthGapThresh || supportBand) && !trailingEdge && !stationaryNpcMode) {
-                float srcSlack = max(0.01, warpedD * 0.03);
-                if (npcScatterSrcDepth > warpedD + srcSlack) {
-                    float bestDist = 999.0;
-                    int2 bestPx = npcScatterSrcPixel;
-                    bool foundSrc = false;
-                    [unroll] for (int ry = -6; ry <= 6; ry++) {
-                        [unroll] for (int rx = -6; rx <= 6; rx++) {
-                            int2 tp = clamp(npcScatterSrcPixel + int2(rx, ry), int2(0,0), int2(resolution) - 1);
-                            float td = depthTex[ToDepthCoord(tp)];
-                            if (td <= warpedD + srcSlack) {
-                                float dist = float(rx * rx + ry * ry);
-                                if (dist < bestDist) {
-                                    bestDist = dist;
-                                    bestPx = tp;
-                                    foundSrc = true;
-                                }
-                            }
-                        }
-                    }
-                    if (foundSrc) {
-                        npcScatterSrcPixel = bestPx;
-                        npcScatterSrcDepth = depthTex[ToDepthCoord(bestPx)];
-                    }
-                }
-                foundForeground = true;
-                npcExpanded = true;
-                fgPixel = npcScatterSrcPixel;
-                d = npcScatterSrcDepth;
-            }
-        }
-    }
-
-    if (!foundForeground && (hasLoco || allowHeadDepthSearch) && searchMagPx > 0.5) {
-        int maxSearch = min(48, max(24, (int)searchMagPx + 16));
-        for (int step = 1; step <= maxSearch; step++) {
+    if (fgSearchMax > 0) {
+        for (int step = 1; step <= fgSearchMax; step++) {
             int2 searchPx = pixel + int2(stepVec * (float)step);
             searchPx = clamp(searchPx, int2(0,0), int2(resolution) - 1);
+            // Stop at disocclusion gaps — foreground on the other side has moved away.
+            // At leading edges there are NO gaps between us and the foreground (it moved here).
+            // At trailing edges there ARE gaps (it moved away) — must not reach across.
+            if (atomicDepth[searchPx] == 0xFFFFFFFF) break;
             float searchD = depthTex[ToDepthCoord(searchPx)];
             if (d - searchD > 0.01) {
                 d = searchD;
@@ -320,55 +395,8 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         }
     }
 
-    // Cardinal search fallback
-    if (hasLoco && !foundForeground && origD > 0.50 && searchMagPx > 0.5) {
-        int bestDist = 49;
-        int2 dirs[8] = {
-            int2(1,0), int2(-1,0), int2(0,1), int2(0,-1),
-            int2(1,1), int2(1,-1), int2(-1,1), int2(-1,-1)
-        };
-        [unroll]
-        for (int dir = 0; dir < 8; dir++) {
-            for (int step = 2; step < bestDist; step += 2) {
-                int2 sp = pixel + dirs[dir] * step;
-                if (any(sp < 0) || sp.x >= (int)resolution.x || sp.y >= (int)resolution.y)
-                    break;
-                float sd = depthTex[ToDepthCoord(sp)];
-                if (origD - sd > 0.01) {
-                    bestDist = step;
-                    d = sd;
-                    fgPixel = sp;
-                    foundForeground = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Step into foreground interior for cleaner MV
-    if (foundForeground) {
-        float2 stepInDir = float2(fgPixel - pixel);
-        float stepInLen = length(stepInDir);
-        if (stepInLen > 0.5) {
-            stepInDir /= stepInLen;
-            for (int extra = 1; extra <= 4; extra++) {
-                int2 deepPx = fgPixel + int2(round(stepInDir * (float)extra));
-                deepPx = clamp(deepPx, int2(0,0), int2(resolution) - 1);
-                float deepD = depthTex[ToDepthCoord(deepPx)];
-                if (abs(deepD - d) < 0.02) {
-                    fgPixel = deepPx;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    // Recompute parallax with (possibly foreground) depth.
-    // Both locomotion-found foreground and npcExpanded use fgPixel's angle for parallax
-    // and uv as the base. This ensures npcExpanded pixels get the same warp as locomotion.
+    // Recompute parallax with foreground depth if found.
     bool useFgAngle = foundForeground;
-    bool useFgBase = npcExpanded;
     float2 fgUV = useFgAngle ? (float2(fgPixel) + 0.5) / resolution : uv;
     float fgTanX = useFgAngle ? lerp(fovTanLeft, fovTanRight, fgUV.x) : tanX;
     float fgTanY = useFgAngle ? lerp(fovTanUp, fovTanDown, fgUV.y) : tanY;
@@ -382,30 +410,29 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (scaledDepth > 0.001 && oldViewPos.z > 0.001) {
         float oldTanX = oldViewPos.x / oldViewPos.z;
         float oldTanY = oldViewPos.y / oldViewPos.z;
-        // Compute where fgPixel's surface projects in the cached frame, then express
-        // as an offset relative to the OUTPUT pixel so parallax is a warp displacement.
         float2 cachedUV = float2(
             (oldTanX - fovTanLeft) / (fovTanRight - fovTanLeft),
             (oldTanY - fovTanUp) / (fovTanDown - fovTanUp));
         parallaxUV = uv + (cachedUV - fgUV);
     }
 
-    // Near-field depth fade
+    // Near-field depth fade.
     float depthFade = (nearFadeDepth > 0.0) ? saturate((linearDepth - nearFadeDepth) / nearFadeDepth) : 1.0;
+    float2 fadedParallax = (parallaxUV - uv) * depthFade;
+    float2 parallaxSourceUV = uv + fadedParallax;
 
-    float2 parallaxOffset = parallaxUV - uv;
-
-    // 3. Combine: parallax (faded at near-field only) to get source position in cached frame.
-    float2 fadedParallax = parallaxOffset * depthFade;
-    // BG npcExpanded: uv base (body MV redirects to NPC body, continuous with neighbors).
-    // FG npcExpanded: fgUV base (samples from NPC interior, prevents leading-edge holes).
-    // Locomotion search: uv base (original behavior).
-    float2 parallaxSourceUV = (useFgBase ? fgUV : uv) + fadedParallax;
-
-    // Read MV
+    // Read MV: prefer scatter source position (correct for leading edges where
+    // the output pixel has foreground depth but the cached frame has background).
+    // The scatter packed value encodes the source→dest offset in the lower 16 bits.
     int2 mvSourcePixel;
     if (foundForeground) {
         mvSourcePixel = ToMVCoord(fgPixel);
+    } else if (scatteredDepth != 0xFFFFFFFF) {
+        // Recover scatter source position from packed offset (relative to scatter write position)
+        int sdx = (int)((scatteredDepth >> 8) & 0xFFu) - 127;
+        int sdy = (int)(scatteredDepth & 0xFFu) - 127;
+        int2 scatterSrc = clamp(pixel - int2(sdx, sdy), int2(0,0), int2(resolution) - 1);
+        mvSourcePixel = ToMVCoord(scatterSrc);
     } else {
         mvSourcePixel = ToMVCoord(clamp(int2(parallaxSourceUV * resolution), int2(0,0), int2(resolution) - 1));
     }
@@ -414,9 +441,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     totalMV = clamp(totalMV, float2(-0.15, -0.15), float2(0.15, 0.15));
 
 )" R"(
-    // headOnlyMV from headRotMatrix (OpenXR frame-to-frame, NO stick rotation).
-    // Use fgPixel's angle when foreground found — game MV at fgPixel is relative to fgPixel's
-    // position, so headOnlyMV must match to get a clean residual (loco component).
+    // headOnlyMV from headRotMatrix (OpenXR pose delta, NO stick rotation).
     float2 headOnlyMV = float2(0, 0);
     {
         float3 viewPos = float3(fgTanX * scaledDepth, fgTanY * scaledDepth, scaledDepth);
@@ -431,8 +456,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         }
     }
 
-    // c2cHeadMV from clipToClipNoLoco: subtracts full head motion and matches fgPixel
-    // when foreground was found.
+    // c2cHeadMV from clipToClipNoLoco (head rotation + stick rotation, no locomotion).
     float2 c2cHeadMV = float2(0, 0);
     if (hasClipToClipNoLoco) {
         float2 c2cBaseUV = useFgAngle ? fgUV : uv;
@@ -446,135 +470,126 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     }
 
 )" R"(
-    // MV residual decomposition: separate rotation from loco+animation for independent stop control.
-    // headOnlyMV = head rotation only (from headRotMatrix)
-    // c2cHeadMV = head rotation + stick rotation (from clipToClipNoLoco / RSS VP)
-    // fullResidual = totalMV - headOnlyMV = rotation + loco + animation
-    // locoResidual = totalMV - c2cHeadMV = loco + animation (rotation subtracted)
-    // rotComponent = fullResidual - locoResidual = rotation only
-    // final residual = locoResidual + rotMVScale * rotComponent
-    //   → rotMVScale=1.0 during rotation, 0.0 on rotation stop (suppresses stale rotation MVs)
-    //   → mvConfidence scales the whole residual (for loco stop suppression)
+    // MV residual decomposition.
+    // Skip ALL MV corrections for first-person geometry (hands/weapons).
+    // Hands are camera-relative — they move with the head, not with the world.
+    // The game MVs capture world motion (loco) but hands should use ONLY parallax
+    // from poseDelta (head tracking). Applying loco MV to close pixels creates huge
+    // offsets that shift sourceUV far away → wrong content → hands invisible.
+    //
+    // Detection: depth threshold + FP bounding box AABBs (projected from worldBound each frame).
+    float2 pixelUV = (float2(tid.xy) + 0.5) / resolution;
+    bool isWorldPixel = !IsFirstPerson(pixelUV, d);
+
     float2 mvOffset = float2(0, 0);
-    if (abs(mvConfidence) > 0.001 && !npcExpanded) {
-        float2 fullResidual = totalMV - headOnlyMV;       // rot + loco + animation
-        float2 locoResidual = totalMV - c2cHeadMV;        // loco + animation (no rotation)
-        float2 rotComponent = fullResidual - locoResidual; // rotation only
-        float2 residual = locoResidual + rotMVScale * rotComponent;
+    float2 sourceUV = parallaxSourceUV;
+
+    // For FP pixels: extract controller-only motion from game MVs.
+    // FP is camera-relative → game MVs contain ONLY head tracking + controller motion
+    // (no locomotion, no stick rotation). Subtract head-only motion (headRotMatrix)
+    // to isolate pure controller tracking. Extrapolate 1.5x.
+    if (!isWorldPixel && scatteredDepth != 0xFFFFFFFF) {
+        // FP pixels: use forward scatter source color directly.
+        // The scatter (CSDepthPreScatter) already computed the correct destination using
+        // forwardPoseDelta (head+stick) + game MV residual (controller+bone). The packed
+        // offset in atomicDepth encodes source→destination. Sampling prevColor at the
+        // scatter source gives the exact cached content with zero MV subtraction errors.
+        // No c2c, no head subtraction, no stick rotation issues.
+        int sdx = (int)((scatteredDepth >> 8) & 0xFF) - 127;
+        int sdy = (int)(scatteredDepth & 0xFF) - 127;
+        int2 scatterSrc = pixel - int2(sdx, sdy);
+        sourceUV = saturate((float2(scatterSrc) + 0.5) / resolution);
+    }
+
+    if (isWorldPixel && abs(mvConfidence) > 0.001 && !isMenuOpen && !isLegacyMode) {
+        // Residual = totalMV - headOnlyMV = stick rotation + loco + animation.
+        // Matches CSDepthPreScatter which also uses headOnlyMV for both FP and world.
+        // headOnlyMV from OpenXR poses is jitter-free; c2cHeadMV from RSS VP matrices
+        // had precision issues causing sporadic incorrect frames during rotation.
+        float2 residual = totalMV - headOnlyMV;
         mvOffset = mvConfidence * residual;
+        sourceUV = parallaxSourceUV + mvOffset;
     }
 
-    float2 sourceUV = parallaxSourceUV + mvOffset;
 
-    // In locomotion mode, npcExpanded boundary pixels use fgUV for small head motion
-    // to avoid sampling background.
-    if (npcExpanded && !stationaryNpcMode && parallaxMagPx <= 0.75) {
-        sourceUV = fgUV;
-    }
-
+    // Clamp fallback.
     if (any(sourceUV < -0.01) || any(sourceUV > 1.01)) {
         sourceUV = uv + mvOffset;
         if (any(sourceUV < -0.01) || any(sourceUV > 1.01))
             sourceUV = uv;
     }
 
-    // Edge depth guard: only for npcExpanded scatter pixels whose sourceUV may
-    // overshoot the NPC body.
-    if (npcExpanded) {
-        int2 srcPx = clamp(int2(sourceUV * float2(resolution)), int2(0,0), int2(resolution) - 1);
-        float srcD = depthTex[ToDepthCoord(srcPx)];
-        float fgSlack = max(0.01, d * 0.03);
-        if (srcD - d > fgSlack) {
-            float bestDist = 999.0;
-            int2 bestPx = srcPx;
-            bool foundFg = false;
-            [unroll] for (int ry = -8; ry <= 8; ry++) {
-                [unroll] for (int rx = -8; rx <= 8; rx++) {
-                    if (rx == 0 && ry == 0) continue;
-                    int2 tp = clamp(srcPx + int2(rx, ry), int2(0,0), int2(resolution) - 1);
-                    float td = depthTex[ToDepthCoord(tp)];
-                    if (td <= d + fgSlack) {
-                        float dist = float(rx*rx + ry*ry);
-                        if (dist < bestDist) {
-                            bestDist = dist;
-                            bestPx = tp;
-                            foundFg = true;
-                        }
-                    }
-                }
-            }
-            if (foundFg) {
-                sourceUV = (float2(bestPx) + 0.5) / float2(resolution);
-            } else {
-                sourceUV = parallaxSourceUV;
-            }
-        }
-    }
-
-    // Ghost suppression: when stationary, detect backward-warp pixels that are
-    // moving NPC content (significant MV residual). Replace with background by
-    // searching along the residual direction for deeper depth. The NPC forward
-    // overlay then composites the correctly-positioned NPC on top.
-    if (stationaryNpcMode && origD < 0.97) {
-        int2 ghostSrcPx = clamp(int2(sourceUV * float2(resolution)), int2(0,0), int2(resolution) - 1);
-        float2 ghostMV = mvTex[ToMVCoord(ghostSrcPx)] * mvPixelScale;
-        // Compute accurate head MV at the source pixel position and depth,
-        // not the output pixel. For close objects with large parallax, the source
-        // is many pixels from the output — head MV differs significantly, causing
-        // false negatives in the residual check.
-        float2 ghostSrcUV = (float2(ghostSrcPx) + 0.5) / float2(resolution);
-        float ghostSrcD = depthTex[ToDepthCoord(ghostSrcPx)];
-        float2 ghostHeadMV = c2cHeadMV; // fallback
-        if (hasClipToClipNoLoco) {
-            float2 gNdc = float2(ghostSrcUV.x * 2.0 - 1.0, 1.0 - ghostSrcUV.y * 2.0);
-            float4 gClip = float4(gNdc, ghostSrcD, 1.0);
-            float4 gPrev = mul(clipToClipNoLoco, gClip);
-            if (abs(gPrev.w) > 0.0001) {
-                float2 gPrevNDC = gPrev.xy / gPrev.w;
-                ghostHeadMV = float2(gPrevNDC.x * 0.5 + 0.5, 0.5 - gPrevNDC.y * 0.5) - ghostSrcUV;
-            }
-        }
-        float2 ghostResidual = ghostMV - ghostHeadMV;
-        float ghostResidualPx = length(ghostResidual * resolution);
-        float ghostThreshold = 1.5;
-
-        if (ghostResidualPx > ghostThreshold) {
-            // Source is a moving object that has departed. Search along the
-            // residual direction (toward trailing edge) for background depth.
-            float2 searchDir = normalize(ghostResidual * resolution);
-            float ghostD = depthTex[ToDepthCoord(ghostSrcPx)];
-            float bgSlack = max(0.005, ghostD * 0.02);
-            bool foundBg = false;
-            for (int step = 1; step <= 32; step++) {
-                int2 tp = clamp(ghostSrcPx + int2(round(searchDir * float(step))),
-                    int2(0,0), int2(resolution) - 1);
-                float td = depthTex[ToDepthCoord(tp)];
-                if (td - ghostD > bgSlack) {
-                    sourceUV = (float2(tp) + 0.5) / float2(resolution);
-                    foundBg = true;
-                    break;
-                }
-            }
-            if (!foundBg) {
-                // Try opposite direction (leading edge background)
-                for (int step = 1; step <= 32; step++) {
-                    int2 tp = clamp(ghostSrcPx - int2(round(searchDir * float(step))),
-                        int2(0,0), int2(resolution) - 1);
-                    float td = depthTex[ToDepthCoord(tp)];
-                    if (td - ghostD > bgSlack) {
-                        sourceUV = (float2(tp) + 0.5) / float2(resolution);
-                        foundBg = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    // At scatter-covered pixels, override sourceUV with the scatter source position.
+    // The scatter source directly encodes WHERE this pixel's content lives in the cached
+    // frame — the actual position where the content was visible (not occluded).
+    //
+    // Backward warp sourceUV used for ALL pixels. No scatter-source override.
+    // The override was tried but caused dilation/thickening at depth edges —
+    // the 2x2 splat's integer-precision offsets and foreground-winning InterlockedMin
+    // degraded visual quality across the entire scene during both locomotion and
+    // head-tracking. Disocclusion zones are handled purely by gap detection + CSDilate.
 
     sourceUV = saturate(sourceUV);
 
-    // Sample cached frame
+    // Sample cached frame.
     float4 color = prevColor.SampleLevel(linearClamp, sourceUV, 0);
+
+    // Debug mode 60: depth scatter visualization
+    // RED = scattered foreground depth read from atomicDepth
+    // GREEN = cached depth (no scatter hit at this pixel)
+    // Brightness = depth value (darker = closer)
+    if (debugMode == 60) {
+        uint sd = atomicDepth[pixel];
+        if (sd != 0xFFFFFFFF) {
+            float scatD = (float)(sd >> 16) / 65535.0;
+            color = float4(1.0 - scatD, 0, 0, 1); // RED, brighter = closer
+        } else {
+            float cachedD = depthTex[depthPixel];
+            color = float4(0, 1.0 - cachedD, 0, 1); // GREEN
+        }
+    }
+
+    // Debug mode 65: first-person bounding sphere detection.
+    // Unproject pixel to rendering space, check distance to FP sphere center.
+    // RED = inside FP sphere (player model), dimmed = world.
+    if (debugMode == 65 && hasFPSphere) {
+        // Unproject pixel to view/rendering space using depth + FOV tangents
+        float linearD = LinearizeDepth(d, nearZ, farZ);
+        float scaledD = linearD * depthScale;
+        float3 viewPos = float3(tanX * scaledD, tanY * scaledD, scaledD);
+        float dist = length(viewPos - fpSphereCenter.xyz);
+        bool isFirstPerson = (dist < fpSphereRadius && d < 0.87);
+        if (isFirstPerson)
+            color = float4(1.0, color.g * 0.3, color.b * 0.3, 1); // RED = first-person
+        else
+            color = float4(color.rgb * 0.5, 1); // dimmed = world
+    }
+
+    // Debug mode 68: FP detection via depth + AABB bounding boxes.
+    if (debugMode == 68) {
+        float2 dbgUV = (float2(tid.xy) + 0.5) / resolution;
+        if (IsFirstPerson(dbgUV, d))
+            color = float4(1.0, color.g * 0.3, color.b * 0.3, 1); // RED = first-person
+        else
+            color = float4(color.rgb * 0.5, 1); // dimmed = world
+    }
+
+    // Debug mode 67: VR controller hand detection circles.
+    if (debugMode == 67 && hasControllerPose) {
+        float2 ctrls[2] = { controllerUV_LR.xy, controllerUV_LR.zw };
+        for (int h = 0; h < 2; h++) {
+            float rawDist = length(uv - ctrls[h]);
+            bool inside = rawDist < controllerRadius;
+            bool onRing = abs(rawDist - controllerRadius) < (2.0 / resolution.y);
+            if (onRing)
+                color = (h == 0) ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
+            else if (inside && d < 0.87)
+                color = float4(color.r * 0.5 + 0.25, color.g * 0.5 + 0.25, color.b * 0.5, 1);
+            else if (inside)
+                color = float4(color.r * 0.7, color.g * 0.7, color.b * 0.7 + 0.3, 1);
+        }
+    }
+
 
     output[tid.xy] = color;
 }
@@ -590,6 +605,7 @@ void CSClear(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
         return;
     atomicDepth[tid.xy] = 0xFFFFFFFF;   // clear to max for InterlockedMin (smaller depth = closer = wins)
+    disocclusionMap[tid.xy] = 0;       // clear disocclusion map (0=normal)
     output[tid.xy] = float4(0, 0, 0, 1);
 }
 
@@ -922,282 +938,174 @@ void CSDilate(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
         return;
 
-    uint myDepth = atomicDepth[tid.xy];
+    // Only process pixels marked as disoccluded by CSDepthPreScatter.
+    // The disocclusionMap is proactively filled at trailing depth edges during scatter.
+    if (disocclusionMap[tid.xy] == 0) return;
 
-    // Case 1: DISABLED — the two-pass pipeline handles depth-edge correctness
-    // by finalizing depth before writing color. Case 1 was creating visible
-    // streak artifacts by replacing background pixels at depth edges.
-    if (myDepth < 0xFFFFFFFE) {
+    // DEBUG: visualize disocclusion areas
+    // Don't overwrite — CSMain already wrote the detection source color:
+    // RED=gap, YELLOW=near-gap, GREEN=depth-mismatch
+    if (debugMode == 61) {
+        return; // keep CSMain's debug color
+    }
+    // DEBUG 64: solid cyan fill — confirms CSDilate processes ALL void pixels.
+    // If any void pixel shows foreground instead of cyan, it's NOT being processed
+    // by CSDilate (CSMain handled it instead — detection gap).
+    if (debugMode == 64) {
+        output[tid.xy] = float4(0, 1, 1, 1); // CYAN
         return;
     }
 
-    // Case 3 only: unfilled (black) pixels. Skip sky-marked pixels entirely —
-    // filling sky gaps with fg color makes distant trees/foliage look solid.
-    if (myDepth != 0xFFFFFFFF) return;  // only process unfilled pixels
+    // ── Loco-direction background extension with perpendicular smoothing ──
+    // Walk in the LOCO direction past the gap to find actual background content.
+    // Then sample a perpendicular strip at that position for smooth fill.
+    //
+    // Why loco-only: Isotropic blur samples from ALL directions including the
+    // foreground edge, creating angled geometric artifacts where different parts
+    // of the foreground silhouette contaminate the fill at different angles.
+    // By ONLY extending from the loco side, the fill is pure background — the
+    // same approach Oculus ASW uses ("stretching nearby background pixels").
+    int2 pixel = (int2)tid.xy;
+    bool hasLoco = length(locoScreenDir) > 0.001;
 
-    // Locomotion-aligned mirror-fill with source-passthrough fallback.
-    // The mirror-fill along the loco direction produces smooth, motion-aligned
-    // content for trailing-edge disocclusion. When no background is found in the
-    // loco direction, fall back to source frame passthrough (previous frame's
-    // content at this screen position) instead of nearest-pixel search, which
-    // pulls in wrong content (ground, other fg) and creates streak artifacts.
+    {
+        // 8-direction nearest-neighbor, background-preferring fill.
+        // Works for BOTH locomotion disocclusion AND NPC animation disocclusion.
+        // Phase 1: find nearest valid pixel + its depth in each direction.
+        // Phase 2: find the max depth (most background) across all candidates.
+        // Phase 3: average only candidates within 0.02 of max depth.
+        //   - Trailing edges: max=sky/wall, foreground excluded → pure background fill
+        //   - Inner gaps: max=NPC, all NPC candidates included → NPC fill
+        int2 dirs8[8] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1),
+                          int2(-1,-1), int2(1,-1), int2(-1,1), int2(1,1) };
+        int2 candPixel[8];
+        float candDepth[8];
+        int candDist[8];
+        bool candFound[8];
 
-    int maxSearch = 128;
-
-    int2 dirs[8] = {
-        int2(-1,0), int2(1,0), int2(0,-1), int2(0,1),
-        int2(-1,-1), int2(1,-1), int2(-1,1), int2(1,1)
-    };
-
-    // locoScreenDir is pre-computed from actorPos delta (thumbstick locomotion),
-    // NOT from forwardPoseDelta (which is head-only tracking translation).
-    // This ensures CSDilate searches along the actual locomotion direction.
-
-    // Find which of the 8 directions best aligns with locomotion
-    float bestAlign = -2.0;
-    int primaryDir = 0;
-    if (length(locoScreenDir) > 0.0001) {
-        float2 locoNorm = normalize(locoScreenDir);
-        [unroll]
-        for (int i = 0; i < 8; i++) {
-            float2 d = normalize(float2(dirs[i]));
-            float alignment = dot(d, locoNorm);
-            if (alignment > bestAlign) {
-                bestAlign = alignment;
-                primaryDir = i;
-            }
+        [unroll] for (int i = 0; i < 8; i++) {
+            candFound[i] = false; candDepth[i] = 0; candDist[i] = 999;
         }
-    }
 
-    bool useLocoDir = (length(locoScreenDir) > 0.0001 && bestAlign > 0.3);
-
-    // --- Direction-agnostic mirror fill ---
-    // Search BOTH loco and opposite directions with contig>=3 filter.
-    // Assign fg/bg by depth (closer=fg, farther=bg). Mirror from bg side.
-    // Farthest-depth-edge fallback for intra-object gaps (similar depth).
-
-    int2 oppDirVec = -dirs[primaryDir];
-
-    // Search direction A (loco direction) — skip isolated scattered pixels
-    int distA = 0;
-    uint depthA = 0xFFFFFFFF;
-    bool foundA = false;
-
-    if (useLocoDir) {
-        for (int step = 1; step <= maxSearch; step++) {
-            int2 p = (int2)tid.xy + dirs[primaryDir] * step;
-            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                break;
-            uint nd = atomicDepth[p];
-            if (nd == 0xFFFFFFFF) continue;
-
-            int contig = 1;
-            for (int c = 1; c <= 3; c++) {
-                int2 cp = p + dirs[primaryDir] * c;
-                if (any(cp < 0) || cp.x >= (int)resolution.x || cp.y >= (int)resolution.y)
-                    break;
-                if (atomicDepth[cp] == 0xFFFFFFFF) break;
-                contig++;
-            }
-
-            if (contig >= 3) {
-                distA = step;
-                depthA = nd;
-                foundA = true;
+        [unroll] for (int dir = 0; dir < 8; dir++) {
+            for (int step = 1; step <= 60; step++) {
+                int2 np = pixel + dirs8[dir] * step;
+                if (any(np < 0) || np.x >= (int)resolution.x || np.y >= (int)resolution.y) break;
+                uint nd = atomicDepth[np];
+                if (nd == 0xFFFFFFFF) continue;
+                if (disocclusionMap[np] != 0) continue;
+                candPixel[dir] = np;
+                candDepth[dir] = (float)(nd >> 16) / 65535.0;
+                candDist[dir] = step;
+                candFound[dir] = true;
                 break;
             }
         }
-    }
 
-    // Search direction B (opposite to loco) — skip isolated scattered pixels
-    int distB = 0;
-    uint depthB = 0xFFFFFFFF;
-    bool foundB = false;
+        // Find max depth (background)
+        float maxD = 0;
+        [unroll] for (int i = 0; i < 8; i++) {
+            if (candFound[i] && candDepth[i] > maxD) maxD = candDepth[i];
+        }
 
-    if (useLocoDir) {
-        for (int step = 1; step <= maxSearch; step++) {
-            int2 p = (int2)tid.xy + oppDirVec * step;
-            if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                break;
-            uint nd = atomicDepth[p];
-            if (nd == 0xFFFFFFFF) continue;
-
-            int contig = 1;
-            for (int c = 1; c <= 3; c++) {
-                int2 cp = p + oppDirVec * c;
-                if (any(cp < 0) || cp.x >= (int)resolution.x || cp.y >= (int)resolution.y)
-                    break;
-                if (atomicDepth[cp] == 0xFFFFFFFF) break;
-                contig++;
-            }
-
-            if (contig >= 3) {
-                distB = step;
-                depthB = nd;
-                foundB = true;
-                break;
+        // Find foreground depth to set the background threshold.
+        // Use the SHALLOWEST (closest) candidate from the 8-direction search as fgRef.
+        // During loco: this is the NPC/tree that created the trailing edge.
+        // During NPC animation: this is the NPC body part that moved.
+        float fgRef = 0.0;
+        [unroll] for (int i = 0; i < 8; i++) {
+            if (candFound[i] && (fgRef < 0.001 || candDepth[i] < fgRef)) {
+                fgRef = candDepth[i];
             }
         }
-    }
+        float bgThreshold = fgRef + 0.02;
 
-    // Assign fg/bg by depth. Mirror from bg side.
-    bool useMirror = false;
-    int bgDist = 0;
-    int2 bgDirVec = oppDirVec;
-
-    if (foundA && foundB) {
-        if (depthA >= 0xFFFFFFFE || depthB >= 0xFFFFFFFE) {
-            useMirror = true;
-            if (depthA >= 0xFFFFFFFE) {
-                bgDist = distA; bgDirVec = dirs[primaryDir];
-            } else {
-                bgDist = distB; bgDirVec = oppDirVec;
-            }
-        } else {
-            float dA = asfloat(depthA);
-            float dB = asfloat(depthB);
-
-            float fgD, bgD;
-            if (dA > dB) {
-                bgD = dA; fgD = dB;
-                bgDist = distA; bgDirVec = dirs[primaryDir];
-            } else {
-                bgD = dB; fgD = dA;
-                bgDist = distB; bgDirVec = oppDirVec;
-            }
-
-            bool realDisocclusion = (bgD > fgD * 1.01);
-
-            if (realDisocclusion) {
-                // Real disocclusion confirmed — always mirror from bg side.
-                useMirror = true;
-            } else {
-                // Both edges at similar depth — second-pass search skipping
-                // content at the found depth to find real background.
-                float skipD = min(dA, dB);
-
-                [unroll]
-                for (int dir = 0; dir < 2; dir++) {
-                    if (useMirror) break;
-                    int2 searchDir = (dir == 0) ? dirs[primaryDir] : oppDirVec;
-                    int startStep = (dir == 0) ? distA + 1 : distB + 1;
-
-                    for (int step = startStep; step <= maxSearch; step++) {
-                        int2 p = (int2)tid.xy + searchDir * step;
-                        if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                            break;
-                        uint nd = atomicDepth[p];
-                        if (nd == 0xFFFFFFFF) continue;
-                        if (nd >= 0xFFFFFFFE) {
-                            bgDist = step; bgDirVec = searchDir;
-                            useMirror = true;
-                            break;
-                        }
-                        float d = asfloat(nd);
-                        if (d <= skipD * 1.01) continue;
-                        int contig = 1;
-                        for (int c = 1; c <= 3; c++) {
-                            int2 cp = p + searchDir * c;
-                            if (any(cp < 0) || cp.x >= (int)resolution.x || cp.y >= (int)resolution.y)
-                                break;
-                            if (atomicDepth[cp] == 0xFFFFFFFF) break;
-                            contig++;
-                        }
-                        if (contig >= 3) {
-                            bgDist = step; bgDirVec = searchDir;
-                            useMirror = true;
-                            break;
-                        }
-                    }
+        // Find best background candidate.
+        // When fgRef found: closest candidate deeper than fgRef+0.02 (contextual bg).
+        // When fgRef NOT found (all-void anti-loco): deepest candidate (avoids
+        // picking nearby branch over distant sky when threshold is meaningless).
+        int bestDir = -1;
+        if (fgRef > 0.001) {
+            // Closest background deeper than foreground
+            int bestDist = 999;
+            [unroll] for (int i = 0; i < 8; i++) {
+                if (candFound[i] && candDepth[i] > bgThreshold && candDist[i] < bestDist) {
+                    bestDist = candDist[i];
+                    bestDir = i;
                 }
             }
         }
-    } else if (foundA && !foundB) {
-        bgDist = distA; bgDirVec = dirs[primaryDir];
-        useMirror = true;
-    } else if (foundB && !foundA) {
-        bgDist = distB; bgDirVec = oppDirVec;
-        useMirror = true;
-    }
-
-    if (useMirror) {
-        // Locomotion mirror fill: sample from background surface past the bg edge.
-        // Cap the mirror offset to prevent body-shape echo — when bgDist varies
-        // along a foreground object's outline, uncapped 2x mirror traces the outline
-        // into the background, creating visible outline-shaped fill. Capping to a
-        // small fixed offset (8px) makes fill content uniform across the gap.
-        int2 bgEdge = (int2)tid.xy + bgDirVec * bgDist;
-        int mirrorOffset = min(bgDist, 8);
-        int2 mirrorPos = bgEdge + bgDirVec * mirrorOffset;
-        mirrorPos = clamp(mirrorPos, int2(0, 0),
-                          int2((int)resolution.x - 1, (int)resolution.y - 1));
-        uint mirrorDepth = atomicDepth[mirrorPos];
-        if (mirrorDepth != 0xFFFFFFFF) {
-            output[tid.xy] = output[mirrorPos];
-        } else {
-            output[tid.xy] = output[bgEdge];
-        }
-    } else if (useLocoDir) {
-        // Locomotion active but mirror rejected (intra-object gap).
-        // Use farthest-depth edge found (most likely background).
-        bool fallbackFilled = false;
-        if (foundA || foundB) {
-            int2 bestEdge;
-            if (foundA && foundB) {
-                float dAf = (depthA >= 0xFFFFFFFE) ? 1.0 : asfloat(depthA);
-                float dBf = (depthB >= 0xFFFFFFFE) ? 1.0 : asfloat(depthB);
-                if (dAf >= dBf) {
-                    bestEdge = (int2)tid.xy + dirs[primaryDir] * distA;
-                } else {
-                    bestEdge = (int2)tid.xy + oppDirVec * distB;
-                }
-            } else if (foundA) {
-                bestEdge = (int2)tid.xy + dirs[primaryDir] * distA;
-            } else {
-                bestEdge = (int2)tid.xy + oppDirVec * distB;
+        // Fallback: deepest overall (also used when fgRef not found)
+        if (bestDir < 0) {
+            [unroll] for (int i = 0; i < 8; i++) {
+                if (candFound[i] && (bestDir < 0 || candDepth[i] > candDepth[bestDir]))
+                    bestDir = i;
             }
-            bestEdge = clamp(bestEdge, int2(0, 0),
-                             int2((int)resolution.x - 1, (int)resolution.y - 1));
-            output[tid.xy] = output[bestEdge];
-            fallbackFilled = true;
         }
-        if (!fallbackFilled) {
-            float2 srcUV = (float2(tid.xy) + 0.5) / resolution;
+
+        // Single scatter-source pixel fill — clean background color, no foreground.
+        if (bestDir >= 0) {
+            uint cnd = atomicDepth[candPixel[bestDir]];
+            int cdx = (int)((cnd >> 8) & 0xFFu) - 127;
+            int cdy = (int)(cnd & 0xFFu) - 127;
+            int2 src = clamp(candPixel[bestDir] - int2(cdx, cdy), int2(0,0), int2(resolution) - 1);
+            float2 srcUV = (float2(src) + 0.5) / resolution;
             output[tid.xy] = prevColor.SampleLevel(linearClamp, srcUV, 0);
-        }
-    } else {
-        // No locomotion: minimal fill for immediate scatter seams only.
-        // Head tracking creates sub-pixel to 1px displacement, so scatter gaps
-        // are tiny. Search only 2 steps (immediate neighbors) to seal 1px seams.
-        // Anything farther is natural foliage transparency — prevColor passthrough
-        // preserves thin geometry (flowers, grass) without thickening.
-        uint bestDepth = 0;
-        int2 bestPos = (int2)tid.xy;
-        bool found = false;
-        [unroll]
-        for (int d = 0; d < 8; d++) {
-            for (int step = 1; step <= 2; step++) {
-                int2 p = (int2)tid.xy + dirs[d] * step;
-                if (any(p < 0) || p.x >= (int)resolution.x || p.y >= (int)resolution.y)
-                    break;
-                uint nd = atomicDepth[p];
-                if (nd != 0xFFFFFFFF) {
-                    if (!found || nd > bestDepth) {
-                        bestDepth = nd;
-                        bestPos = p;
-                        found = true;
-                    }
-                    break;
-                }
-            }
-        }
-        if (found) {
-            output[tid.xy] = output[bestPos];
-        } else {
-            float2 srcUV = (float2(tid.xy) + 0.5) / resolution;
-            output[tid.xy] = prevColor.SampleLevel(linearClamp, srcUV, 0);
+            return;
         }
     }
+
+    // Final fallback
+    output[tid.xy] = float4(0, 0, 0, 1);
+}
+
+// ── Post-fill blur: smooth ONLY the void-zone pixels among themselves ──
+// Dispatched AFTER CSDilate. Reads the filled output values and averages
+// each void pixel with its void-pixel neighbors. Non-void pixels are excluded.
+// This adds natural blur without introducing any foreground contamination.
+[numthreads(8, 8, 1)]
+void CSBlurVoids(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y) return;
+    // Process void pixels AND pixels 1-2px outside the void boundary.
+    // The border pixels (non-void, next to void) may have dark foreground
+    // from CSMain's backward warp — blurring smooths them out.
+    if (disocclusionMap[tid.xy] == 0) {
+        bool nearVoid = false;
+        [unroll] for (int r = 1; r <= 2 && !nearVoid; r++) {
+            int2 np;
+            np = (int2)tid.xy + int2(-r, 0); if (np.x >= 0 && disocclusionMap[np] != 0) nearVoid = true;
+            np = (int2)tid.xy + int2(r, 0); if (np.x < (int)resolution.x && disocclusionMap[np] != 0) nearVoid = true;
+            np = (int2)tid.xy + int2(0, -r); if (np.y >= 0 && disocclusionMap[np] != 0) nearVoid = true;
+            np = (int2)tid.xy + int2(0, r); if (np.y < (int)resolution.y && disocclusionMap[np] != 0) nearVoid = true;
+        }
+        if (!nearVoid) return;
+    }
+
+    // Void neighbors: always included.
+    // Non-void neighbors: only if background scatter depth (deeper than foreground).
+    // This smooths the void↔background border without pulling in foreground.
+    float4 blurred = float4(0, 0, 0, 0);
+    float weight = 0;
+    [unroll] for (int dy = -6; dy <= 6; dy++) {
+        [unroll] for (int dx = -6; dx <= 6; dx++) {
+            if (dx*dx + dy*dy > 36) continue; // circular kernel
+            int2 np = (int2)tid.xy + int2(dx, dy);
+            if (any(np < 0) || np.x >= (int)resolution.x || np.y >= (int)resolution.y)
+                continue;
+            if (disocclusionMap[np] == 0) {
+                // Non-void: only include if background scatter depth
+                uint nd = atomicDepth[np];
+                if (nd == 0xFFFFFFFF) continue;
+                float ndd = (float)(nd >> 16) / 65535.0;
+                if (ndd < 0.95) continue; // foreground — skip
+            }
+            float w = exp(-(float)(dx*dx + dy*dy) / 24.0);
+            blurred += output[np] * w;
+            weight += w;
+        }
+    }
+    if (weight > 0.001)
+        output[tid.xy] = blurred / weight;
 }
 
 )";
@@ -1221,9 +1129,189 @@ void CSCompositeNpcForward(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// Hand composite: overlay re-rendered FP hand pixels onto warp output.
+// Hand RT was cleared to depth=1.0 — any pixel with depth < 0.999 is a hand pixel.
+// Controller delta shifts the hand RT sampling to the warp-time controller position.
+// Since the hand RT has a transparent background, trailing-edge gaps just show through
+// to the warp output beneath — no disocclusion artifacts.
+static const char* s_handCompositeHLSL = R"(
+Texture2D<float4> handColor : register(t0);
+Texture2D<float>  handDepth : register(t1);
+RWTexture2D<float4> output  : register(u0);
+
+cbuffer HandCompositeCB : register(b0) {
+    float2 controllerDeltaL;  // UV shift for left hand (warp_UV - cached_UV)
+    float2 controllerDeltaR;  // UV shift for right hand
+    float2 controllerUV_L;    // cached-frame left controller UV
+    float2 controllerUV_R;    // cached-frame right controller UV
+    float  controllerRadius;  // hand detection radius in UV
+    float2 resolution;        // output resolution
+    float  _pad;
+};
+
+[numthreads(8, 8, 1)]
+void CSHandComposite(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    float2 uv = (float2(tid.xy) + 0.5) / resolution;
+
+    // Per-pixel controller delta: blend between L/R based on proximity
+    float distL = length(uv - (controllerUV_L + controllerDeltaL));
+    float distR = length(uv - (controllerUV_R + controllerDeltaR));
+    float2 delta = (distL < distR) ? controllerDeltaL : controllerDeltaR;
+
+    // Source pixel in hand RT (shift backward by controller delta)
+    int2 srcPx = int2((uv - delta) * resolution);
+    if (srcPx.x < 0 || srcPx.y < 0 || srcPx.x >= (int)resolution.x || srcPx.y >= (int)resolution.y)
+        return;
+
+    float hd = handDepth[srcPx];
+    if (hd < 0.999) {
+        output[tid.xy] = handColor[srcPx];
+    }
+}
+)";
+
+// ── Legacy ASW shader: simple backward warp with translation-only parallax ──
+// Self-contained — uses its own cbuffer matching the main WarpConstants layout.
+// No forward scatter, no MV correction, no disocclusion fill.
+static const char* s_legacyWarpHLSL = R"(
+Texture2D<float4> prevColor    : register(t0);
+Texture2D<float>  depthTex     : register(t2);
+RWTexture2D<float4> output     : register(u0);
+SamplerState linearClamp       : register(s0);
+
+cbuffer WarpParams : register(b0) {
+    row_major float4x4 poseDeltaMatrix;
+    float2 resolution;
+    float nearZ, farZ;
+    float fovTanLeft, fovTanRight, fovTanUp, fovTanDown;
+    float depthScale;
+    float3 _pad;
+};
+
+float LinearizeDepth(float d, float zNear, float zFar) {
+    float denom = zFar - d * (zFar - zNear);
+    return (abs(denom) > 0.0001) ? (zNear * zFar / denom) : zFar;
+}
+
+[numthreads(8, 8, 1)]
+void CSLegacyWarp(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    float2 uv = ((float2)tid.xy + 0.5) / resolution;
+    float d = depthTex[tid.xy];
+    float linearDepth = LinearizeDepth(d, nearZ, farZ) * depthScale;
+
+    float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
+    float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
+    float3 viewPos = float3(tanX * linearDepth, tanY * linearDepth, linearDepth);
+
+    float4 transformed = mul(poseDeltaMatrix, float4(viewPos, 1.0));
+
+    float2 sourceUV = uv;
+    if (linearDepth > 0.001 && transformed.z > 0.001) {
+        float oldTanX = transformed.x / transformed.z;
+        float oldTanY = transformed.y / transformed.z;
+        sourceUV = float2(
+            (oldTanX - fovTanLeft) / (fovTanRight - fovTanLeft),
+            (oldTanY - fovTanUp) / (fovTanDown - fovTanUp));
+    }
+
+    sourceUV = saturate(sourceUV);
+    output[tid.xy] = prevColor.SampleLevel(linearClamp, sourceUV, 0);
+}
+)";
+
 static const char* s_npcScatterHLSL = R"(
-// ── NPC depth scatter: forward-scatter NPC depth for backward warp boundary extension ──
-// For each pixel with significant NPC animation MV, scatter its depth to the
+// ── CSDepthPreScatter: scatter ALL cached pixels' depths to their WARP OUTPUT positions ──
+// Uses forwardPoseDelta (cached→warp head delta) + MV residual (loco/stick/NPC)
+// to place scatter in WARP OUTPUT space. The old approach (srcUV - totalMV) placed
+// scatter in game-frame space, misaligned with the output by the cached→warp head
+// delta — causing the scatter buffer to shift ~7-14px with head turns.
+[numthreads(8, 8, 1)]
+void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    int2 srcPixel = (int2)tid.xy;
+    float d = depthTex[ToDepthCoord(srcPixel)];
+    // Sky pixels ARE scattered (not skipped) so that sky areas fill atomicDepth
+    // with valid depth values. Without this, sky positions remain 0xFFFFFFFF and
+    // are falsely detected as disocclusion gaps. Only true voids (behind foreground
+    // where nothing was rendered in the cached frame) should remain as 0xFFFFFFFF.
+
+    float2 srcUV = (float2(srcPixel) + 0.5) / resolution;
+
+    // Step 1: Forward transform via forwardPoseDelta (cached view → warp view).
+    // This handles the head tracking delta from cached pose to warp predicted pose.
+    float linearDepth = LinearizeDepth(d, nearZ, farZ);
+    float scaledDepth = linearDepth * depthScale;
+    float srcTanX = lerp(fovTanLeft, fovTanRight, srcUV.x);
+    float srcTanY = lerp(fovTanUp, fovTanDown, srcUV.y);
+    float3 viewPos = float3(srcTanX * scaledDepth, srcTanY * scaledDepth, scaledDepth);
+    float4 xformed = mul(forwardPoseDelta, float4(viewPos, 1.0));
+    float2 dstUV = srcUV;
+    if (scaledDepth > 0.001 && xformed.z > 0.001) {
+        dstUV = float2(
+            (xformed.x / xformed.z - fovTanLeft) / (fovTanRight - fovTanLeft),
+            (xformed.y / xformed.z - fovTanUp) / (fovTanDown - fovTanUp));
+    }
+    float depthFade = (nearFadeDepth > 0.0) ? saturate((linearDepth - nearFadeDepth) / nearFadeDepth) : 1.0;
+    dstUV = lerp(srcUV, dstUV, depthFade);
+
+    // Step 2: Add MV residual for scatter destination.
+    // FP pixels: per-pixel game MV residual (totalMV - headOnlyMV) captures controller
+    // motion + bone animation. Scatter to predicted position so CSMain has depth coverage.
+    // World pixels: loco + stick rotation + NPC animation as before.
+    bool isFPScatter = IsFirstPerson(srcUV, d);
+    if (abs(mvConfidence) > 0.001 && !isMenuOpen && !isLegacyMode) {
+        float2 rawMV = mvTex[ToMVCoord(srcPixel)];
+        float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
+
+        float4 rotated = mul(headRotMatrix, float4(viewPos, 1.0));
+        float2 headOnlyMV = float2(0, 0);
+        if (scaledDepth > 0.001 && rotated.z > 0.001) {
+            headOnlyMV = float2(
+                (rotated.x / rotated.z - fovTanLeft) / (fovTanRight - fovTanLeft),
+                (rotated.y / rotated.z - fovTanUp) / (fovTanDown - fovTanUp)) - srcUV;
+        }
+        if (isFPScatter) {
+            float2 fpResidual = totalMV - headOnlyMV;
+            dstUV -= mvConfidence * fpResidual;
+        } else {
+            dstUV -= mvConfidence * (totalMV - headOnlyMV);
+        }
+
+    }
+
+    float2 dstPx = dstUV * resolution;
+    uint depth16 = (uint)round(saturate(d) * 65535.0);
+
+    // 2x2 bilinear splat: provides full scatter coverage on surfaces with non-uniform MVs
+    // (NPC animation, cloth folds). 1x1 scatter created systematic gaps on NPC surfaces
+    // that were falsely detected as disocclusion → grid lines filled with background.
+    // The 2x2 splat's foreground contamination at gap edges is handled by flagging
+    // gap-adjacent pixels for CSDilate fill (adjacentToGap check in CSMain).
+    // The scatter-source color override in CSMain handles non-adjacent pixels correctly.
+    int2 p0 = int2(floor(dstPx - 0.5));
+    for (int sy = 0; sy <= 1; sy++) {
+        for (int sx = 0; sx <= 1; sx++) {
+            int2 p = p0 + int2(sx, sy);
+            if (all(p >= 0) && p.x < (int)resolution.x && p.y < (int)resolution.y) {
+                int dx = clamp(p.x - srcPixel.x, -127, 127);
+                int dy = clamp(p.y - srcPixel.y, -127, 127);
+                uint packed = (depth16 << 16) |
+                    ((uint)clamp(dx + 127, 0, 255) << 8) |
+                    (uint)clamp(dy + 127, 0, 255);
+                InterlockedMin(atomicDepth[p], packed);
+            }
+        }
+    }
+}
+
 // predicted NPC position via InterlockedMin. The packed value stores 16 bits of
 // depth and 8 bits per axis for the source offset (signed ±127).
 [numthreads(8, 8, 1)]
@@ -1435,6 +1523,24 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t renderWidth, uint32_
 	m_hasLastPublishedPose = false;
 	m_frameCounter = 0;
 
+	// Compile legacy warp shader synchronously (tiny shader, <1ms)
+	{
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errs = nullptr;
+		HRESULT hr = D3DCompile(s_legacyWarpHLSL, strlen(s_legacyWarpHLSL),
+		    "LegacyWarp", nullptr, nullptr, "CSLegacyWarp", "cs_5_0",
+		    D3DCOMPILE_PACK_MATRIX_ROW_MAJOR | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errs);
+		if (SUCCEEDED(hr) && blob) {
+			device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+			    nullptr, &m_legacyWarpCS);
+			blob->Release();
+			OOVR_LOG("ASW: Legacy warp shader compiled OK");
+		} else {
+			if (errs) { OOVR_LOGF("ASW: Legacy shader error: %s", (char*)errs->GetBufferPointer()); errs->Release(); }
+		}
+		if (errs) errs->Release();
+	}
+
 	OOVR_LOGF("ASW: Resources created — render %ux%u, output %ux%u per eye, shaders compiling in background",
 	    m_renderWidth, m_renderHeight, m_outputWidth, m_outputHeight);
 	return true; // m_ready stays false until shaders are done
@@ -1536,6 +1642,7 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	std::string fullShaderSrc = csMainSrc + s_forwardScatterHLSL;
 	std::string npcShaderSrc  = csMainSrc + s_npcScatterHLSL;
 	std::string compositeStr  = std::string(s_npcForwardCompositeHLSL);
+	std::string handCompStr   = std::string(s_handCompositeHLSL);
 
 	DWORD flags = D3DCOMPILE_PACK_MATRIX_ROW_MAJOR | D3DCOMPILE_ENABLE_STRICTNESS;
 #ifdef _DEBUG
@@ -1549,7 +1656,8 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	static const char* entryPoints[] = {
 		"CSMain", "CSClear", "CSForwardDepth", "CSForwardColor",
 		"CSForwardDepthNpcOnly", "CSForwardColorNpcOnly", "CSDilate",
-		"CSCompositeNpcForward", "CSNpcDepthScatter"
+		"CSCompositeNpcForward", "CSNpcDepthScatter", "CSDepthPreScatter", "CSBlurVoids",
+		"CSHandComposite"
 	};
 	constexpr int kJobCount = _countof(entryPoints);
 	m_pendingBlobs.resize(kJobCount);
@@ -1560,12 +1668,13 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 	}
 
 	// Source string to use for each entry point (by index)
-	// 0=csMainSrc, 1-6=fullShaderSrc, 7=compositeStr, 8=npcShaderSrc
+	// 0=csMainSrc, 1-6=fullShaderSrc, 7=compositeStr, 8-9=npcShaderSrc, 10=fullShaderSrc, 11=handCompStr
 	struct SourceMap { int blobIdx; const std::string* src; };
 	SourceMap srcMap[] = {
 		{0, &csMainSrc}, {1, &fullShaderSrc}, {2, &fullShaderSrc}, {3, &fullShaderSrc},
 		{4, &fullShaderSrc}, {5, &fullShaderSrc}, {6, &fullShaderSrc},
-		{7, &compositeStr}, {8, &npcShaderSrc}
+		{7, &compositeStr}, {8, &npcShaderSrc}, {9, &npcShaderSrc}, {10, &fullShaderSrc},
+		{11, &handCompStr}
 	};
 
 	// Launch a single background thread that compiles all shaders in parallel internally.
@@ -1576,13 +1685,15 @@ bool ASWProvider::LaunchAsyncShaderCompilation()
 		 fullShaderSrc = std::move(fullShaderSrc),
 		 npcShaderSrc = std::move(npcShaderSrc),
 		 compositeStr = std::move(compositeStr),
+		 handCompStr = std::move(handCompStr),
 		 flags]() {
 		const std::string* sources[] = {
 			&csMainSrc, &fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
 			&fullShaderSrc, &fullShaderSrc, &fullShaderSrc,
-			&compositeStr, &npcShaderSrc
+			&compositeStr, &npcShaderSrc, &npcShaderSrc, &fullShaderSrc,
+			&handCompStr
 		};
-		constexpr int N = 9;
+		constexpr int N = 12;
 
 		// Launch parallel sub-tasks for each shader
 		std::vector<std::future<void>> futures;
@@ -1623,7 +1734,8 @@ void ASWProvider::TryFinishShaderCompilation()
 	    &m_warpCS,               // [0] CSMain
 	    &m_clearCS, &m_forwardDepthCS, &m_forwardColorCS,
 	    &m_forwardDepthNpcOnlyCS, &m_forwardColorNpcOnlyCS, &m_dilateCS,
-	    &m_compositeNpcForwardCS, &m_npcDepthScatterCS,
+	    &m_compositeNpcForwardCS, &m_npcDepthScatterCS, &m_depthPreScatterCS, &m_blurVoidsCS,
+	    &m_handCompositeCS,      // [11] CSHandComposite
 	};
 	const int kJobCount = (int)m_pendingBlobs.size();
 	bool csMainOk = false;
@@ -1682,8 +1794,120 @@ void ASWProvider::TryFinishShaderCompilation()
 		return;
 	}
 
+	// Create hand render targets + replay CBs for FP hand re-rendering
+	if (!CreateHandRenderTargets(m_device, m_renderWidth, m_renderHeight)) {
+		OOVR_LOG("ASW: Hand render targets failed (non-fatal — FP replay disabled)");
+	}
+
 	m_ready = true;
 	OOVR_LOG("ASW: Shaders compiled and ready — ASW active");
+}
+
+bool ASWProvider::CreateHandRenderTargets(ID3D11Device* device, uint32_t w, uint32_t h)
+{
+	HRESULT hr;
+
+	// Per-eye hand color RT (RGBA8)
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w; td.Height = h;
+	td.MipLevels = 1; td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+	D3D11_TEXTURE2D_DESC dd = {};
+	dd.Width = w; dd.Height = h;
+	dd.MipLevels = 1; dd.ArraySize = 1;
+	dd.Format = DXGI_FORMAT_R32_TYPELESS; // TYPELESS allows both D32_FLOAT DSV and R32_FLOAT SRV
+	dd.SampleDesc.Count = 1; dd.Usage = D3D11_USAGE_DEFAULT;
+	dd.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+
+	for (int eye = 0; eye < 2; eye++) {
+		hr = device->CreateTexture2D(&td, nullptr, &m_handColor[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand color RT failed hr=0x%08x", (unsigned)hr); return false; }
+
+		D3D11_RENDER_TARGET_VIEW_DESC rtvd = {};
+		rtvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		hr = device->CreateRenderTargetView(m_handColor[eye], &rtvd, &m_handRTV[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand RTV failed hr=0x%08x", (unsigned)hr); return false; }
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+		srvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvd.Texture2D.MipLevels = 1;
+		hr = device->CreateShaderResourceView(m_handColor[eye], &srvd, &m_srvHandColor[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand color SRV failed hr=0x%08x", (unsigned)hr); return false; }
+
+		hr = device->CreateTexture2D(&dd, nullptr, &m_handDepthTex[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand depth tex failed hr=0x%08x", (unsigned)hr); return false; }
+
+		D3D11_DEPTH_STENCIL_VIEW_DESC dsvd = {};
+		dsvd.Format = DXGI_FORMAT_D32_FLOAT;
+		dsvd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+		hr = device->CreateDepthStencilView(m_handDepthTex[eye], &dsvd, &m_handDSV[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand DSV failed hr=0x%08x", (unsigned)hr); return false; }
+
+		// SRV on D32_FLOAT (read as R32_FLOAT)
+		D3D11_SHADER_RESOURCE_VIEW_DESC dsrvd = {};
+		dsrvd.Format = DXGI_FORMAT_R32_FLOAT;
+		dsrvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		dsrvd.Texture2D.MipLevels = 1;
+		hr = device->CreateShaderResourceView(m_handDepthTex[eye], &dsrvd, &m_srvHandDepth[eye]);
+		if (FAILED(hr)) { OOVR_LOGF("ASW: hand depth SRV failed hr=0x%08x", (unsigned)hr); return false; }
+	}
+
+	// Depth stencil state for hand replay: LESS_EQUAL, depth write enabled
+	D3D11_DEPTH_STENCIL_DESC dssd = {};
+	dssd.DepthEnable = TRUE;
+	dssd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+	dssd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+	dssd.StencilEnable = FALSE;
+	hr = device->CreateDepthStencilState(&dssd, &m_handDSS);
+	if (FAILED(hr)) { OOVR_LOGF("ASW: hand DSS failed hr=0x%08x", (unsigned)hr); return false; }
+
+	// Pre-allocate replay constant buffers
+	for (int i = 0; i < 7; i++) {
+		D3D11_BUFFER_DESC cbd = {};
+		cbd.ByteWidth = (kReplayCBSizes[i] + 15) & ~15; // 16-byte aligned
+		cbd.Usage = D3D11_USAGE_DEFAULT;
+		cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		hr = device->CreateBuffer(&cbd, nullptr, &m_replayCB[i]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: replay CB[%d] (slot %d, %u bytes) failed hr=0x%08x",
+				i, kReplayCBSlots[i], kReplayCBSizes[i], (unsigned)hr);
+			return false;
+		}
+	}
+	// PS replay CBs (256 bytes each)
+	for (int i = 0; i < 3; i++) {
+		D3D11_BUFFER_DESC cbd = {};
+		cbd.ByteWidth = 256;
+		cbd.Usage = D3D11_USAGE_DEFAULT;
+		cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		hr = device->CreateBuffer(&cbd, nullptr, &m_replayPSCB[i]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: replay PSCB[%d] failed hr=0x%08x", i, (unsigned)hr);
+			return false;
+		}
+	}
+
+	// Hand composite CB
+	{
+		D3D11_BUFFER_DESC cbd = {};
+		cbd.ByteWidth = (sizeof(HandCompositeConstants) + 15) & ~15;
+		cbd.Usage = D3D11_USAGE_DYNAMIC;
+		cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		hr = device->CreateBuffer(&cbd, nullptr, &m_handCompositeCB);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: hand composite CB failed hr=0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	OOVR_LOGF("ASW: Hand render targets created (%ux%u per eye)", w, h);
+	return true;
 }
 
 bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
@@ -1751,6 +1975,37 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 			}
 			if (FAILED(hr)) {
 				OOVR_LOGF("ASW: CreateSRV depth[%u][%d] failed", slot, eye);
+				return false;
+			}
+
+			// Cached stencil (R8_UINT — extracted from R24G8 depth-stencil)
+			desc.Format = DXGI_FORMAT_R8_UINT;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			desc.MiscFlags = 0;
+			hr = device->CreateTexture2D(&desc, nullptr, &m_cachedStencil[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateTexture2D stencil[%u][%d] R8_UINT failed hr=0x%08X", slot, eye, hr);
+				return false;
+			}
+			srvDesc.Format = DXGI_FORMAT_R8_UINT;
+			hr = device->CreateShaderResourceView(m_cachedStencil[slot][eye], &srvDesc, &m_srvStencil[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateSRV stencil[%u][%d] failed", slot, eye);
+				return false;
+			}
+
+			// Cached FP mask (R8_UINT from SKSE DS→DS depth comparison)
+			desc.Format = DXGI_FORMAT_R8_UINT;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			hr = device->CreateTexture2D(&desc, nullptr, &m_cachedPreFPDepth[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateTexture2D fpMask[%u][%d] failed hr=0x%08X", slot, eye, hr);
+				return false;
+			}
+			srvDesc.Format = DXGI_FORMAT_R8_UINT;
+			hr = device->CreateShaderResourceView(m_cachedPreFPDepth[slot][eye], &srvDesc, &m_srvPreFPDepth[slot][eye]);
+			if (FAILED(hr)) {
+				OOVR_LOGF("ASW: CreateSRV fpMask[%u][%d] failed", slot, eye);
 				return false;
 			}
 
@@ -1832,6 +2087,35 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 			return false;
 		}
 
+	}
+
+	// Forward map: R32_UINT per source pixel, stores scatter destination (x16|y16)
+	for (int eye = 0; eye < 2; eye++) {
+		desc.Format = DXGI_FORMAT_R32_UINT;
+		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+		desc.MiscFlags = 0;
+		HRESULT hr = device->CreateTexture2D(&desc, nullptr, &m_forwardMap[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateTexture2D forwardMap[%d] failed hr=0x%08X", eye, hr);
+			return false;
+		}
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+		uavDesc.Format = DXGI_FORMAT_R32_UINT;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		hr = device->CreateUnorderedAccessView(m_forwardMap[eye], &uavDesc, &m_uavForwardMap[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateUAV forwardMap[%d] failed", eye);
+			return false;
+		}
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+		srvDesc.Format = DXGI_FORMAT_R32_UINT;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+		hr = device->CreateShaderResourceView(m_forwardMap[eye], &srvDesc, &m_srvForwardMap[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateSRV forwardMap[%d] failed", eye);
+			return false;
+		}
 	}
 
 	OOVR_LOGF("ASW: Cache textures created (%u slots x 2 eyes)", kAswCacheSlotCount);
@@ -1954,6 +2238,19 @@ static bool SafeBridgeCopy(ID3D11DeviceContext* ctx,
 	}
 }
 
+void ASWProvider::CachePreFPDepth(int eye, ID3D11DeviceContext* ctx,
+    ID3D11Texture2D* preFPR32F, const D3D11_BOX* region)
+{
+	if (!m_ready || eye < 0 || eye > 1 || !preFPR32F || !region) return;
+	const int slot = m_buildSlot;
+	if (!m_cachedPreFPDepth[slot][eye]) return;
+
+	if (!SafeBridgeCopy(ctx, m_cachedPreFPDepth[slot][eye], 0, 0, 0, 0,
+	        preFPR32F, 0, region)) {
+		OOVR_LOG("ASW: TOCTOU - preFPDepth texture freed during copy");
+	}
+}
+
 void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
     ID3D11Texture2D* colorTex, const D3D11_BOX* colorRegion,
     ID3D11Texture2D* mvTex, const D3D11_BOX* mvRegion,
@@ -2056,8 +2353,253 @@ void ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	}
 }
 
+void ASWProvider::CacheStencil(int eye, ID3D11DeviceContext* ctx,
+    ID3D11Texture2D* stencilTex, const D3D11_BOX* stencilRegion)
+{
+	if (!m_ready || eye < 0 || eye > 1 || !stencilTex || !stencilRegion)
+		return;
+	// CacheStencil is called AFTER CacheFrame. For eye 0, the build slot hasn't
+	// advanced yet (CacheFrame only advances on eye 1). For eye 1, we've already
+	// advanced — use the PREVIOUS slot (which is the just-published slot).
+	int slot = (eye == 1)
+	    ? m_publishedSlot.load(std::memory_order_acquire)
+	    : m_buildSlot;
+	if (slot < 0 || slot >= (int)kAswCacheSlotCount)
+		return;
+	if (!SafeBridgeCopy(ctx, m_cachedStencil[slot][eye], 0, 0, 0, 0,
+	        stencilTex, 0, stencilRegion)) {
+		static int s_count = 0;
+		if (s_count++ < 3)
+			OOVR_LOG("ASW: stencil copy failed");
+	}
+}
 
-bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
+// ── FP Hand Replay: re-render captured FP draws with updated View matrix ──
+// Called per-eye from WarpFrame after the main warp dispatches.
+// Renders to m_handColor/m_handDepth, then composites onto m_warpedOutput.
+bool ASWProvider::ReplayFPHands(int eye, ID3D11DeviceContext* ctx,
+    const float* forwardPoseDelta, const HandCompositeConstants& hcc)
+{
+	if (!m_fpReplayPtr || !m_handRTV[eye] || !m_handDSV[eye] || !m_handCompositeCS)
+		return false;
+
+	int readIdx = m_fpReplayPtr->readyIdx.load(std::memory_order_acquire);
+	if (readIdx < 0 || readIdx >= FPReplayData::NUM_BUFS)
+		return false;
+
+	auto& cs = m_fpReplayPtr->sets[readIdx];
+	if (cs.drawCount <= 0 || !cs.hasCB12)
+		return false;
+
+	static int s_replayLog = 0;
+	bool doLog = (s_replayLog < 20 && eye == 0);
+
+	// Build patched CB[12]: overwrite CameraView[0] with new View for this eye.
+	//
+	// CB[12] (FrameBufferVR) layout — column-major float4x3 (4 rows × 3 cols = 48 bytes each):
+	//   CameraView[0]: bytes 0-47   (12 floats) — column-major 4x3
+	//   CameraView[1]: bytes 48-95  (12 floats)
+	//   CameraProj[0]: bytes 96-143 (12 floats)
+	//   CameraProj[1]: bytes 144-191 (12 floats)
+	//
+	// Column-major float4x3 memory layout (3 columns of float4):
+	//   Col 0: [R00, R10, R20, Tx]  — rotation column 0 + translation X
+	//   Col 1: [R01, R11, R21, Ty]  — rotation column 1 + translation Y
+	//   Col 2: [R02, R12, R22, Tz]  — rotation column 2 + translation Z
+	//
+	// Row-vector shader convention: viewPos = mul(float4(worldPos,1), CameraView)
+	// = float3(dot(col0, wp4), dot(col1, wp4), dot(col2, wp4))
+	static constexpr int kViewBytes = 48;   // 12 floats per View matrix
+	static constexpr int kProjOffset = 96;  // CameraProj[0] starts at byte 96
+
+	uint8_t patchedCB12[1408];
+	memcpy(patchedCB12, cs.cb12, 1408);
+
+	const float* cachedView = reinterpret_cast<const float*>(&cs.cb12[eye * kViewBytes]);
+	const float* cachedProj = reinterpret_cast<const float*>(&cs.cb12[kProjOffset + eye * kViewBytes]);
+
+	// Apply forwardPoseDelta to compute newView for warp-time head pose.
+	//
+	// forwardPoseDelta (4×4 row-major) transforms cached eye → new eye:
+	//   p_new = delta * p_cached  (column-vector, our internal convention)
+	//
+	// CameraView is column-major float4x3 used with row-vector mul:
+	//   viewPos = mul(float4(worldPos, 1), CameraView)
+	//   = float3(dot(col0, wp4), dot(col1, wp4), dot(col2, wp4))
+	//
+	// The View matrix V maps world → eye.  We want V_new = delta * V_cached.
+	// But V is 4×3 (column-major). Expand to 4×4 by adding row [0,0,0,1]:
+	//   V_4x4 = | col0  col1  col2  [0,0,0,1]^T |
+	// Then V_new_4x4 = delta * V_4x4 and extract first 3 columns.
+	//
+	// For each output column j (j=0,1,2):
+	//   newCol_j[i] = sum_k delta[i][k] * cachedCol_j[k]   for i=0..3
+	// where delta is row-major: delta[i][k] = forwardPoseDelta[i*4+k]
+	// and cachedCol_j = cachedView[j*4 .. j*4+3]
+	float newView[12]; // 3 columns of float4
+	for (int col = 0; col < 3; col++) {
+		for (int row = 0; row < 4; row++) {
+			float sum = 0.0f;
+			for (int k = 0; k < 4; k++)
+				sum += forwardPoseDelta[row * 4 + k] * cachedView[col * 4 + k];
+			newView[col * 4 + row] = sum;
+		}
+	}
+
+	// Write newView into CameraView[0] (bytes 0-47)
+	memcpy(&patchedCB12[0], newView, kViewBytes);
+	// Write this eye's Proj into CameraProj[0] (bytes 96-143)
+	memcpy(&patchedCB12[kProjOffset], cachedProj, kViewBytes);
+
+	if (doLog) {
+		const float* cv = cachedView;
+		const float* nv = newView;
+		OOVR_LOGF("FPReplay[%d]: cachedView col0=[%.3f %.3f %.3f %.1f] col1=[%.3f %.3f %.3f %.1f] col2=[%.3f %.3f %.3f %.1f]",
+			eye, cv[0],cv[1],cv[2],cv[3], cv[4],cv[5],cv[6],cv[7], cv[8],cv[9],cv[10],cv[11]);
+		OOVR_LOGF("FPReplay[%d]: newView    col0=[%.3f %.3f %.3f %.1f] col1=[%.3f %.3f %.3f %.1f] col2=[%.3f %.3f %.3f %.1f]",
+			eye, nv[0],nv[1],nv[2],nv[3], nv[4],nv[5],nv[6],nv[7], nv[8],nv[9],nv[10],nv[11]);
+		OOVR_LOGF("FPReplay[%d]: fwdDelta row0=[%.5f %.5f %.5f %.5f]",
+			eye, forwardPoseDelta[0], forwardPoseDelta[1], forwardPoseDelta[2], forwardPoseDelta[3]);
+		OOVR_LOGF("FPReplay[%d]: replaying %d draws", eye, cs.drawCount);
+	}
+
+	// Upload patched CB[12] to replay buffer
+	ctx->UpdateSubresource(m_replayCB[5], 0, nullptr, patchedCB12, 0, 0); // index 5 = CB[12]
+
+	// Clear hand RT
+	FLOAT clearColor[4] = { 0, 0, 0, 0 };
+	ctx->ClearRenderTargetView(m_handRTV[eye], clearColor);
+	ctx->ClearDepthStencilView(m_handDSV[eye], D3D11_CLEAR_DEPTH, 1.0f, 0);
+
+	// Set viewport
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)m_renderWidth;
+	vp.Height = (float)m_renderHeight;
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &vp);
+
+	// Bind hand RT + DSV
+	ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	rtvs[0] = m_handRTV[eye];
+	ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, m_handDSV[eye]);
+
+	// Replay each captured FP draw
+	int replayed = 0;
+	for (int i = 0; i < cs.drawCount && i < FPReplayData::MAX_DRAWS; i++) {
+		const auto& draw = cs.draws[i];
+		if (!draw.valid || draw.indexCount == 0)
+			continue;
+
+		// IA state
+		ctx->IASetIndexBuffer(draw.ib, draw.ibFmt, draw.ibOff);
+		ctx->IASetVertexBuffers(0, 1, const_cast<ID3D11Buffer* const*>(&draw.vb),
+			&draw.vbStride, &draw.vbOff);
+		ctx->IASetInputLayout(draw.il);
+		ctx->IASetPrimitiveTopology(draw.topo);
+
+		// VS + PS shaders
+		ctx->VSSetShader(draw.vs, nullptr, 0);
+		ctx->PSSetShader(draw.ps, nullptr, 0);
+
+		// Per-draw VS CBs: upload byte snapshots to pre-allocated buffers
+		if (draw.hasCB0) ctx->UpdateSubresource(m_replayCB[0], 0, nullptr, draw.cb0, 0, 0);
+		if (draw.hasCB1) ctx->UpdateSubresource(m_replayCB[1], 0, nullptr, draw.cb1, 0, 0);
+		if (draw.hasCB2) ctx->UpdateSubresource(m_replayCB[2], 0, nullptr, draw.cb2, 0, 0);
+		if (draw.hasCB9) ctx->UpdateSubresource(m_replayCB[3], 0, nullptr, draw.cb9, 0, 0);
+		if (draw.hasCB10) ctx->UpdateSubresource(m_replayCB[4], 0, nullptr, draw.cb10, 0, 0);
+		if (draw.hasCB13) ctx->UpdateSubresource(m_replayCB[6], 0, nullptr, draw.cb13, 0, 0);
+
+		// Bind VS CBs to proper slots
+		// Slots: 0, 1, 2, 9, 10, 12, 13
+		ID3D11Buffer* vsCBBinds[14] = {};
+		if (draw.hasCB0) vsCBBinds[0] = m_replayCB[0];
+		if (draw.hasCB1) vsCBBinds[1] = m_replayCB[1];
+		if (draw.hasCB2) vsCBBinds[2] = m_replayCB[2];
+		if (draw.hasCB9) vsCBBinds[9] = m_replayCB[3];
+		if (draw.hasCB10) vsCBBinds[10] = m_replayCB[4];
+		vsCBBinds[12] = m_replayCB[5]; // always bind patched CB[12]
+		if (draw.hasCB13) vsCBBinds[13] = m_replayCB[6];
+		ctx->VSSetConstantBuffers(0, 14, vsCBBinds);
+
+		// PS SRVs + samplers
+		ctx->PSSetShaderResources(0, 8, const_cast<ID3D11ShaderResourceView* const*>(draw.psSRVs));
+		ctx->PSSetSamplers(0, 4, const_cast<ID3D11SamplerState* const*>(draw.psSamplers));
+
+		// PS CBs
+		if (draw.hasPSCB0) ctx->UpdateSubresource(m_replayPSCB[0], 0, nullptr, draw.psCB0, 0, 0);
+		if (draw.hasPSCB1) ctx->UpdateSubresource(m_replayPSCB[1], 0, nullptr, draw.psCB1, 0, 0);
+		if (draw.hasPSCB2) ctx->UpdateSubresource(m_replayPSCB[2], 0, nullptr, draw.psCB2, 0, 0);
+		ID3D11Buffer* psCBBinds[3] = {};
+		if (draw.hasPSCB0) psCBBinds[0] = m_replayPSCB[0];
+		if (draw.hasPSCB1) psCBBinds[1] = m_replayPSCB[1];
+		if (draw.hasPSCB2) psCBBinds[2] = m_replayPSCB[2];
+		ctx->PSSetConstantBuffers(0, 3, psCBBinds);
+
+		// OM: our own DSS for depth testing, capture's blend state
+		ctx->OMSetDepthStencilState(m_handDSS, 0);
+		if (draw.blendState)
+			ctx->OMSetBlendState(draw.blendState, draw.blendFactor, draw.sampleMask);
+
+		// RS
+		if (draw.rs)
+			ctx->RSSetState(draw.rs);
+
+		// Draw (instanceCount=1 for single-eye)
+		ctx->DrawIndexed(draw.indexCount, draw.startIndex, draw.baseVertex);
+		replayed++;
+	}
+
+	// Unbind hand RT
+	ID3D11RenderTargetView* nullRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullRTVs, nullptr);
+
+	if (replayed == 0)
+		return false;
+
+	// Composite hand pixels onto warp output via CS, with controller delta shift
+	{
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		if (SUCCEEDED(ctx->Map(m_handCompositeCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+			memcpy(mapped.pData, &hcc, sizeof(hcc));
+			ctx->Unmap(m_handCompositeCB, 0);
+		}
+
+		ID3D11ShaderResourceView* handSRVs[] = { m_srvHandColor[eye], m_srvHandDepth[eye] };
+		ctx->CSSetShaderResources(0, 2, handSRVs);
+		ID3D11UnorderedAccessView* compUAV[] = { m_uavOutput[eye] };
+		ctx->CSSetUnorderedAccessViews(0, 1, compUAV, nullptr);
+		ID3D11Buffer* cbs[] = { m_handCompositeCB };
+		ctx->CSSetConstantBuffers(0, 1, cbs);
+		ctx->CSSetShader(m_handCompositeCS, nullptr, 0);
+
+		uint32_t groupsX = (m_renderWidth + 7) / 8;
+		uint32_t groupsY = (m_renderHeight + 7) / 8;
+		ctx->Dispatch(groupsX, groupsY, 1);
+
+		// Unbind
+		ID3D11ShaderResourceView* nullSRVs[2] = {};
+		ID3D11UnorderedAccessView* nullUAVs[1] = {};
+		ID3D11Buffer* nullCBs[1] = {};
+		ctx->CSSetShaderResources(0, 2, nullSRVs);
+		ctx->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
+		ctx->CSSetConstantBuffers(0, 1, nullCBs);
+		ctx->CSSetShader(nullptr, nullptr, 0);
+	}
+
+	if (doLog) {
+		s_replayLog++;
+		OOVR_LOGF("FPReplay[%d]: replayed %d draws, composite dispatched (%ux%u) ctrlDelta L=(%.4f,%.4f) R=(%.4f,%.4f)",
+			eye, replayed, m_renderWidth, m_renderHeight,
+			hcc.controllerDeltaL[0], hcc.controllerDeltaL[1],
+			hcc.controllerDeltaR[0], hcc.controllerDeltaR[1]);
+	}
+
+	return true;
+}
+
+bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride,
+    XrTime warpDisplayTime)
 {
 	if (!m_ready || eye < 0 || eye > 1)
 		return false;
@@ -2068,7 +2610,7 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 			slot = slotOverride;
 		} else {
 			// N-1 warping: use the PREVIOUS frame's cache slot.
-			// Its fence was signaled last cycle (~27ms ago) — zero wait.
+			// Locomotion/rotation deltas are calibrated for N-2→N-1 step.
 			slot = m_previousPublishedSlot.load(std::memory_order_acquire);
 		}
 		if (slot < 0)
@@ -2222,6 +2764,76 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	}
 	cb.rotMVScale = m_rotMVScale;
 
+	// Reprojection: compute clipToClip from warp output → frame N (published slot).
+	// Frame N was rendered at a newer pose where disoccluded background may be visible.
+	// Uses direct deltaV computation (proven correct for warp-to-warp DLSS MVs).
+	int pubSlot = m_publishedSlot.load(std::memory_order_acquire);
+	if (pubSlot >= 0 && pubSlot != slot) {
+		const auto& warpP = newPose;  // current warp pose
+		const auto& frameNP = m_slotPose[pubSlot][eye]; // frame N's pose
+
+		// deltaV = V_frameN * inv(V_warp) — maps warp view → frame N view
+		float pqx=frameNP.orientation.x, pqy=frameNP.orientation.y, pqz=frameNP.orientation.z, pqw=frameNP.orientation.w;
+		float Rn00=1-2*(pqy*pqy+pqz*pqz), Rn01=2*(pqx*pqy-pqz*pqw), Rn02=2*(pqx*pqz+pqy*pqw);
+		float Rn10=2*(pqx*pqy+pqz*pqw), Rn11=1-2*(pqx*pqx+pqz*pqz), Rn12=2*(pqy*pqz-pqx*pqw);
+		float Rn20=2*(pqx*pqz-pqy*pqw), Rn21=2*(pqy*pqz+pqx*pqw), Rn22=1-2*(pqx*pqx+pqy*pqy);
+
+		float cqx=warpP.orientation.x, cqy=warpP.orientation.y, cqz=warpP.orientation.z, cqw=warpP.orientation.w;
+		float Rw00=1-2*(cqy*cqy+cqz*cqz), Rw01=2*(cqx*cqy-cqz*cqw), Rw02=2*(cqx*cqz+cqy*cqw);
+		float Rw10=2*(cqx*cqy+cqz*cqw), Rw11=1-2*(cqx*cqx+cqz*cqz), Rw12=2*(cqy*cqz-cqx*cqw);
+		float Rw20=2*(cqx*cqz-cqy*cqw), Rw21=2*(cqy*cqz+cqx*cqw), Rw22=1-2*(cqx*cqx+cqy*cqy);
+
+		// deltaRot = Rn^T * Rw
+		float d00=Rn00*Rw00+Rn10*Rw10+Rn20*Rw20, d01=Rn00*Rw01+Rn10*Rw11+Rn20*Rw21, d02=Rn00*Rw02+Rn10*Rw12+Rn20*Rw22;
+		float d10=Rn01*Rw00+Rn11*Rw10+Rn21*Rw20, d11=Rn01*Rw01+Rn11*Rw11+Rn21*Rw21, d12=Rn01*Rw02+Rn11*Rw12+Rn21*Rw22;
+		float d20=Rn02*Rw00+Rn12*Rw10+Rn22*Rw20, d21=Rn02*Rw01+Rn12*Rw11+Rn22*Rw21, d22=Rn02*Rw02+Rn12*Rw12+Rn22*Rw22;
+
+		// deltaTrans = Rn^T * (pw - pn)
+		float dpx=warpP.position.x-frameNP.position.x, dpy=warpP.position.y-frameNP.position.y, dpz=warpP.position.z-frameNP.position.z;
+		float dt0=Rn00*dpx+Rn10*dpy+Rn20*dpz;
+		float dt1=Rn01*dpx+Rn11*dpy+Rn21*dpz;
+		float dt2=Rn02*dpx+Rn12*dpy+Rn22*dpz;
+
+		// deltaV column-major
+		float dV[16] = {};
+		dV[0]=d00; dV[4]=d01; dV[8]=d02;  dV[12]=dt0;
+		dV[1]=d10; dV[5]=d11; dV[9]=d12;  dV[13]=dt1;
+		dV[2]=d20; dV[6]=d21; dV[10]=d22; dV[14]=dt2;
+		dV[3]=0;   dV[7]=0;   dV[11]=0;   dV[15]=1;
+
+		// P and P^{-1} from FOV (right-handed, same as DLSS warp callback)
+		float tanL=cb.fovTanLeft, tanR=cb.fovTanRight, tanU=cb.fovTanUp, tanD=cb.fovTanDown;
+		float w=tanR-tanL, h=tanU-tanD, n=cb.nearZ, f=cb.farZ;
+
+		float P[16]={}, Pi[16]={};
+		P[0]=2.0f/w; P[8]=(tanR+tanL)/w;
+		P[5]=2.0f/h; P[9]=(tanU+tanD)/h;
+		P[10]=-f/(f-n); P[14]=-(f*n)/(f-n);
+		P[11]=-1.0f;
+
+		Pi[0]=w/2.0f; Pi[12]=(tanR+tanL)/2.0f;
+		Pi[5]=h/2.0f; Pi[13]=(tanU+tanD)/2.0f;
+		Pi[14]=-1.0f;
+		Pi[11]=-(f-n)/(f*n); Pi[15]=1.0f/n;
+
+		// reprojC2C = P * dV * Pi (column-major)
+		float tmp[16]={}, reproj[16]={};
+		for (int c=0; c<4; c++) for (int r=0; r<4; r++) {
+			float s=0; for (int k=0; k<4; k++) s+=dV[k*4+r]*Pi[c*4+k]; tmp[c*4+r]=s;
+		}
+		for (int c=0; c<4; c++) for (int r=0; r<4; r++) {
+			float s=0; for (int k=0; k<4; k++) s+=P[k*4+r]*tmp[c*4+k]; reproj[c*4+r]=s;
+		}
+
+		// Store as row-major for HLSL (transpose column-major → row-major)
+		for (int r=0; r<4; r++) for (int c=0; c<4; c++)
+			cb.reprojClipToClip[r*4+c] = reproj[c*4+r];
+		cb.hasReprojData = 1;
+	} else {
+		memset(cb.reprojClipToClip, 0, sizeof(cb.reprojClipToClip));
+		cb.hasReprojData = 0;
+	}
+
 	// clipToClipNoLoco: prevVP * inv(curVP_original) — head rotation + head translation,
 	// no locomotion injection. Per-eye from RSS VP matrices.
 	if (m_slotHasClipToClipNoLoco[slot] && eye >= 0 && eye < 2) {
@@ -2233,6 +2845,17 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 			cb.clipToClipNoLoco[i] = 0;
 		cb.clipToClipNoLoco[0] = cb.clipToClipNoLoco[5] = cb.clipToClipNoLoco[10] = cb.clipToClipNoLoco[15] = 1.0f;
 		cb.hasClipToClipNoLoco = 0;
+	}
+
+	// fullWarpC2C: pass through the raw c2c_with_loco (N-1→N-2, with locomotion injection).
+	// In the shader, the DIFFERENCE between this and clipToClipNoLoco at each pixel's depth
+	// gives the depth-aware locomotion offset. This avoids composing matrices from different
+	// frameworks (RSS vs OpenXR) which causes clip space mismatches.
+	if (m_slotHasClipToClipWithLoco[slot] && eye >= 0 && eye < 2) {
+		memcpy(cb.fullWarpC2C, m_slotClipToClipWithLoco[slot][eye], sizeof(cb.fullWarpC2C));
+		cb.hasFullWarpC2C = 1;
+	} else {
+		cb.hasFullWarpC2C = 0;
 	}
 
 	cb.resolution[0] = (float)m_renderWidth;
@@ -2247,12 +2870,27 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	cb.depthScale = (ds < 0.0f) ? 0.0f : ds;
 	cb.edgeFadeWidth = oovr_global_configuration.ASWEdgeFadeWidth();
 	cb.nearFadeDepth = oovr_global_configuration.ASWNearFadeDepth() * 72.0f;
+	// MV correction scale: with N-1 warping, the cache slot is frame N-2 (previousPublished).
+	// The game MVs in that slot measure one period of motion (N-3 → N-2).
+	// We extrapolate from T_{N-2} to T_warp. Scale = (T_warp - T_{N-2}) / period.
+	// Uses XrTime predicted display times (from xrWaitFrame) which are jitter-free.
+	// m_mvConfidenceScale decays when sticks are released to prevent overshoot on stop.
 	{
-		// MV correction: residual = totalMV - headOnlyMV isolates stick + loco + animation
-		// from game MVs. poseDeltaMatrix handles real-time head tracking from OpenXR.
-		// m_mvConfidenceScale decays at warp time when sticks are released to prevent
-		// stale game MVs from overshooting on stop transitions.
-		cb.mvConfidence = oovr_global_configuration.ASWMVConfidence() * m_mvConfidenceScale;
+		float mvScale = 1.5f; // fallback for nominal half-rate timing
+		int pubSlot = m_publishedSlot.load(std::memory_order_acquire);
+		XrTime cacheTime = m_slotDisplayTime[slot];
+		XrTime pubTime = (pubSlot >= 0 && pubSlot != slot) ? m_slotDisplayTime[pubSlot] : 0;
+		if (warpDisplayTime > 0 && cacheTime > 0 && pubTime > 0 && pubTime > cacheTime) {
+			// period = time between cache (N-2) and published (N-1) display times
+			double periodNs = (double)(pubTime - cacheTime);
+			// extrapolation = time from cache to warp display
+			double extrapolateNs = (double)(warpDisplayTime - cacheTime);
+			if (periodNs > 1000000.0) { // > 1ms sanity
+				mvScale = (float)(extrapolateNs / periodNs);
+				mvScale = (mvScale < 0.5f) ? 0.5f : (mvScale > 3.0f) ? 3.0f : mvScale;
+			}
+		}
+		cb.mvConfidence = mvScale * m_mvConfidenceScale;
 	}
 	cb.mvPixelScale = oovr_global_configuration.ASWMVPixelScale();
 	cb.depthResolution[0] = (m_slotDepthDataW[slot] > 0) ? (float)m_slotDepthDataW[slot] : (float)m_renderWidth;
@@ -2260,19 +2898,251 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	cb.mvResolution[0] = (m_slotMVDataW[slot] > 0) ? (float)m_slotMVDataW[slot] : (float)m_renderWidth;
 	cb.mvResolution[1] = (m_slotMVDataH[slot] > 0) ? (float)m_slotMVDataH[slot] : (float)m_renderHeight;
 	cb._pad_npcMask = 0;  // removed: was hasNpcMask
+	cb.debugMode = oovr_global_configuration.ASWDebugMode();
 
 
 
 	const float locoMotion = sqrtf(m_locoTransX * m_locoTransX +
 		m_locoTransY * m_locoTransY + m_locoTransZ * m_locoTransZ);
 	const float stickYawMotion = fabsf(m_locoYaw);
-	const bool useForwardScatterForMotion = (locoMotion > 0.15f || stickYawMotion > 0.002f);
+	// Always use backward warp + NPC overlay. Forward scatter during locomotion is disabled
+	// because: (1) we now warp the most recent frame (locomotion baked in, only head tracking delta),
+	// (2) forward scatter requires dilation which thickens foliage noticeably,
+	// (3) the mode switch on start/stop locomotion causes a visible jerk.
+	// NPC-only forward scatter overlay handles moving NPCs with correct depth ordering.
+	const bool useForwardScatterForMotion = false;
+
+	// ── Controller hand detection (pre-projected at CacheFrame time) ──
+	cb.hasControllerPose = 0;
+	if (m_slotHasControllerUV[slot][eye]) {
+		cb.controllerUV_LR[0] = m_slotControllerUV[slot][eye][0][0];
+		cb.controllerUV_LR[1] = m_slotControllerUV[slot][eye][0][1];
+		cb.controllerUV_LR[2] = m_slotControllerUV[slot][eye][1][0];
+		cb.controllerUV_LR[3] = m_slotControllerUV[slot][eye][1][1];
+		cb.controllerRadius = m_slotControllerRadius[slot];
+		cb.hasControllerPose = 1;
+	}
+	// Compute controller UV delta for FP hand prediction.
+	// Project current controller positions using the CACHED-FRAME head pose, not warp-time.
+	// This way the delta captures ONLY controller movement relative to head —
+	// head rotation/translation is already handled by parallaxSourceUV (poseDeltaMatrix).
+	cb.controllerDeltaL[0] = cb.controllerDeltaL[1] = 0.0f;
+	cb.controllerDeltaR[0] = cb.controllerDeltaR[1] = 0.0f;
+
+	// Compute FP controller scale from timing.
+	// Controller delta spans cache_time → now (warp compute time).
+	// We want to scale it to cache_time → warp_display_time.
+	// Scale = (warpDisplayTime - cacheTime) / (now - cacheTime).
+	// Uses XrTime predicted display times for jitter-free calculation.
+	{
+		float scale = 0.5f; // fallback
+		XrTime cacheTime = m_slotDisplayTime[slot];
+		if (warpDisplayTime > 0 && cacheTime > 0 && warpDisplayTime > cacheTime) {
+			auto now = std::chrono::steady_clock::now();
+			float cacheAgeMs = std::chrono::duration<float, std::milli>(now - m_slotTimestamp[slot]).count();
+			if (cacheAgeMs > 1.0f) {
+				double displayOffsetNs = (double)(warpDisplayTime - cacheTime);
+				double cacheAgeNs = cacheAgeMs * 1000000.0; // ms → ns
+				scale = (float)(displayOffsetNs / cacheAgeNs);
+				scale = (scale < 0.2f) ? 0.2f : (scale > 1.5f) ? 1.5f : scale;
+			}
+		}
+		cb.fpControllerScale = scale;
+	}
+	if (cb.hasControllerPose && m_controllerValid[0] && m_controllerValid[1]) {
+		const XrPosef& cachedPose = m_slotPose[slot][eye];
+		// Log cached vs current controller positions to verify delta
+		{
+			static int s_deltaLog = 0;
+			if (s_deltaLog++ < 20 && eye == 0) {
+				// Cached controller positions were stored via SetSlotControllerUV at CacheFrame time.
+				// m_controllerPos is from the LATEST WaitGetPoses call.
+				OOVR_LOGF("CtrlDelta: slot=%d cachedUV_L=(%.4f,%.4f) cachedUV_R=(%.4f,%.4f) "
+				    "ctrlPos_L=(%.3f,%.3f,%.3f) ctrlPos_R=(%.3f,%.3f,%.3f) "
+				    "cachedHead=(%.3f,%.3f,%.3f)",
+				    slot,
+				    cb.controllerUV_LR[0], cb.controllerUV_LR[1],
+				    cb.controllerUV_LR[2], cb.controllerUV_LR[3],
+				    m_controllerPos[0][0], m_controllerPos[0][1], m_controllerPos[0][2],
+				    m_controllerPos[1][0], m_controllerPos[1][1], m_controllerPos[1][2],
+				    cachedPose.position.x, cachedPose.position.y, cachedPose.position.z);
+			}
+		}
+		XrQuaternionf qi = { -cachedPose.orientation.x, -cachedPose.orientation.y,
+		    -cachedPose.orientation.z, cachedPose.orientation.w };
+		float fovL = cb.fovTanLeft, fovR = cb.fovTanRight;
+		float fovU = cb.fovTanUp, fovD = cb.fovTanDown;
+		float vOffset = 0.07f;
+		for (int h = 0; h < 2; h++) {
+			float cx = m_controllerPos[h][0], cy = m_controllerPos[h][1], cz = m_controllerPos[h][2];
+			// Relative to CACHED head position (same frame as controllerUV_LR)
+			float rx = cx - cachedPose.position.x;
+			float ry = cy - cachedPose.position.y;
+			float rz = cz - cachedPose.position.z;
+			// Rotate by inverse CACHED head orientation → view space
+			float qx = qi.x, qy = qi.y, qz = qi.z, qw = qi.w;
+			float tx = 2.0f * (qy * rz - qz * ry);
+			float ty = 2.0f * (qz * rx - qx * rz);
+			float tz = 2.0f * (qx * ry - qy * rx);
+			float vx = rx + qw * tx + (qy * tz - qz * ty);
+			float vy = ry + qw * ty + (qz * tx - qx * tz);
+			float vz = rz + qw * tz + (qx * ty - qy * tx);
+			if (vz > -0.01f) continue;
+			float tanX = vx / (-vz);
+			float tanY = vy / (-vz);
+			float nowU = (tanX - fovL) / (fovR - fovL);
+			float nowV = (tanY - fovU) / (fovD - fovU) + vOffset;
+			// Delta = current controller UV (in cached head space) - cached-frame UV
+			// This is purely controller-relative-to-head motion.
+			if (h == 0) {
+				cb.controllerDeltaL[0] = nowU - cb.controllerUV_LR[0];
+				cb.controllerDeltaL[1] = nowV - cb.controllerUV_LR[1];
+			} else {
+				cb.controllerDeltaR[0] = nowU - cb.controllerUV_LR[2];
+				cb.controllerDeltaR[1] = nowV - cb.controllerUV_LR[3];
+			}
+		}
+		{
+			static int s_deltaLog2 = 0;
+			if (s_deltaLog2++ < 20 && eye == 0) {
+				OOVR_LOGF("CtrlDeltaUV: dL=(%.5f,%.5f) dR=(%.5f,%.5f) px_dL=(%.1f,%.1f) px_dR=(%.1f,%.1f)",
+				    cb.controllerDeltaL[0], cb.controllerDeltaL[1],
+				    cb.controllerDeltaR[0], cb.controllerDeltaR[1],
+				    cb.controllerDeltaL[0] * cb.resolution[0], cb.controllerDeltaL[1] * cb.resolution[1],
+				    cb.controllerDeltaR[0] * cb.resolution[0], cb.controllerDeltaR[1] * cb.resolution[1]);
+			}
+		}
+	}
+
+	// ── First-person bounding sphere (world-space distance test) ──
+	// Read worldBound from FP root NiAVObject, subtract posAdjust for rendering space.
+	// posAdjust is at RSS base + 0x3A4 (EYE_POSITION<NiPoint3, 2>).
+	cb.hasFPSphere = 0;
+	if (m_firstPersonRootPtr && m_rssViewMatPtr) {
+		const uint8_t* fpNode = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(m_firstPersonRootPtr));
+		const float* bc = reinterpret_cast<const float*>(fpNode + 0xE4); // worldBound.center
+		float br = *reinterpret_cast<const float*>(fpNode + 0xF0);       // worldBound.radius
+
+		// posAdjust: rssViewMatPtr = rssBase + 0x3E0 + 1*0x250 + 0x30
+		// posAdjust for eye 0 = rssBase + 0x3A4
+		// offset from rssViewMatPtr: 0x3A4 - (0x3E0 + 0x250 + 0x30) = 0x3A4 - 0x660 = -0x2BC
+		const float* posAdj = reinterpret_cast<const float*>(
+		    reinterpret_cast<const uint8_t*>(m_rssViewMatPtr) - 0x2BC + eye * 12);
+
+		if (br > 0.1f && br < 500.0f) {
+			cb.fpSphereCenter[0] = bc[0] - posAdj[0];
+			cb.fpSphereCenter[1] = bc[1] - posAdj[1];
+			cb.fpSphereCenter[2] = bc[2] - posAdj[2];
+			cb.fpSphereCenter[3] = 0.0f; // padding
+			cb.fpSphereRadius = br * 1.5f; // scale up to cover fully extended arms + weapons
+			cb.hasFPSphere = 1;
+
+			static int s_fpLog = 0;
+			if (s_fpLog++ < 5 && eye == 0) {
+				OOVR_LOGF("FPSphere: center=(%.1f,%.1f,%.1f) r=%.1f posAdj=(%.1f,%.1f,%.1f)",
+				    cb.fpSphereCenter[0], cb.fpSphereCenter[1], cb.fpSphereCenter[2], br,
+				    posAdj[0], posAdj[1], posAdj[2]);
+			}
+		}
+	}
+
+	// ── Menu state (skip MV corrections when menu is open) ──
+	cb.isMenuOpen = m_isMenuOpen ? 1 : 0;
+	cb.isLegacyMode = oovr_global_configuration.aswForceLegacy ? 1 : 0;
+
+	// ── FP bounding box projection (world spheres → screen AABBs) ──
+	cb.fpBoxCount = 0;
+	// Project per-geometry FP bounds to screen-space AABBs — read LIVE from game memory
+	if (m_rssViewMatPtr && m_fpGeomCount > 0) {
+		const float* posAdj = reinterpret_cast<const float*>(
+		    reinterpret_cast<const uint8_t*>(m_rssViewMatPtr) - 0x2BC + eye * 12);
+		// RSS VP: row-major, row-vector convention (clip = v * M)
+		// m_rssViewMatPtr = rssBase + 0x3E0 + 1*0x250 + 0x30 (eye 1 view matrix)
+		// VP for eye e = rssBase + 0x3E0 + e*0x250 + 0x130
+		// offset from m_rssViewMatPtr: (e-1)*0x250 + (0x130-0x30) = (e-1)*0x250 + 0x100
+		float vp[16];
+		memcpy(vp, reinterpret_cast<const uint8_t*>(m_rssViewMatPtr) + (eye - 1) * 0x250 + 0x100, sizeof(vp));
+		// vp is now row-major (RSS convention). For v*M: clip = [x,y,z,1] * vp
+
+		int boxCount = 0;
+		for (uint32_t i = 0; i < m_fpGeomCount && i < 16; i++) {
+			// Read worldBound LIVE from BSGeometry pointer (NiAVObject::worldBound at +0xE4)
+			const uint8_t* geom = reinterpret_cast<const uint8_t*>(
+			    static_cast<uintptr_t>(m_fpGeomPointers[i]));
+			if (!geom) continue;
+			const float* bc = reinterpret_cast<const float*>(geom + 0xE4);
+			float r = *reinterpret_cast<const float*>(geom + 0xF0);
+			if (r < 0.01f || r > 500.0f) continue;
+			float cx = bc[0] - posAdj[0];
+			float cy = bc[1] - posAdj[1];
+			float cz = bc[2] - posAdj[2];
+
+			// Transform center by VP (row-major, row-vector: clip = v * M)
+			float clipX = cx * vp[0] + cy * vp[4] + cz * vp[8]  + vp[12];
+			float clipY = cx * vp[1] + cy * vp[5] + cz * vp[9]  + vp[13];
+			float clipW = cx * vp[3] + cy * vp[7] + cz * vp[11] + vp[15];
+
+			if (clipW <= 0.01f) continue; // Behind camera
+
+			// NDC
+			float ndcX = clipX / clipW;
+			float ndcY = clipY / clipW;
+
+			// Screen-space radius: approximate as r / distance (clipW ≈ view-space Z)
+			float screenR = r / clipW;
+			// Scale by projection (approximate: use average of fovTanLeft/Right)
+			float projScale = 0.5f * (fabsf(cb.fovTanLeft) + fabsf(cb.fovTanRight));
+			if (projScale > 0.01f) screenR /= projScale;
+			screenR *= 1.3f; // Conservative margin
+
+			// NDC to UV: u = (ndcX + 1) * 0.5, v = (1 - ndcY) * 0.5
+			float u = (ndcX + 1.0f) * 0.5f;
+			float v = (1.0f - ndcY) * 0.5f;
+
+			float minU = u - screenR;
+			float minV = v - screenR;
+			float maxU = u + screenR;
+			float maxV = v + screenR;
+
+			// Clamp to [0,1] and skip if entirely off-screen
+			if (maxU < 0.0f || minU > 1.0f || maxV < 0.0f || minV > 1.0f) continue;
+			if (minU < 0.0f) minU = 0.0f;
+			if (minV < 0.0f) minV = 0.0f;
+			if (maxU > 1.0f) maxU = 1.0f;
+			if (maxV > 1.0f) maxV = 1.0f;
+
+			cb.fpScreenBoxes[boxCount * 4 + 0] = minU;
+			cb.fpScreenBoxes[boxCount * 4 + 1] = minV;
+			cb.fpScreenBoxes[boxCount * 4 + 2] = maxU;
+			cb.fpScreenBoxes[boxCount * 4 + 3] = maxV;
+			boxCount++;
+		}
+		cb.fpBoxCount = boxCount;
+
+		static int s_boxLog = 0;
+		if (s_boxLog++ < 10 && eye == 0 && boxCount > 0) {
+			OOVR_LOGF("FPBox: %d boxes from %u geoms (LIVE). box[0]=(%.3f,%.3f)-(%.3f,%.3f)",
+				boxCount, m_fpGeomCount,
+				cb.fpScreenBoxes[0], cb.fpScreenBoxes[1],
+				cb.fpScreenBoxes[2], cb.fpScreenBoxes[3]);
+		}
+	}
 
 	// ── D3D11 warp path ──
 	ID3D11DeviceContext* ctx = nullptr;
 	m_device->GetImmediateContext(&ctx);
 	if (!ctx)
 		return false;
+
+	ID3D11ShaderResourceView* mvSRV = (fabsf(cb.mvConfidence) > 0.001f) ? m_srvMV[slot][eye] : nullptr;
+	// Bind frame N (published slot) color + depth for disocclusion reprojection fill
+	ID3D11ShaderResourceView* frameNColorSRV = nullptr;
+	ID3D11ShaderResourceView* frameNDepthSRV = nullptr;
+	if (cb.hasReprojData && pubSlot >= 0 && pubSlot != slot) {
+		frameNColorSRV = m_srvColor[pubSlot][eye];
+		frameNDepthSRV = m_srvDepth[pubSlot][eye];
+	}
+	// FP depth texture SRV no longer used — replaced by world-space sphere test.
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	HRESULT hr = ctx->Map(m_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -2283,11 +3153,14 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	memcpy(mapped.pData, &cb, sizeof(cb));
 	ctx->Unmap(m_constantBuffer, 0);
 
-	ID3D11ShaderResourceView* mvSRV = (fabsf(cb.mvConfidence) > 0.001f) ? m_srvMV[slot][eye] : nullptr;
-	ID3D11ShaderResourceView* srvs[] = { m_srvColor[slot][eye], mvSRV, m_srvDepth[slot][eye] };
+	ID3D11ShaderResourceView* srvs[] = {
+		m_srvColor[slot][eye], mvSRV, m_srvDepth[slot][eye],
+		frameNColorSRV, frameNDepthSRV,
+		m_srvPreFPDepth[slot][eye]  // t5: pre-FP depth
+	};
 	ctx->CSSetShaderResources(0, _countof(srvs), srvs);
-	ID3D11UnorderedAccessView* uavs2[] = { m_uavOutput[eye], m_uavAtomicDepth[eye] };
-	ctx->CSSetUnorderedAccessViews(0, 2, uavs2, nullptr);
+	ID3D11UnorderedAccessView* uavs3[] = { m_uavOutput[eye], m_uavAtomicDepth[eye], m_uavForwardMap[eye] };
+	ctx->CSSetUnorderedAccessViews(0, 3, uavs3, nullptr);
 	ctx->CSSetConstantBuffers(0, 1, &m_constantBuffer);
 	ctx->CSSetSamplers(0, 1, &m_linearSampler);
 
@@ -2297,12 +3170,38 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	// MV residual (moving objects) on top of the backward warp output. Uses
 	// IsMovingNpcPixelForward() which detects motion via MV residual after c2c head
 	// subtraction, with a threshold that scales with head motion magnitude.
-	const bool useStationaryNpcForwardOverlay = !useForwardScatterForMotion;
+	// Disabled during locomotion testing — NPC detection can't distinguish NPCs from
+	// static objects when locomotion is in gameMV but not clipToClipNoLoco.
+	const bool useStationaryNpcForwardOverlay = false;
 
+	// Legacy mode: skip all forward scatter, disocclusion fill, MV correction.
+	// Just clear + backward warp (translation-only parallax). The shader checks
+	// isLegacyMode to skip MV corrections in CSMain.
+	bool legacyMode = oovr_global_configuration.aswForceLegacy;
+	if (legacyMode && m_legacyWarpCS) {
+		// Legacy: self-contained backward warp shader. Own cbuffer layout, own textures.
+		// Only needs t0=color, t2=depth, u0=output, b0=CB, s0=sampler.
+		ctx->CSSetShader(m_legacyWarpCS, nullptr, 0);
+		ID3D11ShaderResourceView* legSRVs[3] = { m_srvColor[slot][eye], nullptr, m_srvDepth[slot][eye] };
+		ctx->CSSetShaderResources(0, 3, legSRVs);
+		ID3D11UnorderedAccessView* legUAVs[1] = { m_uavOutput[eye] };
+		ctx->CSSetUnorderedAccessViews(0, 1, legUAVs, nullptr);
+		ctx->CSSetConstantBuffers(0, 1, &m_constantBuffer);
+		ctx->CSSetSamplers(0, 1, &m_linearSampler);
+		ctx->Dispatch(groupsX, groupsY, 1);
+		// Unbind and return
+		ID3D11ShaderResourceView* nullSRVs[3] = {};
+		ID3D11UnorderedAccessView* nullUAVs[1] = {};
+		ctx->CSSetShaderResources(0, 3, nullSRVs);
+		ctx->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
+		ctx->CSSetShader(nullptr, nullptr, 0);
+		ctx->Release();
+		return true;
+	}
 	// Forward scatter pipeline: each SOURCE pixel projects to its destination.
 	// Depth test via InterlockedMin ensures closest pixel wins (tree over sky).
 	// This naturally handles locomotion disocclusion without expensive searches.
-	if (m_clearCS && m_forwardDepthCS && m_forwardColorCS && m_dilateCS && useForwardScatterForMotion) {
+	else if (m_clearCS && m_forwardDepthCS && m_forwardColorCS && m_dilateCS && useForwardScatterForMotion) {
 		// Pass 0: clear output + atomic depth
 		ctx->CSSetShader(m_clearCS, nullptr, 0);
 		ctx->Dispatch(groupsX, groupsY, 1);
@@ -2322,15 +3221,34 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		if (m_clearCS) {
 			ctx->CSSetShader(m_clearCS, nullptr, 0);
 			ctx->Dispatch(groupsX, groupsY, 1);
+		}
 
-			if (m_npcDepthScatterCS) {
-				ctx->CSSetShader(m_npcDepthScatterCS, nullptr, 0);
-				ctx->Dispatch(groupsX, groupsY, 1);
-			}
+		// Depth pre-scatter: forward-scatter all cached depths to their warp output positions.
+		// CSMain reads warped depth from atomicDepth → correct foreground depth at leading edges.
+		if (m_depthPreScatterCS) {
+			ctx->CSSetShader(m_depthPreScatterCS, nullptr, 0);
+			ctx->Dispatch(groupsX, groupsY, 1);
+		} else {
+			static bool logged = false;
+			if (!logged) { OOVR_LOG("ASW: CSDepthPreScatter shader is NULL"); logged = true; }
 		}
 
 		ctx->CSSetShader(m_warpCS, nullptr, 0);
 		ctx->Dispatch(groupsX, groupsY, 1);
+
+		// CSDilate: fill disocclusion holes with background content.
+		if (m_dilateCS) {
+			ctx->CSSetShader(m_dilateCS, nullptr, 0);
+			ctx->Dispatch(groupsX, groupsY, 1);
+		}
+
+		// CSBlurVoids: post-fill blur within void zones only.
+		// Averages filled void pixels with their void-pixel neighbors.
+		// No non-void pixels are introduced — purely smooths the fill.
+		if (m_blurVoidsCS) {
+			ctx->CSSetShader(m_blurVoidsCS, nullptr, 0);
+			ctx->Dispatch(groupsX, groupsY, 1);
+		}
 
 		if (useStationaryNpcForwardOverlay) {
 			ID3D11UnorderedAccessView* overlayUAVs[] = { m_uavForwardNpcOutput[eye], m_uavAtomicDepth[eye] };
@@ -2357,11 +3275,16 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		}
 	}
 
-	ID3D11ShaderResourceView* nullSRVs[4] = {};
-	ID3D11UnorderedAccessView* nullUAVs[2] = {};
-	ctx->CSSetShaderResources(0, 4, nullSRVs);
-	ctx->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+	ID3D11ShaderResourceView* nullSRVs[6] = {};
+	ID3D11UnorderedAccessView* nullUAVs[3] = {};
+	ctx->CSSetShaderResources(0, 6, nullSRVs);
+	ctx->CSSetUnorderedAccessViews(0, 3, nullUAVs, nullptr);
 	ctx->CSSetShader(nullptr, nullptr, 0);
+
+	// FP Hand Replay disabled — captures are stale (frame 1 only, game's main FP render
+	// bypasses all hooks on frame 2+). Controller motion is now handled by the warp shader
+	// via GetControllerDelta() UV shift on FP pixels.
+	// ReplayFPHands(eye, ctx, cb.forwardPoseDelta, hcc);
 
 	ctx->Release();
 	return true;
@@ -2640,6 +3563,22 @@ void ASWProvider::Shutdown()
 				m_cachedDepth[slot][eye]->Release();
 				m_cachedDepth[slot][eye] = nullptr;
 			}
+			if (m_srvStencil[slot][eye]) {
+				m_srvStencil[slot][eye]->Release();
+				m_srvStencil[slot][eye] = nullptr;
+			}
+			if (m_cachedStencil[slot][eye]) {
+				m_cachedStencil[slot][eye]->Release();
+				m_cachedStencil[slot][eye] = nullptr;
+			}
+			if (m_srvPreFPDepth[slot][eye]) {
+				m_srvPreFPDepth[slot][eye]->Release();
+				m_srvPreFPDepth[slot][eye] = nullptr;
+			}
+			if (m_cachedPreFPDepth[slot][eye]) {
+				m_cachedPreFPDepth[slot][eye]->Release();
+				m_cachedPreFPDepth[slot][eye] = nullptr;
+			}
 			if (m_cachedMV[slot][eye]) {
 				m_cachedMV[slot][eye]->Release();
 				m_cachedMV[slot][eye] = nullptr;
@@ -2671,6 +3610,29 @@ void ASWProvider::Shutdown()
 	if (m_compositeNpcForwardCS) { m_compositeNpcForwardCS->Release(); m_compositeNpcForwardCS = nullptr; }
 	if (m_dilateCS) { m_dilateCS->Release(); m_dilateCS = nullptr; }
 	if (m_npcDepthScatterCS) { m_npcDepthScatterCS->Release(); m_npcDepthScatterCS = nullptr; }
+	if (m_depthPreScatterCS) { m_depthPreScatterCS->Release(); m_depthPreScatterCS = nullptr; }
+	if (m_legacyWarpCS) { m_legacyWarpCS->Release(); m_legacyWarpCS = nullptr; }
+	if (m_blurVoidsCS) { m_blurVoidsCS->Release(); m_blurVoidsCS = nullptr; }
+	if (m_handCompositeCS) { m_handCompositeCS->Release(); m_handCompositeCS = nullptr; }
+
+	// Hand render targets
+	for (int e = 0; e < 2; e++) {
+		if (m_srvHandColor[e]) { m_srvHandColor[e]->Release(); m_srvHandColor[e] = nullptr; }
+		if (m_handRTV[e]) { m_handRTV[e]->Release(); m_handRTV[e] = nullptr; }
+		if (m_handColor[e]) { m_handColor[e]->Release(); m_handColor[e] = nullptr; }
+		if (m_srvHandDepth[e]) { m_srvHandDepth[e]->Release(); m_srvHandDepth[e] = nullptr; }
+		if (m_handDSV[e]) { m_handDSV[e]->Release(); m_handDSV[e] = nullptr; }
+		if (m_handDepthTex[e]) { m_handDepthTex[e]->Release(); m_handDepthTex[e] = nullptr; }
+	}
+	if (m_handDSS) { m_handDSS->Release(); m_handDSS = nullptr; }
+	if (m_handCompositeCB) { m_handCompositeCB->Release(); m_handCompositeCB = nullptr; }
+	for (int i = 0; i < 7; i++) {
+		if (m_replayCB[i]) { m_replayCB[i]->Release(); m_replayCB[i] = nullptr; }
+	}
+	for (int i = 0; i < 3; i++) {
+		if (m_replayPSCB[i]) { m_replayPSCB[i]->Release(); m_replayPSCB[i] = nullptr; }
+	}
+	m_fpReplayPtr = nullptr;
 
 	for (int e = 0; e < 2; ++e) {
 		if (m_srvAtomicDepth[e]) { m_srvAtomicDepth[e]->Release(); m_srvAtomicDepth[e] = nullptr; }

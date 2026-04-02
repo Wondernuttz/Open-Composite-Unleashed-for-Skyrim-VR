@@ -130,6 +130,7 @@ public:
 	inline float ASWRotationScale() const { return aswRotationScale; }
 	inline float ASWTranslationScale() const { return aswTranslationScale; }
 	inline float ASWLocoScale() const { return aswLocoScale; }
+	inline float ASWFPControllerScale() const { return aswFPControllerScale; }
 	inline float ASWDepthScale() const { return aswDepthScale; }
 	inline float ASWEdgeFadeWidth() const { return aswEdgeFadeWidth; }
 	inline float ASWNearFadeDepth() const { return aswNearFadeDepth; }
@@ -164,13 +165,15 @@ public:
 	float aswRotationScale = 0.0f; // 0.0 = no rotation correction, 1.0 = full
 	float aswTranslationScale = 1.0f; // 0.0 = no translation correction, 1.0 = full
 	float aswLocoScale = 1.0f;     // locomotion correction scale (0=off, 1=full). Multiplied by timingRatio (~0.5).
+	float aswFPControllerScale = 0.63f; // FP hand/weapon controller delta scale (0=off, 0.63=tuned, 1=raw)
 	float aswDepthScale = 1.0f;    // multiplier on linearized depth (parallax intensity)
 	float aswEdgeFadeWidth = 3.0f;   // depth-edge fade threshold (depth ratio units)
 	float aswNearFadeDepth = 0.0f;   // parallax fades to 0 below this depth (meters); 0 = disabled
-	float aswMVConfidence = 1.5f;    // MV loco correction strength: 1.5 = confirmed working value for locomotion + stick rotation residual scaling. 0 = off.
+	float aswMVConfidence = 1.5f;    // MV extrapolation scale: 1.5 = correct for N-1 warping (1.5 periods from cache to display). 0 = off.
 	float aswMVPixelScale = 1.0f;    // overall MV magnitude multiplier (1.0 = identity)
 	int aswDebugMode = 0;            // 0=normal, 1=depth viz, 2=linearized depth, 3=MV magnitude, 50=black warp frame, 56=stationary NPC dest-depth reject, 57=stationary NPC path overview
 	bool aswCaptureEnabled = false;  // true = capture warp diagnostics (color/depth/MV/CB) to TestWarp folder
+	bool aswForceLegacy = false;     // true = legacy ASW (translation-only parallax, no MV/scatter/disocclusion)
 
 private:
 	static int ini_handler(

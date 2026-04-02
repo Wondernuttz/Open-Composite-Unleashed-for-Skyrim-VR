@@ -46,6 +46,10 @@ public:
 		int debugMode;                       ///< 0=off, 2=bypass (raw game image)
 	};
 
+	/// Override the DLSS quality preset for this upscaler instance.
+	/// -1 = use global config (default), 0-4 = force specific preset.
+	void SetPresetOverride(int preset) { m_presetOverride = preset; }
+
 	/// Dispatch DLSS for one eye (0=left, 1=right). Synchronous — no 1-frame delay.
 	/// Returns false on error; GetOutputDX11() returns the upscaled result.
 	bool Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const DispatchParams& params);
@@ -74,6 +78,7 @@ private:
 	    ID3D11Texture2D* colorSrc, ID3D11Texture2D* mvSrc, ID3D11Texture2D* depthSrc);
 	void DestroyStagingTextures();
 
+	int m_presetOverride = -1; // -1 = use global config
 	bool m_ready = false;
 	ID3D11Device* m_device = nullptr;   // NOT owned
 

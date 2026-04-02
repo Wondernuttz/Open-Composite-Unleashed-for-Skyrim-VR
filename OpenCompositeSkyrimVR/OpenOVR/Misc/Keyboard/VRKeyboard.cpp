@@ -293,6 +293,8 @@ static bool ReloadKeyboardSettings()
 				oovr_global_configuration.aswMVConfidence = val;
 			if (sscanf(line, "aswMVPixelScale=%f", &val) == 1)
 				oovr_global_configuration.aswMVPixelScale = val;
+			if (sscanf(line, "aswFPControllerScale=%f", &val) == 1)
+				oovr_global_configuration.aswFPControllerScale = val;
 		}
 	}
 	fclose(f);

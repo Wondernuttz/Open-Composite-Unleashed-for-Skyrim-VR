@@ -4,7 +4,7 @@ project(
     OpenCompositeInput
     VERSION 1.0.0
     DESCRIPTION "SKSE VR plugin for OpenComposite - bridges keyboard input to Scaleform"
-    LANGUAGES CXX
+    LANGUAGES CXX C
 )
 
 set(CMAKE_CXX_STANDARD 23)
@@ -25,6 +25,16 @@ add_subdirectory(
 
 # Include the plugin helper macro from CommonLibVR
 include("C:/Users/JLWel/Documents/GitHub/CommonLibVR-4.1.3/cmake/CommonLibSSE.cmake")
+
+# MinHook — inline hooking library (needed for D3D11 DrawIndexed hook)
+set(MINHOOK_DIR "C:/Users/JLWel/Documents/GitHub/Open-Composite-Unleashed-for-Skyrim-VR/OpenCompositeSkyrimVR/libs/minhook")
+add_library(minhook_skse STATIC
+    ${MINHOOK_DIR}/src/buffer.c
+    ${MINHOOK_DIR}/src/hook.c
+    ${MINHOOK_DIR}/src/trampoline.c
+    ${MINHOOK_DIR}/src/hde/hde64.c
+)
+target_include_directories(minhook_skse PUBLIC ${MINHOOK_DIR}/include)
 
 # Plugin source files
 set(SOURCES
@@ -56,6 +66,9 @@ if(MSVC)
         /bigobj
     )
 endif()
+
+# Link MinHook
+target_link_libraries(${PROJECT_NAME} PRIVATE minhook_skse)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     OUTPUT_NAME "OpenCompositeInput"

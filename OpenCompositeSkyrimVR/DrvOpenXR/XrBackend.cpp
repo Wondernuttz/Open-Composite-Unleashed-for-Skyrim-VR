@@ -63,11 +63,12 @@ using namespace vr;
 // ── Aim pose data shared with PrismaVR via window property ──
 // PrismaVR reads OC_AIM_POSES to get controller pointing direction
 // without per-controller calibration constants.
+// Also used by ASW to project controller positions for hand detection.
 struct OCAimPoseData {
 	vr::HmdMatrix34_t matrix[2]; // [0]=left, [1]=right
 	bool valid[2];
 };
-static OCAimPoseData g_aimPoses = {};
+OCAimPoseData g_aimPoses = {}; // non-static: accessed from dx11compositor for ASW hand detection
 static HWND g_aimPoseHwnd = nullptr;
 
 static BOOL CALLBACK FindGameWindowCB(HWND hwnd, LPARAM lParam)
@@ -301,7 +302,34 @@ void XrBackend::GetDeviceToAbsoluteTrackingPose(
 		}
 	}
 
-	// ── Aim pose: locate aim spaces for PrismaVR laser pointing ──
+	// ── Controller pose caching: used by ASW for hand detection + PrismaVR ──
+	// Read from poseArray (populated above for ALL games via legacy or action API).
+	// Device indices: 1 = left controller, 2 = right controller.
+	{
+		static int s_ctrlDbg = 0;
+		for (int h = 0; h < 2; h++) {
+			uint32_t devIdx = (h == 0) ? 1 : 2; // left=1, right=2
+			if (devIdx < poseArrayCount && poseArray[devIdx].bPoseIsValid) {
+				g_aimPoses.valid[h] = true;
+				g_aimPoses.matrix[h] = poseArray[devIdx].mDeviceToAbsoluteTracking;
+				if (g_aswProvider) {
+					auto& m = poseArray[devIdx].mDeviceToAbsoluteTracking;
+					g_aswProvider->SetControllerPos(h, m.m[0][3], m.m[1][3], m.m[2][3], true);
+				}
+			} else {
+				g_aimPoses.valid[h] = false;
+				if (g_aswProvider) g_aswProvider->SetControllerPos(h, 0, 0, 0, false);
+			}
+		}
+		if (s_ctrlDbg++ < 3) {
+			OOVR_LOGF("CtrlPose: count=%u asw=%p L_valid=%d R_valid=%d L=(%.3f,%.3f,%.3f)",
+			    poseArrayCount, (void*)g_aswProvider,
+			    (int)g_aimPoses.valid[0], (int)g_aimPoses.valid[1],
+			    g_aimPoses.matrix[0].m[0][3], g_aimPoses.matrix[0].m[1][3], g_aimPoses.matrix[0].m[2][3]);
+		}
+	}
+
+	// Action-based aim poses (PrismaVR laser pointing) — only when actions are loaded.
 	BaseInput* input = GetUnsafeBaseInput();
 	if (input && input->AreActionsLoaded()) {
 		for (int h = 0; h < 2; h++) {
@@ -696,52 +724,72 @@ bool XrBackend::SubmitAswWarpFrame(const XrFrameState& frameState,
 		if (rotStickIdle)
 			g_aswProvider->SetLocomotionYaw(0.0f);
 
-		// Independent stop handling for locomotion and rotation.
-		// Each has its own frame counter and confidence suppression so they
-		// can stop independently without affecting the other.
-		static int s_locoStopFrames = 0;
+		// Proportional MV scaling from live stick deflection at warp time.
+		// Instead of detecting stops after the fact (which causes jerk from
+		// overshoot), scale the MV correction by how much the stick is deflected.
+		// Analog stick → smooth transition → no jerk on release.
+		float locoStickMag = sqrtf(leftX * leftX + leftY * leftY);
+		float rotStickMag = fabsf(rightX);
+
+		// Compute per-stick scales with quick ramp (dead zone → 20% = proportional, above = 1.0)
+		auto rampScale = [](float mag, float dead) -> float {
+			if (mag < dead) return 0.0f;
+			if (mag < 0.2f) return (mag - dead) / (0.2f - dead);
+			return 1.0f;
+		};
+		float locoScale = rampScale(locoStickMag, kStickDead);
+		float rotScale = rampScale(rotStickMag, kStickDead);
+
+		// Track when each stick was last active for transition detection
 		static bool s_locoWasActive = false;
-		static int s_rotStopFrames = 0;
 		static bool s_rotWasActive = false;
+		static int s_locoReleaseFrames = 99;
+		static int s_rotReleaseFrames = 99;
 
-		// Locomotion stop → suppress mvConfidenceScale (affects loco+animation residual)
-		if (!locoStickIdle) {
-			s_locoWasActive = true;
-			s_locoStopFrames = 0;
-			g_aswProvider->SetMVConfidenceScale(1.0f);
-		} else if (s_locoWasActive && s_locoStopFrames < 3) {
-			float scale = (s_locoStopFrames == 0) ? 0.33f : 0.0f;
-			g_aswProvider->SetMVConfidenceScale(scale);
-			s_locoStopFrames++;
-		} else {
-			g_aswProvider->SetMVConfidenceScale(1.0f);
-			s_locoWasActive = false;
+		if (locoScale > 0.5f) { s_locoWasActive = true; s_locoReleaseFrames = 99; }
+		else if (s_locoWasActive && locoScale < 0.1f) { s_locoWasActive = false; s_locoReleaseFrames = 0; }
+		if (s_locoReleaseFrames < 99) s_locoReleaseFrames++;
+
+		if (rotScale > 0.5f) { s_rotWasActive = true; s_rotReleaseFrames = 99; }
+		else if (s_rotWasActive && rotScale < 0.1f) { s_rotWasActive = false; s_rotReleaseFrames = 0; }
+		if (s_rotReleaseFrames < 99) s_rotReleaseFrames++;
+
+		// Combined scale: full when both active, suppressed when one just released.
+		// When one stick releases while the other is active, the cached MVs still
+		// contain the released component → brief suppression prevents overshoot.
+		float stickScale = std::max(locoScale, rotScale);
+		if (s_locoReleaseFrames < 3 || s_rotReleaseFrames < 3) {
+			stickScale = 0.0f; // suppress during transition
 		}
+		g_aswProvider->SetMVConfidenceScale(stickScale);
+	}
 
-		// Rotation stop → suppress rotMVScale (affects only rotation component)
-		if (!rotStickIdle) {
-			s_rotWasActive = true;
-			s_rotStopFrames = 0;
-			g_aswProvider->SetRotMVScale(1.0f);
-		} else if (s_rotWasActive && s_rotStopFrames < 3) {
-			g_aswProvider->SetRotMVScale(0.0f);
-			s_rotStopFrames++;
-		} else {
-			g_aswProvider->SetRotMVScale(1.0f);
-			s_rotWasActive = false;
+	// When stick is near-idle, use the newest cache slot (N-0) instead of N-1.
+	// With reduced MV confidence, this shows the freshest content with minimal overshoot.
+	bool stopping = (g_aswProvider->GetMVConfidenceScale() < 0.5f);
+	int slotOverride = stopping ? g_aswProvider->GetPublishedSlot() : -1;
+
+	// Fetch FRESH controller positions at warp time using the same coordinate path
+	// as CacheFrame (GetDeviceToAbsoluteTrackingPose → g_aimPoses → SetControllerPos).
+	// This ensures the warp-time positions are in the same space as the cached UVs.
+	{
+		vr::TrackedDevicePose_t warpPoses[3] = {};
+		GetDeviceToAbsoluteTrackingPose(
+		    vr::TrackingUniverseStanding, 0.0f, warpPoses, 3);
+		// Device 1 = left, 2 = right (same as CacheFrame path)
+		for (int h = 0; h < 2; h++) {
+			uint32_t devIdx = (h == 0) ? 1 : 2;
+			if (warpPoses[devIdx].bPoseIsValid) {
+				auto& m = warpPoses[devIdx].mDeviceToAbsoluteTracking;
+				g_aswProvider->SetControllerPos(h, m.m[0][3], m.m[1][3], m.m[2][3], true);
+			}
 		}
 	}
 
-	// On stop transition, use the most recent cache slot (N-0) instead of N-1.
-	// Combined with zero MV confidence, this reprojects the last game frame
-	// with head-tracking only — minimal discontinuity with the next game frame.
-	bool stopping = (g_aswProvider->GetMVConfidenceScale() < 0.5f)
-	             || (g_aswProvider->GetRotMVScale() < 0.5f);
-	int slotOverride = stopping ? g_aswProvider->GetPublishedSlot() : -1;
-
 	bool warpOk = true;
 	for (int eye = 0; eye < 2; eye++) {
-		if (!g_aswProvider->WarpFrame(eye, views[eye].pose, slotOverride)) {
+		if (!g_aswProvider->WarpFrame(eye, views[eye].pose, slotOverride,
+		        frameState.predictedDisplayTime)) {
 			warpOk = false;
 			break;
 		}
@@ -1309,7 +1357,8 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 					// 4. Warp cached frame — translation/parallax only (rotation=0, handled by runtime ATW)
 					bool warpOk = true;
 					for (int eye = 0; eye < 2; eye++) {
-						if (!g_aswProvider->WarpFrame(eye, views[eye].pose)) {
+						if (!g_aswProvider->WarpFrame(eye, views[eye].pose, -1,
+						        aswState.predictedDisplayTime)) {
 							warpOk = false;
 							break;
 						}

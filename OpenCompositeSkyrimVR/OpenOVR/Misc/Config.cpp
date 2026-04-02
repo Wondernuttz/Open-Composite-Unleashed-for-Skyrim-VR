@@ -252,6 +252,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, aswRotationScale);
 		CFGOPT(float, aswTranslationScale);
 		CFGOPT(float, aswLocoScale);
+		CFGOPT(float, aswFPControllerScale);
 		CFGOPT(float, aswDepthScale);
 		CFGOPT(float, aswEdgeFadeWidth);
 		CFGOPT(float, aswNearFadeDepth);
@@ -259,6 +260,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, aswMVPixelScale);
 		CFGOPT(int, aswDebugMode);
 		CFGOPT(bool, aswCaptureEnabled);
+		CFGOPT(bool, aswForceLegacy);
 		CFGOPT(bool, aswConcurrentFrameThread);
 		CFGOPT(bool, aswSpeculativeTrackingLead);
 		CFGOPT(bool, aswBufferEnabled);
@@ -401,16 +403,8 @@ Config::Config()
 	}
 
 	if (err == -1) {
-		// Couldn't open file, no problem since the config file is optional and
-		//  the defaults are set up as the default values for the variables
-		if (dlssEnabled && !fsrEnabled) {
-			fsrRenderScale = dlss_preset_render_scale(dlssPreset);
-			OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",
-			    dlssPreset, fsrRenderScale);
-		}
-		return;
+		// Couldn't open file, no problem since the config file is optional
 	} else if (err) {
-		// err is the line number
 		string str = "Config error on line " + to_string(err);
 		ABORT(str);
 	}
@@ -431,25 +425,28 @@ Config::Config()
 	}
 
 	if (err == -1) {
-		// Couldn't open file, no problem since the config file is optional and
-		//  the defaults are set up as the default values for the variables
-		if (dlssEnabled && !fsrEnabled) {
-			fsrRenderScale = dlss_preset_render_scale(dlssPreset);
-			OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",
-			    dlssPreset, fsrRenderScale);
-		}
-		return;
+		// Couldn't open file, no problem
 	} else if (err) {
-		// err is the line number
 		string str = "Config error on line " + to_string(err);
 		ABORT(str);
 	}
 
-	// Everything should have been set up by ini_handler
+	// Post-processing: apply derived config settings after all INI files parsed
 	if (dlssEnabled && !fsrEnabled) {
 		fsrRenderScale = dlss_preset_render_scale(dlssPreset);
 		OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",
 		    dlssPreset, fsrRenderScale);
+	}
+
+	// DLAA via NVIDIA DLSS: when dlaaEnabled=true, enable DLSS in DLAA mode (preset 4).
+	// Works standalone (native-res AA) or on top of FSR3 (post-upscale AA).
+	if (dlaaEnabled && !dlssEnabled) {
+		dlssEnabled = true;
+		dlssPreset = 4;
+		if (!fsrEnabled) {
+			fsrRenderScale = 1.0f; // DLAA = native resolution
+		}
+		OOVR_LOGF("DLAA: Enabling DLSS in DLAA mode (preset 4, renderScale=%.2f)", fsrRenderScale);
 	}
 }
 

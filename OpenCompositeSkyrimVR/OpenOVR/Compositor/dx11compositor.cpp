@@ -12,9 +12,79 @@
 #include <cmath>
 #include <d3dcompiler.h> // For compiling shaders! D3DCompile
 #include <string>
+#include <filesystem>
+#include <fstream>
 
 
 #pragma comment(lib, "d3dcompiler.lib")
+
+// ── Shader disk cache (same as ASWProvider) ──
+static uint64_t FnvHash(const void* data, size_t len)
+{
+	uint64_t h = 14695981039346656037ULL;
+	for (size_t i = 0; i < len; i++) {
+		h ^= ((const uint8_t*)data)[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static bool CompileOrLoadCached(
+    const char* source, size_t sourceLen, const char* entry, const char* target,
+    DWORD flags, ID3DBlob** outBlob)
+{
+	uint64_t srcHash = FnvHash(source, sourceLen);
+	uint64_t entryHash = FnvHash(entry, strlen(entry));
+	uint64_t flagsHash = FnvHash(&flags, sizeof(flags));
+	uint64_t cacheKey = srcHash ^ (entryHash * 31) ^ (flagsHash * 997);
+
+	namespace fs = std::filesystem;
+	wchar_t dllPath[MAX_PATH] = {};
+	HMODULE hm = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	    (LPCWSTR)&CompileOrLoadCached, &hm);
+	GetModuleFileNameW(hm, dllPath, MAX_PATH);
+	fs::path cacheDir = fs::path(dllPath).parent_path() / ".shader_cache";
+	char cacheName[64];
+	snprintf(cacheName, sizeof(cacheName), "%s_%016llx.cso", entry, (unsigned long long)cacheKey);
+	fs::path cachePath = cacheDir / cacheName;
+
+	if (fs::exists(cachePath)) {
+		std::ifstream f(cachePath, std::ios::binary | std::ios::ate);
+		if (f.is_open()) {
+			auto sz = f.tellg();
+			if (sz > 0) {
+				f.seekg(0);
+				if (SUCCEEDED(D3DCreateBlob((SIZE_T)sz, outBlob))) {
+					f.read((char*)(*outBlob)->GetBufferPointer(), sz);
+					if (f.good())
+						return true;
+					(*outBlob)->Release();
+					*outBlob = nullptr;
+				}
+			}
+		}
+	}
+
+	ID3DBlob* errs = nullptr;
+	HRESULT hr = D3DCompile(source, sourceLen, entry, nullptr, nullptr, entry, target, flags, 0, outBlob, &errs);
+	if (FAILED(hr)) {
+		if (errs) {
+			OOVR_LOGF("Shader compile error (%s): %s", entry, (char*)errs->GetBufferPointer());
+			errs->Release();
+		}
+		return false;
+	}
+	if (errs) errs->Release();
+
+	try {
+		fs::create_directories(cacheDir);
+		std::ofstream f(cachePath, std::ios::binary);
+		if (f.is_open())
+			f.write((const char*)(*outBlob)->GetBufferPointer(), (*outBlob)->GetBufferSize());
+	} catch (...) {}
+	return true;
+}
 
 // AMD FidelityFX FSR 1.0 — CPU-side constant setup functions (FsrEasuCon, FsrRcasCon)
 #define A_CPU
@@ -32,6 +102,10 @@
 
 #include "../../DrvOpenXR/ASWProvider.h"
 #include "../../DrvOpenXR/SpaceWarpProvider.h"
+
+#include <MinHook.h>
+
+// (Controller poses now routed through ASWProvider::SetControllerPos/GetControllerPos)
 
 // ============================================================================
 // SKSE Render Target Bridge — shared memory for motion vectors + depth
@@ -84,6 +158,49 @@ struct OCRenderTargetBridge {
 	uint64_t actorMvRootPtrs[MAX_ACTOR_MV]; // NiAVObject* root node pointers
 	uint32_t actorMvRequestRefresh; // OC sets to 1 to request SKSE re-enumerate
 	uint32_t _padActorMv;
+
+	// Stencil capture — R24G8_TYPELESS copy captured mid-frame by SKSE plugin's
+	// ClearDepthStencilView hook (before the game clears stencil).
+	uint64_t stencilCaptureTexture; // ID3D11Texture2D* (R24G8_TYPELESS, same size as depth)
+	uint8_t stencilCapturedThisFrame; // 1 = valid capture for current frame
+	uint8_t _padStencil[7];
+
+	// Player first-person model — NiAVObject nodes for hand bounding sphere detection.
+	uint64_t playerFirstPersonRootPtr; // NiAVObject* → player's 1st-person skeleton root
+	uint64_t playerFPLeftHandPtr;      // NiAVObject* → left hand node
+	uint64_t playerFPRightHandPtr;     // NiAVObject* → right hand node
+	uint64_t playerFPWeaponPtr;        // NiAVObject* → weapon node
+
+	// First-person render pass detection.
+	uint8_t fpRenderFinished; // 1 = FP render done (set by hook, reset by compositor)
+	uint8_t _padFPRender[7];
+	uint64_t finishAccumulatingAddr; // BSShaderAccumulator::FinishAccumulating function address
+
+	// Per-draw-call stencil injection — marks FP pixels with stencil=2
+	uint8_t  fpStencilInjectionActive; // 1 = SetupGeometry hook is running, stencil=2 marks FP pixels
+	uint8_t  fpStencilInjectNow;       // 1 = currently inside FP draw (set by SKSE, read by OC MinHook)
+	uint8_t  _padFPStencil[6];
+	uint32_t fpStencilDrawCount;       // Number of FP draw calls this frame (diagnostic)
+	uint32_t fpStencilDrawCountTotal;  // Cumulative FP draws (diagnostic)
+
+	// Pre-FP depth snapshot — depth buffer state before first-person geometry renders.
+	// OC compares this against post-FP depth: where depth got closer → FP pixel.
+	uint64_t preFPDepthTexture;        // ID3D11Texture2D* (R24G8_TYPELESS, same size as main DS)
+	uint8_t  preFPDepthCaptured;       // 1 = valid capture for current frame
+	uint8_t  _padPreFP[7];
+
+	// FP geometry pointers — BSGeometry* addresses for positively-identified FP draws.
+	// OC reads their worldBound LIVE at WarpFrame time (no stale data).
+	uint64_t fpGeomPointers[16];       // Up to 16 BSGeometry* pointers
+	uint32_t fpGeomCount;              // Number of valid pointers
+	uint32_t _padGeom[3];              // Alignment to 16 bytes
+
+	// FP draw replay — pointer to heap-allocated FPReplayData (same process, read by OC).
+	uint64_t fpReplayDataPtr;          // FPReplayData* (cast to uint64_t)
+
+	// Menu state — ASW skips MV corrections when a menu is open.
+	uint8_t  isMenuOpen;               // 1 = a gameplay menu is open, 0 = gameplay
+	uint8_t  _padMenu[7];              // alignment
 };
 #pragma pack(pop)
 
@@ -165,6 +282,701 @@ static ID3D11ShaderResourceView* s_depthBridgeSRV = nullptr; // SRV on bridge de
 static ID3D11Texture2D* s_depthBridgeSRVTex = nullptr; // Cached: which tex the SRV was created for
 static uint32_t s_depthR32FWidth = 0;
 static uint32_t s_depthR32FHeight = 0;
+static ID3D11ShaderResourceView* s_preFPDepthSRV = nullptr; // SRV on bridge preFPDepth (separate from main depth SRV)
+static ID3D11Texture2D* s_preFPDepthSRVTex = nullptr;
+
+// ── FP mask via hardware stencil test ──
+// Stencil=2 is injected by SKSE for FP draws. We read it by rendering a full-screen
+// triangle with StencilFunc=EQUAL,ref=2 — only FP pixels pass → R8 mask.
+static ID3D11Texture2D* s_stencilCopyDS = nullptr;
+static ID3D11DepthStencilView* s_stencilTestDSV = nullptr;
+static ID3D11Texture2D* s_fpMaskTex = nullptr;
+static ID3D11RenderTargetView* s_fpMaskRTV = nullptr;
+static ID3D11VertexShader* s_fullscreenVS = nullptr;
+static ID3D11PixelShader* s_stencilTestPS = nullptr;
+static ID3D11DepthStencilState* s_stencilTestDSS = nullptr;
+static ID3D11RasterizerState* s_noCullRS = nullptr;
+static uint32_t s_fpMaskWidth = 0, s_fpMaskHeight = 0;
+
+static const char s_stencilTestShaderSrc[] = R"(
+void VS(uint id : SV_VertexID, out float4 pos : SV_Position)
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    pos = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+float4 PS(float4 pos : SV_Position) : SV_Target { return 1.0; }
+)";
+
+static bool EnsureStencilTestResources(ID3D11Device* device, uint32_t w, uint32_t h)
+{
+	if (!s_fullscreenVS) {
+		ID3DBlob* blob = nullptr;
+		if (CompileOrLoadCached(s_stencilTestShaderSrc, sizeof(s_stencilTestShaderSrc) - 1,
+		        "VS", "vs_5_0", 0, &blob)) {
+			device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+			    nullptr, &s_fullscreenVS);
+			blob->Release();
+		}
+		if (CompileOrLoadCached(s_stencilTestShaderSrc, sizeof(s_stencilTestShaderSrc) - 1,
+		        "PS", "ps_5_0", 0, &blob)) {
+			device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+			    nullptr, &s_stencilTestPS);
+			blob->Release();
+		}
+	}
+
+	if (!s_stencilTestDSS) {
+		D3D11_DEPTH_STENCIL_DESC d = {};
+		d.DepthEnable = FALSE;
+		d.StencilEnable = TRUE;
+		d.StencilReadMask = 0x02;  // Only check bit 1 (our FP bit; game uses bit 0)
+		d.StencilWriteMask = 0x00;
+		d.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
+		d.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+		d.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+		d.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+		d.BackFace = d.FrontFace;
+		device->CreateDepthStencilState(&d, &s_stencilTestDSS);
+	}
+
+	if (!s_noCullRS) {
+		D3D11_RASTERIZER_DESC r = {};
+		r.FillMode = D3D11_FILL_SOLID;
+		r.CullMode = D3D11_CULL_NONE;
+		r.DepthClipEnable = FALSE;
+		device->CreateRasterizerState(&r, &s_noCullRS);
+	}
+
+	if (!s_fpMaskTex || s_fpMaskWidth != w || s_fpMaskHeight != h) {
+		if (s_fpMaskTex) s_fpMaskTex->Release();
+		if (s_fpMaskRTV) s_fpMaskRTV->Release();
+		s_fpMaskTex = nullptr; s_fpMaskRTV = nullptr;
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8_UNORM;
+		td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+		if (FAILED(device->CreateTexture2D(&td, nullptr, &s_fpMaskTex))) return false;
+
+		D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+		rv.Format = DXGI_FORMAT_R8_UNORM;
+		rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		if (FAILED(device->CreateRenderTargetView(s_fpMaskTex, &rv, &s_fpMaskRTV))) return false;
+
+		s_fpMaskWidth = w; s_fpMaskHeight = h;
+		OOVR_LOGF("FPMask: Stencil test resources created %ux%u", w, h);
+	}
+
+	return s_fullscreenVS && s_stencilTestPS && s_stencilTestDSS &&
+	       s_noCullRS && s_fpMaskTex && s_fpMaskRTV;
+}
+
+static bool ExtractFPMask(ID3D11DeviceContext* ctx, ID3D11Device* device,
+    ID3D11Texture2D* gameDS, uint32_t w, uint32_t h)
+{
+	if (!EnsureStencilTestResources(device, w, h)) return false;
+
+	// Create a read-only DSV directly on the game's live DS (no CopyResource —
+	// NVIDIA doesn't preserve stencil in copies). The game's stencil is live here.
+	// DSV is cached by texture pointer.
+	if (s_stencilCopyDS != gameDS) {
+		if (s_stencilTestDSV) { s_stencilTestDSV->Release(); s_stencilTestDSV = nullptr; }
+		D3D11_DEPTH_STENCIL_VIEW_DESC dv = {};
+		dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+		dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+		dv.Flags = 0; // No read-only flags — DepthEnable=FALSE in our DSS prevents writes
+		HRESULT hr = device->CreateDepthStencilView(gameDS, &dv, &s_stencilTestDSV);
+		if (FAILED(hr)) {
+			OOVR_LOGF("FPMask: CreateDSV on game DS failed hr=0x%08X", hr);
+			return false;
+		}
+		s_stencilCopyDS = gameDS;
+		OOVR_LOGF("FPMask: Created DSV (no read-only flag) on game DS %p", gameDS);
+	}
+	if (!s_stencilTestDSV) return false;
+
+	// CPU readback: CopyResource to STAGING preserves stencil on NVIDIA (decompress
+	// for CPU access). GPU DSV stencil test on game's compressed DS does NOT work.
+	// Double-buffered: frame N copies DS → staging[N%2], Maps staging[(N-1)%2]
+	// with DO_NOT_WAIT to avoid stalls. Mask is one frame behind (OK for ASW).
+	extern int s_omDSSFPCount; // defined later, near Hook_OMSetDSS_OC
+	static ID3D11Texture2D* s_staging[2] = {};
+	static int s_frameIdx = 0;
+	static bool s_stagingValid[2] = {};
+
+	if (!s_staging[0]) {
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R24G8_TYPELESS; td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		for (int i = 0; i < 2; i++) {
+			if (FAILED(device->CreateTexture2D(&td, nullptr, &s_staging[i]))) {
+				OOVR_LOGF("FPMask: Failed to create staging[%d]", i);
+				return false;
+			}
+		}
+		OOVR_LOGF("FPMask: CPU readback staging %ux%u created", w, h);
+	}
+
+	int curBuf = s_frameIdx % 2;
+	int prevBuf = (s_frameIdx + 1) % 2;
+
+	// Copy game DS → current staging (GPU async)
+	ctx->CopyResource(s_staging[curBuf], gameDS);
+	s_stagingValid[curBuf] = true;
+
+	// One-time SYNCHRONOUS diagnostic at frame 30 — bypass double-buffering
+	if (s_frameIdx == 200) {
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		HRESULT hr = ctx->Map(s_staging[curBuf], 0, D3D11_MAP_READ, 0, &mapped); // BLOCKING
+		if (SUCCEEDED(hr)) {
+			int hist[8] = {}; int nonZero = 0; int val255 = 0;
+			for (uint32_t y = 0; y < h; y += 2) {
+				const uint8_t* src = (const uint8_t*)mapped.pData + y * mapped.RowPitch;
+				for (uint32_t x = 0; x < w; x += 2) {
+					uint8_t s = src[x * 4 + 3];
+					if (s < 8) hist[s]++;
+					if (s != 0) nonZero++;
+					if (s == 255) val255++;
+				}
+			}
+			ctx->Unmap(s_staging[curBuf], 0);
+			OOVR_LOGF("FPMask SYNC DIAG frame 200: nonzero=%d h[0]=%d h[1]=%d h[2]=%d h[3]=%d h[255]=%d omFP=%d",
+			    nonZero, hist[0], hist[1], hist[2], hist[3], val255, s_omDSSFPCount);
+		}
+	}
+
+	// Map PREVIOUS frame's staging (should be done by now)
+	if (s_stagingValid[prevBuf] && s_frameIdx > 0) {
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		HRESULT hr = ctx->Map(s_staging[prevBuf], 0, D3D11_MAP_READ,
+		    D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			static int s_skipLog = 0;
+			if (s_skipLog++ < 3) OOVR_LOG("FPMask: Staging not ready, skip");
+		} else if (SUCCEEDED(hr)) {
+			int fpCount = 0;
+			int hist[8] = {}; int nonZero = 0; int val255 = 0;
+			uint8_t* maskBuf = new uint8_t[w * h];
+			for (uint32_t y = 0; y < h; y++) {
+				const uint8_t* src = (const uint8_t*)mapped.pData + y * mapped.RowPitch;
+				uint8_t* dst = maskBuf + y * w;
+				for (uint32_t x = 0; x < w; x++) {
+					uint8_t stencil = src[x * 4 + 3];
+					uint8_t fp = (stencil & 0x02) ? 255 : 0;
+					dst[x] = fp;
+					if (fp) fpCount++;
+					if (stencil < 8) hist[stencil]++;
+					if (stencil != 0) nonZero++;
+					if (stencil == 255) val255++;
+				}
+			}
+			ctx->Unmap(s_staging[prevBuf], 0);
+			ctx->UpdateSubresource(s_fpMaskTex, 0, nullptr, maskBuf, w, 0);
+			delete[] maskBuf;
+
+			static int s_diagLog = 0;
+			if (s_diagLog++ < 10)
+				OOVR_LOGF("FPMask: frame %d: %d FP, nonzero=%d, h[0]=%d h[1]=%d h[2]=%d h[3]=%d h[255]=%d, omDSS_FP=%d",
+				    s_frameIdx, fpCount, nonZero, hist[0], hist[1], hist[2], hist[3], val255, s_omDSSFPCount);
+		}
+	}
+
+	s_frameIdx++;
+	return true;
+}
+
+// ── First-person depth buffer detection via MinHook ──
+// Skyrim VR renders first-person arms/weapons to a SEPARATE depth-stencil texture
+// with zNear=1 (world uses zNear=13). We detect the FP render pass via RSSetViewports
+// hook (reading NiFrustum.Near) and capture the FP depth-stencil texture pointer.
+// The warp shader uses the FP depth buffer to identify player model pixels:
+// any pixel with valid depth in the FP DS = player character (hands, arms, weapons, shields).
+static bool s_fpHooked = false;
+static bool s_inFirstPersonPass = false;
+static ID3D11Texture2D* s_fpDepthStencilTex = nullptr; // FP depth-stencil (game's live texture)
+static ID3D11Texture2D* s_fpDepthCopy = nullptr;        // Our copy (persists after game clears)
+static ID3D11ShaderResourceView* s_fpDepthSRV = nullptr; // SRV on our copy (not the game's live tex)
+
+// ── BSShaderAccumulator::FinishAccumulating hook via MinHook ──
+// Detects when first-person rendering completes. The `firstPerson` bool at offset 0x128
+// indicates whether the accumulator was for first-person geometry.
+using FinishAccum_fn = void(__fastcall*)(void*);
+static FinishAccum_fn s_origFinishAccum = nullptr;
+static bool s_fpFinishAccumHooked = false;
+
+// Note: FinishAccumulatingPostResolveDepth takes (void* this, uint32_t flags)
+using FinishAccumFlags_fn = void(__fastcall*)(void*, uint32_t);
+static FinishAccumFlags_fn s_origFinishAccumPost = nullptr;
+
+static void __fastcall Hook_FinishAccumPost(void* accumulator, uint32_t flags)
+{
+	s_origFinishAccumPost(accumulator, flags);
+
+	auto base = reinterpret_cast<uintptr_t>(accumulator);
+	// Scan bytes around offset 0x128 for the firstPerson flag and nearby render mode
+	bool fp128 = *reinterpret_cast<bool*>(base + 0x128);
+	uint32_t rm150 = *reinterpret_cast<uint32_t*>(base + 0x150); // SE renderMode
+	uint32_t rm178 = *reinterpret_cast<uint32_t*>(base + 0x178); // VR renderMode
+	static int s_log = 0;
+	if (s_log < 20) {
+		s_log++;
+		OOVR_LOGF("FinishAccumPost: accum=%p fp@128=%d rm@150=%u rm@178=%u flags=0x%X",
+		    accumulator, (int)fp128, rm150, rm178, flags);
+	}
+	if ((fp128 || rm178 == 22) && s_pBridge)
+		s_pBridge->fpRenderFinished = 1;
+}
+
+static void InstallFinishAccumHook()
+{
+	if (s_fpFinishAccumHooked || !s_pBridge || !s_pBridge->finishAccumulatingAddr)
+		return;
+
+	void* target = reinterpret_cast<void*>(static_cast<uintptr_t>(s_pBridge->finishAccumulatingAddr));
+	MH_STATUS st = MH_Initialize();
+	if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return;
+
+	st = MH_CreateHook(target, (void*)&Hook_FinishAccumPost, (void**)&s_origFinishAccumPost);
+	if (st == MH_OK) st = MH_EnableHook(target);
+	if (st != MH_OK) {
+		OOVR_LOGF("FinishAccumPost: MH_CreateHook failed (%d) at %p", (int)st, target);
+	} else {
+		s_fpFinishAccumHooked = true;
+		OOVR_LOGF("FinishAccumPost: Hooked at %p (PostResolveDepth, slot 0x2B)", target);
+	}
+}
+
+// ── OMSetDepthStencilState MinHook: inject stencil bit 1 during FP draws ──
+// CS caches the original OMSetDSS function pointer and bypasses vtable hooks.
+// MinHook patches the function body, intercepting ALL callers including CS.
+static bool s_omSetDSSHooked = false;
+using OMSetDSS_fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilState*, UINT);
+static OMSetDSS_fn s_origOMSetDSS = nullptr;
+
+// DSS cache: maps original DSS → modified DSS with stencil bit 1 write
+struct DSSCacheEntry { ID3D11DepthStencilState* original; ID3D11DepthStencilState* modified; };
+static DSSCacheEntry s_dssCache[16] = {};
+static int s_dssCacheCount = 0;
+
+static ID3D11DepthStencilState* GetOrCreateModifiedDSS_OC(ID3D11Device* device, ID3D11DepthStencilState* original)
+{
+	for (int i = 0; i < s_dssCacheCount; i++)
+		if (s_dssCache[i].original == original) return s_dssCache[i].modified;
+
+	D3D11_DEPTH_STENCIL_DESC desc;
+	original->GetDesc(&desc);
+	desc.StencilEnable = TRUE;
+	desc.StencilWriteMask = desc.StencilWriteMask | 0x02; // Add bit 1 to existing mask
+	desc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+	desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+	desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+	desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+	desc.BackFace = desc.FrontFace;
+
+	ID3D11DepthStencilState* modified = nullptr;
+	ID3D11Device* dev = nullptr;
+	original->GetDevice(&dev);
+	if (!dev) return nullptr;
+	HRESULT hr = dev->CreateDepthStencilState(&desc, &modified);
+	dev->Release();
+	if (FAILED(hr)) return nullptr;
+
+	if (s_dssCacheCount < 16)
+		s_dssCache[s_dssCacheCount++] = { original, modified };
+	else { modified->Release(); return nullptr; }
+
+	OOVR_LOGF("FPStencil: OC created modified DSS #%d (depthEn=%d depthFunc=%d +stencil bit1)",
+	    s_dssCacheCount, desc.DepthEnable, desc.DepthFunc);
+	return modified;
+}
+
+// (declared earlier as extern, defined here)
+int s_omDSSFPCount = 0;
+int s_omDSSTotalCount = 0;
+
+// OMSetDSS hook: pure passthrough — exists only to get s_origOMSetDSS trampoline
+// (clean path to real d3d11 function, bypassing CS wrappers)
+static void STDMETHODCALLTYPE Hook_OMSetDSS_OC(ID3D11DeviceContext* ctx,
+    ID3D11DepthStencilState* dss, UINT ref)
+{
+	s_origOMSetDSS(ctx, dss, ref);
+}
+
+// Draw call MinHooks: wrap the ACTUAL GPU draw with stencil DSS injection.
+// CS-agnostic — MinHook patches d3d11.dll function body, not vtable.
+// Hook BOTH DrawIndexed (slot 12) and DrawIndexedInstanced (slot 20) since
+// the game/CS may use either.
+using DrawIndexed_fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
+static DrawIndexed_fn s_origDrawIndexed = nullptr;
+
+using DrawIndexedInstanced_fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
+static DrawIndexedInstanced_fn s_origDrawIndexedInstanced = nullptr;
+
+static int s_drawIndexedCallCount = 0;
+static int s_drawIndexedInstancedCallCount = 0;
+
+// Shared logic for stencil injection around any draw call
+static bool InjectFPStencil(ID3D11DeviceContext* ctx)
+{
+	if (!s_pBridge || !s_pBridge->fpStencilInjectNow) return false;
+
+	ID3D11DepthStencilState* curDSS = nullptr;
+	UINT curRef = 0;
+	ctx->OMGetDepthStencilState(&curDSS, &curRef);
+	auto* modDSS = curDSS ? GetOrCreateModifiedDSS_OC(nullptr, curDSS) : nullptr;
+	if (!modDSS) { if (curDSS) curDSS->Release(); return false; }
+
+	s_omDSSFPCount++;
+	s_origOMSetDSS(ctx, modDSS, curRef | 0x02);
+	// Caller does the actual draw
+	// Then caller calls RestoreFPStencil
+	return true; // curDSS is NOT released — caller must restore+release
+}
+
+// Stored for restore after draw
+static ID3D11DepthStencilState* s_savedInjectDSS = nullptr;
+static UINT s_savedInjectRef = 0;
+
+static void STDMETHODCALLTYPE Hook_DrawIndexed_OC(ID3D11DeviceContext* ctx,
+    UINT indexCount, UINT startIndex, INT baseVertex)
+{
+	s_drawIndexedCallCount++;
+	if (s_drawIndexedCallCount <= 3 || s_drawIndexedCallCount == 1000)
+		OOVR_LOGF("FPStencil: DrawIndexed #%d injectNow=%d",
+		    s_drawIndexedCallCount, s_pBridge ? (int)s_pBridge->fpStencilInjectNow : -1);
+
+	if (s_pBridge && s_pBridge->fpStencilInjectNow) {
+		// Get current DSS (whatever game/CS set), modify for stencil bit 1
+		ID3D11DepthStencilState* curDSS = nullptr;
+		UINT curRef = 0;
+		ctx->OMGetDepthStencilState(&curDSS, &curRef);
+		auto* modDSS = curDSS ? GetOrCreateModifiedDSS_OC(nullptr, curDSS) : nullptr;
+		if (modDSS) {
+			s_omDSSFPCount++;
+			// Use trampoline to bypass ALL hooks (including our own OMSetDSS)
+			ctx->OMSetDepthStencilState(modDSS, curRef | 0x02);
+			s_origDrawIndexed(ctx, indexCount, startIndex, baseVertex);
+			ctx->OMSetDepthStencilState(curDSS, curRef); // restore
+			if (curDSS) curDSS->Release();
+
+			static int s_fpLog = 0;
+			if (s_fpLog++ < 5)
+				OOVR_LOGF("FPStencil: DrawIndexed FP inject #%d dss=%p→%p ref=%u→%u",
+				    s_omDSSFPCount, curDSS, modDSS, curRef, curRef | 0x02);
+			return;
+		}
+		if (curDSS) curDSS->Release();
+	}
+	s_origDrawIndexed(ctx, indexCount, startIndex, baseVertex);
+}
+
+static void STDMETHODCALLTYPE Hook_DrawIndexedInstanced_OC(ID3D11DeviceContext* ctx,
+    UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance)
+{
+	s_drawIndexedInstancedCallCount++;
+	if (s_drawIndexedInstancedCallCount <= 3 || s_drawIndexedInstancedCallCount == 1000)
+		OOVR_LOGF("FPStencil: DrawIndexedInstanced #%d injectNow=%d",
+		    s_drawIndexedInstancedCallCount, s_pBridge ? (int)s_pBridge->fpStencilInjectNow : -1);
+
+	if (s_pBridge && s_pBridge->fpStencilInjectNow) {
+		ID3D11DepthStencilState* curDSS = nullptr;
+		UINT curRef = 0;
+		ctx->OMGetDepthStencilState(&curDSS, &curRef);
+		auto* modDSS = curDSS ? GetOrCreateModifiedDSS_OC(nullptr, curDSS) : nullptr;
+		if (modDSS) {
+			s_omDSSFPCount++;
+			ctx->OMSetDepthStencilState(modDSS, curRef | 0x02);
+			s_origDrawIndexedInstanced(ctx, indexCountPerInstance, instanceCount, startIndex, baseVertex, startInstance);
+			ctx->OMSetDepthStencilState(curDSS, curRef);
+			if (curDSS) curDSS->Release();
+
+			static int s_fpLog2 = 0;
+			if (s_fpLog2++ < 5)
+				OOVR_LOGF("FPStencil: DrawIndexedInstanced FP inject #%d ref=%u→%u",
+				    s_omDSSFPCount, curRef, curRef | 0x02);
+			return;
+		}
+		if (curDSS) curDSS->Release();
+	}
+	s_origDrawIndexedInstanced(ctx, indexCountPerInstance, instanceCount, startIndex, baseVertex, startInstance);
+}
+
+static void InstallOMSetDSSHook()
+{
+	if (s_omSetDSSHooked || !s_pBridge || !s_pBridge->d3dContext)
+		return;
+
+	auto* ctx = reinterpret_cast<ID3D11DeviceContext*>(static_cast<uintptr_t>(s_pBridge->d3dContext));
+	auto vtable = *reinterpret_cast<void***>(ctx);
+
+	MH_STATUS st = MH_Initialize();
+	if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return;
+
+	// Hook DrawIndexed (slot 12) AND DrawIndexedInstanced (slot 20)
+	// OMSetDSS is NOT hooked — MinHook passthrough broke game's stencil writes.
+	// Instead, DSS is set via ctx->OMSetDepthStencilState() inside draw hooks.
+	void* drawTarget = vtable[12];
+	st = MH_CreateHook(drawTarget, (void*)&Hook_DrawIndexed_OC, (void**)&s_origDrawIndexed);
+	if (st == MH_OK) st = MH_EnableHook(drawTarget);
+	if (st != MH_OK) {
+		OOVR_LOGF("FPStencil: MH_CreateHook DrawIndexed failed (%d) at %p", (int)st, drawTarget);
+	} else {
+		OOVR_LOGF("FPStencil: DrawIndexed MinHook at %p", drawTarget);
+	}
+
+	void* drawInstTarget = vtable[20]; // DrawIndexedInstanced
+	st = MH_CreateHook(drawInstTarget, (void*)&Hook_DrawIndexedInstanced_OC, (void**)&s_origDrawIndexedInstanced);
+	if (st == MH_OK) st = MH_EnableHook(drawInstTarget);
+	if (st != MH_OK) {
+		OOVR_LOGF("FPStencil: MH_CreateHook DrawIndexedInstanced failed (%d) at %p", (int)st, drawInstTarget);
+	} else {
+		OOVR_LOGF("FPStencil: DrawIndexedInstanced MinHook at %p", drawInstTarget);
+	}
+
+	s_omSetDSSHooked = true;
+}
+
+// ── OMSetRenderTargets hook: detect FP DS binding and copy when unbound ──
+using OMSetRT_fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
+static OMSetRT_fn s_origOMSetRT = nullptr;
+static bool s_fpDSWasBound = false; // true when FP DS was bound last OMSetRT call
+static bool s_fpRTUAVCall = false;  // true when Hook_OMSetRenderTargets is called from RTUAV wrapper
+
+static void STDMETHODCALLTYPE Hook_OMSetRenderTargets(
+    ID3D11DeviceContext* ctx, UINT numViews, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV)
+{
+	// Check if the DSV being bound is the FP DS or the main DS
+	if (s_pBridge && s_pBridge->depthTexture && s_pBridge->status == 1
+	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen) {
+		ID3D11Texture2D* mainDS = reinterpret_cast<ID3D11Texture2D*>(s_pBridge->depthTexture);
+		ID3D11Texture2D* dsvTex = nullptr;
+
+		if (pDSV) {
+			ID3D11Resource* res = nullptr;
+			pDSV->GetResource(&res);
+			if (res) {
+				res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&dsvTex);
+				res->Release();
+			}
+		}
+
+		bool isFPDS = false;
+		if (dsvTex) {
+			D3D11_TEXTURE2D_DESC td, mainDesc;
+			dsvTex->GetDesc(&td);
+			mainDS->GetDesc(&mainDesc);
+			static int s_omLog = 0;
+			if (s_omLog < 20) {
+				s_omLog++;
+				OOVR_LOGF("OMRT_DSV: %p %ux%u fmt=%u (mainDS=%p %ux%u fmt=%u) same=%d",
+				    dsvTex, td.Width, td.Height, td.Format,
+				    mainDS, mainDesc.Width, mainDesc.Height, mainDesc.Format,
+				    (int)(dsvTex == mainDS));
+			}
+			if (dsvTex != mainDS) {
+				isFPDS = (td.Width == mainDesc.Width && td.Height == mainDesc.Height
+				    && td.Format == mainDesc.Format);
+			}
+
+			// First time seeing FP DS: capture the pointer
+			if (isFPDS && dsvTex != s_fpDepthStencilTex) {
+				if (s_fpDepthStencilTex) s_fpDepthStencilTex->Release();
+				s_fpDepthStencilTex = dsvTex;
+				dsvTex->AddRef(); // we keep a ref via s_fpDepthStencilTex
+				if (s_fpDepthCopy) { s_fpDepthCopy->Release(); s_fpDepthCopy = nullptr; }
+				if (s_fpDepthSRV) { s_fpDepthSRV->Release(); s_fpDepthSRV = nullptr; }
+				OOVR_LOGF("FPDepth: Captured FP DS %p %ux%u (mainDS=%p)",
+				    dsvTex, td.Width, td.Height, mainDS);
+			}
+		}
+
+		// When FP DS was bound and is now being UNBOUND: copy depth data.
+		// This is the exact moment after FP draws complete.
+		if (s_fpDSWasBound && !isFPDS && s_fpDepthStencilTex) {
+			// Create copy texture once
+			if (!s_fpDepthCopy) {
+				D3D11_TEXTURE2D_DESC fpDesc;
+				s_fpDepthStencilTex->GetDesc(&fpDesc);
+				D3D11_TEXTURE2D_DESC copyDesc = fpDesc;
+				copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+				copyDesc.MiscFlags = 0;
+				ID3D11Device* dev = nullptr;
+				ctx->GetDevice(&dev);
+				if (dev) {
+					dev->CreateTexture2D(&copyDesc, nullptr, &s_fpDepthCopy);
+					dev->Release();
+					if (s_fpDepthCopy)
+						OOVR_LOGF("FPDepth: Copy texture %ux%u created", fpDesc.Width, fpDesc.Height);
+				}
+			}
+			if (s_fpDepthCopy) {
+				ctx->CopyResource(s_fpDepthCopy, s_fpDepthStencilTex);
+
+				// One-shot readback to verify
+				static int s_readback = 0;
+				if (s_readback++ == 200) {
+					D3D11_TEXTURE2D_DESC rd;
+					s_fpDepthStencilTex->GetDesc(&rd);
+					D3D11_TEXTURE2D_DESC stg = {};
+					stg.Width = rd.Width; stg.Height = rd.Height;
+					stg.MipLevels = 1; stg.ArraySize = 1;
+					stg.Format = rd.Format; stg.SampleDesc.Count = 1;
+					stg.Usage = D3D11_USAGE_STAGING;
+					stg.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+					ID3D11Device* dev = nullptr;
+					ctx->GetDevice(&dev);
+					if (dev) {
+						ID3D11Texture2D* cpu = nullptr;
+						if (SUCCEEDED(dev->CreateTexture2D(&stg, nullptr, &cpu))) {
+							ctx->CopyResource(cpu, s_fpDepthStencilTex);
+							D3D11_MAPPED_SUBRESOURCE m;
+							if (SUCCEEDED(ctx->Map(cpu, 0, D3D11_MAP_READ, 0, &m))) {
+								int nz = 0, zeros = 0;
+								const uint8_t* data = (const uint8_t*)m.pData;
+								uint32_t cx = rd.Width / 4, cy = rd.Height / 2;
+								for (int i = 0; i < 1000; i++) {
+									uint32_t x = cx + (i % 50) - 25;
+									uint32_t y = cy + (i / 50) - 10;
+									if (x >= rd.Width || y >= rd.Height) continue;
+									const uint8_t* px = data + y * m.RowPitch + x * 4;
+									uint32_t d24 = px[0] | (px[1] << 8) | (px[2] << 16);
+									if (d24 == 0) zeros++;
+									else nz++;
+								}
+								OOVR_LOGF("FPDepth OMRT readback: nonzero=%d zeros=%d (at FP→other transition)",
+								    nz, zeros);
+								ctx->Unmap(cpu, 0);
+							}
+							cpu->Release();
+						}
+						dev->Release();
+					}
+				}
+			}
+		}
+
+		s_fpDSWasBound = isFPDS;
+		s_inFirstPersonPass = isFPDS;
+		if (dsvTex) dsvTex->Release();
+	}
+
+	// Only call original if this is a direct OMSetRenderTargets call (not from RTUAV wrapper).
+	// The RTUAV wrapper calls its own original.
+	if (!s_fpRTUAVCall)
+		s_origOMSetRT(ctx, numViews, ppRTVs, pDSV);
+}
+
+// ── RSSetViewports hook (kept for FP detection logging only) ──
+using RSSetViewports_fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_VIEWPORT*);
+static RSSetViewports_fn s_origRSSetViewports = nullptr;
+
+static void STDMETHODCALLTYPE Hook_RSSetViewports(
+    ID3D11DeviceContext* ctx, UINT numViewports, const D3D11_VIEWPORT* viewports)
+{
+	s_origRSSetViewports(ctx, numViewports, viewports);
+}
+
+// Get or create a depth SRV (R24_UNORM_X8_TYPELESS) on the FP depth-stencil texture.
+// Uses the same depth extraction compute shader as the main depth path.
+static ID3D11ShaderResourceView* GetOrCreateFPDepthSRV(ID3D11Device* device)
+{
+	if (!s_fpDepthStencilTex) return nullptr;
+	if (s_fpDepthSRV) return s_fpDepthSRV;
+
+	D3D11_TEXTURE2D_DESC td;
+	s_fpDepthStencilTex->GetDesc(&td);
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+
+	HRESULT hr = device->CreateShaderResourceView(s_fpDepthStencilTex, &srvDesc, &s_fpDepthSRV);
+	if (FAILED(hr)) {
+		OOVR_LOGF("FPDepth: CreateSRV failed (hr=0x%08X)", hr);
+		return nullptr;
+	}
+	OOVR_LOGF("FPDepth: SRV created for FP DS %ux%u", td.Width, td.Height);
+	return s_fpDepthSRV;
+}
+
+static void InstallFPDepthHook(ID3D11Device* device)
+{
+	if (s_fpHooked) return;
+
+	ID3D11DeviceContext* ctx = nullptr;
+	device->GetImmediateContext(&ctx);
+	if (!ctx) return;
+
+	auto vtable = *reinterpret_cast<void***>(ctx);
+
+	MH_STATUS st = MH_Initialize();
+	if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
+		OOVR_LOGF("FPDepth: MH_Initialize failed (%d)", (int)st);
+		ctx->Release();
+		return;
+	}
+
+	// Hook RSSetViewports (vtable slot 44) — kept for compatibility
+	st = MH_CreateHook(vtable[44], (void*)&Hook_RSSetViewports, (void**)&s_origRSSetViewports);
+	if (st == MH_OK) st = MH_EnableHook(vtable[44]);
+	if (st != MH_OK) {
+		OOVR_LOGF("FPDepth: RSSetViewports hook failed (%d)", (int)st);
+	} else {
+		OOVR_LOGF("FPDepth: RSSetViewports hooked at %p", vtable[44]);
+	}
+
+	// Hook OMSetRenderTargets (vtable slot 33)
+	st = MH_CreateHook(vtable[33], (void*)&Hook_OMSetRenderTargets, (void**)&s_origOMSetRT);
+	if (st == MH_OK) st = MH_EnableHook(vtable[33]);
+	if (st != MH_OK) {
+		OOVR_LOGF("FPDepth: OMSetRenderTargets hook failed (%d)", (int)st);
+	} else {
+		OOVR_LOGF("FPDepth: OMSetRenderTargets hooked at %p", vtable[33]);
+	}
+
+	// Also hook OMSetRenderTargetsAndUnorderedAccessViews (vtable slot 34)
+	// — many games use this variant instead of slot 33
+	using OMSetRTUAV_fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
+	    ID3D11DepthStencilView*, UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*);
+	static OMSetRTUAV_fn s_origOMSetRTUAV = nullptr;
+	// We'll forward to the same logic via a wrapper that extracts the DSV
+	struct RTUAVHook {
+		static void STDMETHODCALLTYPE Hook(ID3D11DeviceContext* ctx, UINT numRTVs,
+		    ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV,
+		    UINT uavStart, UINT numUAVs, ID3D11UnorderedAccessView* const* ppUAVs, const UINT* pInitial)
+		{
+			s_fpRTUAVCall = true;
+			Hook_OMSetRenderTargets(ctx, numRTVs, ppRTVs, pDSV);
+			s_fpRTUAVCall = false;
+			s_origOMSetRTUAV(ctx, numRTVs, ppRTVs, pDSV, uavStart, numUAVs, ppUAVs, pInitial);
+		}
+	};
+	st = MH_CreateHook(vtable[34], (void*)&RTUAVHook::Hook, (void**)&s_origOMSetRTUAV);
+	if (st == MH_OK) st = MH_EnableHook(vtable[34]);
+	if (st != MH_OK) {
+		OOVR_LOGF("FPDepth: OMSetRTAndUAV hook failed (%d)", (int)st);
+	} else {
+		OOVR_LOGF("FPDepth: OMSetRTAndUAV hooked at %p", vtable[34]);
+	}
+
+	s_fpHooked = true;
+	ctx->Release();
+}
+
+// ── Stencil extraction resources ──
+// Extract stencil channel from R24G8_TYPELESS depth-stencil into a separate R8_UINT texture.
+// Used by ASW to identify hands/weapons/UI by stencil value instead of fragile depth threshold.
+static ID3D11ComputeShader* s_stencilExtractCS = nullptr;
+static ID3D11Texture2D* s_stencilR8 = nullptr;        // Full-size R8_UINT copy of stencil
+static ID3D11UnorderedAccessView* s_stencilR8UAV = nullptr;
+static ID3D11Texture2D* s_stencilStagingDS = nullptr;  // kept for fallback (unused with MinHook approach)
+static ID3D11ShaderResourceView* s_stencilBridgeSRV = nullptr; // SRV on staging copy (X24_TYPELESS_G8_UINT)
+static ID3D11Texture2D* s_stencilBridgeSRVTex = nullptr;       // Cached: which game tex was copied
+static uint32_t s_stencilR8Width = 0;
+static uint32_t s_stencilR8Height = 0;
 
 static constexpr char s_depthExtractHLSL[] = R"HLSL(
 Texture2D<float>   DepthIn  : register(t0);  // R24_UNORM_X8_TYPELESS view of depth-stencil
@@ -179,6 +991,83 @@ void CS_DepthExtract(uint3 id : SV_DispatchThreadID)
     DepthOut[id.xy] = DepthIn.Load(int3(id.xy, 0));
 }
 )HLSL";
+
+// Stencil extraction shader: reads stencil channel via X24_TYPELESS_G8_UINT SRV → R8_UINT output.
+// The SRV reads the 8-bit stencil from the G8 channel of R24G8_TYPELESS depth-stencil textures.
+static constexpr char s_stencilExtractHLSL[] = R"HLSL(
+Texture2D<uint2>       StencilIn  : register(t0);  // X24_TYPELESS_G8_UINT view
+RWTexture2D<uint>      StencilOut : register(u0);  // R8_UINT output
+
+[numthreads(8, 8, 1)]
+void CS_StencilExtract(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    StencilOut.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    StencilOut[id.xy] = StencilIn.Load(int3(id.xy, 0)).y;
+}
+)HLSL";
+
+// CPU-side stencil extraction: read R24G8 via staging texture, extract stencil byte,
+// write to R8_UINT. Needed because X24_TYPELESS_G8_UINT SRV reads return 0 on some GPUs.
+static ID3D11Texture2D* s_stencilCPUStagingTex = nullptr;  // STAGING texture for CPU readback
+static uint32_t s_stencilCPUStagingW = 0, s_stencilCPUStagingH = 0;
+
+static bool ExtractStencilCPU(ID3D11DeviceContext* context, ID3D11Device* device,
+    ID3D11Texture2D* capturedDS, ID3D11Texture2D* outputR8,
+    uint32_t width, uint32_t height)
+{
+	// Create/recreate CPU staging texture if needed
+	if (!s_stencilCPUStagingTex || s_stencilCPUStagingW != width || s_stencilCPUStagingH != height) {
+		if (s_stencilCPUStagingTex) { s_stencilCPUStagingTex->Release(); s_stencilCPUStagingTex = nullptr; }
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = width;
+		td.Height = height;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R24G8_TYPELESS;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+		HRESULT hr = device->CreateTexture2D(&td, nullptr, &s_stencilCPUStagingTex);
+		if (FAILED(hr)) {
+			OOVR_LOGF("StencilCPU: CreateTexture2D staging failed (hr=0x%08X)", hr);
+			return false;
+		}
+		s_stencilCPUStagingW = width;
+		s_stencilCPUStagingH = height;
+		OOVR_LOGF("StencilCPU: Staging %ux%u created", width, height);
+	}
+
+	// Copy captured DS → CPU staging
+	context->CopyResource(s_stencilCPUStagingTex, capturedDS);
+
+	// Map, extract stencil bytes, write to R8_UINT via UpdateSubresource
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	HRESULT hr = context->Map(s_stencilCPUStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+	if (FAILED(hr))
+		return false;
+
+	// Allocate temporary buffer for R8 stencil data
+	std::vector<uint8_t> stencilData(width * height);
+	const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+	for (uint32_t y = 0; y < height; y++) {
+		const uint8_t* row = src + y * mapped.RowPitch;
+		for (uint32_t x = 0; x < width; x++) {
+			// R24G8: 4 bytes per pixel, stencil is byte 3 (bits 24-31)
+			stencilData[y * width + x] = row[x * 4 + 3];
+		}
+	}
+	context->Unmap(s_stencilCPUStagingTex, 0);
+
+	// Upload to R8_UINT output texture
+	D3D11_BOX box = { 0, 0, 0, width, height, 1 };
+	context->UpdateSubresource(outputR8, 0, &box, stencilData.data(), width, 0);
+
+	return true;
+}
 
 #if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 // ── Reactive mask compute shader ──
@@ -427,25 +1316,15 @@ static bool EnsureDepthExtractResources(ID3D11Device* device, uint32_t depthW, u
 	// Compile CS once
 	if (!s_depthExtractCS) {
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(s_depthExtractHLSL, sizeof(s_depthExtractHLSL) - 1,
-		    "DepthExtract", nullptr, nullptr, "CS_DepthExtract", "cs_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("DepthExtract CS compile failed: %s", (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(s_depthExtractHLSL, sizeof(s_depthExtractHLSL) - 1,
+		        "CS_DepthExtract", "cs_5_0", 0, &blob))
 			return false;
-		}
-		if (errors)
-			errors->Release();
-		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_depthExtractCS);
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_depthExtractCS);
 		blob->Release();
 		if (FAILED(hr)) {
 			OOVR_LOGF("DepthExtract: CreateComputeShader failed (hr=0x%08X)", hr);
 			return false;
 		}
-		OOVR_LOG("DepthExtract: Compute shader compiled OK");
 	}
 
 	// Create/recreate R32F output texture if dimensions changed
@@ -583,25 +1462,166 @@ static bool ExtractDepthToR32F(ID3D11DeviceContext* context, ID3D11ShaderResourc
 	return true;
 }
 
+// ── Stencil extraction ──
+
+// Lazily compile the stencil extraction CS and create output R8_UINT texture + staging DS copy.
+static bool EnsureStencilExtractResources(ID3D11Device* device, uint32_t w, uint32_t h,
+    DXGI_FORMAT depthFmt)
+{
+	if (!s_stencilExtractCS) {
+		ID3DBlob* blob = nullptr;
+		if (!CompileOrLoadCached(s_stencilExtractHLSL, sizeof(s_stencilExtractHLSL) - 1,
+		        "CS_StencilExtract", "cs_5_0", 0, &blob))
+			return false;
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_stencilExtractCS);
+		blob->Release();
+		if (FAILED(hr)) {
+			OOVR_LOGF("StencilExtract: CreateComputeShader failed (hr=0x%08X)", hr);
+			return false;
+		}
+	}
+
+	if (!s_stencilR8 || s_stencilR8Width != w || s_stencilR8Height != h) {
+		if (s_stencilR8UAV) { s_stencilR8UAV->Release(); s_stencilR8UAV = nullptr; }
+		if (s_stencilR8) { s_stencilR8->Release(); s_stencilR8 = nullptr; }
+		if (s_stencilStagingDS) { s_stencilStagingDS->Release(); s_stencilStagingDS = nullptr; }
+		if (s_stencilBridgeSRV) { s_stencilBridgeSRV->Release(); s_stencilBridgeSRV = nullptr; }
+		s_stencilBridgeSRVTex = nullptr;
+
+		// R8_UINT output texture
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8_UINT;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+		HRESULT hr = device->CreateTexture2D(&td, nullptr, &s_stencilR8);
+		if (FAILED(hr)) {
+			OOVR_LOGF("StencilExtract: CreateTexture2D(%ux%u R8_UINT) failed (hr=0x%08X)", w, h, hr);
+			return false;
+		}
+
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+		uavDesc.Format = DXGI_FORMAT_R8_UINT;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		hr = device->CreateUnorderedAccessView(s_stencilR8, &uavDesc, &s_stencilR8UAV);
+		if (FAILED(hr)) {
+			OOVR_LOGF("StencilExtract: CreateUAV failed (hr=0x%08X)", hr);
+			s_stencilR8->Release();
+			s_stencilR8 = nullptr;
+			return false;
+		}
+
+		// Staging R24G8_TYPELESS copy — reading stencil via SRV on the game's own
+		// depth-stencil returns 0 on some GPUs. CopyResource to our own texture
+		// with BIND_DEPTH_STENCIL + BIND_SHADER_RESOURCE ensures the driver
+		// allocates the stencil plane and allows SRV access.
+		DXGI_FORMAT stagingFmt = DXGI_FORMAT_R24G8_TYPELESS;
+		if (depthFmt == DXGI_FORMAT_R32G8X24_TYPELESS || depthFmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+			stagingFmt = DXGI_FORMAT_R32G8X24_TYPELESS;
+		td.Format = stagingFmt;
+		td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+		hr = device->CreateTexture2D(&td, nullptr, &s_stencilStagingDS);
+		if (FAILED(hr)) {
+			OOVR_LOGF("StencilExtract: CreateTexture2D staging(%ux%u fmt=%u) failed (hr=0x%08X)",
+			    w, h, stagingFmt, hr);
+			// Non-fatal: we can still try SRV on original texture
+			s_stencilStagingDS = nullptr;
+		} else {
+			OOVR_LOGF("StencilExtract: Staging DS copy %ux%u fmt=%u created", w, h, stagingFmt);
+		}
+
+		s_stencilR8Width = w;
+		s_stencilR8Height = h;
+		OOVR_LOGF("StencilExtract: R8_UINT output %ux%u created", w, h);
+	}
+
+	return true;
+}
+
+// Create X24_TYPELESS_G8_UINT SRV on the given depth-stencil texture (SKSE staging copy
+// or our own staging copy). The texture must already contain stencil data.
+static ID3D11ShaderResourceView* GetOrCreateStencilSRV(ID3D11Device* device,
+    ID3D11DeviceContext* context, ID3D11Texture2D* stencilSrcTex,
+    DXGI_FORMAT depthFmt, uint32_t depthW, uint32_t depthH)
+{
+	// Recreate SRV if source texture changed
+	if (s_stencilBridgeSRVTex != stencilSrcTex || !s_stencilBridgeSRV) {
+		if (s_stencilBridgeSRV) {
+			s_stencilBridgeSRV->Release();
+			s_stencilBridgeSRV = nullptr;
+		}
+		s_stencilBridgeSRVTex = nullptr;
+
+		DXGI_FORMAT srvFmt = DXGI_FORMAT_UNKNOWN;
+		if (depthFmt == DXGI_FORMAT_R24G8_TYPELESS || depthFmt == DXGI_FORMAT_D24_UNORM_S8_UINT)
+			srvFmt = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+		else if (depthFmt == DXGI_FORMAT_R32G8X24_TYPELESS || depthFmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+			srvFmt = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+		else
+			return nullptr;
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+		srvDesc.Format = srvFmt;
+		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srvDesc.Texture2D.MipLevels = 1;
+
+		HRESULT hr = device->CreateShaderResourceView(stencilSrcTex, &srvDesc, &s_stencilBridgeSRV);
+		if (FAILED(hr)) {
+			OOVR_LOGF("StencilExtract: CreateSRV(fmt=%u) failed (hr=0x%08X)", srvFmt, hr);
+			return nullptr;
+		}
+
+		s_stencilBridgeSRVTex = stencilSrcTex;
+		OOVR_LOGF("StencilExtract: SRV created (srvFmt=%u depthFmt=%u %ux%u)", srvFmt, depthFmt, depthW, depthH);
+	}
+
+	return s_stencilBridgeSRV;
+}
+
+// Run stencil extraction CS: stencil SRV → R8_UINT output texture
+static bool ExtractStencilToR8(ID3D11DeviceContext* context, ID3D11Device* device,
+    ID3D11ShaderResourceView* stencilSRV, uint32_t width, uint32_t height)
+{
+	ID3D11ComputeShader* oldCS = nullptr;
+	ID3D11ShaderResourceView* oldSRV = nullptr;
+	ID3D11UnorderedAccessView* oldUAV = nullptr;
+	context->CSGetShader(&oldCS, nullptr, nullptr);
+	context->CSGetShaderResources(0, 1, &oldSRV);
+	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
+
+	context->CSSetShader(s_stencilExtractCS, nullptr, 0);
+	context->CSSetShaderResources(0, 1, &stencilSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &s_stencilR8UAV, nullptr);
+
+	uint32_t groupsX = (width + 7) / 8;
+	uint32_t groupsY = (height + 7) / 8;
+	context->Dispatch(groupsX, groupsY, 1);
+
+	context->CSSetShader(oldCS, nullptr, 0);
+	context->CSSetShaderResources(0, 1, &oldSRV);
+	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
+	if (oldCS) oldCS->Release();
+	if (oldSRV) oldSRV->Release();
+	if (oldUAV) oldUAV->Release();
+
+	return true;
+}
+
 // ── Reactive mask generation ──
 
 static bool EnsureReactiveMaskResources(ID3D11Device* device, uint32_t w, uint32_t h)
 {
 	if (!s_reactiveMaskCS) {
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(s_reactiveMaskHLSL, sizeof(s_reactiveMaskHLSL) - 1,
-		    "ReactiveMask", nullptr, nullptr, "CS_ReactiveMask", "cs_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("ReactiveMask CS compile failed: %s", (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(s_reactiveMaskHLSL, sizeof(s_reactiveMaskHLSL) - 1,
+		        "CS_ReactiveMask", "cs_5_0", 0, &blob))
 			return false;
-		}
-		if (errors)
-			errors->Release();
-		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_reactiveMaskCS);
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_reactiveMaskCS);
 		blob->Release();
 		if (FAILED(hr)) {
 			OOVR_LOGF("ReactiveMask: CreateComputeShader failed (hr=0x%08X)", hr);
@@ -803,25 +1823,15 @@ static bool EnsureCameraMVResources(ID3D11Device* device, uint32_t w, uint32_t h
 	// Compile CS once
 	if (!s_cameraMVCS) {
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(s_cameraMVHLSL, sizeof(s_cameraMVHLSL) - 1,
-		    "CameraMV", nullptr, nullptr, "CS_CameraMV", "cs_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("CameraMV CS compile failed: %s", (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(s_cameraMVHLSL, sizeof(s_cameraMVHLSL) - 1,
+		        "CS_CameraMV", "cs_5_0", 0, &blob))
 			return false;
-		}
-		if (errors)
-			errors->Release();
-		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_cameraMVCS);
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_cameraMVCS);
 		blob->Release();
 		if (FAILED(hr)) {
 			OOVR_LOGF("CameraMV: CreateComputeShader failed (hr=0x%08X)", hr);
 			return false;
 		}
-		OOVR_LOG("CameraMV: Compute shader compiled OK");
 	}
 
 	// Create/recreate R16G16_FLOAT output texture if dimensions changed
@@ -970,18 +1980,10 @@ static bool EnsureMVDilateResources(ID3D11Device* device, uint32_t w, uint32_t h
 {
 	if (!s_mvDilateCS) {
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(s_mvDilateHLSL, sizeof(s_mvDilateHLSL) - 1,
-		    "MVDilate", nullptr, nullptr, "CS_MVDilate", "cs_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("MVDilate CS compile failed: %s", (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(s_mvDilateHLSL, sizeof(s_mvDilateHLSL) - 1,
+		        "CS_MVDilate", "cs_5_0", 0, &blob))
 			return false;
-		}
-		if (errors) errors->Release();
-		hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_mvDilateCS);
+		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_mvDilateCS);
 		blob->Release();
 		if (FAILED(hr)) return false;
 	}
@@ -1169,17 +2171,8 @@ static void EnsureDebugShaders(ID3D11Device* device)
 		if (*out)
 			return;
 		ID3DBlob* blob = nullptr;
-		ID3DBlob* errors = nullptr;
-		HRESULT hr = D3DCompile(src, len, entry, nullptr, nullptr, entry, "ps_5_0", 0, 0, &blob, &errors);
-		if (FAILED(hr)) {
-			if (errors) {
-				OOVR_LOGF("Debug %s compile failed: %s", entry, (char*)errors->GetBufferPointer());
-				errors->Release();
-			}
+		if (!CompileOrLoadCached(src, len, entry, "ps_5_0", 0, &blob))
 			return;
-		}
-		if (errors)
-			errors->Release();
 		device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, out);
 		blob->Release();
 	};
@@ -1521,6 +2514,42 @@ static bool DlssWarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p, ID3
 }
 #endif
 
+#ifdef OC_HAS_FSR3
+// FSR3 warp upscale callback — spatial-only upscaling (reset=true) for ASW warp frames.
+static bool Fsr3WarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p,
+    ID3D11Texture2D** outResult)
+{
+	if (!s_fsr3Upscaler || !s_fsr3Upscaler->IsReady())
+		return false;
+
+	Fsr3Upscaler::DispatchParams params = {};
+	params.color = p.warpedColor;
+	params.colorSourceRegion = nullptr;
+	params.motionVectors = nullptr; // no MVs for spatial-only
+	params.mvSourceRegion = nullptr;
+	params.depth = p.cachedDepth;
+	params.depthSourceRegion = nullptr;
+	params.renderWidth = p.renderW;
+	params.renderHeight = p.renderH;
+	params.outputWidth = p.outputW;
+	params.outputHeight = p.outputH;
+	params.cameraNear = p.nearZ;
+	params.cameraFar = p.farZ;
+	params.cameraFovY = fabsf(p.cachedFov.angleUp) + fabsf(p.cachedFov.angleDown);
+	params.sharpness = oovr_global_configuration.Fsr3Sharpness();
+	params.reset = true; // spatial-only, no temporal accumulation
+	params.jitterCancellation = false;
+	params.mvScale = 1.0f;
+	params.viewToMeters = oovr_global_configuration.Fsr3ViewToMeters();
+
+	if (!s_fsr3Upscaler->Dispatch(p.eye, p.ctx, params))
+		return false;
+
+	*outResult = s_fsr3Upscaler->GetOutputDX11(p.eye);
+	return (*outResult != nullptr);
+}
+#endif
+
 // Shader HLSL headers are embedded as Win32 resources (avoids MSVC string literal size limits)
 #include "../resources.h"
 
@@ -1822,12 +2851,9 @@ ID3DBlob* d3d_compile_shader(const char* hlsl, const char* entrypoint, const cha
 	flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
 #endif
 
-	ID3DBlob *compiled, *errors;
-	if (FAILED(D3DCompile(hlsl, strlen(hlsl), nullptr, nullptr, nullptr, entrypoint, target, flags, 0, &compiled, &errors)))
-		OOVR_ABORTF("Error: D3DCompile failed %s", (char*)errors->GetBufferPointer());
-	if (errors)
-		errors->Release();
-
+	ID3DBlob *compiled = nullptr;
+	if (!CompileOrLoadCached(hlsl, strlen(hlsl), entrypoint, target, flags, &compiled))
+		OOVR_ABORTF("Error: Shader compile failed for %s", entrypoint);
 	return compiled;
 }
 
@@ -2178,7 +3204,7 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 #ifdef OC_HAS_DLSS
 	bool dlssNeedsInflation = !fsrActive && s_dlssUpscaler && s_dlssUpscaler->IsReady()
 	    && oovr_global_configuration.DlssEnabled()
-	    && oovr_global_configuration.FsrRenderScale() < 0.99f
+	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)
 	    && !cube && !isOverlay;
 #else
 	bool dlssNeedsInflation = false;
@@ -2391,9 +3417,10 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 				dlaaOutput = nullptr;
 			}
 
-			// DLAA operates at the game's render resolution (srcDesc dimensions)
-			uint32_t dw = srcDesc.Width;
-			uint32_t dh = srcDesc.Height;
+			// DLAA operates at the output resolution (display-res when upscaler active,
+			// render-res when no upscaler). This ensures DLAA can process FSR3/DLSS output.
+			uint32_t dw = outWidth;
+			uint32_t dh = outHeight;
 
 			// Intermediate: RGBA8 (RGB = pre-filtered color, A = edge luminance)
 			D3D11_TEXTURE2D_DESC diDesc = {};
@@ -2566,7 +3593,6 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	// Takes priority over FSR 1 when the SKSE bridge provides motion vectors + depth.
 	else if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
 	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
-	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen // Skip FSR3 on menu/loading
 	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
 	    && oovr_global_configuration.MotionVectorsEnabled()
 	    && oovr_global_configuration.FsrEnabled()
@@ -3004,13 +4030,14 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 				fsr3Params.cameraFar = g_fsr3CameraFar;
 				fsr3Params.cameraFovY = s_fsr3CameraFovY;
 				fsr3Params.sharpness = oovr_global_configuration.Fsr3Sharpness();
-				fsr3Params.reset = s_fsr3FirstDispatch;
+				fsr3Params.reset = s_fsr3FirstDispatch
+				    || (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen));
 				// Jitter cancellation: when camera MVs are active, our shader compensates for
 				// the jitter delta and FSR3's context-level jitter cancellation also subtracts
 				// jitter. This is technically double-compensation, but the error is sub-pixel
 				// (~0.15px max) and invisible. Empirically, having jitter cancellation ON when
 				// camera MVs are active produces stable results, while OFF causes shaking.
-				fsr3Params.jitterCancellation = oovr_global_configuration.Fsr3CameraMV();
+				fsr3Params.jitterCancellation = oovr_global_configuration.Fsr3JitterCancellation();
 				fsr3Params.viewToMeters = oovr_global_configuration.Fsr3ViewToMeters();
 				fsr3Params.mvScale = oovr_global_configuration.MotionVectorScale();
 				int fsr3DbgMode = oovr_global_configuration.Fsr3DebugMode();
@@ -3271,10 +4298,9 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	// ── DLSS 4 Super Resolution path (native DX11 NGX, no DX12 interop) ──
 	else if (s_dlssUpscaler && s_dlssUpscaler->IsReady()
 	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
-	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen
 	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
 	    && oovr_global_configuration.DlssEnabled()
-	    && oovr_global_configuration.FsrRenderScale() < 0.99f
+	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)
 	    && !isOverlay && !swapchain_rtvs.empty()) {
 
 		{
@@ -3627,7 +4653,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			dlssParams.sharpness = oovr_global_configuration.DlssSharpness();
 			dlssParams.biasMask = dlssBiasMaskTex;
 			dlssParams.biasMaskSourceRegion = dlssBiasMaskRegionPtr;
-			dlssParams.reset = s_fsr3FirstDispatch;
+			dlssParams.reset = s_fsr3FirstDispatch
+			    || (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen));
 			dlssParams.debugMode = 0;
 			s_fsr3FirstDispatch = false;
 
@@ -3931,6 +4958,10 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 #endif
 	}
 
+	// (NVIDIA DLAA post-pass removed — DLAA is handled via dlssEnabled + dlssPreset=4
+	// in the main DLSS path above. When FSR3 is also active, DLSS runs as else-if and
+	// won't fire, but standalone DLAA works through the normal DLSS dispatch.)
+
 	// Release the swapchain - OpenXR will use the last-released image in a swapchain
 	// No manual Flush() needed — xrReleaseSwapchainImage handles GPU synchronization internally.
 	XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -4038,7 +5069,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		// IMPORTANT: Do NOT compute next-frame jitter here — right eye's GetProjectionRaw
 		// hasn't been called yet and would pick up the wrong (next) jitter value.
 		if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady() && eye == XruEyeLeft) {
-			// No jitter on main menu / loading screen — upscaler won't run
+			// No jitter on main menu / loading screen — spatial-only upscale (reset=true)
 			if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
 				g_fsr3JitterEnabled = false;
 			} else {
@@ -4064,7 +5095,8 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 #ifdef OC_HAS_DLSS
 	// ── DLSS: save jitter and enable on left eye ──
-	if (oovr_global_configuration.DlssEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f
+	if (oovr_global_configuration.DlssEnabled()
+	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)
 	    && s_dlssUpscaler && s_dlssUpscaler->IsReady() && eye == XruEyeLeft) {
 		if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
 			g_fsr3JitterEnabled = false;
@@ -4080,7 +5112,8 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 	// ── DLSS 4: lazy-init upscaler ──
 	// DLSS is mutually exclusive with FSR3 — only one activates at a time.
-	if (oovr_global_configuration.DlssEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+	if (oovr_global_configuration.DlssEnabled()
+	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)) {
 		static bool s_dlssInitFailed = false; // Prevent retrying every frame (~300ms per attempt)
 		OpenRenderTargetBridge();
 		if (!s_dlssUpscaler && !s_dlssInitFailed && s_pBridge && s_pBridge->status == 1) {
@@ -4153,8 +5186,23 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 				if (!useMetaSpaceWarp) {
 					// Custom PC-side ASW
+					// When FSR3 is active (no DLSS warp callback), ASW caches FSR3's
+					// display-res output → warp at display-res. When DLSS is active,
+					// warp at render-res with DLSS callback upscaling.
+					uint32_t aswRenderW = renderEyeW, aswRenderH = renderEyeH;
+#ifdef OC_HAS_FSR3
+					bool fsr3WillHandleColor = s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
+					    && oovr_global_configuration.FsrEnabled()
+					    && oovr_global_configuration.FsrRenderScale() < 0.99f
+					    && !(dlssEn && s_dlssUpscaler && s_dlssUpscaler->IsReady());
+					if (fsr3WillHandleColor) {
+						aswRenderW = aswEyeW;  // display-res
+						aswRenderH = aswEyeH;
+						OOVR_LOGF("ASW: FSR3 active — warp at display-res %ux%u", aswRenderW, aswRenderH);
+					}
+#endif
 					g_aswProvider = new ASWProvider();
-					if (!g_aswProvider->Initialize(device, renderEyeW, renderEyeH, aswEyeW, aswEyeH)) {
+					if (!g_aswProvider->Initialize(device, aswRenderW, aswRenderH, aswEyeW, aswEyeH)) {
 						OOVR_LOG("ASW: Custom ASW initialization failed — disabling");
 						delete g_aswProvider;
 						g_aswProvider = nullptr;
@@ -4289,17 +5337,29 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			mvRegion.front = 0;
 			mvRegion.back = 1;
 
-			// Always cache pre-upscaler render-res color for ASW.
-			// When DLSS/FSR3 is active, warp output will be upscaled via the
-			// warp upscale callback (SubmitWarpedOutput). This ensures every
-			// displayed frame goes through the upscaler, fixing jitter shaking
-			// that occurs when alternating upscaled game frames with non-upscaled warps.
+			// Cache color for ASW. When DLSS is active, the warp upscale callback
+			// handles upscaling render-res warp output to display-res.
+			// When FSR3 is active, ASW is initialized at display-res (outputWidth)
+			// and we cache FSR3's upscaled output directly.
 			ID3D11Texture2D* colorSrc = (ID3D11Texture2D*)texture->handle;
 			D3D11_TEXTURE2D_DESC colorDesc;
 			D3D11_BOX colorRegion = {};
 
-			if (SafeGetTextureDesc(colorSrc, &colorDesc)) {
-				// Raw submitted texture may be stereo-packed
+#ifdef OC_HAS_FSR3
+			// Use FSR3 upscaled output when available (display-res, per-eye)
+			if (!g_aswProvider->HasWarpUpscaleCallback()
+			    && s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
+			    && oovr_global_configuration.FsrEnabled()) {
+				ID3D11Texture2D* fsr3Out = s_fsr3Upscaler->GetOutputDX11(eyeIdx);
+				if (fsr3Out) {
+					colorSrc = fsr3Out;
+					if (SafeGetTextureDesc(colorSrc, &colorDesc)) {
+						colorRegion = { 0, 0, 0, colorDesc.Width, colorDesc.Height, 1 };
+					}
+				}
+			}
+#endif
+			if (colorRegion.right == 0 && SafeGetTextureDesc(colorSrc, &colorDesc)) {
 				uint32_t colorEyeW = ptrBounds ? colorDesc.Width / 2 : colorDesc.Width;
 				colorRegion.left = ptrBounds ? eyeIdx * colorEyeW : 0;
 				colorRegion.right = colorRegion.left + colorEyeW;
@@ -4312,29 +5372,85 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			// Extract bridge depth (R24G8_TYPELESS) to R32F via compute shader.
 			// CopySubresourceRegion silently produces zeros for depth-stencil textures
 			// due to GPU-internal depth compression. SRV read via CS works correctly.
+			// Install first-person depth detection hooks (once each)
+			InstallFPDepthHook(device);
+			InstallFinishAccumHook();
+			// InstallOMSetDSSHook(); // Disabled — MinHook on Draw* broke NVIDIA stencil. Using depth comparison instead.
+
 			ID3D11Texture2D* aswDepthSrc = nullptr;
 			D3D11_BOX depthRegion = {};
 			if (depthTex) {
 				D3D11_TEXTURE2D_DESC depthDesc;
 				if (SafeGetTextureDesc(depthTex, &depthDesc)) {
 					if (EnsureDepthExtractResources(device, depthDesc.Width, depthDesc.Height)) {
+						uint32_t depthEyeW = depthDesc.Width / 2;
+						depthRegion.left = eyeIdx * depthEyeW;
+						depthRegion.right = depthRegion.left + depthEyeW;
+						depthRegion.top = 0;
+						depthRegion.bottom = depthDesc.Height;
+						depthRegion.front = 0;
+						depthRegion.back = 1;
+
+						// Extract kPOST_ZPREPASS_COPY (world-only depth) to R32F, cache per-slot.
+						// Must happen BEFORE main depth extraction (both use s_depthR32F).
+						if (s_pBridge->stencilCapturedThisFrame && s_pBridge->stencilCaptureTexture) {
+							static ID3D11ShaderResourceView* s_zPrepassSRV = nullptr;
+							static ID3D11Texture2D* s_zPrepassSRVTex = nullptr;
+							auto* zPreTex = reinterpret_cast<ID3D11Texture2D*>(
+							    static_cast<uintptr_t>(s_pBridge->stencilCaptureTexture));
+							// Create SRV once (or recreate if texture changes)
+							if (zPreTex != s_zPrepassSRVTex) {
+								if (s_zPrepassSRV) { s_zPrepassSRV->Release(); s_zPrepassSRV = nullptr; }
+								D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+								sd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+								sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+								sd.Texture2D.MipLevels = 1;
+								HRESULT hr = device->CreateShaderResourceView(zPreTex, &sd, &s_zPrepassSRV);
+								s_zPrepassSRVTex = SUCCEEDED(hr) ? zPreTex : nullptr;
+								static int s_log = 0;
+								if (s_log++ < 3)
+									OOVR_LOGF("ASW: zPrepass SRV created: %s (tex=%p)",
+										SUCCEEDED(hr) ? "OK" : "FAILED", zPreTex);
+							}
+							// Extract zPrepass to R32F and cache for warp shader
+							if (s_zPrepassSRV && ExtractDepthToR32F(context, s_zPrepassSRV,
+							        depthDesc.Width, depthDesc.Height)) {
+								g_aswProvider->CachePreFPDepth(eyeIdx, context,
+								    s_depthR32F, &depthRegion);
+								static int s_log2 = 0;
+								if (s_log2++ < 3)
+									OOVR_LOGF("ASW: zPrepass R32F cached (eye=%d)", eyeIdx);
+							}
+						}
+
+						// Cache FP mask (R8_UINT) from SKSE re-draw approach
+						if (s_pBridge->fpStencilInjectionActive && s_pBridge->preFPDepthTexture) {
+							auto* fpMaskTex = reinterpret_cast<ID3D11Texture2D*>(
+							    static_cast<uintptr_t>(s_pBridge->preFPDepthTexture));
+							g_aswProvider->CachePreFPDepth(eyeIdx, context,
+							    fpMaskTex, &depthRegion);
+							s_pBridge->preFPDepthCaptured = 0; // signal SKSE: consumed, reset for next eye
+							static int s_log = 0;
+							if (s_log++ < 5)
+								OOVR_LOGF("ASW: FP mask R8 cached + consumed signal (eye=%d)", eyeIdx);
+						}
+
+						// Extract main depth (overwrites s_depthR32F)
 						auto* depthSRV = GetOrCreateDepthSRV(device, depthTex,
 						    depthDesc.Format, depthDesc.Width, depthDesc.Height);
 						if (depthSRV && ExtractDepthToR32F(context, depthSRV,
 						        depthDesc.Width, depthDesc.Height)) {
-							// Use the R32F extraction result instead of raw bridge depth
 							aswDepthSrc = s_depthR32F;
-							uint32_t depthEyeW = depthDesc.Width / 2;
-							depthRegion.left = eyeIdx * depthEyeW;
-							depthRegion.right = depthRegion.left + depthEyeW;
-							depthRegion.top = 0;
-							depthRegion.bottom = depthDesc.Height;
-							depthRegion.front = 0;
-							depthRegion.back = 1;
 							}
 					}
 				}
 			}
+
+			// Pass FP depth-stencil texture pointer to ASWProvider.
+			// The warp shader reads it directly (via SRV) to identify player model pixels:
+			// any pixel with valid depth in the FP DS = first-person (hands, arms, weapons).
+			if (s_fpDepthCopy)
+				g_aswProvider->SetFPDepthTex(s_fpDepthCopy);
 
 			// Compute clipToClipNoLoco for this eye from RSS VP matrices.
 			// MUST be done BEFORE CacheFrame — CacheFrame(eye=1) advances m_buildSlot,
@@ -4351,13 +5467,80 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				memcpy(curVP, rssVPRM, sizeof(curVP));
 
 				if (s_aswHasPrevVP[eyeIdx]) {
+					// No-loco c2c: head rotation + head translation only
 					float c2cNoLoco[16];
 					if (ComputeClipToClip(curVP, s_aswPrevVP[eyeIdx], c2cNoLoco)) {
 						g_aswProvider->SetClipToClipNoLoco(eyeIdx, c2cNoLoco);
 					}
+
+					// Full c2c WITH locomotion: inject actorPos delta into curVP
+					// (same as camera MV code), giving depth-aware locomotion parallax.
+					float curVPWithLoco[16];
+					memcpy(curVPWithLoco, curVP, sizeof(curVPWithLoco));
+					if (s_cmvLocoDx != 0.0f || s_cmvLocoDy != 0.0f || s_cmvLocoDz != 0.0f) {
+						InjectLocoIntoVP(curVPWithLoco, s_cmvLocoDx, s_cmvLocoDy, s_cmvLocoDz);
+					}
+					float c2cWithLoco[16];
+					if (ComputeClipToClip(curVPWithLoco, s_aswPrevVP[eyeIdx], c2cWithLoco)) {
+						g_aswProvider->SetClipToClipWithLoco(eyeIdx, c2cWithLoco);
+					}
 				}
 				memcpy(s_aswPrevVP[eyeIdx], curVP, sizeof(curVP));
 				s_aswHasPrevVP[eyeIdx] = true;
+
+				// Project VR controller positions to screen UV for ASW hand detection.
+				// Controller positions from g_aimPoses are in OpenVR tracking space.
+				// Compute position relative to head, rotate by inverse head orientation → view space,
+				// then project via FOV tangents to screen UV.
+				if (g_aswProvider->GetControllerValid(0) && g_aswProvider->GetControllerValid(1)) {
+					XrPosef headPose = layer.pose;
+					// Inverse head rotation (quaternion conjugate)
+					XrQuaternionf qi = { -headPose.orientation.x, -headPose.orientation.y,
+					    -headPose.orientation.z, headPose.orientation.w };
+					float luv[2], ruv[2];
+					bool bothValid = true;
+					for (int h = 0; h < 2; h++) {
+						const float* cp = g_aswProvider->GetControllerPos(h);
+						float cx = cp[0], cy = cp[1], cz = cp[2];
+						// Relative to head in tracking space
+						float rx = cx - headPose.position.x;
+						float ry = cy - headPose.position.y;
+						float rz = cz - headPose.position.z;
+						// Rotate by inverse head orientation → view space
+						float qx = qi.x, qy = qi.y, qz = qi.z, qw = qi.w;
+						float tx = 2.0f * (qy * rz - qz * ry);
+						float ty = 2.0f * (qz * rx - qx * rz);
+						float tz = 2.0f * (qx * ry - qy * rx);
+						float vx = rx + qw * tx + (qy * tz - qz * ty);
+						float vy = ry + qw * ty + (qz * tx - qx * tz);
+						float vz = rz + qw * tz + (qx * ty - qy * tx);
+						// OpenXR: -Z forward. Project to tangent angles.
+						if (vz > -0.01f) { bothValid = false; break; }
+						float tanX = vx / (-vz);
+						float tanY = vy / (-vz); // +Y up in both OpenXR and FOV tangent space
+						float fovL = tanf(layer.fov.angleLeft);
+						float fovR = tanf(layer.fov.angleRight);
+						float fovU = tanf(layer.fov.angleUp);
+						float fovD = tanf(layer.fov.angleDown);
+						float u = (tanX - fovL) / (fovR - fovL);
+						float v = (tanY - fovU) / (fovD - fovU);
+						if (h == 0) { luv[0] = u; luv[1] = v; }
+						else { ruv[0] = u; ruv[1] = v; }
+					}
+					if (bothValid) {
+						// Offset circles downward: controller tracking point is at the grip,
+						// but rendered hands extend below (hand + wrist + forearm).
+						float vOffset = 0.07f; // shift down in UV space
+						luv[1] += vOffset;
+						ruv[1] += vOffset;
+						float handRadius = 0.18f; // UV units — covers hand + forearm
+						g_aswProvider->SetSlotControllerUV(eyeIdx, luv, ruv, handRadius);
+						static int s_ctrlLog = 0;
+						if (s_ctrlLog++ < 5)
+							OOVR_LOGF("CtrlUV: eye=%d L=(%.3f,%.3f) R=(%.3f,%.3f) r=%.3f",
+							    eyeIdx, luv[0], luv[1], ruv[0], ruv[1], handRadius);
+					}
+				}
 			}
 
 			// Store NiCamera Z for vertical warp correction (BEFORE CacheFrame)
@@ -4367,13 +5550,24 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				g_aswProvider->SetSlotCameraPosZ(camPos[2]);
 				// Pass live pointer + view matrix so WarpFrame can read at warp time
 				g_aswProvider->SetCameraPosPtr(s_pBridge->cameraPosPtr);
+				if (s_pBridge->playerFirstPersonRootPtr)
+					g_aswProvider->SetFirstPersonRootPtr(s_pBridge->playerFirstPersonRootPtr);
 				if (s_pBridge->rssBasePtr) {
 					g_aswProvider->SetRSSViewMatPtr(reinterpret_cast<const float*>(
 					    reinterpret_cast<const uint8_t*>(
 					        static_cast<uintptr_t>(s_pBridge->rssBasePtr))
 					    + 0x3E0 + 1 * 0x250 + 0x30));
 				}
+				// FP draw replay data (heap-allocated in SKSE, same process)
+				if (s_pBridge->fpReplayDataPtr) {
+					g_aswProvider->SetFPReplayPtr(
+					    reinterpret_cast<FPReplayData*>(
+					        static_cast<uintptr_t>(s_pBridge->fpReplayDataPtr)));
+				}
 			}
+
+			// Menu state — skip MV corrections when a menu is open
+			g_aswProvider->SetMenuOpen(s_pBridge->isMenuOpen != 0);
 
 			g_aswProvider->CacheFrame(eyeIdx, context,
 			    colorSrc, &colorRegion,
@@ -4381,6 +5575,17 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			    aswDepthSrc, aswDepthSrc ? &depthRegion : nullptr,
 			    layer.pose, layer.fov,
 			    g_fsr3CameraNear, g_fsr3CameraFar);
+
+			// Store predicted display time for this cache slot (for MV extrapolation timing).
+			// After CacheFrame eye 1, buildSlot has advanced — use publishedSlot instead.
+			{
+				// For eye 0: buildSlot hasn't advanced yet. For eye 1: just published.
+				int dtSlot = (eyeIdx == 1)
+				    ? g_aswProvider->GetPublishedSlot()
+				    : g_aswProvider->GetBuildSlot();
+				if (dtSlot >= 0)
+					g_aswProvider->SetSlotDisplayTime(dtSlot, xr_gbl->nextPredictedFrameTime);
+			}
 
 			// Stick locomotion + yaw correction: compute once per real frame (right eye).
 			//
@@ -4406,12 +5611,24 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				    static_cast<uintptr_t>(s_pBridge->actorPosPtr));
 				float posX = actorPos[0], posY = actorPos[1], posZ = actorPos[2];
 
-	
+				// Vertical: use NiCamera Z instead of actorPos Z.
+				// actorPos.z = character root (captures jumping/terrain but NOT camera bob).
+				// NiCamera.z = actual camera position (captures bob + jumping + terrain).
+				// This matches the FSR3/DLSS camera MV vertical injection.
+				static float s_prevCamZ = 0.0f;
+				static bool s_hasPrevCamZ = false;
+				float camZ = posZ; // fallback to actorPos Z
+				if (s_pBridge->cameraPosPtr) {
+					const float* camPos = reinterpret_cast<const float*>(
+					    static_cast<uintptr_t>(s_pBridge->cameraPosPtr));
+					camZ = camPos[2];
+				}
+
 				if (s_hasPrevActor) {
-					// World-space delta (new - old): direction of locomotion
+					// World-space delta: horizontal from actorPos, vertical from NiCamera
 					float dwx = posX - s_prevActorPos[0];
 					float dwy = posY - s_prevActorPos[1];
-					float dwz = posZ - s_prevActorPos[2];
+					float dwz = s_hasPrevCamZ ? (camZ - s_prevCamZ) : (posZ - s_prevActorPos[2]);
 
 					float dist2 = dwx * dwx + dwy * dwy + dwz * dwz;
 					if (dist2 > 0.0001f && dist2 < 225.0f) { // dead zone + 15-unit teleport clamp
@@ -4507,6 +5724,8 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				s_prevActorPos[0] = posX;
 				s_prevActorPos[1] = posY;
 				s_prevActorPos[2] = posZ;
+				s_prevCamZ = camZ;
+				s_hasPrevCamZ = true;
 				s_hasPrevActor = true;
 			}
 		}

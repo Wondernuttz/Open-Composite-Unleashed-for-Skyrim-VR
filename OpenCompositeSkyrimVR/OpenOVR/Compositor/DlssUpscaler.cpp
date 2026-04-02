@@ -288,14 +288,16 @@ bool DlssUpscaler::EnsureFeature(int eyeIdx, ID3D11DeviceContext* ctx,
 		return false;
 
 	// Map config preset to NGX quality value
-	// 0=Quality(67%) 1=Balanced(58%) 2=Performance(50%) 3=UltraPerf(33%)
+	// 0=Quality(67%) 1=Balanced(58%) 2=Performance(50%) 3=UltraPerf(33%) 4=DLAA(100%)
 	static const NVSDK_NGX_PerfQuality_Value presetMap[] = {
 		NVSDK_NGX_PerfQuality_Value_MaxQuality,       // 0 = Quality
 		NVSDK_NGX_PerfQuality_Value_Balanced,          // 1 = Balanced
 		NVSDK_NGX_PerfQuality_Value_MaxPerf,           // 2 = Performance
 		NVSDK_NGX_PerfQuality_Value_UltraPerformance,  // 3 = UltraPerf
+		NVSDK_NGX_PerfQuality_Value_DLAA,              // 4 = DLAA (native res, AA only)
 	};
-	int presetIdx = std::max(0, std::min(3, oovr_global_configuration.DlssPreset()));
+	int preset = (m_presetOverride >= 0) ? m_presetOverride : oovr_global_configuration.DlssPreset();
+	int presetIdx = std::max(0, std::min(4, preset));
 	NVSDK_NGX_PerfQuality_Value perfQuality = presetMap[presetIdx];
 
 	// Set creation parameters
