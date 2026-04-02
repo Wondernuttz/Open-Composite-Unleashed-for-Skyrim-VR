@@ -5513,6 +5513,17 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			    layer.pose, layer.fov,
 			    g_fsr3CameraNear, g_fsr3CameraFar);
 
+			// Store predicted display time for this cache slot (for MV extrapolation timing).
+			// After CacheFrame eye 1, buildSlot has advanced — use publishedSlot instead.
+			{
+				// For eye 0: buildSlot hasn't advanced yet. For eye 1: just published.
+				int dtSlot = (eyeIdx == 1)
+				    ? g_aswProvider->GetPublishedSlot()
+				    : g_aswProvider->GetBuildSlot();
+				if (dtSlot >= 0)
+					g_aswProvider->SetSlotDisplayTime(dtSlot, xr_gbl->nextPredictedFrameTime);
+			}
+
 			// Stick locomotion + yaw correction: compute once per real frame (right eye).
 			//
 			// Uses actorPosPtr (PlayerCharacter::data.location) for world position.

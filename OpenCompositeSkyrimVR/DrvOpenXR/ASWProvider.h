@@ -169,7 +169,10 @@ public:
 	/// Warp cached frame to new pose, write result to output texture.
 	/// Call for each eye during the injected frame.
 	/// @param slotOverride  If >= 0, force reading from this cache slot instead of m_publishedSlot.
-	bool WarpFrame(int eye, const XrPosef& newPose, int slotOverride = -1);
+	/// @param warpDisplayTime  Predicted display time for this warp frame (from xrWaitFrame).
+	///                         Used for precise MV extrapolation timing. 0 = use fallback.
+	bool WarpFrame(int eye, const XrPosef& newPose, int slotOverride = -1,
+	    XrTime warpDisplayTime = 0);
 
 	/// Get the output XR swapchain for the warped frame (for layer assembly).
 	XrSwapchain GetOutputSwapchain() const { return m_outputSwapchain; }
@@ -198,6 +201,7 @@ public:
 
 	/// Get the most recently published cache slot index (-1 if none).
 	int GetPublishedSlot() const { return m_publishedSlot.load(std::memory_order_acquire); }
+	int GetBuildSlot() const { return m_buildSlot; }
 
 	/// Store the predicted display time associated with a cache slot.
 	void SetSlotDisplayTime(int slot, XrTime t) {

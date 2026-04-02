@@ -1279,7 +1279,7 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
         }
         if (isFPScatter) {
             float2 fpResidual = totalMV - headOnlyMV;
-            dstUV -= 1.5 * fpResidual;
+            dstUV -= mvConfidence * fpResidual;
         } else {
             dstUV -= mvConfidence * (totalMV - headOnlyMV);
         }
@@ -2597,7 +2597,8 @@ bool ASWProvider::ReplayFPHands(int eye, ID3D11DeviceContext* ctx,
 	return true;
 }
 
-bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
+bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride,
+    XrTime warpDisplayTime)
 {
 	if (!m_ready || eye < 0 || eye > 1)
 		return false;
@@ -2868,12 +2869,27 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	cb.depthScale = (ds < 0.0f) ? 0.0f : ds;
 	cb.edgeFadeWidth = oovr_global_configuration.ASWEdgeFadeWidth();
 	cb.nearFadeDepth = oovr_global_configuration.ASWNearFadeDepth() * 72.0f;
+	// MV correction scale: with N-1 warping, the cache slot is frame N-2 (previousPublished).
+	// The game MVs in that slot measure one period of motion (N-3 → N-2).
+	// We extrapolate from T_{N-2} to T_warp. Scale = (T_warp - T_{N-2}) / period.
+	// Uses XrTime predicted display times (from xrWaitFrame) which are jitter-free.
+	// m_mvConfidenceScale decays when sticks are released to prevent overshoot on stop.
 	{
-		// MV correction: residual = totalMV - headOnlyMV isolates stick + loco + animation
-		// from game MVs. poseDeltaMatrix handles real-time head tracking from OpenXR.
-		// m_mvConfidenceScale decays at warp time when sticks are released to prevent
-		// stale game MVs from overshooting on stop transitions.
-		cb.mvConfidence = oovr_global_configuration.ASWMVConfidence() * m_mvConfidenceScale;
+		float mvScale = 1.5f; // fallback for nominal half-rate timing
+		int pubSlot = m_publishedSlot.load(std::memory_order_acquire);
+		XrTime cacheTime = m_slotDisplayTime[slot];
+		XrTime pubTime = (pubSlot >= 0 && pubSlot != slot) ? m_slotDisplayTime[pubSlot] : 0;
+		if (warpDisplayTime > 0 && cacheTime > 0 && pubTime > 0 && pubTime > cacheTime) {
+			// period = time between cache (N-2) and published (N-1) display times
+			double periodNs = (double)(pubTime - cacheTime);
+			// extrapolation = time from cache to warp display
+			double extrapolateNs = (double)(warpDisplayTime - cacheTime);
+			if (periodNs > 1000000.0) { // > 1ms sanity
+				mvScale = (float)(extrapolateNs / periodNs);
+				mvScale = (mvScale < 0.5f) ? 0.5f : (mvScale > 3.0f) ? 3.0f : mvScale;
+			}
+		}
+		cb.mvConfidence = mvScale * m_mvConfidenceScale;
 	}
 	cb.mvPixelScale = oovr_global_configuration.ASWMVPixelScale();
 	cb.depthResolution[0] = (m_slotDepthDataW[slot] > 0) ? (float)m_slotDepthDataW[slot] : (float)m_renderWidth;
@@ -2913,29 +2929,23 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	cb.controllerDeltaR[0] = cb.controllerDeltaR[1] = 0.0f;
 
 	// Compute FP controller scale from timing.
-	// Controller delta spans cache_time → now (warp read time).
-	// With N-1 warping, cache is ~1 period old, so delta ≈ 1 period of motion.
-	// The warp frame displays at the midpoint between game frames = 0.5 periods
-	// after the latest game frame = (cacheAge - 0.5*period) from cache time.
-	// Since cacheAge ≈ period: display offset ≈ 0.5 * cacheAge.
-	// Scale = displayOffset / cacheAge = 0.5 * (cacheAge + jitter) / cacheAge.
-	// The autoScale term captures the timing jitter (typically 1.0-1.2).
+	// Controller delta spans cache_time → now (warp compute time).
+	// We want to scale it to cache_time → warp_display_time.
+	// Scale = (warpDisplayTime - cacheTime) / (now - cacheTime).
+	// Uses XrTime predicted display times for jitter-free calculation.
 	{
-		auto now = std::chrono::steady_clock::now();
-		float cacheAgeMs = std::chrono::duration<float, std::milli>(now - m_slotTimestamp[slot]).count();
-		// previousPublished is N-1; the published slot (N) is one period newer.
-		// Display time is 0.5 periods after slot N = cacheAge - 0.5*period from cache.
-		// Estimate period from the gap between published and previousPublished timestamps.
-		int pubSlot = m_publishedSlot.load(std::memory_order_acquire);
-		float periodMs = cacheAgeMs; // fallback: assume cacheAge ≈ period
-		if (pubSlot >= 0 && pubSlot != slot) {
-			float pubAgeMs = std::chrono::duration<float, std::milli>(now - m_slotTimestamp[pubSlot]).count();
-			periodMs = cacheAgeMs - pubAgeMs; // time between N-1 and N
-			if (periodMs < 5.0f) periodMs = cacheAgeMs; // fallback
+		float scale = 0.5f; // fallback
+		XrTime cacheTime = m_slotDisplayTime[slot];
+		if (warpDisplayTime > 0 && cacheTime > 0 && warpDisplayTime > cacheTime) {
+			auto now = std::chrono::steady_clock::now();
+			float cacheAgeMs = std::chrono::duration<float, std::milli>(now - m_slotTimestamp[slot]).count();
+			if (cacheAgeMs > 1.0f) {
+				double displayOffsetNs = (double)(warpDisplayTime - cacheTime);
+				double cacheAgeNs = cacheAgeMs * 1000000.0; // ms → ns
+				scale = (float)(displayOffsetNs / cacheAgeNs);
+				scale = (scale < 0.2f) ? 0.2f : (scale > 1.5f) ? 1.5f : scale;
+			}
 		}
-		float displayOffsetMs = cacheAgeMs - 0.5f * periodMs;
-		float scale = (cacheAgeMs > 1.0f) ? (displayOffsetMs / cacheAgeMs) : 0.5f;
-		scale = (scale < 0.2f) ? 0.2f : (scale > 1.0f) ? 1.0f : scale; // clamp
 		cb.fpControllerScale = scale;
 	}
 	if (cb.hasControllerPose && m_controllerValid[0] && m_controllerValid[1]) {

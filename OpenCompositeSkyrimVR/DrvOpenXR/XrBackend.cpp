@@ -786,7 +786,8 @@ bool XrBackend::SubmitAswWarpFrame(const XrFrameState& frameState,
 
 	bool warpOk = true;
 	for (int eye = 0; eye < 2; eye++) {
-		if (!g_aswProvider->WarpFrame(eye, views[eye].pose, slotOverride)) {
+		if (!g_aswProvider->WarpFrame(eye, views[eye].pose, slotOverride,
+		        frameState.predictedDisplayTime)) {
 			warpOk = false;
 			break;
 		}
@@ -1354,7 +1355,8 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 					// 4. Warp cached frame — translation/parallax only (rotation=0, handled by runtime ATW)
 					bool warpOk = true;
 					for (int eye = 0; eye < 2; eye++) {
-						if (!g_aswProvider->WarpFrame(eye, views[eye].pose)) {
+						if (!g_aswProvider->WarpFrame(eye, views[eye].pose, -1,
+						        aswState.predictedDisplayTime)) {
 							warpOk = false;
 							break;
 						}

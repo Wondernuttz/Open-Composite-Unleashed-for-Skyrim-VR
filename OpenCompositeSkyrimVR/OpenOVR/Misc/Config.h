@@ -169,7 +169,7 @@ public:
 	float aswDepthScale = 1.0f;    // multiplier on linearized depth (parallax intensity)
 	float aswEdgeFadeWidth = 3.0f;   // depth-edge fade threshold (depth ratio units)
 	float aswNearFadeDepth = 0.0f;   // parallax fades to 0 below this depth (meters); 0 = disabled
-	float aswMVConfidence = 1.5f;    // MV loco correction strength: 1.5 = confirmed working value for locomotion + stick rotation residual scaling. 0 = off.
+	float aswMVConfidence = 1.5f;    // MV extrapolation scale: 1.5 = correct for N-1 warping (1.5 periods from cache to display). 0 = off.
 	float aswMVPixelScale = 1.0f;    // overall MV magnitude multiplier (1.0 = identity)
 	int aswDebugMode = 0;            // 0=normal, 1=depth viz, 2=linearized depth, 3=MV magnitude, 50=black warp frame, 56=stationary NPC dest-depth reject, 57=stationary NPC path overview
 	bool aswCaptureEnabled = false;  // true = capture warp diagnostics (color/depth/MV/CB) to TestWarp folder
