@@ -4001,7 +4001,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 				// jitter. This is technically double-compensation, but the error is sub-pixel
 				// (~0.15px max) and invisible. Empirically, having jitter cancellation ON when
 				// camera MVs are active produces stable results, while OFF causes shaking.
-				fsr3Params.jitterCancellation = oovr_global_configuration.Fsr3CameraMV();
+				fsr3Params.jitterCancellation = oovr_global_configuration.Fsr3JitterCancellation();
 				fsr3Params.viewToMeters = oovr_global_configuration.Fsr3ViewToMeters();
 				fsr3Params.mvScale = oovr_global_configuration.MotionVectorScale();
 				int fsr3DbgMode = oovr_global_configuration.Fsr3DebugMode();
