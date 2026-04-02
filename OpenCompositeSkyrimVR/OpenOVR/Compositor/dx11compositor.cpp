@@ -2514,6 +2514,42 @@ static bool DlssWarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p, ID3
 }
 #endif
 
+#ifdef OC_HAS_FSR3
+// FSR3 warp upscale callback — spatial-only upscaling (reset=true) for ASW warp frames.
+static bool Fsr3WarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p,
+    ID3D11Texture2D** outResult)
+{
+	if (!s_fsr3Upscaler || !s_fsr3Upscaler->IsReady())
+		return false;
+
+	Fsr3Upscaler::DispatchParams params = {};
+	params.color = p.warpedColor;
+	params.colorSourceRegion = nullptr;
+	params.motionVectors = nullptr; // no MVs for spatial-only
+	params.mvSourceRegion = nullptr;
+	params.depth = p.cachedDepth;
+	params.depthSourceRegion = nullptr;
+	params.renderWidth = p.renderW;
+	params.renderHeight = p.renderH;
+	params.outputWidth = p.outputW;
+	params.outputHeight = p.outputH;
+	params.cameraNear = p.nearZ;
+	params.cameraFar = p.farZ;
+	params.cameraFovY = fabsf(p.cachedFov.angleUp) + fabsf(p.cachedFov.angleDown);
+	params.sharpness = oovr_global_configuration.Fsr3Sharpness();
+	params.reset = true; // spatial-only, no temporal accumulation
+	params.jitterCancellation = false;
+	params.mvScale = 1.0f;
+	params.viewToMeters = oovr_global_configuration.Fsr3ViewToMeters();
+
+	if (!s_fsr3Upscaler->Dispatch(p.eye, p.ctx, params))
+		return false;
+
+	*outResult = s_fsr3Upscaler->GetOutputDX11(p.eye);
+	return (*outResult != nullptr);
+}
+#endif
+
 // Shader HLSL headers are embedded as Win32 resources (avoids MSVC string literal size limits)
 #include "../resources.h"
 
@@ -5150,8 +5186,23 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 				if (!useMetaSpaceWarp) {
 					// Custom PC-side ASW
+					// When FSR3 is active (no DLSS warp callback), ASW caches FSR3's
+					// display-res output → warp at display-res. When DLSS is active,
+					// warp at render-res with DLSS callback upscaling.
+					uint32_t aswRenderW = renderEyeW, aswRenderH = renderEyeH;
+#ifdef OC_HAS_FSR3
+					bool fsr3WillHandleColor = s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
+					    && oovr_global_configuration.FsrEnabled()
+					    && oovr_global_configuration.FsrRenderScale() < 0.99f
+					    && !(dlssEn && s_dlssUpscaler && s_dlssUpscaler->IsReady());
+					if (fsr3WillHandleColor) {
+						aswRenderW = aswEyeW;  // display-res
+						aswRenderH = aswEyeH;
+						OOVR_LOGF("ASW: FSR3 active — warp at display-res %ux%u", aswRenderW, aswRenderH);
+					}
+#endif
 					g_aswProvider = new ASWProvider();
-					if (!g_aswProvider->Initialize(device, renderEyeW, renderEyeH, aswEyeW, aswEyeH)) {
+					if (!g_aswProvider->Initialize(device, aswRenderW, aswRenderH, aswEyeW, aswEyeH)) {
 						OOVR_LOG("ASW: Custom ASW initialization failed — disabling");
 						delete g_aswProvider;
 						g_aswProvider = nullptr;
@@ -5286,17 +5337,29 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			mvRegion.front = 0;
 			mvRegion.back = 1;
 
-			// Always cache pre-upscaler render-res color for ASW.
-			// When DLSS/FSR3 is active, warp output will be upscaled via the
-			// warp upscale callback (SubmitWarpedOutput). This ensures every
-			// displayed frame goes through the upscaler, fixing jitter shaking
-			// that occurs when alternating upscaled game frames with non-upscaled warps.
+			// Cache color for ASW. When DLSS is active, the warp upscale callback
+			// handles upscaling render-res warp output to display-res.
+			// When FSR3 is active, ASW is initialized at display-res (outputWidth)
+			// and we cache FSR3's upscaled output directly.
 			ID3D11Texture2D* colorSrc = (ID3D11Texture2D*)texture->handle;
 			D3D11_TEXTURE2D_DESC colorDesc;
 			D3D11_BOX colorRegion = {};
 
-			if (SafeGetTextureDesc(colorSrc, &colorDesc)) {
-				// Raw submitted texture may be stereo-packed
+#ifdef OC_HAS_FSR3
+			// Use FSR3 upscaled output when available (display-res, per-eye)
+			if (!g_aswProvider->HasWarpUpscaleCallback()
+			    && s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
+			    && oovr_global_configuration.FsrEnabled()) {
+				ID3D11Texture2D* fsr3Out = s_fsr3Upscaler->GetOutputDX11(eyeIdx);
+				if (fsr3Out) {
+					colorSrc = fsr3Out;
+					if (SafeGetTextureDesc(colorSrc, &colorDesc)) {
+						colorRegion = { 0, 0, 0, colorDesc.Width, colorDesc.Height, 1 };
+					}
+				}
+			}
+#endif
+			if (colorRegion.right == 0 && SafeGetTextureDesc(colorSrc, &colorDesc)) {
 				uint32_t colorEyeW = ptrBounds ? colorDesc.Width / 2 : colorDesc.Width;
 				colorRegion.left = ptrBounds ? eyeIdx * colorEyeW : 0;
 				colorRegion.right = colorRegion.left + colorEyeW;

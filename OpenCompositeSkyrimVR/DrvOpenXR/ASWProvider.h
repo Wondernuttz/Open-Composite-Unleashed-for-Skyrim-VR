@@ -388,6 +388,7 @@ public:
 
 	/// Set a callback for upscaling warp output through DLSS (set by dx11compositor after init).
 	void SetWarpUpscaleCallback(WarpUpscaleCallback cb) { m_warpUpscaleCallback = cb; }
+	bool HasWarpUpscaleCallback() const { return m_warpUpscaleCallback != nullptr; }
 
 	/// Get per-eye output dimensions (display-res when upscaler active)
 	uint32_t GetEyeWidth() const { return m_outputWidth; }

@@ -502,10 +502,11 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     }
 
     if (isWorldPixel && abs(mvConfidence) > 0.001 && !isMenuOpen && !isLegacyMode) {
-        float2 fullResidual = totalMV - headOnlyMV;
-        float2 locoResidual = totalMV - c2cHeadMV;
-        float2 rotComponent = fullResidual - locoResidual;
-        float2 residual = locoResidual + rotMVScale * rotComponent;
+        // Residual = totalMV - headOnlyMV = stick rotation + loco + animation.
+        // Matches CSDepthPreScatter which also uses headOnlyMV for both FP and world.
+        // headOnlyMV from OpenXR poses is jitter-free; c2cHeadMV from RSS VP matrices
+        // had precision issues causing sporadic incorrect frames during rotation.
+        float2 residual = totalMV - headOnlyMV;
         mvOffset = mvConfidence * residual;
         sourceUV = parallaxSourceUV + mvOffset;
     }
