@@ -495,6 +495,7 @@ private:
 	ID3D11ComputeShader* m_npcDepthScatterCS = nullptr; // CSNpcDepthScatter (moving-NPC boundary extension)
 	ID3D11ComputeShader* m_depthPreScatterCS = nullptr; // CSDepthPreScatter (warp depth forward for leading edges)
 	ID3D11ComputeShader* m_blurVoidsCS = nullptr;      // CSBlurVoids (post-fill blur within void zones)
+	ID3D11ComputeShader* m_legacyWarpCS = nullptr;     // Legacy backward-warp-only shader
 	ID3D11Buffer* m_constantBuffer = nullptr;
 	ID3D11SamplerState* m_linearSampler = nullptr;
 
@@ -624,7 +625,8 @@ private:
 		float _padCtrl;                // alignment                                                 — 4 bytes
 		float fpSphereCenter[4];       // [x,y,z,pad] FP sphere center in rendering space           — 16 bytes
 		int isMenuOpen;                // 1 if a gameplay menu is open (skip MV corrections)       — 4 bytes
-		float _padPreFP[3];            // alignment to 16 bytes                                  — 12 bytes
+		int isLegacyMode;              // 1 = legacy ASW (parallax only, no MV/scatter)          — 4 bytes
+		float _padPreFP[2];            // alignment to 16 bytes                                  — 8 bytes
 		float fpScreenBoxes[16 * 4];   // Up to 16 AABBs: [minU, minV, maxU, maxV] × 16         — 256 bytes
 		int fpBoxCount;                // Number of valid screen-space FP bounding boxes          — 4 bytes
 		float _padBoxes[3];            // alignment to 16 bytes                                  — 12 bytes

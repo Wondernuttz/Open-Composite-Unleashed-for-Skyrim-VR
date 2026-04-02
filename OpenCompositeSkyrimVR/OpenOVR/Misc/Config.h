@@ -173,6 +173,7 @@ public:
 	float aswMVPixelScale = 1.0f;    // overall MV magnitude multiplier (1.0 = identity)
 	int aswDebugMode = 0;            // 0=normal, 1=depth viz, 2=linearized depth, 3=MV magnitude, 50=black warp frame, 56=stationary NPC dest-depth reject, 57=stationary NPC path overview
 	bool aswCaptureEnabled = false;  // true = capture warp diagnostics (color/depth/MV/CB) to TestWarp folder
+	bool aswForceLegacy = false;     // true = legacy ASW (translation-only parallax, no MV/scatter/disocclusion)
 
 private:
 	static int ini_handler(

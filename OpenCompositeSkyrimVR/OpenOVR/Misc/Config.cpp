@@ -260,6 +260,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, aswMVPixelScale);
 		CFGOPT(int, aswDebugMode);
 		CFGOPT(bool, aswCaptureEnabled);
+		CFGOPT(bool, aswForceLegacy);
 		CFGOPT(bool, aswConcurrentFrameThread);
 		CFGOPT(bool, aswSpeculativeTrackingLead);
 		CFGOPT(bool, aswBufferEnabled);

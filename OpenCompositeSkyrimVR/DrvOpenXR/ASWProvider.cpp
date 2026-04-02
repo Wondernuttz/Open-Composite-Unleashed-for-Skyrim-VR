@@ -97,7 +97,8 @@ cbuffer WarpParams : register(b0) {
     float _padCtrl;
     float4 fpSphereCenter;  // xyz = center in rendering space, w unused
     int isMenuOpen;         // 1 if a gameplay menu is open (skip MV corrections)
-    float3 _padPreFP;
+    int isLegacyMode;       // 1 = legacy ASW (parallax only, no MV/scatter)
+    float2 _padPreFP;
     float4 fpScreenBoxes[16]; // Up to 16 AABBs: [minU, minV, maxU, maxV]
     int fpBoxCount;           // Number of valid screen-space FP bounding boxes
     float3 _padBoxes;
@@ -210,7 +211,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     // Disocclusion detection via forward-scatter gaps.
     // NPC animation disocclusion (simple gap detection, no nearGap complexity)
     // with special MVs that don't match world scatter, creating false gaps.
-    if (!hasLoco && !isCloseGeometry && scatteredDepth == 0xFFFFFFFF) {
+    if (!isLegacyMode && !hasLoco && !isCloseGeometry && scatteredDepth == 0xFFFFFFFF) {
         // Check if gap is near very close geometry (hands) — skip if so
         float nearestD = 1.0;
         int gapN = 0;
@@ -231,7 +232,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
     }
 
     // Locomotion disocclusion (full detection with nearGap contamination handling)
-    if (hasLoco && !isCloseGeometry) {
+    if (!isLegacyMode && hasLoco && !isCloseGeometry) {
         bool isGap = (scatteredDepth == 0xFFFFFFFF);
         bool adjacentToGap = false;
 
@@ -500,7 +501,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         sourceUV = saturate((float2(scatterSrc) + 0.5) / resolution);
     }
 
-    if (isWorldPixel && abs(mvConfidence) > 0.001 && !isMenuOpen) {
+    if (isWorldPixel && abs(mvConfidence) > 0.001 && !isMenuOpen && !isLegacyMode) {
         float2 fullResidual = totalMV - headOnlyMV;
         float2 locoResidual = totalMV - c2cHeadMV;
         float2 rotComponent = fullResidual - locoResidual;
@@ -509,44 +510,6 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         sourceUV = parallaxSourceUV + mvOffset;
     }
 
-    // Depth-aware locomotion offset: replaces flat loco MV residual with depth-correct
-    // parallax from the difference between c2c_with_loco and c2c_no_loco.
-    if (isWorldPixel && !isMenuOpen && hasFullWarpC2C && hasClipToClipNoLoco && abs(mvConfidence) > 0.001) {
-        float2 baseUV = useFgAngle ? fgUV : uv;
-        float2 ndc = float2(baseUV.x * 2.0 - 1.0, 1.0 - baseUV.y * 2.0);
-        float4 clipPos = float4(ndc, d, 1.0);
-
-        float4 locoClip = mul(fullWarpC2C, clipPos);
-        float4 noLocoClip = mul(clipToClipNoLoco, clipPos);
-
-        if (abs(locoClip.w) > 0.0001 && abs(noLocoClip.w) > 0.0001) {
-            float2 locoUV = float2(locoClip.x / locoClip.w * 0.5 + 0.5,
-                                   0.5 - locoClip.y / locoClip.w * 0.5);
-            float2 noLocoUV = float2(noLocoClip.x / noLocoClip.w * 0.5 + 0.5,
-                                     0.5 - noLocoClip.y / noLocoClip.w * 0.5);
-
-            float2 depthAwareLocoOffset = locoUV - noLocoUV;
-            float2 rotComponent = c2cHeadMV - headOnlyMV;
-
-            // NPC residual: totalMV includes NPC animation, c2cHeadMV captures head,
-            // depthAwareLocoOffset captures camera locomotion. What remains = NPC motion.
-            float2 npcMotion = totalMV - c2cHeadMV - depthAwareLocoOffset;
-            float npcMotionMag = length(npcMotion * resolution);
-
-            sourceUV = parallaxSourceUV + mvConfidence * (depthAwareLocoOffset + rotMVScale * rotComponent);
-            // NPC motion correction: only apply when the residual is reasonable.
-            // At background pixels near NPCs, the 2x2 depth scatter splat can bleed
-            // foreground depth, causing depthAwareLocoOffset to be computed at WRONG
-            // (foreground) depth — much larger than the actual background loco offset.
-            // This creates a large spurious npcMotion residual (20-50+ px) that shifts
-            // sourceUV to completely wrong positions, causing "warped background in NPC
-            // outline shape" artifacts. Real NPC animation at 1.5x extrapolation is
-            // rarely > 15px. Clamping eliminates the contamination artifacts.
-            if (npcMotionMag < 15.0) {
-                sourceUV += 1.5 * npcMotion;
-            }
-        }
-    }
 
     // Clamp fallback.
     if (any(sourceUV < -0.01) || any(sourceUV > 1.01)) {
@@ -1209,6 +1172,58 @@ void CSHandComposite(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// ── Legacy ASW shader: simple backward warp with translation-only parallax ──
+// Self-contained — uses its own cbuffer matching the main WarpConstants layout.
+// No forward scatter, no MV correction, no disocclusion fill.
+static const char* s_legacyWarpHLSL = R"(
+Texture2D<float4> prevColor    : register(t0);
+Texture2D<float>  depthTex     : register(t2);
+RWTexture2D<float4> output     : register(u0);
+SamplerState linearClamp       : register(s0);
+
+cbuffer WarpParams : register(b0) {
+    row_major float4x4 poseDeltaMatrix;
+    float2 resolution;
+    float nearZ, farZ;
+    float fovTanLeft, fovTanRight, fovTanUp, fovTanDown;
+    float depthScale;
+    float3 _pad;
+};
+
+float LinearizeDepth(float d, float zNear, float zFar) {
+    float denom = zFar - d * (zFar - zNear);
+    return (abs(denom) > 0.0001) ? (zNear * zFar / denom) : zFar;
+}
+
+[numthreads(8, 8, 1)]
+void CSLegacyWarp(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    float2 uv = ((float2)tid.xy + 0.5) / resolution;
+    float d = depthTex[tid.xy];
+    float linearDepth = LinearizeDepth(d, nearZ, farZ) * depthScale;
+
+    float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
+    float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
+    float3 viewPos = float3(tanX * linearDepth, tanY * linearDepth, linearDepth);
+
+    float4 transformed = mul(poseDeltaMatrix, float4(viewPos, 1.0));
+
+    float2 sourceUV = uv;
+    if (linearDepth > 0.001 && transformed.z > 0.001) {
+        float oldTanX = transformed.x / transformed.z;
+        float oldTanY = transformed.y / transformed.z;
+        sourceUV = float2(
+            (oldTanX - fovTanLeft) / (fovTanRight - fovTanLeft),
+            (oldTanY - fovTanUp) / (fovTanDown - fovTanUp));
+    }
+
+    sourceUV = saturate(sourceUV);
+    output[tid.xy] = prevColor.SampleLevel(linearClamp, sourceUV, 0);
+}
+)";
+
 static const char* s_npcScatterHLSL = R"(
 // ── CSDepthPreScatter: scatter ALL cached pixels' depths to their WARP OUTPUT positions ──
 // Uses forwardPoseDelta (cached→warp head delta) + MV residual (loco/stick/NPC)
@@ -1251,7 +1266,7 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
     // motion + bone animation. Scatter to predicted position so CSMain has depth coverage.
     // World pixels: loco + stick rotation + NPC animation as before.
     bool isFPScatter = IsFirstPerson(srcUV, d);
-    if (abs(mvConfidence) > 0.001 && !isMenuOpen) {
+    if (abs(mvConfidence) > 0.001 && !isMenuOpen && !isLegacyMode) {
         float2 rawMV = mvTex[ToMVCoord(srcPixel)];
         float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
 
@@ -1506,6 +1521,24 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t renderWidth, uint32_
 	m_buildEyeReady[1] = false;
 	m_hasLastPublishedPose = false;
 	m_frameCounter = 0;
+
+	// Compile legacy warp shader synchronously (tiny shader, <1ms)
+	{
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errs = nullptr;
+		HRESULT hr = D3DCompile(s_legacyWarpHLSL, strlen(s_legacyWarpHLSL),
+		    "LegacyWarp", nullptr, nullptr, "CSLegacyWarp", "cs_5_0",
+		    D3DCOMPILE_PACK_MATRIX_ROW_MAJOR | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errs);
+		if (SUCCEEDED(hr) && blob) {
+			device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+			    nullptr, &m_legacyWarpCS);
+			blob->Release();
+			OOVR_LOG("ASW: Legacy warp shader compiled OK");
+		} else {
+			if (errs) { OOVR_LOGF("ASW: Legacy shader error: %s", (char*)errs->GetBufferPointer()); errs->Release(); }
+		}
+		if (errs) errs->Release();
+	}
 
 	OOVR_LOGF("ASW: Resources created — render %ux%u, output %ux%u per eye, shaders compiling in background",
 	    m_renderWidth, m_renderHeight, m_outputWidth, m_outputHeight);
@@ -3004,6 +3037,7 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 
 	// ── Menu state (skip MV corrections when menu is open) ──
 	cb.isMenuOpen = m_isMenuOpen ? 1 : 0;
+	cb.isLegacyMode = oovr_global_configuration.aswForceLegacy ? 1 : 0;
 
 	// ── FP bounding box projection (world spheres → screen AABBs) ──
 	cb.fpBoxCount = 0;
@@ -3129,10 +3163,34 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	// static objects when locomotion is in gameMV but not clipToClipNoLoco.
 	const bool useStationaryNpcForwardOverlay = false;
 
+	// Legacy mode: skip all forward scatter, disocclusion fill, MV correction.
+	// Just clear + backward warp (translation-only parallax). The shader checks
+	// isLegacyMode to skip MV corrections in CSMain.
+	bool legacyMode = oovr_global_configuration.aswForceLegacy;
+	if (legacyMode && m_legacyWarpCS) {
+		// Legacy: self-contained backward warp shader. Own cbuffer layout, own textures.
+		// Only needs t0=color, t2=depth, u0=output, b0=CB, s0=sampler.
+		ctx->CSSetShader(m_legacyWarpCS, nullptr, 0);
+		ID3D11ShaderResourceView* legSRVs[3] = { m_srvColor[slot][eye], nullptr, m_srvDepth[slot][eye] };
+		ctx->CSSetShaderResources(0, 3, legSRVs);
+		ID3D11UnorderedAccessView* legUAVs[1] = { m_uavOutput[eye] };
+		ctx->CSSetUnorderedAccessViews(0, 1, legUAVs, nullptr);
+		ctx->CSSetConstantBuffers(0, 1, &m_constantBuffer);
+		ctx->CSSetSamplers(0, 1, &m_linearSampler);
+		ctx->Dispatch(groupsX, groupsY, 1);
+		// Unbind and return
+		ID3D11ShaderResourceView* nullSRVs[3] = {};
+		ID3D11UnorderedAccessView* nullUAVs[1] = {};
+		ctx->CSSetShaderResources(0, 3, nullSRVs);
+		ctx->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
+		ctx->CSSetShader(nullptr, nullptr, 0);
+		ctx->Release();
+		return true;
+	}
 	// Forward scatter pipeline: each SOURCE pixel projects to its destination.
 	// Depth test via InterlockedMin ensures closest pixel wins (tree over sky).
 	// This naturally handles locomotion disocclusion without expensive searches.
-	if (m_clearCS && m_forwardDepthCS && m_forwardColorCS && m_dilateCS && useForwardScatterForMotion) {
+	else if (m_clearCS && m_forwardDepthCS && m_forwardColorCS && m_dilateCS && useForwardScatterForMotion) {
 		// Pass 0: clear output + atomic depth
 		ctx->CSSetShader(m_clearCS, nullptr, 0);
 		ctx->Dispatch(groupsX, groupsY, 1);
@@ -3542,6 +3600,7 @@ void ASWProvider::Shutdown()
 	if (m_dilateCS) { m_dilateCS->Release(); m_dilateCS = nullptr; }
 	if (m_npcDepthScatterCS) { m_npcDepthScatterCS->Release(); m_npcDepthScatterCS = nullptr; }
 	if (m_depthPreScatterCS) { m_depthPreScatterCS->Release(); m_depthPreScatterCS = nullptr; }
+	if (m_legacyWarpCS) { m_legacyWarpCS->Release(); m_legacyWarpCS = nullptr; }
 	if (m_blurVoidsCS) { m_blurVoidsCS->Release(); m_blurVoidsCS = nullptr; }
 	if (m_handCompositeCS) { m_handCompositeCS->Release(); m_handCompositeCS = nullptr; }
 
