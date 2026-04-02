@@ -197,6 +197,10 @@ struct OCRenderTargetBridge {
 
 	// FP draw replay — pointer to heap-allocated FPReplayData (same process, read by OC).
 	uint64_t fpReplayDataPtr;          // FPReplayData* (cast to uint64_t)
+
+	// Menu state — ASW skips MV corrections when a menu is open.
+	uint8_t  isMenuOpen;               // 1 = a gameplay menu is open, 0 = gameplay
+	uint8_t  _padMenu[7];              // alignment
 };
 #pragma pack(pop)
 
@@ -3552,7 +3556,6 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	// Takes priority over FSR 1 when the SKSE bridge provides motion vectors + depth.
 	else if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
 	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
-	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen // Skip FSR3 on menu/loading
 	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
 	    && oovr_global_configuration.MotionVectorsEnabled()
 	    && oovr_global_configuration.FsrEnabled()
@@ -3990,7 +3993,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 				fsr3Params.cameraFar = g_fsr3CameraFar;
 				fsr3Params.cameraFovY = s_fsr3CameraFovY;
 				fsr3Params.sharpness = oovr_global_configuration.Fsr3Sharpness();
-				fsr3Params.reset = s_fsr3FirstDispatch;
+				fsr3Params.reset = s_fsr3FirstDispatch
+				    || (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen));
 				// Jitter cancellation: when camera MVs are active, our shader compensates for
 				// the jitter delta and FSR3's context-level jitter cancellation also subtracts
 				// jitter. This is technically double-compensation, but the error is sub-pixel
@@ -4257,7 +4261,6 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	// ── DLSS 4 Super Resolution path (native DX11 NGX, no DX12 interop) ──
 	else if (s_dlssUpscaler && s_dlssUpscaler->IsReady()
 	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
-	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen
 	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
 	    && oovr_global_configuration.DlssEnabled()
 	    && oovr_global_configuration.FsrRenderScale() < 0.99f
@@ -4613,7 +4616,8 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 			dlssParams.sharpness = oovr_global_configuration.DlssSharpness();
 			dlssParams.biasMask = dlssBiasMaskTex;
 			dlssParams.biasMaskSourceRegion = dlssBiasMaskRegionPtr;
-			dlssParams.reset = s_fsr3FirstDispatch;
+			dlssParams.reset = s_fsr3FirstDispatch
+			    || (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen));
 			dlssParams.debugMode = 0;
 			s_fsr3FirstDispatch = false;
 
@@ -5024,7 +5028,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		// IMPORTANT: Do NOT compute next-frame jitter here — right eye's GetProjectionRaw
 		// hasn't been called yet and would pick up the wrong (next) jitter value.
 		if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady() && eye == XruEyeLeft) {
-			// No jitter on main menu / loading screen — upscaler won't run
+			// No jitter on main menu / loading screen — spatial-only upscale (reset=true)
 			if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
 				g_fsr3JitterEnabled = false;
 			} else {
@@ -5491,6 +5495,9 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 					        static_cast<uintptr_t>(s_pBridge->fpReplayDataPtr)));
 				}
 			}
+
+			// Menu state — skip MV corrections when a menu is open
+			g_aswProvider->SetMenuOpen(s_pBridge->isMenuOpen != 0);
 
 			g_aswProvider->CacheFrame(eyeIdx, context,
 			    colorSrc, &colorRegion,

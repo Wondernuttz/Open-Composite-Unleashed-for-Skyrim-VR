@@ -341,6 +341,9 @@ public:
 	/// Gives the exact interpolation weight (0.5 at half-refresh).
 	void SetMVTimingRatio(float r) { m_mvTimingRatio = r; }
 
+	/// Set menu open state — when true, ASW skips MV corrections to prevent UI duplication.
+	void SetMenuOpen(bool open) { m_isMenuOpen = open; }
+
 	/// Cached pose/FOV for building projection views during injection
 	XrPosef GetCachedPose(int eye) const {
 		int slot = GetActiveCacheSlot();
@@ -550,6 +553,7 @@ private:
 	uint32_t m_slotMVDataH[kAswCacheSlotCount] = {};
 	int m_buildSlot = 0;
 	bool m_buildEyeReady[2] = {};
+	bool m_isMenuOpen = false;
 	std::atomic<int> m_publishedSlot{ -1 };
 	std::atomic<int> m_previousPublishedSlot{ -1 };  // N-1 warping: previous cycle's cache slot
 	std::atomic<int> m_warpReadSlot{ -1 };
@@ -619,7 +623,7 @@ private:
 		float fpSphereRadius;          // FP bounding sphere radius                                 — 4 bytes
 		float _padCtrl;                // alignment                                                 — 4 bytes
 		float fpSphereCenter[4];       // [x,y,z,pad] FP sphere center in rendering space           — 16 bytes
-		int hasPreFPDepth;             // 1 if preFPDepth texture has valid data                  — 4 bytes
+		int isMenuOpen;                // 1 if a gameplay menu is open (skip MV corrections)       — 4 bytes
 		float _padPreFP[3];            // alignment to 16 bytes                                  — 12 bytes
 		float fpScreenBoxes[16 * 4];   // Up to 16 AABBs: [minU, minV, maxU, maxV] × 16         — 256 bytes
 		int fpBoxCount;                // Number of valid screen-space FP bounding boxes          — 4 bytes

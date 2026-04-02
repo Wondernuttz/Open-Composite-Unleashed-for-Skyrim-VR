@@ -171,6 +171,12 @@ struct OCRenderTargetBridge {
 	// FP draw replay — pointer to heap-allocated FPReplayData (same process, read by OC).
 	// Double-buffered: SKSE writes captures, OC reads at warp time.
 	uint64_t fpReplayDataPtr;          // FPReplayData* (cast to uint64_t)
+
+	// Menu state — set by MenuWatcher when any gameplay menu is open.
+	// ASW uses this to skip MV corrections (reprojection-only) during menus,
+	// preventing UI element duplication on warp frames.
+	uint8_t  isMenuOpen;               // 1 = a gameplay menu is open, 0 = gameplay
+	uint8_t  _padMenu[7];              // alignment
 };
 #pragma pack(pop)
 
@@ -727,6 +733,11 @@ namespace
 				SKSE::log::info("Menu {} {} - active:{} gamePaused:{}",
 				    name, a_event->opening ? "opened" : "closed",
 				    !g_activeTrackedMenus.empty(), ui->GameIsPaused());
+
+				// Update ASW menu flag — when any menu is visible, ASW skips MV
+				// corrections to prevent UI duplication on warp frames.
+				if (g_pBridge)
+					g_pBridge->isMenuOpen = anyMenuVisible ? 1 : 0;
 			}
 
 			return RE::BSEventNotifyControl::kContinue;

@@ -47,7 +47,7 @@ Texture2D<float2> mvTex        : register(t1);  // camera MVs: prevUV - uv (UV s
 Texture2D<float>  depthTex     : register(t2);
 Texture2D<float4> frameNColor  : register(t3);  // frame N color (newer frame for disocclusion fill)
 Texture2D<float>  frameNDepth  : register(t4);  // frame N depth (newer frame)
-Texture2D<uint>   fpMask       : register(t5);  // R8_UINT FP mask from SKSE DS->DS depth comparison
+Texture2D<uint>   fpMask       : register(t5);  // R8_UINT FP mask (reserved)
 RWTexture2D<float4> output     : register(u0);
 RWTexture2D<uint> atomicDepth  : register(u1);  // forward scatter depth test buffer (R32_UINT)
 RWTexture2D<uint> disocclusionMap : register(u2);  // 0=normal, 1=disoccluded (proactive marking)
@@ -96,7 +96,7 @@ cbuffer WarpParams : register(b0) {
     float fpSphereRadius;   // FP bounding sphere radius
     float _padCtrl;
     float4 fpSphereCenter;  // xyz = center in rendering space, w unused
-    int hasPreFPDepth;      // 1 if preFPDepth texture has valid data
+    int isMenuOpen;         // 1 if a gameplay menu is open (skip MV corrections)
     float3 _padPreFP;
     float4 fpScreenBoxes[16]; // Up to 16 AABBs: [minU, minV, maxU, maxV]
     int fpBoxCount;           // Number of valid screen-space FP bounding boxes
@@ -500,7 +500,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
         sourceUV = saturate((float2(scatterSrc) + 0.5) / resolution);
     }
 
-    if (isWorldPixel && abs(mvConfidence) > 0.001) {
+    if (isWorldPixel && abs(mvConfidence) > 0.001 && !isMenuOpen) {
         float2 fullResidual = totalMV - headOnlyMV;
         float2 locoResidual = totalMV - c2cHeadMV;
         float2 rotComponent = fullResidual - locoResidual;
@@ -511,7 +511,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
 
     // Depth-aware locomotion offset: replaces flat loco MV residual with depth-correct
     // parallax from the difference between c2c_with_loco and c2c_no_loco.
-    if (isWorldPixel && hasFullWarpC2C && hasClipToClipNoLoco && abs(mvConfidence) > 0.001) {
+    if (isWorldPixel && !isMenuOpen && hasFullWarpC2C && hasClipToClipNoLoco && abs(mvConfidence) > 0.001) {
         float2 baseUV = useFgAngle ? fgUV : uv;
         float2 ndc = float2(baseUV.x * 2.0 - 1.0, 1.0 - baseUV.y * 2.0);
         float4 clipPos = float4(ndc, d, 1.0);
@@ -625,6 +625,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID) {
                 color = float4(color.r * 0.7, color.g * 0.7, color.b * 0.7 + 0.3, 1);
         }
     }
+
 
     output[tid.xy] = color;
 }
@@ -1250,9 +1251,10 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
     // motion + bone animation. Scatter to predicted position so CSMain has depth coverage.
     // World pixels: loco + stick rotation + NPC animation as before.
     bool isFPScatter = IsFirstPerson(srcUV, d);
-    if (abs(mvConfidence) > 0.001) {
+    if (abs(mvConfidence) > 0.001 && !isMenuOpen) {
         float2 rawMV = mvTex[ToMVCoord(srcPixel)];
         float2 totalMV = clamp(rawMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
+
         float4 rotated = mul(headRotMatrix, float4(viewPos, 1.0));
         float2 headOnlyMV = float2(0, 0);
         if (scaledDepth > 0.001 && rotated.z > 0.001) {
@@ -1266,6 +1268,7 @@ void CSDepthPreScatter(uint3 tid : SV_DispatchThreadID) {
         } else {
             dstUV -= mvConfidence * (totalMV - headOnlyMV);
         }
+
     }
 
     float2 dstPx = dstUV * resolution;
@@ -2999,9 +3002,8 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 		}
 	}
 
-	// ── Pre-FP depth availability ──
-	cb.hasPreFPDepth = (m_srvPreFPDepth[slot][eye] != nullptr &&
-	                    m_cachedPreFPDepth[slot][eye] != nullptr) ? 1 : 0;
+	// ── Menu state (skip MV corrections when menu is open) ──
+	cb.isMenuOpen = m_isMenuOpen ? 1 : 0;
 
 	// ── FP bounding box projection (world spheres → screen AABBs) ──
 	cb.fpBoxCount = 0;
@@ -3109,7 +3111,7 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride)
 	ID3D11ShaderResourceView* srvs[] = {
 		m_srvColor[slot][eye], mvSRV, m_srvDepth[slot][eye],
 		frameNColorSRV, frameNDepthSRV,
-		m_srvPreFPDepth[slot][eye]  // t5: pre-FP depth (depth before first-person geometry)
+		m_srvPreFPDepth[slot][eye]  // t5: pre-FP depth
 	};
 	ctx->CSSetShaderResources(0, _countof(srvs), srvs);
 	ID3D11UnorderedAccessView* uavs3[] = { m_uavOutput[eye], m_uavAtomicDepth[eye], m_uavForwardMap[eye] };
