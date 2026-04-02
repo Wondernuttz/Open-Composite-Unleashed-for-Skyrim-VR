@@ -5548,12 +5548,24 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				    static_cast<uintptr_t>(s_pBridge->actorPosPtr));
 				float posX = actorPos[0], posY = actorPos[1], posZ = actorPos[2];
 
-	
+				// Vertical: use NiCamera Z instead of actorPos Z.
+				// actorPos.z = character root (captures jumping/terrain but NOT camera bob).
+				// NiCamera.z = actual camera position (captures bob + jumping + terrain).
+				// This matches the FSR3/DLSS camera MV vertical injection.
+				static float s_prevCamZ = 0.0f;
+				static bool s_hasPrevCamZ = false;
+				float camZ = posZ; // fallback to actorPos Z
+				if (s_pBridge->cameraPosPtr) {
+					const float* camPos = reinterpret_cast<const float*>(
+					    static_cast<uintptr_t>(s_pBridge->cameraPosPtr));
+					camZ = camPos[2];
+				}
+
 				if (s_hasPrevActor) {
-					// World-space delta (new - old): direction of locomotion
+					// World-space delta: horizontal from actorPos, vertical from NiCamera
 					float dwx = posX - s_prevActorPos[0];
 					float dwy = posY - s_prevActorPos[1];
-					float dwz = posZ - s_prevActorPos[2];
+					float dwz = s_hasPrevCamZ ? (camZ - s_prevCamZ) : (posZ - s_prevActorPos[2]);
 
 					float dist2 = dwx * dwx + dwy * dwy + dwz * dwz;
 					if (dist2 > 0.0001f && dist2 < 225.0f) { // dead zone + 15-unit teleport clamp
@@ -5649,6 +5661,8 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				s_prevActorPos[0] = posX;
 				s_prevActorPos[1] = posY;
 				s_prevActorPos[2] = posZ;
+				s_prevCamZ = camZ;
+				s_hasPrevCamZ = true;
 				s_hasPrevActor = true;
 			}
 		}
