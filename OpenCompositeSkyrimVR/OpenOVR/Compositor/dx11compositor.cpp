@@ -3168,7 +3168,7 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 #ifdef OC_HAS_DLSS
 	bool dlssNeedsInflation = !fsrActive && s_dlssUpscaler && s_dlssUpscaler->IsReady()
 	    && oovr_global_configuration.DlssEnabled()
-	    && oovr_global_configuration.FsrRenderScale() < 0.99f
+	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)
 	    && !cube && !isOverlay;
 #else
 	bool dlssNeedsInflation = false;
@@ -3381,9 +3381,10 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 				dlaaOutput = nullptr;
 			}
 
-			// DLAA operates at the game's render resolution (srcDesc dimensions)
-			uint32_t dw = srcDesc.Width;
-			uint32_t dh = srcDesc.Height;
+			// DLAA operates at the output resolution (display-res when upscaler active,
+			// render-res when no upscaler). This ensures DLAA can process FSR3/DLSS output.
+			uint32_t dw = outWidth;
+			uint32_t dh = outHeight;
 
 			// Intermediate: RGBA8 (RGB = pre-filtered color, A = edge luminance)
 			D3D11_TEXTURE2D_DESC diDesc = {};
@@ -4263,7 +4264,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	    && s_pBridge && s_pBridge->status == 1 && s_pBridge->mvTexture
 	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
 	    && oovr_global_configuration.DlssEnabled()
-	    && oovr_global_configuration.FsrRenderScale() < 0.99f
+	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)
 	    && !isOverlay && !swapchain_rtvs.empty()) {
 
 		{
@@ -4921,6 +4922,10 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 #endif
 	}
 
+	// (NVIDIA DLAA post-pass removed — DLAA is handled via dlssEnabled + dlssPreset=4
+	// in the main DLSS path above. When FSR3 is also active, DLSS runs as else-if and
+	// won't fire, but standalone DLAA works through the normal DLSS dispatch.)
+
 	// Release the swapchain - OpenXR will use the last-released image in a swapchain
 	// No manual Flush() needed — xrReleaseSwapchainImage handles GPU synchronization internally.
 	XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -5054,7 +5059,8 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 #ifdef OC_HAS_DLSS
 	// ── DLSS: save jitter and enable on left eye ──
-	if (oovr_global_configuration.DlssEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f
+	if (oovr_global_configuration.DlssEnabled()
+	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)
 	    && s_dlssUpscaler && s_dlssUpscaler->IsReady() && eye == XruEyeLeft) {
 		if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
 			g_fsr3JitterEnabled = false;
@@ -5070,7 +5076,8 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 	// ── DLSS 4: lazy-init upscaler ──
 	// DLSS is mutually exclusive with FSR3 — only one activates at a time.
-	if (oovr_global_configuration.DlssEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+	if (oovr_global_configuration.DlssEnabled()
+	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)) {
 		static bool s_dlssInitFailed = false; // Prevent retrying every frame (~300ms per attempt)
 		OpenRenderTargetBridge();
 		if (!s_dlssUpscaler && !s_dlssInitFailed && s_pBridge && s_pBridge->status == 1) {
