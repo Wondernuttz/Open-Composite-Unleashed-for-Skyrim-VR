@@ -144,7 +144,7 @@ public:
 
 	// CAS sharpening (RCAS) — independent of FSR
 	inline bool CasEnabled() const { return casEnabled; }
-	inline float CasSharpness() const { return fsrSharpness; }
+	inline float CasSharpness() const { return casSharpness; }
 
 	// FSR radius optimization
 	inline bool FsrRadiusEnabled() const { return fsrRadiusEnabled; }
@@ -290,6 +290,7 @@ private:
 
 	// CAS sharpening (RCAS) — independent of FSR
 	bool casEnabled = false;
+	float casSharpness = 0.5f;  // CAS sharpness (0.0-1.0, lower = sharper)
 	float fsrSharpness = 0.2f;      // 0.0 - 1.0, higher = sharper
 
 	// FSR radius optimization

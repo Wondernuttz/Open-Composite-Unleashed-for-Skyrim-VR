@@ -265,6 +265,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(bool, aswSpeculativeTrackingLead);
 		CFGOPT(bool, aswBufferEnabled);
 		CFGOPT(bool, casEnabled);
+		CFGOPT(float, casSharpness);
 		CFGOPT(float, fsrSharpness);
 		CFGOPT(bool, fsrRadiusEnabled);
 		CFGOPT(float, fsrRadius);

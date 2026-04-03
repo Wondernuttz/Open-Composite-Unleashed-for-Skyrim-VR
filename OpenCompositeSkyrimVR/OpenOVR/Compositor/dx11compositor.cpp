@@ -3389,8 +3389,12 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 			}
 		}
 
-		// ── DLAA: create intermediate + output textures (game resolution, skip for overlays) ──
-		if (dlaaReady && !isOverlay) {
+		// ── DLAA / CAS staging textures (output resolution, skip for overlays) ──
+		// dlaaOutput is used as staging for both DLAA and CAS post-passes
+		// (both need to copy swapchain content before reading+writing it).
+		bool needStagingTextures = !isOverlay &&
+		    (dlaaReady || oovr_global_configuration.CasEnabled());
+		if (needStagingTextures) {
 			// Release old textures
 			if (dlaaIntermediateRTV) {
 				dlaaIntermediateRTV->Release();
@@ -3431,22 +3435,33 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 			diDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 			diDesc.SampleDesc.Count = 1;
 			diDesc.Usage = D3D11_USAGE_DEFAULT;
-			diDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+			diDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
 
-			// Output: same format as game texture
+			// Output/staging: match swapchain's actual texture format (may be TYPELESS).
+			// Used as staging for CAS and DLAA post-passes.
 			D3D11_TEXTURE2D_DESC doDesc = diDesc;
-			doDesc.Format = srcDesc.Format;
+			{
+				D3D11_TEXTURE2D_DESC swapDesc;
+				imagesHandles[0].texture->GetDesc(&swapDesc);
+				doDesc.Format = swapDesc.Format;
+			}
 
 			HRESULT hr1 = device->CreateTexture2D(&diDesc, nullptr, &dlaaIntermediate);
 			HRESULT hr2 = device->CreateTexture2D(&doDesc, nullptr, &dlaaOutput);
 			if (SUCCEEDED(hr1) && SUCCEEDED(hr2)) {
 				device->CreateShaderResourceView(dlaaIntermediate, nullptr, &dlaaIntermediateSRV);
-				device->CreateShaderResourceView(dlaaOutput, nullptr, &dlaaOutputSRV);
+				// dlaaOutput may be TYPELESS (matching swapchain) — need explicit SRGB for views
+				// so hardware correctly decodes gamma (swapchain content is SRGB-encoded).
+				D3D11_SHADER_RESOURCE_VIEW_DESC outSrvDesc = {};
+				outSrvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+				outSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				outSrvDesc.Texture2D.MipLevels = 1;
+				device->CreateShaderResourceView(dlaaOutput, &outSrvDesc, &dlaaOutputSRV);
 				D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
 				rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
 				rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 				device->CreateRenderTargetView(dlaaIntermediate, &rtvDesc, &dlaaIntermediateRTV);
-				rtvDesc.Format = srcDesc.Format;
+				rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 				device->CreateRenderTargetView(dlaaOutput, &rtvDesc, &dlaaOutputRTV);
 				dlaaWidth = dw;
 				dlaaHeight = dh;
@@ -4958,9 +4973,137 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 #endif
 	}
 
-	// (NVIDIA DLAA post-pass removed — DLAA is handled via dlssEnabled + dlssPreset=4
-	// in the main DLSS path above. When FSR3 is also active, DLSS runs as else-if and
-	// won't fire, but standalone DLAA works through the normal DLSS dispatch.)
+	// ── Unsharp Mask sharpening post-pass ──
+	// Simple and effective: blur → subtract from original → add scaled difference.
+	// casSharpness controls intensity (0 = off, 1 = strong, 2+ = extreme).
+	if (oovr_global_configuration.CasEnabled() && !isOverlay
+	    && oovr_global_configuration.CasSharpness() > 0.0f
+	    && dlaaOutput && !swapchain_rtvs.empty()) {
+
+		// Lazy-compile unsharp mask compute shader
+		static ID3D11ComputeShader* s_unsharpCS = nullptr;
+		static bool s_compileFailed = false;
+		if (!s_unsharpCS && !s_compileFailed) {
+			static const char hlsl[] = R"(
+Texture2D<float4> Input : register(t0);  // SRGB SRV — reads return linear values
+RWTexture2D<float4> Output : register(u0);  // UNORM UAV — must write SRGB-encoded
+cbuffer CB : register(b0) { float strength; float3 _pad; };
+
+// Linear → sRGB encoding (D3D11 UAVs don't support auto SRGB encode)
+float3 LinearToSRGB(float3 c) {
+    float3 lo = c * 12.92;
+    float3 hi = 1.055 * pow(abs(c), 1.0/2.4) - 0.055;
+    return (c <= 0.0031308) ? lo : hi;
+}
+
+[numthreads(8, 8, 1)]
+void CS(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    Output.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+
+    float3 center = Input.Load(int3(id.xy, 0)).rgb;
+
+    // Luma-weighted unsharp mask — sharpens luminance only (no color fringing)
+    // 5-tap cross blur
+    float3 blur = center;
+    blur += Input.Load(int3(id.xy + int2(-1, 0), 0)).rgb;
+    blur += Input.Load(int3(id.xy + int2( 1, 0), 0)).rgb;
+    blur += Input.Load(int3(id.xy + int2( 0,-1), 0)).rgb;
+    blur += Input.Load(int3(id.xy + int2( 0, 1), 0)).rgb;
+    blur *= 0.2;
+
+    // Sharpen in linear space
+    float3 sharp = saturate(center + strength * (center - blur));
+
+    Output[id.xy] = float4(LinearToSRGB(sharp), Input.Load(int3(id.xy, 0)).a);
+}
+)";
+			ID3DBlob* blob = nullptr;
+			ID3DBlob* errs = nullptr;
+			HRESULT hr = D3DCompile(hlsl, sizeof(hlsl) - 1, "UnsharpMask", nullptr, nullptr,
+			    "CS", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errs);
+			if (SUCCEEDED(hr) && blob) {
+				device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+				    nullptr, &s_unsharpCS);
+				blob->Release();
+			} else {
+				s_compileFailed = true;
+				if (errs) { OOVR_LOGF("Unsharp CS compile failed: %s", (char*)errs->GetBufferPointer()); }
+			}
+			if (errs) errs->Release();
+
+			// Also create a CB for the strength parameter
+			if (s_unsharpCS) {
+				OOVR_LOG("Unsharp mask shader compiled OK");
+			}
+		}
+
+		static ID3D11Buffer* s_unsharpCB = nullptr;
+		if (s_unsharpCS && !s_unsharpCB) {
+			D3D11_BUFFER_DESC cbd = {};
+			cbd.ByteWidth = 16;
+			cbd.Usage = D3D11_USAGE_DYNAMIC;
+			cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+			device->CreateBuffer(&cbd, nullptr, &s_unsharpCB);
+		}
+
+		if (s_unsharpCS && s_unsharpCB) {
+			uint32_t sharpW = s_fsr3ViewportW > 0 ? s_fsr3ViewportW : createInfo.width;
+			uint32_t sharpH = s_fsr3ViewportH > 0 ? s_fsr3ViewportH : createInfo.height;
+
+			// Copy swapchain → staging
+			D3D11_BOX box = { 0, 0, 0, sharpW, sharpH, 1 };
+			context->CopySubresourceRegion(dlaaOutput, 0, 0, 0, 0,
+			    imagesHandles[currentIndex].texture, 0, &box);
+
+			// Update strength CB
+			D3D11_MAPPED_SUBRESOURCE mapped;
+			if (SUCCEEDED(context->Map(s_unsharpCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+				float* cb = (float*)mapped.pData;
+				cb[0] = oovr_global_configuration.CasSharpness();
+				cb[1] = cb[2] = cb[3] = 0;
+				context->Unmap(s_unsharpCB, 0);
+			}
+
+			// Write to dlaaOutput itself as both input AND output — wait, can't do that.
+			// Instead: read from dlaaOutput (staging copy of swapchain), write to
+			// dlaaIntermediate (separate texture), then copy intermediate → swapchain.
+			ID3D11UnorderedAccessView* sharpUAV = nullptr;
+			{
+				D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+				uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+				device->CreateUnorderedAccessView(dlaaIntermediate, &uavDesc, &sharpUAV);
+			}
+
+			if (sharpUAV) {
+				ID3D11ComputeShader* oldCS = nullptr;
+				context->CSGetShader(&oldCS, nullptr, nullptr);
+
+				context->CSSetShader(s_unsharpCS, nullptr, 0);
+				context->CSSetShaderResources(0, 1, &dlaaOutputSRV);
+				context->CSSetUnorderedAccessViews(0, 1, &sharpUAV, nullptr);
+				context->CSSetConstantBuffers(0, 1, &s_unsharpCB);
+				context->Dispatch((sharpW + 7) / 8, (sharpH + 7) / 8, 1);
+
+				// Unbind
+				ID3D11ShaderResourceView* nullSRV = nullptr;
+				ID3D11UnorderedAccessView* nullUAV = nullptr;
+				context->CSSetShaderResources(0, 1, &nullSRV);
+				context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+				context->CSSetShader(oldCS, nullptr, 0);
+				if (oldCS) oldCS->Release();
+
+				// Copy sharpened result back to swapchain
+				context->CopySubresourceRegion(imagesHandles[currentIndex].texture, 0,
+				    0, 0, 0, dlaaIntermediate, 0, &box);
+				context->Flush();
+				sharpUAV->Release();
+			}
+		}
+	}
 
 	// Release the swapchain - OpenXR will use the last-released image in a swapchain
 	// No manual Flush() needed — xrReleaseSwapchainImage handles GPU synchronization internally.
