@@ -29,10 +29,38 @@ using glm::vec4;
 #include "Drivers/Backend.h"
 #include "Misc/ScopeGuard.h"
 
+#include <atomic>
+#include <chrono>
+
 using namespace vr;
 using namespace IVRCompositor_022;
 
 typedef int ovr_enum_t;
+
+// === FRAME-HEARTBEAT instrumentation ===========================================
+// Diagnostic for whole-game freezes where AIAgent (CHIM) goes silent. If OCU's
+// render path is healthy, [FRAME-HB] keeps ticking once per second through any
+// CHIM-side hang. If [FRAME-HB] ALSO stops at the moment AIAgent stops logging,
+// the freeze is render-side (OpenXR xrEndFrame, swapchain wedge, GPU stall).
+//
+// Granularity:
+//  - [FRAME-HB submit] logs from Submit() when both eyes have been submitted.
+//  - [FRAME-HB poses]  logs from WaitGetPoses() — independent of Submit signal.
+//  - [FRAME-SLOW SubmitFrames ms=N] fires if the OpenXR submit blocks >50ms.
+namespace {
+static std::atomic<uint64_t> s_submitFrameCount{ 0 };
+static std::atomic<uint64_t> s_posesFrameCount{ 0 };
+static std::atomic<int64_t> s_lastSubmitHbMs{ 0 };
+static std::atomic<int64_t> s_lastPosesHbMs{ 0 };
+static const auto s_hbEpoch = std::chrono::steady_clock::now();
+
+static int64_t HbNowMs()
+{
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now() - s_hbEpoch)
+	    .count();
+}
+} // namespace
 
 #define SESS (*ovr::session)
 
@@ -71,7 +99,20 @@ ovr_enum_t BaseCompositor::WaitGetPoses(TrackedDevicePose_t* renderPoseArray, ui
 	leftEyeSubmitted = false;
 	rightEyeSubmitted = false;
 
+	const int64_t hbBefore = HbNowMs();
 	BackendManager::Instance().WaitForTrackingData();
+	const int64_t hbAfter = HbNowMs();
+	const uint64_t poses = s_posesFrameCount.fetch_add(1, std::memory_order_relaxed) + 1;
+	const int64_t lastHb = s_lastPosesHbMs.load(std::memory_order_relaxed);
+	if (hbAfter - lastHb >= 1000) {
+		s_lastPosesHbMs.store(hbAfter, std::memory_order_relaxed);
+		OOVR_LOGF("[FRAME-HB poses count=%llu wait_ms=%lld]",
+		    (unsigned long long)poses, (long long)(hbAfter - hbBefore));
+	}
+	if (hbAfter - hbBefore >= 100) {
+		OOVR_LOGF("[FRAME-SLOW WaitForTrackingData ms=%lld count=%llu]",
+		    (long long)(hbAfter - hbBefore), (unsigned long long)poses);
+	}
 
 	auto result = GetLastPoses(renderPoseArray, renderPoseArrayCount, gamePoseArray, gamePoseArrayCount);
 
@@ -280,8 +321,24 @@ ovr_enum_t BaseCompositor::Submit(EVREye eye, const Texture_t* texture, const VR
 			BackendManager::Instance().StoreEyeTexture(eye, texture, bounds, submitFlags, isFirstEye);
 
 		if (leftEyeSubmitted && rightEyeSubmitted) {
-			if (!isNullRender)
+			if (!isNullRender) {
+				const int64_t sfBefore = HbNowMs();
 				BackendManager::Instance().SubmitFrames(isInSkybox, false);
+				const int64_t sfAfter = HbNowMs();
+				const uint64_t fc = s_submitFrameCount.fetch_add(1, std::memory_order_relaxed) + 1;
+				const int64_t lastHb = s_lastSubmitHbMs.load(std::memory_order_relaxed);
+				if (sfAfter - lastHb >= 1000) {
+					s_lastSubmitHbMs.store(sfAfter, std::memory_order_relaxed);
+					OOVR_LOGF("[FRAME-HB submit count=%llu submit_ms=%lld]",
+					    (unsigned long long)fc, (long long)(sfAfter - sfBefore));
+				}
+				if (sfAfter - sfBefore >= 50) {
+					OOVR_LOGF("[FRAME-SLOW SubmitFrames ms=%lld count=%llu]",
+					    (long long)(sfAfter - sfBefore), (unsigned long long)fc);
+				}
+			} else {
+				s_submitFrameCount.fetch_add(1, std::memory_order_relaxed);
+			}
 
 			leftEyeSubmitted = false;
 			rightEyeSubmitted = false;

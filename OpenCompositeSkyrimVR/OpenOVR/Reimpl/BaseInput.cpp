@@ -1079,6 +1079,8 @@ void BaseInput::CreateLegacyActions()
 		create(&ctrl.triggerTouch, "trigger-touch", "Trigger (Touch)", XR_ACTION_TYPE_BOOLEAN_INPUT);
 		create(&ctrl.triggerClick, "trigger-click", "Trigger (Digital)", XR_ACTION_TYPE_BOOLEAN_INPUT);
 
+		create(&ctrl.thumbrestTouch, "thumbrest-touch", "Thumbrest (Touch)", XR_ACTION_TYPE_BOOLEAN_INPUT);
+
 		create(&ctrl.haptic, "haptic", "Vibration Haptics", XR_ACTION_TYPE_VIBRATION_OUTPUT);
 
 		create(&ctrl.gripPoseAction, "grip-pose", "Grip Pose", XR_ACTION_TYPE_POSE_INPUT);
@@ -2419,6 +2421,9 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 	// this will make thumb curl when knuckles trackpad sensor detects a touch
 	bindButton(XR_NULL_HANDLE, ctrl.trackPadTouch, vr::k_EButton_SteamVR_Touchpad, hand, inputSmoothingEnabled);
 
+	// Thumbrest touch → mapped as DPad_Up button press so it's bindable in controlmapvr.txt (0x04)
+	bindButton(ctrl.thumbrestTouch, XR_NULL_HANDLE, vr::k_EButton_DPad_Up, hand, inputSmoothingEnabled);
+
 	bool enableVRIKKnucklesTrackPadSupport = oovr_global_configuration.EnableVRIKKnucklesTrackPadSupport();
 	if (enableVRIKKnucklesTrackPadSupport) {
 		// VRIK binds knuckles trackpad click to "A" button touch in SteamVR controllers settings, this code replicates that behavior
@@ -2476,14 +2481,19 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 	}
 
 	VRControllerAxis_t& thumbstick = state->rAxis[0];
+	// When swapThumbsticks is enabled, read from the OTHER hand's stick axes
+	int stickSourceHand = hand;
+	if (oovr_global_configuration.SwapThumbsticks())
+		stickSourceHand = 1 - hand;
+	auto& stickSource = legacyControllers[stickSourceHand];
 	if (inputSmoothingEnabled) {
-		smoothInput.updateJoystickXValue(hand, readFloat(ctrl.stickX));
-		smoothInput.updateJoystickYValue(hand, readFloat(ctrl.stickY));
+		smoothInput.updateJoystickXValue(hand, readFloat(stickSource.stickX));
+		smoothInput.updateJoystickYValue(hand, readFloat(stickSource.stickY));
 		thumbstick.x = smoothInput.getSmoothedJoystickXValue(hand);
 		thumbstick.y = smoothInput.getSmoothedJoystickYValue(hand);
 	} else {
-		thumbstick.x = readFloat(ctrl.stickX);
-		thumbstick.y = readFloat(ctrl.stickY);
+		thumbstick.x = readFloat(stickSource.stickX);
+		thumbstick.y = readFloat(stickSource.stickY);
 	}
 
 	float deadZoneSize = 0.0f;

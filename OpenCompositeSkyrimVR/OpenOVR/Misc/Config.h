@@ -82,6 +82,7 @@ public:
 	float RotSmoothBeta() { return rotSmoothBeta; }
 
 	inline bool EnableGpuTiming() const { return enableGpuTiming; }
+	inline bool SwapThumbsticks() const { return swapThumbsticks; }
 
 	inline bool DlaaEnabled() const { return dlaaEnabled; }
 	inline float DlaaLambda() const { return dlaaLambda; }
@@ -242,6 +243,7 @@ private:
 	bool disableTrackPad = false;
 	bool enableControllerSmoothing = false;
 	bool enableVRIKKnucklesTrackPadSupport = false;
+	bool swapThumbsticks = false; // Swap left/right thumbstick axes (movement ↔ look)
 	float posSmoothMinCutoff = 1.25;
 	float posSmoothBeta = 20;
 	float rotSmoothMinCutoff = 1.5;
@@ -256,16 +258,16 @@ private:
 
 	// FSR upscaling
 	bool fsrEnabled = false;
-	float fsrRenderScale = 0.77f;   // 0.5 - 1.0, lower = more GPU savings
+	float fsrRenderScale = 0.67f;   // 0.5 - 1.0, lower = more GPU savings
 	float fsr3Sharpness = 0.3f;     // 0.0 - 1.0, FSR3 built-in RCAS sharpness
 	float fsr3JitterScale = 0.3f;   // 0.0 - 1.0, jitter amplitude (lower = more stable, higher = better temporal AA)
 	bool fsr3JitterCancellation = false; // Camera MVs cancel jitter in shader; game MVs don't include jitter
 	float fsr3ShadingChangeScale = 2.0f; // Higher = more reactive to shading changes (reduces ghosting on trees)
 	float fsr3ReactivenessScale = 2.0f; // Multiplier on reactive mask values (higher = more aggressive ghosting reduction)
-	float fsr3AccumulationPerFrame = 0.5f; // Lower = less ghosting but more flicker on thin geometry (0.0-1.0)
+	float fsr3AccumulationPerFrame = 0.20f; // Lower = less ghosting but more flicker on thin geometry (0.0-1.0)
 	float fsr3MinDisocclusionAccumulation = -0.333f; // Higher = less flicker on swaying thin objects (-1.0 to 1.0)
-	float fsr3ReactiveBase = 0.45f;    // Depth-edge reactive mask baseline (reduces thin-geometry ghosting)
-	float fsr3ReactiveEdgeBoost = 0.90f; // Extra reactiveness at depth edges (tree silhouettes, thin geometry)
+	float fsr3ReactiveBase = 0.05f;    // Depth-edge reactive mask baseline (reduces thin-geometry ghosting)
+	float fsr3ReactiveEdgeBoost = 0.10f; // Extra reactiveness at depth edges (tree silhouettes, thin geometry)
 	float fsr3ReactiveDepthFalloffStart = 0.95f; // Depth where reactive mask begins fading (standard-Z, 0=near 1=far)
 	float fsr3ReactiveDepthFalloffEnd = 0.998f;  // Depth where reactive mask reaches zero (distant mountains/sky)
 	bool fsr3CameraMV = true;          // Camera MVs from depth + view-projection deltas (captures locomotion + head tracking)
@@ -311,11 +313,11 @@ private:
 	int   dlssPreset       = 1;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
 	float dlssSharpness    = 20.0f;
 	float dlssMvScale      = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
-	float dlssBiasBase     = 0.05f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
-	float dlssBiasEdgeBoost = 0.20f; // Extra bias at depth edges (foliage silhouettes)
+	float dlssBiasBase     = 0.20f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
+	float dlssBiasEdgeBoost = 0.50f; // Extra bias at depth edges (foliage silhouettes)
 	float dlssBiasDepthFalloffStart = 0.95f; // Depth where bias mask begins fading (standard-Z, 0=near 1=far)
 	float dlssBiasDepthFalloffEnd = 0.99f;   // Depth where bias mask reaches zero (distant mountains/sky)
-	float dlssJitterScale  = 0.3f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
+	float dlssJitterScale  = 0.5f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;

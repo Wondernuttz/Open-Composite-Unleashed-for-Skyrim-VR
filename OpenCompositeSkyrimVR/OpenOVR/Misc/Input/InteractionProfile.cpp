@@ -91,6 +91,7 @@ void InteractionProfile::AddLegacyBindings(const LegacyControllerActions& ctrl, 
 	create(ctrl.triggerClick, paths->triggerClick);
 	create(ctrl.grip, paths->grip);
 	create(ctrl.gripClick, paths->gripClick != NULL ? paths->gripClick : paths->grip);
+	create(ctrl.thumbrestTouch, paths->thumbrestTouch);
 	create(ctrl.haptic, paths->haptic);
 	create(ctrl.gripPoseAction, paths->gripPoseAction);
 	create(ctrl.aimPoseAction, paths->aimPoseAction);
