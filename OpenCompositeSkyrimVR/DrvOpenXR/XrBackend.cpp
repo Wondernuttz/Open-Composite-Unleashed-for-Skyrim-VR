@@ -602,6 +602,7 @@ bool XrBackend::ShouldUseAswSplitPipeline() const
 	return g_aswProvider && g_aswProvider->IsReady() && g_aswProvider->HasPreviousCachedFrame()
 	    && !g_aswProvider->IsPaused()
 	    && oovr_global_configuration.ASWEnabled() && sessionActive
+	    && oovr_global_configuration.ASWBufferEnabled()
 	    && aswStallCount < 5;
 }
 
@@ -1298,10 +1299,10 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	// a warped version of the cached frame. This doubles the effective framerate
 	// sent to the VR runtime, eliminating the need for SSW.
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
-	#if 0
 	static int s_aswStallCount = 0; // consecutive frames where xrWaitFrame took too long
 	if (g_aswProvider && g_aswProvider->IsReady() && g_aswProvider->HasCachedFrame()
 	    && oovr_global_configuration.ASWEnabled() && sessionActive
+	    && !oovr_global_configuration.ASWBufferEnabled()
 	    && s_aswStallCount < 5) { // disable after 5 consecutive stalls
 
 		// Get D3D11 context from ASWProvider's device (independent of GPU timing)
@@ -1445,7 +1446,6 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 		}
 	}
 asw_done:
-	#endif
 	if (aswStallCount >= 5 && g_aswProvider && oovr_global_configuration.ASWEnabled()) {
 		if (!aswDisableWarned) {
 			OOVR_LOG("ASW: Disabled - xrWaitFrame stalled 5 consecutive frames. Restart game to re-enable.");

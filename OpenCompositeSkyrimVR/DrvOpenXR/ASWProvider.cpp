@@ -1225,6 +1225,181 @@ void CSLegacyWarp(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// ── Simple ASW shader ──
+// Single-pass backward warp with:
+//   1. Parallax from poseDeltaMatrix (head rotation + translation, OpenXR poses)
+//   2. Game MV correction (skipped for hands: depth < 0.87)
+//   3. Disocclusion / out-of-bounds fallback: sample frame N (newest cached frame)
+// No forward scatter, dilate, blur, NPC overlay, or CPU matrix surgery.
+// Reuses m_constantBuffer through headRotMatrix for MV residual decomposition.
+static const char* s_simpleWarpHLSL = R"(
+Texture2D<float4> prevColor    : register(t0);
+Texture2D<float2> mvTex        : register(t1);
+Texture2D<float>  depthTex     : register(t2);
+Texture2D<float4> frameNColor  : register(t3);
+Texture2D<float>  frameNDepth  : register(t4);
+RWTexture2D<float4> output     : register(u0);
+RWTexture2D<float2> warpMV     : register(u1);   // warp-to-warp MV for DLSS (prevUV − curUV, UV-space)
+SamplerState linearClamp       : register(s0);
+
+// Layout must match WarpConstants in ASWProvider.h through headRotMatrix.
+cbuffer WarpConstants : register(b0) {
+    row_major float4x4 poseDeltaMatrix;    // 0-63
+    float2 resolution;                      // 64-71
+    float nearZ, farZ;                      // 72-79
+    float fovTanLeft, fovTanRight, fovTanUp, fovTanDown; // 80-95
+    float depthScale;                       // 96
+    float edgeFadeWidth;                    // 100 (unused)
+    float nearFadeDepth;                    // 104 (unused)
+    float mvConfidence;                     // 108
+    float mvPixelScale;                     // 112
+    float2 depthResolution;                 // 116-123 (unused in simple mode)
+    float _pad0;                            // 124-127
+    float2 mvResolution;                    // 128-135 — actual MV data dims (may differ from cached-tex size)
+    int _pad_npcMask;                       // 136-139
+    float _pad1;                            // 140-143
+    int debugMode;                          // 144-147
+    float3 _pad2;                           // 148-159
+    row_major float4x4 headRotMatrix;       // 160-223
+};
+
+// Second CB: warp-to-warp state for DLSS MV output. Layout = WarpMVConstants.
+cbuffer WarpMVConstants : register(b1) {
+    row_major float4x4 warpToPrevMatrix; // 0-63  — cur-warp view → prev-warp view
+    float mvDeltaConf;                    // 64    — prev mvConf − cur mvConf
+    int   hasWarpMV;                      // 68    — 1 = prev state valid, 0 = first frame
+    float2 _padMV;                        // 72-79
+};
+
+static const float FP_DEPTH_THRESHOLD  = 0.87;
+static const float DISOCC_DEPTH_MARGIN = 0.02;
+
+float LinearizeDepth(float d) {
+    float denom = farZ - d * (farZ - nearZ);
+    return (abs(denom) > 0.0001) ? (nearZ * farZ / denom) : farZ;
+}
+
+float2 ProjectViewPos(float3 viewPos) {
+    return float2(
+        (viewPos.x / viewPos.z - fovTanLeft) / (fovTanRight - fovTanLeft),
+        (viewPos.y / viewPos.z - fovTanUp)   / (fovTanDown  - fovTanUp));
+}
+
+float2 ComputeHeadOnlyMV(float2 baseUV) {
+    if (any(baseUV < 0.0) || any(baseUV > 1.0))
+        return float2(0.0, 0.0);
+
+    float cachedDepth = depthTex.SampleLevel(linearClamp, baseUV, 0);
+    float cachedLinearDepth = LinearizeDepth(cachedDepth) * depthScale;
+    if (cachedLinearDepth <= 0.001)
+        return float2(0.0, 0.0);
+
+    float tanX = lerp(fovTanLeft, fovTanRight, baseUV.x);
+    float tanY = lerp(fovTanUp,   fovTanDown,  baseUV.y);
+    float3 cachedViewPos = float3(tanX * cachedLinearDepth, tanY * cachedLinearDepth, cachedLinearDepth);
+    float4 rotated = mul(headRotMatrix, float4(cachedViewPos, 1.0));
+    if (rotated.z <= 0.001)
+        return float2(0.0, 0.0);
+
+    return clamp(ProjectViewPos(rotated.xyz) - baseUV, float2(-0.15, -0.15), float2(0.15, 0.15));
+}
+
+[numthreads(8, 8, 1)]
+void CSSimpleWarp(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= (uint)resolution.x || tid.y >= (uint)resolution.y)
+        return;
+
+    uint2  px = tid.xy;
+    float2 uv = ((float2)px + 0.5) / resolution;
+    float  d  = depthTex[px];
+
+    // 1. Backward parallax (head pose only).
+    float linearDepth = LinearizeDepth(d) * depthScale;
+    float tanX = lerp(fovTanLeft, fovTanRight, uv.x);
+    float tanY = lerp(fovTanUp,   fovTanDown,  uv.y);
+    float3 viewPos = float3(tanX * linearDepth, tanY * linearDepth, linearDepth);
+
+    float4 transformed = mul(poseDeltaMatrix, float4(viewPos, 1.0));
+    float2 cachedUV = uv;
+    if (linearDepth > 0.001 && transformed.z > 0.001) {
+        float oldTanX = transformed.x / transformed.z;
+        float oldTanY = transformed.y / transformed.z;
+        cachedUV = float2(
+            (oldTanX - fovTanLeft) / (fovTanRight - fovTanLeft),
+            (oldTanY - fovTanUp)   / (fovTanDown  - fovTanUp));
+    }
+
+    // 2. Game MV residual correction: bridge MVs include head tracking, so subtract
+    // the head-only component before applying locomotion / stick / animation motion.
+    // Skip on hands/weapons (near pixels).
+    // The MV data region may not fill the cached texture (e.g., bridge-provided
+    // stereo-combined MVs at reduced resolution). Scale UV per-axis into just
+    // the valid data region so sampling never reads uninitialized pixels.
+    // When MV dims match the cached texture (full-res MVs), this collapses to
+    // identity and behaves exactly like UV sampling across the full texture.
+    float2 finalUV = cachedUV;
+    float2 residualGameMV = float2(0.0, 0.0);
+    bool   isHand  = (d < FP_DEPTH_THRESHOLD);
+    if (!isHand && abs(mvConfidence) > 0.001) {
+        float2 mvValidFraction = mvResolution / resolution;
+        float2 mvSampleUV = cachedUV * mvValidFraction;
+        float2 rawGameMV = mvTex.SampleLevel(linearClamp, mvSampleUV, 0).xy;
+        float2 gameMV = clamp(rawGameMV * mvPixelScale, float2(-0.15, -0.15), float2(0.15, 0.15));
+        float2 headOnlyMV = ComputeHeadOnlyMV(cachedUV);
+        residualGameMV = gameMV - headOnlyMV;
+        finalUV = cachedUV + residualGameMV * mvConfidence;
+    }
+
+    // 3. Disocclusion / OOB fallback: use frame N (newest cached frame).
+    bool inBounds = all(saturate(finalUV) == finalUV);
+    bool disocclusion = false;
+    float3 outColor;
+    if (!inBounds) {
+        outColor = frameNColor.SampleLevel(linearClamp, uv, 0).rgb;
+    } else {
+        float cachedDAtSample = depthTex.SampleLevel(linearClamp, finalUV, 0);
+        if (cachedDAtSample < d - DISOCC_DEPTH_MARGIN) {
+            // Cached pixel at finalUV is much closer than us → a foreground occluder
+            // covers our view into the background. Frame N is newer and has the
+            // background visible there, so use it at the same screen position.
+            outColor = frameNColor.SampleLevel(linearClamp, uv, 0).rgb;
+            disocclusion = true;
+        } else {
+            outColor = prevColor.SampleLevel(linearClamp, finalUV, 0).rgb;
+        }
+    }
+
+    output[px] = float4(outColor, 1.0);
+
+    // 4. Per-pixel warp-to-warp MV for DLSS temporal accumulation.
+    //    Convention: prevUV − curUV (UV-space), matches GenerateCameraMVs.
+    float2 warpMVout = float2(0.0, 0.0);
+    if (hasWarpMV != 0) {
+        // Head part: re-project current view-space pos through cur→prev transform.
+        float4 viewPosPrev = mul(warpToPrevMatrix, float4(viewPos, 1.0));
+        if (linearDepth > 0.001 && viewPosPrev.z > 0.001) {
+            float prevTanX = viewPosPrev.x / viewPosPrev.z;
+            float prevTanY = viewPosPrev.y / viewPosPrev.z;
+            float2 prevUV = float2(
+                (prevTanX - fovTanLeft) / (fovTanRight - fovTanLeft),
+                (prevTanY - fovTanUp)   / (fovTanDown  - fovTanUp));
+            warpMVout = prevUV - uv;
+        }
+
+        // Game-MV part: adds the shift the color path applied due to loco /
+        // stick rotation / NPC animation. Skip hands and disocclusion-fallback
+        // pixels (no valid prev-warp correspondence). Uses the same UV-scaling
+        // trick as the color path so sampling stays inside the valid MV region.
+        if (!isHand && inBounds && !disocclusion && abs(mvConfidence) > 0.001) {
+            warpMVout += residualGameMV * mvDeltaConf;
+        } else if (disocclusion) {
+            warpMVout = float2(0.0, 0.0);
+        }
+    }
+    warpMV[px] = warpMVout;
+}
+)";
+
 static const char* s_npcScatterHLSL = R"(
 // ── CSDepthPreScatter: scatter ALL cached pixels' depths to their WARP OUTPUT positions ──
 // Uses forwardPoseDelta (cached→warp head delta) + MV residual (loco/stick/NPC)
@@ -1502,8 +1677,12 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t renderWidth, uint32_
 		return false;
 	}
 
-	if (!CreateDepthSwapchain(m_outputWidth * 2, m_outputHeight)) {
-		OOVR_LOG("ASW: Failed to create depth swapchain (non-fatal — depth layer disabled)");
+	if (m_renderWidth == m_outputWidth && m_renderHeight == m_outputHeight) {
+		if (!CreateDepthSwapchain(m_outputWidth * 2, m_outputHeight)) {
+			OOVR_LOG("ASW: Failed to create depth swapchain (non-fatal - depth layer disabled)");
+		}
+	} else {
+		OOVR_LOG("ASW: Skipping depth layer because render and output resolutions differ");
 	}
 
 	// Launch shader compilation in background — game continues rendering without ASW.
@@ -1537,6 +1716,24 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t renderWidth, uint32_
 			OOVR_LOG("ASW: Legacy warp shader compiled OK");
 		} else {
 			if (errs) { OOVR_LOGF("ASW: Legacy shader error: %s", (char*)errs->GetBufferPointer()); errs->Release(); }
+		}
+		if (errs) errs->Release();
+	}
+
+	// Compile simple warp shader synchronously (small shader, <1ms)
+	{
+		ID3DBlob* blob = nullptr;
+		ID3DBlob* errs = nullptr;
+		HRESULT hr = D3DCompile(s_simpleWarpHLSL, strlen(s_simpleWarpHLSL),
+		    "SimpleWarp", nullptr, nullptr, "CSSimpleWarp", "cs_5_0",
+		    D3DCOMPILE_PACK_MATRIX_ROW_MAJOR | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errs);
+		if (SUCCEEDED(hr) && blob) {
+			device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+			    nullptr, &m_simpleWarpCS);
+			blob->Release();
+			OOVR_LOG("ASW: Simple warp shader compiled OK");
+		} else {
+			if (errs) { OOVR_LOGF("ASW: Simple shader error: %s", (char*)errs->GetBufferPointer()); errs->Release(); errs = nullptr; }
 		}
 		if (errs) errs->Release();
 	}
@@ -2056,6 +2253,48 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 			OOVR_LOGF("ASW: CreateSRV forwardNpcOutput[%d] failed", eye);
 			return false;
 		}
+
+		// Simple-mode warp-to-warp MV output: R16G16_FLOAT, UV-space (prevUV − curUV).
+		// Matches s_cameraMVTex format so it can be swapped into DispatchParams.motionVectors.
+		desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+		desc.MiscFlags = 0;
+		hr = device->CreateTexture2D(&desc, nullptr, &m_warpMVTex[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateTexture2D warpMV[%d] failed hr=0x%08X", eye, hr);
+			return false;
+		}
+		D3D11_UNORDERED_ACCESS_VIEW_DESC mvUavDesc = {};
+		mvUavDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+		mvUavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+		hr = device->CreateUnorderedAccessView(m_warpMVTex[eye], &mvUavDesc, &m_uavWarpMV[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateUAV warpMV[%d] failed", eye);
+			return false;
+		}
+		D3D11_SHADER_RESOURCE_VIEW_DESC mvSrvDesc = {};
+		mvSrvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+		mvSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		mvSrvDesc.Texture2D.MipLevels = 1;
+		hr = device->CreateShaderResourceView(m_warpMVTex[eye], &mvSrvDesc, &m_srvWarpMV[eye]);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateSRV warpMV[%d] failed", eye);
+			return false;
+		}
+	}
+
+	// Simple-mode warp-MV constant buffer (80 bytes, dynamic).
+	{
+		D3D11_BUFFER_DESC cbDesc = {};
+		cbDesc.ByteWidth = sizeof(WarpMVConstants);
+		cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+		cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		HRESULT hr = device->CreateBuffer(&cbDesc, nullptr, &m_warpMVCB);
+		if (FAILED(hr)) {
+			OOVR_LOGF("ASW: CreateBuffer warpMVCB failed hr=0x%08X", hr);
+			return false;
+		}
 	}
 
 	// Forward scatter: atomic depth buffers (R32_UINT, per-eye)
@@ -2176,8 +2415,8 @@ XrRect2Di ASWProvider::GetOutputRect(int eye) const
 bool ASWProvider::CreateDepthSwapchain(uint32_t width, uint32_t height)
 {
 	XrSwapchainCreateInfo ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-	ci.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-	ci.format = DXGI_FORMAT_D32_FLOAT;
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.format = DXGI_FORMAT_R32_FLOAT;
 	ci.sampleCount = 1;
 	ci.width = width;
 	ci.height = height;
@@ -2604,10 +2843,28 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride,
 	if (!m_ready || eye < 0 || eye > 1)
 		return false;
 
+	// ASW has two runtime modes:
+	//   default: Alpha-X-1.0.0 legacy translation-only parallax
+	//   aswExperimentalMode=true: newer single-pass experimental shader
+	// The older experimental complex path is intentionally not selectable.
+	m_warpMVValid[eye].store(false, std::memory_order_release);
+	const bool experimentalMode = oovr_global_configuration.aswExperimentalMode && m_simpleWarpCS;
+	if (oovr_global_configuration.aswExperimentalMode && !m_simpleWarpCS) {
+		static bool s_loggedMissingSimple = false;
+		if (!s_loggedMissingSimple) {
+			OOVR_LOG("ASW: aswExperimentalMode requested, but experimental shader is unavailable");
+			s_loggedMissingSimple = true;
+		}
+		return false;
+	}
+
 	int slot = -1;
 	if (eye == 0) {
 		if (slotOverride >= 0 && slotOverride < (int)kAswCacheSlotCount) {
 			slot = slotOverride;
+		} else if (!experimentalMode) {
+			// Alpha-style legacy ASW uses the latest complete cached frame.
+			slot = m_publishedSlot.load(std::memory_order_acquire);
 		} else {
 			// N-1 warping: use the PREVIOUS frame's cache slot.
 			// Locomotion/rotation deltas are calibrated for N-2→N-1 step.
@@ -2625,6 +2882,75 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride,
 	}
 
 	WarpConstants cb = {};
+	if (!experimentalMode) {
+		if (!m_legacyWarpCS)
+			return false;
+
+		// Exact Alpha-X-1.0.0 legacy constants: backward warp from the
+		// predicted view to the cached view, with rotation removed so the
+		// runtime ATW handles head rotation from the cached layer pose.
+		BuildPoseDeltaMatrix(newPose, m_slotPose[slot][eye], cb.poseDeltaMatrix);
+		for (int r = 0; r < 3; r++)
+			for (int c = 0; c < 3; c++)
+				cb.poseDeltaMatrix[r * 4 + c] = (r == c) ? 1.0f : 0.0f;
+
+		float master = oovr_global_configuration.ASWWarpStrength();
+		float transS = master * oovr_global_configuration.ASWTranslationScale();
+		transS = (transS < 0.0f) ? 0.0f : transS;
+		if (transS != 1.0f) {
+			cb.poseDeltaMatrix[3] *= transS;
+			cb.poseDeltaMatrix[7] *= transS;
+			cb.poseDeltaMatrix[11] *= transS;
+		}
+
+		cb.resolution[0] = (float)m_renderWidth;
+		cb.resolution[1] = (float)m_renderHeight;
+		cb.nearZ = m_slotNear[slot];
+		cb.farZ = m_slotFar[slot];
+		cb.fovTanLeft = tanf(m_slotFov[slot][eye].angleLeft);
+		cb.fovTanRight = tanf(m_slotFov[slot][eye].angleRight);
+		cb.fovTanUp = tanf(m_slotFov[slot][eye].angleUp);
+		cb.fovTanDown = tanf(m_slotFov[slot][eye].angleDown);
+		float ds = oovr_global_configuration.ASWDepthScale();
+		cb.depthScale = (ds < 0.0f) ? 0.0f : ds;
+
+		m_precompPose[eye] = m_slotPose[slot][eye];
+		memcpy(m_lastPoseDelta[eye], cb.poseDeltaMatrix, sizeof(cb.poseDeltaMatrix));
+
+		ID3D11DeviceContext* ctx = nullptr;
+		m_device->GetImmediateContext(&ctx);
+		if (!ctx)
+			return false;
+
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		HRESULT hr = ctx->Map(m_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+		if (FAILED(hr)) {
+			ctx->Release();
+			return false;
+		}
+		memcpy(mapped.pData, &cb, sizeof(cb));
+		ctx->Unmap(m_constantBuffer, 0);
+
+		ctx->CSSetShader(m_legacyWarpCS, nullptr, 0);
+		ID3D11ShaderResourceView* legSRVs[3] = { m_srvColor[slot][eye], nullptr, m_srvDepth[slot][eye] };
+		ctx->CSSetShaderResources(0, 3, legSRVs);
+		ID3D11UnorderedAccessView* legUAVs[1] = { m_uavOutput[eye] };
+		ctx->CSSetUnorderedAccessViews(0, 1, legUAVs, nullptr);
+		ctx->CSSetConstantBuffers(0, 1, &m_constantBuffer);
+		ctx->CSSetSamplers(0, 1, &m_linearSampler);
+
+		uint32_t groupsX = (m_renderWidth + 7) / 8;
+		uint32_t groupsY = (m_renderHeight + 7) / 8;
+		ctx->Dispatch(groupsX, groupsY, 1);
+
+		ID3D11ShaderResourceView* nullSRVs[3] = {};
+		ID3D11UnorderedAccessView* nullUAVs[1] = {};
+		ctx->CSSetShaderResources(0, 3, nullSRVs);
+		ctx->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
+		ctx->CSSetShader(nullptr, nullptr, 0);
+		ctx->Release();
+		return true;
+	}
 	// poseDeltaMatrix: backward warp transform (new view → old view) in shader coords.
 	// The shader uses +Z-forward but OpenXR uses -Z-forward. The correct transform is
 	// F * M * F where M = V_old * W_new (OpenXR backward warp) and F = diag(1,1,-1,1).
@@ -2890,7 +3216,8 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride,
 				mvScale = (mvScale < 0.5f) ? 0.5f : (mvScale > 3.0f) ? 3.0f : mvScale;
 			}
 		}
-		cb.mvConfidence = mvScale * m_mvConfidenceScale;
+		float configuredMax = std::max(0.0f, oovr_global_configuration.ASWMVConfidence());
+		cb.mvConfidence = std::min(mvScale, configuredMax) * m_mvConfidenceScale;
 	}
 	cb.mvPixelScale = oovr_global_configuration.ASWMVPixelScale();
 	cb.depthResolution[0] = (m_slotDepthDataW[slot] > 0) ? (float)m_slotDepthDataW[slot] : (float)m_renderWidth;
@@ -3048,7 +3375,7 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride,
 
 	// ── Menu state (skip MV corrections when menu is open) ──
 	cb.isMenuOpen = m_isMenuOpen ? 1 : 0;
-	cb.isLegacyMode = oovr_global_configuration.aswForceLegacy ? 1 : 0;
+	cb.isLegacyMode = 0;
 
 	// ── FP bounding box projection (world spheres → screen AABBs) ──
 	cb.fpBoxCount = 0;
@@ -3174,34 +3501,76 @@ bool ASWProvider::WarpFrame(int eye, const XrPosef& newPose, int slotOverride,
 	// static objects when locomotion is in gameMV but not clipToClipNoLoco.
 	const bool useStationaryNpcForwardOverlay = false;
 
-	// Legacy mode: skip all forward scatter, disocclusion fill, MV correction.
-	// Just clear + backward warp (translation-only parallax). The shader checks
-	// isLegacyMode to skip MV corrections in CSMain.
-	bool legacyMode = oovr_global_configuration.aswForceLegacy;
-	if (legacyMode && m_legacyWarpCS) {
-		// Legacy: self-contained backward warp shader. Own cbuffer layout, own textures.
-		// Only needs t0=color, t2=depth, u0=output, b0=CB, s0=sampler.
-		ctx->CSSetShader(m_legacyWarpCS, nullptr, 0);
-		ID3D11ShaderResourceView* legSRVs[3] = { m_srvColor[slot][eye], nullptr, m_srvDepth[slot][eye] };
-		ctx->CSSetShaderResources(0, 3, legSRVs);
-		ID3D11UnorderedAccessView* legUAVs[1] = { m_uavOutput[eye] };
-		ctx->CSSetUnorderedAccessViews(0, 1, legUAVs, nullptr);
-		ctx->CSSetConstantBuffers(0, 1, &m_constantBuffer);
+	// Simple mode: single-pass backward warp with parallax + game MV correction +
+	// depth-based FP mask + frame-N disocclusion fallback.
+	// t0=color, t1=MV, t2=depth, t3=frameN color, t4=frameN depth, u0=output.
+	if (m_simpleWarpCS) {
+		// Build warp-to-prev-warp constants for the MV u1 output (feeds DLSS).
+		WarpMVConstants mvcb = {};
+		if (m_hasPrevWarpPoseForMV[eye]) {
+			// cur-warp view → prev-warp view, with Z-flip conjugation (F*M*F),
+			// matching poseDeltaMatrix convention.
+			BuildPoseDeltaMatrix(newPose, m_prevWarpPoseForMV[eye], mvcb.warpToPrevMatrix);
+			mvcb.warpToPrevMatrix[2]  = -mvcb.warpToPrevMatrix[2];
+			mvcb.warpToPrevMatrix[6]  = -mvcb.warpToPrevMatrix[6];
+			mvcb.warpToPrevMatrix[8]  = -mvcb.warpToPrevMatrix[8];
+			mvcb.warpToPrevMatrix[9]  = -mvcb.warpToPrevMatrix[9];
+			mvcb.warpToPrevMatrix[11] = -mvcb.warpToPrevMatrix[11];
+			mvcb.mvDeltaConf = m_prevMvConfidenceForMV[eye] - cb.mvConfidence;
+			mvcb.hasWarpMV = 1;
+		} else {
+			for (int i = 0; i < 16; i++) mvcb.warpToPrevMatrix[i] = 0.0f;
+			mvcb.warpToPrevMatrix[0] = mvcb.warpToPrevMatrix[5] =
+			    mvcb.warpToPrevMatrix[10] = mvcb.warpToPrevMatrix[15] = 1.0f;
+			mvcb.mvDeltaConf = 0.0f;
+			mvcb.hasWarpMV = 0;
+		}
+		{
+			D3D11_MAPPED_SUBRESOURCE mvMapped;
+			HRESULT mvHr = ctx->Map(m_warpMVCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mvMapped);
+			if (SUCCEEDED(mvHr)) {
+				memcpy(mvMapped.pData, &mvcb, sizeof(mvcb));
+				ctx->Unmap(m_warpMVCB, 0);
+			}
+		}
+
+		ctx->CSSetShader(m_simpleWarpCS, nullptr, 0);
+		ID3D11ShaderResourceView* simpSRVs[5] = {
+		    m_srvColor[slot][eye], mvSRV, m_srvDepth[slot][eye],
+		    frameNColorSRV, frameNDepthSRV
+		};
+		ctx->CSSetShaderResources(0, 5, simpSRVs);
+		ID3D11UnorderedAccessView* simpUAVs[2] = { m_uavOutput[eye], m_uavWarpMV[eye] };
+		ctx->CSSetUnorderedAccessViews(0, 2, simpUAVs, nullptr);
+		ID3D11Buffer* simpCBs[2] = { m_constantBuffer, m_warpMVCB };
+		ctx->CSSetConstantBuffers(0, 2, simpCBs);
 		ctx->CSSetSamplers(0, 1, &m_linearSampler);
 		ctx->Dispatch(groupsX, groupsY, 1);
 		// Unbind and return
-		ID3D11ShaderResourceView* nullSRVs[3] = {};
-		ID3D11UnorderedAccessView* nullUAVs[1] = {};
-		ctx->CSSetShaderResources(0, 3, nullSRVs);
-		ctx->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
+		ID3D11ShaderResourceView* nullSRVs[5] = {};
+		ID3D11UnorderedAccessView* nullUAVs[2] = {};
+		ctx->CSSetShaderResources(0, 5, nullSRVs);
+		ctx->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
 		ctx->CSSetShader(nullptr, nullptr, 0);
+
+		// Mark warp MV texture valid for DLSS callback; remember current pose/conf
+		// for next warp's MV computation.
+		m_warpMVValid[eye].store(mvcb.hasWarpMV != 0, std::memory_order_release);
+		m_prevWarpPoseForMV[eye] = newPose;
+		m_prevMvConfidenceForMV[eye] = cb.mvConfidence;
+		m_hasPrevWarpPoseForMV[eye] = true;
+
 		ctx->Release();
 		return true;
 	}
+
+	ctx->Release();
+	return false;
+
 	// Forward scatter pipeline: each SOURCE pixel projects to its destination.
 	// Depth test via InterlockedMin ensures closest pixel wins (tree over sky).
 	// This naturally handles locomotion disocclusion without expensive searches.
-	else if (m_clearCS && m_forwardDepthCS && m_forwardColorCS && m_dilateCS && useForwardScatterForMotion) {
+	if (false && m_clearCS && m_forwardDepthCS && m_forwardColorCS && m_dilateCS && useForwardScatterForMotion) {
 		// Pass 0: clear output + atomic depth
 		ctx->CSSetShader(m_clearCS, nullptr, 0);
 		ctx->Dispatch(groupsX, groupsY, 1);
@@ -3386,8 +3755,6 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 		    m_outputWidth, 0, 0, m_warpedOutput[1], 0, nullptr);
 	}
 
-	ctx->Flush();
-
 	XrSwapchainImageReleaseInfo relInfo = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 	xrReleaseSwapchainImage(m_outputSwapchain, &relInfo);
 
@@ -3412,7 +3779,6 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 					    0, 0, 0, m_cachedDepth[slot][0], 0, &depthBox);
 					ctx->CopySubresourceRegion(depthTarget, 0,
 					    m_outputWidth, 0, 0, m_cachedDepth[slot][1], 0, &depthBox);
-					ctx->Flush();
 				}
 				XrSwapchainImageReleaseInfo depthRel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 				xrReleaseSwapchainImage(m_depthSwapchain, &depthRel);
@@ -3544,7 +3910,13 @@ void ASWProvider::Shutdown()
 			m_warpedOutput[i]->Release();
 			m_warpedOutput[i] = nullptr;
 		}
+		if (m_srvWarpMV[i]) { m_srvWarpMV[i]->Release(); m_srvWarpMV[i] = nullptr; }
+		if (m_uavWarpMV[i]) { m_uavWarpMV[i]->Release(); m_uavWarpMV[i] = nullptr; }
+		if (m_warpMVTex[i]) { m_warpMVTex[i]->Release(); m_warpMVTex[i] = nullptr; }
+		m_warpMVValid[i].store(false, std::memory_order_release);
+		m_hasPrevWarpPoseForMV[i] = false;
 	}
+	if (m_warpMVCB) { m_warpMVCB->Release(); m_warpMVCB = nullptr; }
 	for (uint32_t slot = 0; slot < kAswCacheSlotCount; ++slot) {
 		for (int eye = 0; eye < 2; ++eye) {
 			if (m_srvDepth[slot][eye]) {
@@ -3612,6 +3984,7 @@ void ASWProvider::Shutdown()
 	if (m_npcDepthScatterCS) { m_npcDepthScatterCS->Release(); m_npcDepthScatterCS = nullptr; }
 	if (m_depthPreScatterCS) { m_depthPreScatterCS->Release(); m_depthPreScatterCS = nullptr; }
 	if (m_legacyWarpCS) { m_legacyWarpCS->Release(); m_legacyWarpCS = nullptr; }
+	if (m_simpleWarpCS) { m_simpleWarpCS->Release(); m_simpleWarpCS = nullptr; }
 	if (m_blurVoidsCS) { m_blurVoidsCS->Release(); m_blurVoidsCS = nullptr; }
 	if (m_handCompositeCS) { m_handCompositeCS->Release(); m_handCompositeCS = nullptr; }
 

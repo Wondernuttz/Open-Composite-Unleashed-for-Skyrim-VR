@@ -236,6 +236,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, fsr3ReactivenessScale);
 		CFGOPT(float, fsr3AccumulationPerFrame);
 		CFGOPT(float, fsr3MinDisocclusionAccumulation);
+		CFGOPT(float, fsr3VelocityFactor);
 		CFGOPT(float, fsr3ReactiveBase);
 		CFGOPT(float, fsr3ReactiveEdgeBoost);
 		CFGOPT(float, fsr3ReactiveDepthFalloffStart);
@@ -243,6 +244,9 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(bool, fsr3CameraMV);
 		CFGOPT(float, fsr3ViewToMeters);
 		CFGOPT(int, fsr3DebugMode);
+		CFGOPT(bool, fsr3PostAAEnabled);
+		CFGOPT(float, fsr3PostAALambda);
+		CFGOPT(float, fsr3PostAAEpsilon);
 		CFGOPT(bool, motionVectorsEnabled);
 		CFGOPT(float, motionVectorScale);
 		CFGOPT(bool, actorMV);
@@ -261,6 +265,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(int, aswDebugMode);
 		CFGOPT(bool, aswCaptureEnabled);
 		CFGOPT(bool, aswForceLegacy);
+		CFGOPT(bool, aswExperimentalMode);
 		CFGOPT(bool, aswConcurrentFrameThread);
 		CFGOPT(bool, aswSpeculativeTrackingLead);
 		CFGOPT(bool, aswBufferEnabled);

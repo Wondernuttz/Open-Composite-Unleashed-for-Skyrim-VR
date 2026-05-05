@@ -97,6 +97,7 @@ public:
 	inline float Fsr3ReactivenessScale() const { return fsr3ReactivenessScale; }
 	inline float Fsr3AccumulationPerFrame() const { return fsr3AccumulationPerFrame; }
 	inline float Fsr3MinDisocclusionAccumulation() const { return fsr3MinDisocclusionAccumulation; }
+	inline float Fsr3VelocityFactor() const { return fsr3VelocityFactor; }
 	inline float Fsr3ReactiveBase() const { return fsr3ReactiveBase; }
 	inline float Fsr3ReactiveEdgeBoost() const { return fsr3ReactiveEdgeBoost; }
 	inline float Fsr3ReactiveDepthFalloffStart() const { return fsr3ReactiveDepthFalloffStart; }
@@ -104,6 +105,9 @@ public:
 	inline bool Fsr3CameraMV() const { return fsr3CameraMV; }
 	inline float Fsr3ViewToMeters() const { return fsr3ViewToMeters; }
 	inline int Fsr3DebugMode() const { return fsr3DebugMode; }
+	inline bool Fsr3PostAAEnabled() const { return fsr3PostAAEnabled; }
+	inline float Fsr3PostAALambda() const { return fsr3PostAALambda; }
+	inline float Fsr3PostAAEpsilon() const { return fsr3PostAAEpsilon; }
 
 	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
 	inline bool  DlssEnabled()        const { return dlssEnabled; }
@@ -125,7 +129,7 @@ public:
 
 	// OCU ASW — Asynchronous SpaceWarp
 	inline bool ASWEnabled() const { return aswEnabled; }
-	inline bool ASWForceCustom() const { return aswForceCustom; } // true = always use custom ASW, false = prefer runtime (XR_FB_space_warp)
+	inline bool ASWForceCustom() const { return aswForceCustom; } // Deprecated: ASW always uses OCU PC-side legacy/simple modes
 	inline float ASWWarpStrength() const { return aswWarpStrength; }
 	inline float ASWRotationScale() const { return aswRotationScale; }
 	inline float ASWTranslationScale() const { return aswTranslationScale; }
@@ -173,7 +177,8 @@ public:
 	float aswMVPixelScale = 1.0f;    // overall MV magnitude multiplier (1.0 = identity)
 	int aswDebugMode = 0;            // 0=normal, 1=depth viz, 2=linearized depth, 3=MV magnitude, 50=black warp frame, 56=stationary NPC dest-depth reject, 57=stationary NPC path overview
 	bool aswCaptureEnabled = false;  // true = capture warp diagnostics (color/depth/MV/CB) to TestWarp folder
-	bool aswForceLegacy = false;     // true = legacy ASW (translation-only parallax, no MV/scatter/disocclusion)
+	bool aswForceLegacy = false;     // Deprecated: Alpha legacy ASW is now the default when aswExperimentalMode=false
+	bool aswExperimentalMode = false; // true = experimental ASW: single-pass parallax + game MV residual correction + depth-based FP mask + frame-N disocclusion fallback
 
 private:
 	static int ini_handler(
@@ -257,20 +262,24 @@ private:
 	// FSR upscaling
 	bool fsrEnabled = false;
 	float fsrRenderScale = 0.77f;   // 0.5 - 1.0, lower = more GPU savings
-	float fsr3Sharpness = 0.3f;     // 0.0 - 1.0, FSR3 built-in RCAS sharpness
+	float fsr3Sharpness = 0.2f;     // 0.0 - 1.0, FSR3 built-in RCAS sharpness
 	float fsr3JitterScale = 0.3f;   // 0.0 - 1.0, jitter amplitude (lower = more stable, higher = better temporal AA)
 	bool fsr3JitterCancellation = false; // Camera MVs cancel jitter in shader; game MVs don't include jitter
-	float fsr3ShadingChangeScale = 2.0f; // Higher = more reactive to shading changes (reduces ghosting on trees)
-	float fsr3ReactivenessScale = 2.0f; // Multiplier on reactive mask values (higher = more aggressive ghosting reduction)
-	float fsr3AccumulationPerFrame = 0.5f; // Lower = less ghosting but more flicker on thin geometry (0.0-1.0)
-	float fsr3MinDisocclusionAccumulation = -0.333f; // Higher = less flicker on swaying thin objects (-1.0 to 1.0)
-	float fsr3ReactiveBase = 0.45f;    // Depth-edge reactive mask baseline (reduces thin-geometry ghosting)
-	float fsr3ReactiveEdgeBoost = 0.90f; // Extra reactiveness at depth edges (tree silhouettes, thin geometry)
+	float fsr3ShadingChangeScale = 1.0f; // Higher = more reactive to shading changes (reduces ghosting on trees)
+	float fsr3ReactivenessScale = 1.0f; // Multiplier on reactive mask values (higher = more aggressive ghosting reduction)
+	float fsr3AccumulationPerFrame = 0.8f; // Lower = less ghosting but more flicker on thin geometry (0.0-1.0)
+	float fsr3MinDisocclusionAccumulation = 0.333f; // Higher = less flicker on swaying thin objects (-1.0 to 1.0)
+	float fsr3VelocityFactor = 1.0f; // 0.0 = improve temporal stability of bright pixels (FFX default 1.0)
+	float fsr3ReactiveBase = 0.05f;    // Depth-edge reactive mask baseline (reduces thin-geometry ghosting)
+	float fsr3ReactiveEdgeBoost = 0.20f; // Extra reactiveness at depth edges (tree silhouettes, thin geometry)
 	float fsr3ReactiveDepthFalloffStart = 0.95f; // Depth where reactive mask begins fading (standard-Z, 0=near 1=far)
 	float fsr3ReactiveDepthFalloffEnd = 0.998f;  // Depth where reactive mask reaches zero (distant mountains/sky)
 	bool fsr3CameraMV = true;          // Camera MVs from depth + view-projection deltas (captures locomotion + head tracking)
 	float fsr3ViewToMeters = 0.01428f;  // Skyrim: ~70 units = 1 meter
-	int fsr3DebugMode = 0;             // 0=off, 1=FSR3 debug overlay, 2=bypass (raw game), 3=depth viz
+	int fsr3DebugMode = 0;             // 0=off, 1=FSR3 debug overlay, 2=bypass, 3=depth, 4=final MV, 5=residual MV, 6=raw bridge MV, 7=bridge fallback mask
+	bool fsr3PostAAEnabled = false;    // Optional post-FSR spatial AA pass for testing foliage shimmer
+	float fsr3PostAALambda = 3.0f;     // Edge sensitivity for FSR3 post-AA
+	float fsr3PostAAEpsilon = 0.10f;   // Luminance threshold for FSR3 post-AA
 
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	bool motionVectorsEnabled = true;
@@ -281,10 +290,10 @@ private:
 
 	// OCU ASW — PC-side Asynchronous SpaceWarp (experimental)
 	bool aswEnabled = false;
-	bool aswForceCustom = false;           // true = always use custom PC-side ASW, false = prefer runtime XR_FB_space_warp if available
+	bool aswForceCustom = false;           // Deprecated: ASW always uses OCU PC-side legacy/simple modes
 	bool aswConcurrentFrameThread = false; // If true, dedicated XR thread owns wait/begin/end in buffered mode
 	bool aswSpeculativeTrackingLead = false; // Diagnostic default: prefer begun-slot sync over speculative +1 period lead
-	bool aswBufferEnabled = true;            // true = async warp worker thread (clean GPU queue), false = inline warp on game thread
+	bool aswBufferEnabled = false;           // false = Alpha-style inline ASW; true = experimental split-frame warp scheduling
 	// NOTE: aswWarpStrength, aswRotationScale, aswTranslationScale, aswDepthScale
 	// are declared in the public section above for hot-reload access
 

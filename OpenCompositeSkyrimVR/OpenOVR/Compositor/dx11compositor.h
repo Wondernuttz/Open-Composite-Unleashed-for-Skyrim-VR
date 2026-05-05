@@ -54,6 +54,14 @@ protected:
 	uint32_t dlaaWidth = 0;
 	uint32_t dlaaHeight = 0;
 
+	// FSR3 post-AA source SRVs. Cached because the FSR3 output texture is stable
+	// until the upscaler is recreated.
+	ID3D11Texture2D* fsr3PostAASrcTex[2] = {};
+	ID3D11ShaderResourceView* fsr3PostAASrcSRV[2] = {};
+	ID3D11ShaderResourceView* GetOrCreateFsr3PostAASRV(int eyeIdx, ID3D11Texture2D* src);
+	void ReleaseFsr3PostAASRVs();
+	bool ApplyFsr3PostAA(ID3D11Texture2D* src, int eyeIdx, int currentIndex, uint32_t width, uint32_t height);
+
 	// Cached game texture SRV (avoids per-frame CreateShaderResourceView/Release)
 	ID3D11ShaderResourceView* cachedSrcSRV = nullptr;
 	ID3D11Texture2D* cachedSrcTex = nullptr;

@@ -354,10 +354,9 @@ public:
 		return (slot >= 0 && eye >= 0 && eye < 2) ? m_slotPose[slot][eye] : XrPosef{};
 	}
 
-	/// Predicted pose used for the last precomputed warp (set in WarpFrame).
-	/// The warp shader applies poseDelta rotation from cached→predicted, so the
-	/// output content is at this orientation. Declare this in the composition layer
-	/// for a smaller ATW correction (~7ms vs ~29ms from cached pose).
+	/// Composition pose for the last warped output (set in WarpFrame).
+	/// Legacy mode uses the cached pose so runtime ATW handles rotation; simple
+	/// mode uses the predicted pose because its shader applies poseDelta rotation.
 	XrPosef GetPrecompPose(int eye) const {
 		return (eye >= 0 && eye < 2) ? m_precompPose[eye] : XrPosef{};
 	}
@@ -501,6 +500,7 @@ private:
 	ID3D11ComputeShader* m_depthPreScatterCS = nullptr; // CSDepthPreScatter (warp depth forward for leading edges)
 	ID3D11ComputeShader* m_blurVoidsCS = nullptr;      // CSBlurVoids (post-fill blur within void zones)
 	ID3D11ComputeShader* m_legacyWarpCS = nullptr;     // Legacy backward-warp-only shader
+	ID3D11ComputeShader* m_simpleWarpCS = nullptr;     // Simple ASW: parallax + game MVs + depth FP mask + frame-N disocclusion fallback
 	ID3D11Buffer* m_constantBuffer = nullptr;
 	ID3D11SamplerState* m_linearSampler = nullptr;
 
@@ -532,6 +532,27 @@ private:
 	ID3D11Texture2D* m_forwardNpcOutput[2] = {};
 	ID3D11UnorderedAccessView* m_uavForwardNpcOutput[2] = {};
 	ID3D11ShaderResourceView* m_srvForwardNpcOutput[2] = {};
+
+	// Simple-mode warp-to-warp MV output for DLSS temporal accumulation.
+	// Written by the simple warp shader (u1), consumed by DlssWarpUpscaleCallback.
+	ID3D11Texture2D* m_warpMVTex[2] = {};
+	ID3D11UnorderedAccessView* m_uavWarpMV[2] = {};
+	ID3D11ShaderResourceView*  m_srvWarpMV[2] = {};
+	ID3D11Buffer* m_warpMVCB = nullptr;
+	XrPosef m_prevWarpPoseForMV[2] = {};
+	bool    m_hasPrevWarpPoseForMV[2] = {};
+	float   m_prevMvConfidenceForMV[2] = {};
+	std::atomic<bool> m_warpMVValid[2]{ {false}, {false} };
+
+public:
+	// For DlssWarpUpscaleCallback: returns the simple-shader-produced warp-to-warp MV
+	// texture (prevUV - curUV, UV-space, R16G16_FLOAT) if it was written this warp cycle,
+	// else nullptr. Callers should fall back to computing MVs themselves when nullptr.
+	ID3D11Texture2D* GetWarpMVTex(int eye) const {
+		if (eye < 0 || eye > 1) return nullptr;
+		return m_warpMVValid[eye].load(std::memory_order_acquire) ? m_warpMVTex[eye] : nullptr;
+	}
+private:
 
 	// Stereo-combined XR swapchain for warped output (both eyes side-by-side)
 	XrSwapchain m_outputSwapchain = {};
@@ -636,5 +657,14 @@ private:
 		int fpBoxCount;                // Number of valid screen-space FP bounding boxes          — 4 bytes
 		float _padBoxes[3];            // alignment to 16 bytes                                  — 12 bytes
 	};                                 //                         total: 880 bytes
+
+	// Second constant buffer (b1) for simple-mode warp-to-warp MV output.
+	// Kept separate from WarpConstants so the extension is localized.
+	struct WarpMVConstants {
+		float warpToPrevMatrix[16]; // 64  — cur-warp view → prev-warp view, Z-flipped
+		float mvDeltaConf;          // 4   — prev mvConfidence − cur mvConfidence
+		int   hasWarpMV;            // 4   — 1 = valid prev warp state, 0 = first frame
+		float _pad[2];              // 8   — pad to 80 bytes (16-byte aligned)
+	};
 
 };
