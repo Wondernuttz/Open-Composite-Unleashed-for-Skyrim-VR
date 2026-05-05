@@ -147,6 +147,41 @@ static string parse_string(string orig, string name, int line)
 	return result;
 }
 
+static int parse_dlss_model(string model)
+{
+	if (model.empty() || model == "default" || model == "auto" || model == "0" || model == "off") {
+		return 0;
+	}
+	if (model == "j" || model == "10") {
+		return 10;
+	}
+	if (model == "k" || model == "11") {
+		return 11;
+	}
+	if (model == "l" || model == "12") {
+		return 12;
+	}
+	if (model == "m" || model == "13") {
+		return 13;
+	}
+
+	string err = "Value " + model + " for dlssModel is invalid. Use default/auto/0 or J/K/L/M";
+	ABORT(err);
+	return 0;
+}
+
+static const char* dlss_model_name(int model)
+{
+	switch (model) {
+	case 0: return "Default";
+	case 10: return "J";
+	case 11: return "K";
+	case 12: return "L";
+	case 13: return "M";
+	default: return "Invalid";
+	}
+}
+
 int Config::ini_handler(void* user, const char* pSection,
     const char* pName, const char* pValue,
     int lineno)
@@ -292,6 +327,11 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(bool, vrsFavorHorizontal);
 		CFGOPT(bool, dlssEnabled);
 		CFGOPT(int, dlssPreset);
+		CFGOPT(float, dlssRenderScaleOverride);
+		CFGOPT(string, dlssModel);
+		CFGOPT(int, dlssRenderPreset);
+		CFGOPT(int, dlssModeOverride);
+		CFGOPT(bool, dlssNgxVerboseLogging);
 		CFGOPT(float, dlssSharpness);
 		CFGOPT(float, dlssMvScale);
 		CFGOPT(float, dlssBiasBase);
@@ -341,6 +381,10 @@ static float dlss_preset_render_scale(int preset)
 		return 0.50f; // Performance
 	case 3:
 		return 0.33f; // Ultra Performance
+	case 4:
+		return 1.0f; // DLAA / native AA
+	case 5:
+		return 0.77f; // Ultra Quality
 	default:
 		OOVR_LOGF("DLSS: Unknown preset %d, defaulting render scale to Quality", preset);
 		return 0.67f;
@@ -456,8 +500,21 @@ Config::Config()
 
 	if (dlssEnabled && !fsrEnabled) {
 		fsrRenderScale = dlss_preset_render_scale(dlssPreset);
-		OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",
-		    dlssPreset, fsrRenderScale);
+		if (dlssRenderScaleOverride > 0.0f) {
+			float clampedScale = std::max(0.33f, std::min(1.0f, dlssRenderScaleOverride));
+			OOVR_LOGF("DLSS: render scale override %.2f -> %.2f (preset %d)",
+			    dlssRenderScaleOverride, clampedScale, dlssPreset);
+			fsrRenderScale = clampedScale;
+		} else {
+			OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",
+			    dlssPreset, fsrRenderScale);
+		}
+	}
+
+	if (!dlssModel.empty()) {
+		dlssRenderPreset = parse_dlss_model(dlssModel);
+		OOVR_LOGF("DLSS: model override %s -> render preset hint %s(%d)",
+		    dlssModel.c_str(), dlss_model_name(dlssRenderPreset), dlssRenderPreset);
 	}
 
 	// DLAA via NVIDIA DLSS: when dlaaEnabled=true, enable DLSS in DLAA mode (preset 4).

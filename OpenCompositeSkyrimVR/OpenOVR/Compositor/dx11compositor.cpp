@@ -255,6 +255,7 @@ static float s_fsr3CameraFovY = 1.57f; // Radians, updated from XR view each fra
 static bool s_fsr3FirstDispatch = true;
 static float s_fsr3RenderJitterX = 0.0f; // Jitter that was applied to current frame's rendering
 static float s_fsr3RenderJitterY = 0.0f;
+static uint8_t s_temporalJitterSubmittedEyeMask = 0;
 static uint32_t s_fsr3ViewportW = 0; // FSR3 output viewport (for crop when swapchain > output)
 static uint32_t s_fsr3ViewportH = 0;
 
@@ -2680,6 +2681,7 @@ int g_fsr3JitterPhaseCount = 0;
 // Camera near/far — captured from game's GetProjectionMatrix in XrHMD.cpp
 float g_fsr3CameraNear = 5.0f;
 float g_fsr3CameraFar = 100000.0f;
+
 #endif // defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 
 #ifdef OC_HAS_FSR3
@@ -6181,16 +6183,17 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		}
 
 
-		// Save jitter and camera FOV on left eye (once per stereo frame).
+		// Save jitter and camera FOV for the current submitted eye.
 		// IMPORTANT: Do NOT compute next-frame jitter here — right eye's GetProjectionRaw
 		// hasn't been called yet and would pick up the wrong (next) jitter value.
-		if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady() && eye == XruEyeLeft) {
+		if (s_fsr3Upscaler && s_fsr3Upscaler->IsReady()) {
 			// No jitter on main menu / loading screen — spatial-only upscale (reset=true)
 			if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
 				g_fsr3JitterEnabled = false;
+				s_temporalJitterSubmittedEyeMask = 0;
 			} else {
 				// Save the jitter that was applied to THIS frame's rendering
-				// (g_fsr3JitterX/Y were set after the PREVIOUS frame's right eye submit)
+				// (g_fsr3JitterX/Y advance after the previous complete stereo frame)
 				s_fsr3RenderJitterX = g_fsr3JitterX;
 				s_fsr3RenderJitterY = g_fsr3JitterY;
 #if FSR3_BYPASS_FOR_DIAG
@@ -6206,6 +6209,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	} else if (!oovr_global_configuration.DlssEnabled()) {
 		// Only disable jitter if DLSS isn't handling it either
 		g_fsr3JitterEnabled = false;
+		s_temporalJitterSubmittedEyeMask = 0;
 	}
 #endif
 
@@ -6213,17 +6217,19 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	// ── DLSS: save jitter and enable on left eye ──
 	if (oovr_global_configuration.DlssEnabled()
 	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)
-	    && s_dlssUpscaler && s_dlssUpscaler->IsReady() && eye == XruEyeLeft) {
+	    && s_dlssUpscaler && s_dlssUpscaler->IsReady()) {
 		if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
 			g_fsr3JitterEnabled = false;
+			s_temporalJitterSubmittedEyeMask = 0;
 		} else {
 			s_fsr3RenderJitterX = g_fsr3JitterX;
 			s_fsr3RenderJitterY = g_fsr3JitterY;
 			g_fsr3JitterEnabled = true;
 		}
-	} else if (!oovr_global_configuration.FsrEnabled() && eye == XruEyeLeft
+	} else if (!oovr_global_configuration.FsrEnabled()
 	    && !(s_dlssUpscaler && s_dlssUpscaler->IsReady())) {
 		g_fsr3JitterEnabled = false;
+		s_temporalJitterSubmittedEyeMask = 0;
 	}
 
 	// ── DLSS 4: lazy-init upscaler ──
@@ -6852,16 +6858,18 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	}
 
 #if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
-	// After right eye: compute NEXT frame's jitter and increment frame counter.
+	// After both eyes: compute NEXT frame's jitter and increment frame counter.
 	// This must happen AFTER both eyes have rendered and dispatched with the current jitter.
 	// Previously this was in the left-eye block, which caused the right eye to pick up
 	// the wrong (next-frame) jitter in GetProjectionRaw — producing temporal instability.
-	if (g_fsr3JitterEnabled && eye == XruEyeRight) {
-		auto* src = (ID3D11Texture2D*)texture->handle;
-		D3D11_TEXTURE2D_DESC srcDesc;
-		src->GetDesc(&srcDesc);
-		uint32_t renderW = ptrBounds ? srcDesc.Width / 2 : srcDesc.Width;
-		uint32_t displayW = xr_main_view(XruEyeLeft).recommendedImageRectWidth;
+	if (g_fsr3JitterEnabled) {
+		s_temporalJitterSubmittedEyeMask |= (uint8_t)(1u << s_currentEyeIdx);
+		if ((s_temporalJitterSubmittedEyeMask & 0x3u) == 0x3u) {
+			auto* src = (ID3D11Texture2D*)texture->handle;
+			D3D11_TEXTURE2D_DESC srcDesc;
+			src->GetDesc(&srcDesc);
+			uint32_t renderW = ptrBounds ? srcDesc.Width / 2 : srcDesc.Width;
+			uint32_t displayW = xr_main_view(XruEyeLeft).recommendedImageRectWidth;
 
 #ifdef OC_HAS_FSR3
 		g_fsr3JitterPhaseCount = Fsr3Upscaler::GetJitterPhaseCount(renderW, displayW);
@@ -6883,6 +6891,8 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		g_fsr3JitterX *= jScale;
 		g_fsr3JitterY *= jScale;
 		g_fsr3FrameIndex++;
+			s_temporalJitterSubmittedEyeMask = 0;
+		}
 	}
 #endif
 
