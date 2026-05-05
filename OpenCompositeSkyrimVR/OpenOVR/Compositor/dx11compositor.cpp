@@ -1932,6 +1932,43 @@ static bool GenerateReactiveMask(ID3D11DeviceContext* context, ID3D11ShaderResou
 	return true;
 }
 
+static ID3D11Texture2D* GenerateASWWarpReactiveMask(ID3D11Device* device,
+    ID3D11DeviceContext* context, ID3D11Texture2D* depthR32F,
+    ID3D11Texture2D* warpedColor, uint32_t width, uint32_t height,
+    bool dlssBias)
+{
+	if (!oovr_global_configuration.ASWUpscalerReactiveMask()
+	    || !device || !context || !depthR32F || !warpedColor)
+		return nullptr;
+	if (!EnsureReactiveMaskResources(device, width, height))
+		return nullptr;
+
+	ID3D11ShaderResourceView* depthSRV = GetOrCreateReactiveMaskDepthSRV(device, depthR32F);
+	if (!depthSRV)
+		return nullptr;
+	ID3D11ShaderResourceView* colorSRV = GetOrCreateReactiveMaskColorSRV(device, warpedColor);
+
+	const float base = dlssBias ? oovr_global_configuration.DlssBiasBase()
+	                            : oovr_global_configuration.Fsr3ReactiveBase();
+	const float edgeBoost = dlssBias ? oovr_global_configuration.DlssBiasEdgeBoost()
+	                                 : oovr_global_configuration.Fsr3ReactiveEdgeBoost();
+	const float depthFalloffStart = dlssBias ? oovr_global_configuration.DlssBiasDepthFalloffStart()
+	                                         : oovr_global_configuration.Fsr3ReactiveDepthFalloffStart();
+	const float depthFalloffEnd = dlssBias ? oovr_global_configuration.DlssBiasDepthFalloffEnd()
+	                                       : oovr_global_configuration.Fsr3ReactiveDepthFalloffEnd();
+	const float colorBoost = dlssBias ? 0.0f : oovr_global_configuration.Fsr3ReactiveColorBoost();
+
+	GenerateReactiveMask(context, depthSRV, colorSRV,
+	    width, height, width, height, 0, 0,
+	    base, edgeBoost, 0.005f, 30.0f,
+	    colorBoost,
+	    oovr_global_configuration.Fsr3ReactiveColorThreshold(),
+	    oovr_global_configuration.Fsr3ReactiveColorScale(),
+	    depthFalloffStart, depthFalloffEnd);
+
+	return s_reactiveMaskTex;
+}
+
 // ── Camera MV matrix helpers + generation ──
 // All matrices are column-major float[16]: m[col*4 + row]
 
@@ -2650,8 +2687,8 @@ static DlssUpscaler* s_dlssUpscaler = nullptr;
 
 /// Callback for ASWProvider::SubmitWarpedOutput — runs DLSS spatial upscaling on
 /// the render-res warp output so every displayed frame goes through DLSS.
-/// Uses separate warp NGX handles (indices 2-3) with reset=true to avoid
-/// corrupting the game DLSS temporal accumulation history.
+/// Uses separate warp NGX handles (indices 2-3) so ASW frames cannot corrupt
+/// the game DLSS temporal accumulation history.
 // ── Warp DLSS: VP matrix construction from OpenXR pose + FOV ──
 
 // Build a column-major 4x4 view-projection matrix from XrPosef + XrFovf.
@@ -2894,8 +2931,9 @@ static bool DlssWarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p, ID3
 
 	// Warp jitter: zero. The warp shader doesn't apply sub-pixel jitter to its output,
 	// so telling DLSS about fake jitter would cause it to misalign temporal history.
-	// Warp DLSS accumulates center-sampled frames (no sub-pixel diversity, but cleaner
-	// than reset=true spatial-only since it can average noise across frames).
+	// Warp DLSS normally accumulates center-sampled frames (no sub-pixel diversity).
+	// aswUpscalerReset can force spatial-only warp upscaling when this separate
+	// history causes trails on thin alpha-tested geometry.
 	float warpJitterX = 0.0f, warpJitterY = 0.0f;
 
 	// 2. Get warp MVs. Prefer the simple-mode shader-produced texture (which
@@ -2932,7 +2970,10 @@ static bool DlssWarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p, ID3
 		mvTex = s_cameraMVTex;
 	}
 
-	// 3. Dispatch DLSS — warp handles, independent temporal accumulation
+	ID3D11Texture2D* warpBiasMask = GenerateASWWarpReactiveMask(dev, p.ctx,
+	    p.cachedDepth, p.warpedColor, p.renderW, p.renderH, true);
+
+	// 3. Dispatch DLSS — warp handles, independent from game accumulation
 	DlssUpscaler::DispatchParams params = {};
 	params.color = p.warpedColor;
 	params.colorSourceRegion = nullptr;
@@ -2950,19 +2991,35 @@ static bool DlssWarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p, ID3
 	params.cameraNear = p.nearZ;
 	params.cameraFar = p.farZ;
 	params.sharpness = oovr_global_configuration.DlssSharpness();
-	// Reset on first warp frame only when we had to fall back (no valid prev pose
-	// AND we're using the fallback MV path). When ASW provides MVs the shader's
-	// own hasWarpMV flag handles first-frame zero output, so no reset is needed.
-	params.reset = !hasValidMVs && !aswProvidedMVs;
+	// Optional spatial-only ASW upscaler mode. Synthetic ASW frames do not have
+	// the same jittered source history as real game frames, so accumulated warp
+	// history can drift on thin alpha-tested foliage while moving.
+	params.reset = oovr_global_configuration.ASWUpscalerReset()
+	    || (!hasValidMVs && !aswProvidedMVs);
 	params.mvScaleX = (float)p.renderW;
 	params.mvScaleY = (float)p.renderH;
-	params.biasMask = nullptr;
+	params.biasMask = warpBiasMask;
 	params.biasMaskSourceRegion = nullptr;
 	params.debugMode = 0;
 
 	dev->Release();
 
-	// Use separate warp DLSS handles (2-3) — independent temporal history from game.
+	if (oovr_global_configuration.ASWUpscalerReset()) {
+		static bool s_loggedReset = false;
+		if (!s_loggedReset) {
+			s_loggedReset = true;
+			OOVR_LOG("ASW: DLSS warp upscaler reset enabled (spatial-only ASW upscaling)");
+		}
+	}
+	if (warpBiasMask) {
+		static bool s_loggedMask = false;
+		if (!s_loggedMask) {
+			s_loggedMask = true;
+			OOVR_LOG("ASW: DLSS warp upscaler edge bias mask enabled");
+		}
+	}
+
+	// Use separate warp DLSS handles (2-3) — independent from game history.
 	if (!s_dlssUpscaler->DispatchWarp(p.eye, p.ctx, params)) {
 		static int s_warpFail = 0;
 		if (s_warpFail++ < 5)
@@ -2977,7 +3034,7 @@ static bool DlssWarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p, ID3
 #endif
 
 #ifdef OC_HAS_FSR3
-// FSR3 warp upscale callback — separate temporal ASW history, matching the DLSS callback model.
+// FSR3 warp upscale callback — separate ASW history, matching the DLSS callback model.
 static bool Fsr3WarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p,
     ID3D11Texture2D** outResult)
 {
@@ -3031,6 +3088,9 @@ static bool Fsr3WarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p,
 		mvTex = s_cameraMVTex;
 	}
 
+	ID3D11Texture2D* warpReactiveMask = GenerateASWWarpReactiveMask(dev, p.ctx,
+	    p.cachedDepth, p.warpedColor, p.renderW, p.renderH, false);
+
 	Fsr3Upscaler::DispatchParams params = {};
 	params.color = p.warpedColor;
 	params.colorSourceRegion = nullptr;
@@ -3038,6 +3098,8 @@ static bool Fsr3WarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p,
 	params.mvSourceRegion = nullptr;
 	params.depth = p.cachedDepth;
 	params.depthSourceRegion = nullptr;
+	params.reactiveMask = warpReactiveMask;
+	params.reactiveSourceRegion = nullptr;
 	params.jitterX = 0.0f;
 	params.jitterY = 0.0f;
 	params.deltaTimeMs = 11.1f;
@@ -3049,12 +3111,28 @@ static bool Fsr3WarpUpscaleCallback(const ASWProvider::WarpUpscaleParams& p,
 	params.cameraFar = p.farZ;
 	params.cameraFovY = fabsf(p.cachedFov.angleUp) + fabsf(p.cachedFov.angleDown);
 	params.sharpness = oovr_global_configuration.Fsr3Sharpness();
-	params.reset = !hasValidMVs && !aswProvidedMVs;
+	params.reset = oovr_global_configuration.ASWUpscalerReset()
+	    || (!hasValidMVs && !aswProvidedMVs);
 	params.jitterCancellation = false;
 	params.mvScale = 1.0f;
 	params.viewToMeters = oovr_global_configuration.Fsr3ViewToMeters();
 
 	dev->Release();
+
+	if (oovr_global_configuration.ASWUpscalerReset()) {
+		static bool s_loggedReset = false;
+		if (!s_loggedReset) {
+			s_loggedReset = true;
+			OOVR_LOG("ASW: FSR3 warp upscaler reset enabled (spatial-only ASW upscaling)");
+		}
+	}
+	if (warpReactiveMask) {
+		static bool s_loggedMask = false;
+		if (!s_loggedMask) {
+			s_loggedMask = true;
+			OOVR_LOG("ASW: FSR3 warp upscaler reactive mask enabled");
+		}
+	}
 
 	if (!s_fsr3Upscaler->DispatchWarp(p.eye, p.ctx, params)) {
 		static int s_warpFail = 0;

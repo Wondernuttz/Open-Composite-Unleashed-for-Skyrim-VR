@@ -275,6 +275,8 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(bool, aswConcurrentFrameThread);
 		CFGOPT(bool, aswSpeculativeTrackingLead);
 		CFGOPT(bool, aswBufferEnabled);
+		CFGOPT(bool, aswUpscalerReset);
+		CFGOPT(bool, aswUpscalerReactiveMask);
 		CFGOPT(bool, casEnabled);
 		CFGOPT(float, casSharpness);
 		CFGOPT(float, fsrSharpness);

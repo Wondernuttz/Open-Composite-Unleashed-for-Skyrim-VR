@@ -54,7 +54,7 @@ public:
 	/// Returns false on error; GetOutputDX11() returns the upscaled result.
 	bool Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const DispatchParams& params);
 
-	/// Dispatch DLSS for ASW warp output (spatial-only, always reset=true).
+	/// Dispatch DLSS for ASW warp output (separate history; caller controls reset).
 	/// Uses separate NGX handles (indices 2-3) to preserve game temporal history.
 	bool DispatchWarp(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const DispatchParams& params);
 
@@ -83,7 +83,7 @@ private:
 	ID3D11Device* m_device = nullptr;   // NOT owned
 
 	// NGX handles and shared parameter block
-	// [0-1] = game eyes (temporal accumulation), [2-3] = warp eyes (spatial-only, reset=true)
+	// [0-1] = game eyes (temporal accumulation), [2-3] = warp eyes (separate ASW history)
 	static constexpr int kHandleCount = 4;
 	NVSDK_NGX_Handle*    m_handle[kHandleCount]  = {};
 	NVSDK_NGX_Parameter* m_params     = nullptr;

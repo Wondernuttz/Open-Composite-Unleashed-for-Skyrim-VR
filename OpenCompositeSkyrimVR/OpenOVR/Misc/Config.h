@@ -151,6 +151,8 @@ public:
 	inline bool ASWConcurrentFrameThread() const { return aswConcurrentFrameThread; }
 	inline bool ASWSpeculativeTrackingLead() const { return aswSpeculativeTrackingLead; }
 	inline bool ASWBufferEnabled() const { return aswBufferEnabled; }
+	inline bool ASWUpscalerReset() const { return aswUpscalerReset; }
+	inline bool ASWUpscalerReactiveMask() const { return aswUpscalerReactiveMask; }
 
 	// CAS sharpening (RCAS) — independent of FSR
 	inline bool CasEnabled() const { return casEnabled; }
@@ -306,6 +308,8 @@ private:
 	bool aswConcurrentFrameThread = false; // If true, dedicated XR thread owns wait/begin/end in buffered mode
 	bool aswSpeculativeTrackingLead = false; // Diagnostic default: prefer begun-slot sync over speculative +1 period lead
 	bool aswBufferEnabled = false;           // false = Alpha-style inline ASW; true = experimental split-frame warp scheduling
+	bool aswUpscalerReset = false;           // If true, reset DLSS/FSR warp-upscale temporal history each ASW frame
+	bool aswUpscalerReactiveMask = true;     // If true, bias ASW warp-upscale history at warped depth/color edges
 	// NOTE: aswWarpStrength, aswRotationScale, aswTranslationScale, aswDepthScale
 	// are declared in the public section above for hot-reload access
 
