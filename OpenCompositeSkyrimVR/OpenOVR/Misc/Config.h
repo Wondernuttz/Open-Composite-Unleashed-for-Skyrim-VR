@@ -89,6 +89,7 @@ public:
 
 	// FSR upscaling
 	inline bool FsrEnabled() const { return fsrEnabled; }
+	inline bool FsrNativeAA() const { return fsrNativeAA; }
 	inline float FsrRenderScale() const { return fsrRenderScale; }
 	inline float Fsr3Sharpness() const { return fsr3Sharpness; }
 	inline float Fsr3JitterScale() const { return fsr3JitterScale; }
@@ -269,6 +270,7 @@ private:
 
 	// FSR upscaling
 	bool fsrEnabled = false;
+	bool fsrNativeAA = false;       // Run FSR3 at native resolution for temporal AA without upscaling
 	float fsrRenderScale = 0.77f;   // 0.5 - 1.0, lower = more GPU savings
 	float fsr3Sharpness = 0.2f;     // 0.0 - 1.0, FSR3 built-in RCAS sharpness
 	float fsr3JitterScale = 0.3f;   // 0.0 - 1.0, jitter amplitude (lower = more stable, higher = better temporal AA)

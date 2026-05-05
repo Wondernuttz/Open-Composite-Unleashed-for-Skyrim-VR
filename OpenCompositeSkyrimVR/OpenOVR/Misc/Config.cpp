@@ -228,6 +228,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, dlaaLambda);
 		CFGOPT(float, dlaaEpsilon);
 		CFGOPT(bool, fsrEnabled);
+		CFGOPT(bool, fsrNativeAA);
 		CFGOPT(float, fsrRenderScale);
 		CFGOPT(float, fsr3Sharpness);
 		CFGOPT(float, fsr3JitterScale);
@@ -446,6 +447,12 @@ Config::Config()
 	}
 
 	// Post-processing: apply derived config settings after all INI files parsed
+	if (fsrNativeAA) {
+		fsrEnabled = true;
+		fsrRenderScale = 1.0f;
+		OOVR_LOG("FSR3: Native AA enabled (renderScale=1.00)");
+	}
+
 	if (dlssEnabled && !fsrEnabled) {
 		fsrRenderScale = dlss_preset_render_scale(dlssPreset);
 		OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",

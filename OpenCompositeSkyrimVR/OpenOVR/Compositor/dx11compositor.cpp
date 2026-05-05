@@ -2682,6 +2682,33 @@ float g_fsr3CameraNear = 5.0f;
 float g_fsr3CameraFar = 100000.0f;
 #endif // defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 
+#ifdef OC_HAS_FSR3
+static bool Fsr3TemporalRequested()
+{
+	return oovr_global_configuration.FsrEnabled()
+	    && (oovr_global_configuration.FsrRenderScale() < 0.99f
+	        || oovr_global_configuration.FsrNativeAA());
+}
+
+static float Fsr3EffectiveRenderScale()
+{
+	return oovr_global_configuration.FsrNativeAA()
+	    ? 1.0f
+	    : oovr_global_configuration.FsrRenderScale();
+}
+#else
+static bool Fsr3TemporalRequested()
+{
+	return oovr_global_configuration.FsrEnabled()
+	    && oovr_global_configuration.FsrRenderScale() < 0.99f;
+}
+
+static float Fsr3EffectiveRenderScale()
+{
+	return oovr_global_configuration.FsrRenderScale();
+}
+#endif
+
 #ifdef OC_HAS_DLSS
 static DlssUpscaler* s_dlssUpscaler = nullptr;
 
@@ -3787,8 +3814,7 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 	}
 
 	// ── FSR: determine output dimensions (skip for overlay textures) ──
-	bool fsrActive = fsrReady && oovr_global_configuration.FsrEnabled()
-	    && oovr_global_configuration.FsrRenderScale() < 0.99f && !cube && !isOverlay;
+	bool fsrActive = fsrReady && Fsr3TemporalRequested() && !cube && !isOverlay;
 #ifdef OC_HAS_FSR3
 	// FSR 3 can handle stereo-combined textures (bounds present); FSR 1 cannot
 	if (fsrActive && bounds) {
@@ -3815,7 +3841,7 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 	if (fsrActive || dlssNeedsInflation) {
 		// FSR / DLSS: inflate swapchain to display resolution so the
 		// upscaler has room to write the full-res output.
-		float invScale = 1.0f / std::max(0.5f, oovr_global_configuration.FsrRenderScale());
+		float invScale = 1.0f / std::max(0.5f, Fsr3EffectiveRenderScale());
 		outWidth = (uint32_t)(srcDesc.Width * invScale);
 		outHeight = (uint32_t)(srcDesc.Height * invScale);
 	}
@@ -3846,8 +3872,9 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 		OOVR_LOGF("Texture desc width: %d", srcDesc.Width);
 		OOVR_LOGF("Texture desc height: %d", srcDesc.Height);
 		if (fsrActive || dlssNeedsInflation)
-			OOVR_LOGF("%s output: %dx%d (scale %.2f)", dlssNeedsInflation ? "DLSS" : "FSR",
-			    outWidth, outHeight, oovr_global_configuration.FsrRenderScale());
+			OOVR_LOGF("%s output: %dx%d (scale %.2f%s)", dlssNeedsInflation ? "DLSS" : "FSR",
+			    outWidth, outHeight, Fsr3EffectiveRenderScale(),
+			    oovr_global_configuration.FsrNativeAA() ? ", native AA" : "");
 
 		// ClearState unbinds all SRVs/RTVs/UAVs from the pipeline, releasing the
 		// NVIDIA driver's internal tracking references to our textures. Without
@@ -4322,7 +4349,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		const int fsr3DbgMode = oovr_global_configuration.Fsr3DebugMode();
 		if (fsr3DbgMode != 0
 		    && oovr_global_configuration.FsrEnabled()
-		    && oovr_global_configuration.FsrRenderScale() < 0.99f
+		    && Fsr3TemporalRequested()
 		    && !isOverlay) {
 			const bool upscalerReady = s_fsr3Upscaler && s_fsr3Upscaler->IsReady();
 			const bool bridgeReady = s_pBridge && s_pBridge->status == 1;
@@ -4412,7 +4439,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	    && ValidateBridgeTexture(reinterpret_cast<void*>(s_pBridge->mvTexture), "MV")
 	    && oovr_global_configuration.MotionVectorsEnabled()
 	    && oovr_global_configuration.FsrEnabled()
-	    && oovr_global_configuration.FsrRenderScale() < 0.99f
+	    && Fsr3TemporalRequested()
 	    && !isOverlay && !swapchain_rtvs.empty()) {
 
 		{
@@ -4918,7 +4945,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 				fsr3Params.deltaTimeMs = deltaMs;
 				fsr3Params.renderWidth = perEyeRenderW;
 				fsr3Params.renderHeight = perEyeRenderH;
-				float fsr3InvScale = 1.0f / std::max(0.5f, oovr_global_configuration.FsrRenderScale());
+				float fsr3InvScale = 1.0f / std::max(0.5f, Fsr3EffectiveRenderScale());
 				uint32_t perEyeDisplayW = (uint32_t)(perEyeRenderW * fsr3InvScale);
 				uint32_t perEyeDisplayH = (uint32_t)(perEyeRenderH * fsr3InvScale);
 				perEyeDisplayW = std::min(perEyeDisplayW, (uint32_t)createInfo.width);
@@ -6139,7 +6166,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 #ifdef OC_HAS_FSR3
 	// ── FSR 3: lazy-init upscaler and update per-frame jitter ──
-	if (oovr_global_configuration.FsrEnabled() && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+	if (Fsr3TemporalRequested()) {
 		// Try to open the SKSE render target bridge (MV + depth)
 		OpenRenderTargetBridge();
 
@@ -6232,16 +6259,17 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				uint32_t aswEyeH = renderEyeH;
 
 				// If an upscaler is active, initialize ASW at display resolution
-				float renderScale = oovr_global_configuration.FsrRenderScale();
+				float renderScale = Fsr3EffectiveRenderScale();
 				bool upscalerActive = false;
 				bool dlssEn = false;
+				bool fsr3Temporal = false;
+#ifdef OC_HAS_FSR3
+				fsr3Temporal = Fsr3TemporalRequested();
+				upscalerActive = upscalerActive || fsr3Temporal;
+#endif
 #ifdef OC_HAS_DLSS
 				dlssEn = oovr_global_configuration.DlssEnabled();
-				upscalerActive = upscalerActive || (dlssEn && renderScale < 0.99f);
-#endif
-#ifdef OC_HAS_FSR3
-				if (!upscalerActive)
-					upscalerActive = (oovr_global_configuration.FsrEnabled() && renderScale < 0.99f && !dlssEn);
+				upscalerActive = upscalerActive || (!fsr3Temporal && dlssEn && renderScale < 0.99f);
 #endif
 				OOVR_LOGF("ASW INIT_DIAG: renderScale=%.3f dlssEnabled=%d upscalerActive=%d render=%ux%u swapchain=%ux%u",
 				    renderScale, dlssEn ? 1 : 0, upscalerActive ? 1 : 0,
@@ -6290,15 +6318,13 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 						// Register DLSS warp upscale callback when DLSS is active.
 						// This makes SubmitWarpedOutput run DLSS spatial upscaling on
 						// each eye's render-res warp output before copying to the output swapchain.
-						if (dlssEn && s_dlssUpscaler && s_dlssUpscaler->IsReady()) {
+						if (!fsr3Temporal && dlssEn && s_dlssUpscaler && s_dlssUpscaler->IsReady()) {
 							g_aswProvider->SetWarpUpscaleCallback(&DlssWarpUpscaleCallback);
 							OOVR_LOG("ASW: DLSS warp upscale callback registered");
 						}
 #endif
 #ifdef OC_HAS_FSR3
-						if (!dlssEn && s_fsr3Upscaler && s_fsr3Upscaler->IsReady()
-						    && oovr_global_configuration.FsrEnabled()
-						    && oovr_global_configuration.FsrRenderScale() < 0.99f) {
+						if (fsr3Temporal && s_fsr3Upscaler && s_fsr3Upscaler->IsReady()) {
 							g_aswProvider->SetWarpUpscaleCallback(&Fsr3WarpUpscaleCallback);
 							OOVR_LOG("ASW: FSR3 warp upscale callback registered");
 						}
