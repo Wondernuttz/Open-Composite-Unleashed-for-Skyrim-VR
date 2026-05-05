@@ -119,7 +119,12 @@ public:
 
 	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
 	inline bool  DlssEnabled()        const { return dlssEnabled; }
-	inline int   DlssPreset()         const { return dlssPreset; }    // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
+	inline int   DlssPreset()         const { return dlssPreset; }    // 0=Quality 1=Balanced 2=Perf 3=UltraPerf 4=DLAA 5=UltraQuality
+	inline float DlssRenderScaleOverride() const { return dlssRenderScaleOverride; } // 0=preset scale, >0 custom render scale
+	inline const std::string& DlssModel() const { return dlssModel; }     // Optional alias: default/auto/0, or J/K/L/M
+	inline int   DlssRenderPreset()   const { return dlssRenderPreset; } // 0=NGX default, 10=J, 11=K(default), 12=L, 13=M, 14+ pass through
+	inline int   DlssModeOverride()   const { return dlssModeOverride; } // -1=unset, 0=off, 1=DLSS+DLISP, 2=DLISP only, 3=DLSS(default)
+	inline bool  DlssNgxVerboseLogging() const { return dlssNgxVerboseLogging; }
 	inline float DlssSharpness()      const { return dlssSharpness; }
 	inline float DlssMvScale()        const { return dlssMvScale; }
 	inline float DlssBiasBase()       const { return dlssBiasBase; }       // Depth-edge bias mask baseline (reduces thin-geometry ghosting)
@@ -338,7 +343,12 @@ private:
 
 	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
 	bool  dlssEnabled      = false;
-	int   dlssPreset       = 1;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf
+	int   dlssPreset       = 1;      // 0=Quality 1=Balanced 2=Perf 3=UltraPerf 4=DLAA 5=UltraQuality
+	float dlssRenderScaleOverride = 0.0f; // 0=preset scale, >0 custom render scale
+	std::string dlssModel;           // Optional friendly alias for dlssRenderPreset: default/auto/0, J, K, L, M
+	int   dlssRenderPreset = 11;     // 0=NGX default, 10=J, 11=K(default), 12=L, 13=M, 14+ pass through
+	int   dlssModeOverride = 3;      // -1=unset, 0=off, 1=DLSS+DLISP, 2=DLISP only, 3=DLSS(default)
+	bool  dlssNgxVerboseLogging = false;
 	float dlssSharpness    = 20.0f;
 	float dlssMvScale      = 1.0f;   // Uniform camera MV scale for DLSS (1.0 = no correction)
 	float dlssBiasBase     = 0.20f;  // Depth-edge bias mask baseline (reduces thin-geometry ghosting)

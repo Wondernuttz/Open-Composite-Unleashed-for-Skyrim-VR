@@ -38,6 +38,58 @@ int DlssUpscaler::GetJitterPhaseCount(uint32_t renderWidth, uint32_t displayWidt
 	return std::max(1, static_cast<int>(8.0f * ratio * ratio + 0.5f));
 }
 
+static int NormalizeDlssRenderPreset(int preset)
+{
+	switch (preset) {
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_Default:
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_J:
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_K:
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_L:
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_M:
+		return preset;
+	default:
+		if (preset >= 10 && preset <= 64) {
+			OOVR_LOGF("DLSS: Passing through custom render preset hint %d", preset);
+			return preset;
+		}
+		OOVR_LOGF("DLSS: Unsupported render preset hint %d, using NGX default", preset);
+		return NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
+	}
+}
+
+static const char* DlssRenderPresetName(int preset)
+{
+	switch (preset) {
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_Default: return "Default";
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_J:       return "J";
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_K:       return "K";
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_L:       return "L";
+	case NVSDK_NGX_DLSS_Hint_Render_Preset_M:       return "M";
+	default:                                        return "Custom";
+	}
+}
+
+static void SetDlssRenderPresetHints(NVSDK_NGX_Parameter* params, int preset)
+{
+	if (!params || preset == NVSDK_NGX_DLSS_Hint_Render_Preset_Default)
+		return;
+
+	params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, preset);
+	params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, preset);
+	params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, preset);
+	params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, preset);
+	params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, preset);
+	params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, preset);
+}
+
+static void NVSDK_CONV DlssNgxLogCallback(const char* message, NVSDK_NGX_Logging_Level loggingLevel, NVSDK_NGX_Feature sourceComponent)
+{
+	if (!message || !message[0])
+		return;
+
+	OOVR_LOGF("NGX[%d/%d]: %s", static_cast<int>(sourceComponent), static_cast<int>(loggingLevel), message);
+}
+
 // ============================================================================
 // Lifecycle
 // ============================================================================
@@ -74,6 +126,12 @@ bool DlssUpscaler::Initialize(ID3D11Device* d3d11Device)
 	NVSDK_NGX_FeatureCommonInfo featureInfo = {};
 	featureInfo.PathListInfo.Path = featurePaths;
 	featureInfo.PathListInfo.Length = 1;
+	if (oovr_global_configuration.DlssNgxVerboseLogging()) {
+		featureInfo.LoggingInfo.LoggingCallback = DlssNgxLogCallback;
+		featureInfo.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
+		featureInfo.LoggingInfo.DisableOtherLoggingSinks = false;
+		OOVR_LOG("DLSS: NGX verbose logging enabled");
+	}
 
 	OOVR_LOGF("DLSS: Initializing NGX — DLL dir: %ls", dllDir.c_str());
 
@@ -288,17 +346,20 @@ bool DlssUpscaler::EnsureFeature(int eyeIdx, ID3D11DeviceContext* ctx,
 		return false;
 
 	// Map config preset to NGX quality value
-	// 0=Quality(67%) 1=Balanced(58%) 2=Performance(50%) 3=UltraPerf(33%) 4=DLAA(100%)
+	// 0=Quality(67%) 1=Balanced(58%) 2=Performance(50%) 3=UltraPerf(33%) 4=DLAA(100%) 5=UltraQuality(77%)
 	static const NVSDK_NGX_PerfQuality_Value presetMap[] = {
 		NVSDK_NGX_PerfQuality_Value_MaxQuality,       // 0 = Quality
 		NVSDK_NGX_PerfQuality_Value_Balanced,          // 1 = Balanced
 		NVSDK_NGX_PerfQuality_Value_MaxPerf,           // 2 = Performance
 		NVSDK_NGX_PerfQuality_Value_UltraPerformance,  // 3 = UltraPerf
 		NVSDK_NGX_PerfQuality_Value_DLAA,              // 4 = DLAA (native res, AA only)
+		NVSDK_NGX_PerfQuality_Value_UltraQuality,      // 5 = Ultra Quality
 	};
 	int preset = (m_presetOverride >= 0) ? m_presetOverride : oovr_global_configuration.DlssPreset();
-	int presetIdx = std::max(0, std::min(4, preset));
+	int presetIdx = std::max(0, std::min(5, preset));
 	NVSDK_NGX_PerfQuality_Value perfQuality = presetMap[presetIdx];
+	int renderPreset = NormalizeDlssRenderPreset(oovr_global_configuration.DlssRenderPreset());
+	int modeOverride = oovr_global_configuration.DlssModeOverride();
 
 	// Set creation parameters
 	NVSDK_NGX_DLSS_Create_Params createParams = {};
@@ -312,6 +373,14 @@ bool DlssUpscaler::EnsureFeature(int eyeIdx, ID3D11DeviceContext* ctx,
 		NVSDK_NGX_DLSS_Feature_Flags_DepthInverted | // Skyrim uses reversed-Z depth (1=near, 0=far)
 		NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;   // Let DLSS compute exposure internally
 
+	SetDlssRenderPresetHints(m_params, renderPreset);
+	if (modeOverride >= NVSDK_NGX_DLSS_Mode_Off && modeOverride <= NVSDK_NGX_DLSS_Mode_DLSS) {
+		m_params->Set(NVSDK_NGX_Parameter_DLSSMode, modeOverride);
+		OOVR_LOGF("DLSS: DLSSMode override=%d", modeOverride);
+	} else if (modeOverride != -1) {
+		OOVR_LOGF("DLSS: Invalid DLSSMode override %d ignored", modeOverride);
+	}
+
 	NVSDK_NGX_Result result = NGX_D3D11_CREATE_DLSS_EXT(ctx, &m_handle[eyeIdx], m_params, &createParams);
 	if (NVSDK_NGX_FAILED(result)) {
 		OOVR_LOGF("DLSS: CreateFeature failed for eye %d (0x%08X) render=%ux%u output=%ux%u",
@@ -321,8 +390,9 @@ bool DlssUpscaler::EnsureFeature(int eyeIdx, ID3D11DeviceContext* ctx,
 	}
 
 	m_renderW[eyeIdx] = renderW;  m_renderH[eyeIdx] = renderH;
-	OOVR_LOGF("DLSS: Feature created eye=%d render=%ux%u output=%ux%u preset=%d",
-	    eyeIdx, renderW, renderH, outputW, outputH, presetIdx);
+	OOVR_LOGF("DLSS: Feature created eye=%d render=%ux%u output=%ux%u preset=%d renderPreset=%s(%d)",
+	    eyeIdx, renderW, renderH, outputW, outputH, presetIdx,
+	    DlssRenderPresetName(renderPreset), renderPreset);
 	return true;
 }
 
@@ -427,12 +497,13 @@ bool DlssUpscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* ctx, const Dispatch
 
 	// DIAG: log the actual dispatch params once per ~30 stereo frames per eye
 	{
-		static int s_dlssDispDiag[2] = { 0, 0 };
-		s_dlssDispDiag[eyeIdx]++;
-		if (s_dlssDispDiag[eyeIdx] % 30 == 0) {
+		static int s_dlssDispDiag[kHandleCount] = {};
+		int diagEye = (eyeIdx >= 0 && eyeIdx < kHandleCount) ? eyeIdx : 0;
+		s_dlssDispDiag[diagEye]++;
+		if (s_dlssDispDiag[diagEye] % 30 == 0) {
 			OOVR_LOGF("DLSS-DISPATCH: eye=%d frame=%d jitter=(%.4f,%.4f) mvScale=(%.3f,%.3f) "
 			          "render=%ux%u output=%ux%u dt=%.3fms sharp=%.3f reset=%d",
-			    eyeIdx, s_dlssDispDiag[eyeIdx],
+			    eyeIdx, s_dlssDispDiag[diagEye],
 			    params.jitterX, params.jitterY,
 			    params.mvScaleX, params.mvScaleY,
 			    params.renderWidth, params.renderHeight,
