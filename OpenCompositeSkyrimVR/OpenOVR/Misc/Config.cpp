@@ -217,6 +217,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(bool, disableTrackPad);
 		CFGOPT(bool, enableControllerSmoothing);
 		CFGOPT(bool, enableVRIKKnucklesTrackPadSupport);
+		CFGOPT(bool, swapThumbsticks);
 		CFGOPT(string, keyboardText);
 		CFGOPT(string, controllerModel);
 		CFGOPT(float, posSmoothMinCutoff);

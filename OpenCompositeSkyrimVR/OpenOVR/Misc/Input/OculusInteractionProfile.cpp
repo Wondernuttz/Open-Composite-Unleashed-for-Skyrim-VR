@@ -203,6 +203,7 @@ const InteractionProfile::LegacyBindings* OculusTouchInteractionProfile::GetLega
 		bindings.triggerTouch = "input/trigger/touch";
 
 		bindings.grip = "input/squeeze/value";
+		bindings.thumbrestTouch = "input/thumbrest/touch";
 
 		bindings.haptic = "output/haptic";
 

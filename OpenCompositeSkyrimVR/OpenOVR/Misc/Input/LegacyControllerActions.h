@@ -25,6 +25,8 @@ struct LegacyControllerActions {
 	XrAction trigger, triggerClick, triggerTouch; // Axis1
 	XrAction grip, gripClick; // Axis2
 
+	XrAction thumbrestTouch; // Capacitive thumbrest sensor (Quest Touch)
+
 	XrAction haptic;
 
 	// Note: the 'grip' pose is like the natural holding pose of a controller, the 'aim' pose

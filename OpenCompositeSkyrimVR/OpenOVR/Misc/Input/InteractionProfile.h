@@ -217,6 +217,7 @@ protected:
 		const char *trigger = nullptr, *triggerClick = nullptr, *triggerTouch = nullptr;
 		const char* grip = nullptr;
 		const char* gripClick = nullptr;
+		const char* thumbrestTouch = nullptr;
 
 		const char* haptic = nullptr;
 

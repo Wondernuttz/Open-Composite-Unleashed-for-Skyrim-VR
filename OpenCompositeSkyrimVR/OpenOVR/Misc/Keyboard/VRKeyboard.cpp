@@ -450,38 +450,85 @@ static void EnsureGameForeground()
 		AttachThreadInput(foreThread, curThread, FALSE);
 }
 
+// True when a PrismaVR text input element is currently focused (signalled by
+// the OC_PRISMA_TEXT window property, set/cleared by PrismaVR's async focus
+// tracking). When set, vkey emissions must NOT flow through Windows SendInput
+// — Skyrim should never see the keystroke. Direct-delivery via
+// PrismaVR_DeliverChar / PrismaVR_DeliverVKey (invoked from PostCharToGame)
+// is the only path the keystroke takes. This is what keeps typing in a
+// Prisma chat box from triggering Skyrim's game hotkeys (Inventory, Shout,
+// AIAgent's OverlayStatusCycle, etc.).
+static bool IsPrismaTextFocused()
+{
+	HWND hwnd = GetGameWindow();
+	return hwnd && GetPropW(hwnd, L"OC_PRISMA_TEXT") != nullptr;
+}
+
+// Combined gate used at every SendInput call site. Returns true when vkey
+// keystrokes must NOT reach Skyrim's input system (DirectInput / Papyrus).
+//
+// Note: an earlier revision also gated on OC_MENU_ACTIVE (Scaleform menu
+// open) to defend against accidental hotkey rebinds while a Skyrim menu was
+// active. That over-corrected — it also blocked INTENTIONAL MCM key-remap
+// captures from the vkey, which is a legitimate user flow. The single-
+// channel emission fix in SendSingleVK / SendVirtualKey already kills the
+// 30Hz dual-fire bug that caused unintended MCM rebinds in the first place,
+// so the menu-active gate is no longer needed. Kept the PrismaVR-text gate
+// because that's a strict bypass: PostCharToGame direct-delivers to Prisma,
+// and Skyrim should genuinely never see those keystrokes.
+static bool ShouldSuppressSkyrimInput()
+{
+	return IsPrismaTextFocused();
+}
+
 // Send a virtual key press via Windows SendInput API.
-// Sends BOTH a VK event and a scancode-only event so both the Windows message
-// queue (for text input) and DirectInput (for game input like console toggle)
-// receive the keystroke.
+//
+// Single-channel emission: VK-based events only. Windows synthesizes the
+// matching scancode in the lower-level keyboard input stream automatically
+// when SendInput processes a VK event, so DirectInput-listening consumers
+// (Skyrim's input system, Papyrus OnKeyDown) still see the press. WM_KEYDOWN
+// is posted for Scaleform/menu consumers in the same step.
+//
+// The previous implementation also sent KEYEVENTF_SCANCODE-only events in
+// the same batch as a "belt-and-suspenders" cover for DirectInput. That
+// caused double-emit: each logical press fired Skyrim's OnKeyDown twice
+// (once from the VK-synthesized scancode, once from the explicit one),
+// flooding Papyrus key-handlers (e.g. AIAgent's OverlayStatusCycle hotkey)
+// at ~30Hz. With one channel we keep both paths covered without duplication.
+//
+// Suppression gate: when a Prisma text field is focused, this function is
+// a no-op for SendInput — PostCharToGame's OC_PRISMA_TEXT branch direct-
+// delivers to PrismaVR via PrismaVR_DeliverVKey and Skyrim never sees the
+// keystroke. Outside Prisma focus, SendInput fires normally so the user's
+// intentional vkey presses (incl. MCM remap captures) reach Skyrim. The
+// single-channel emit pattern below ensures one logical press == one
+// OnKeyDown in Papyrus, killing the 30Hz dual-fire bug that previously
+// caused MCM remap to bind to the wrong key.
 static void SendSingleVK(WORD vk)
 {
+	if (ShouldSuppressSkyrimInput()) {
+		OOVR_LOGF("[VKEMIT] SendSingleVK(vk=0x%02X) SUPPRESSED (Prisma focused)", vk);
+		return;
+	}
+	OOVR_LOGF("[VKEMIT] SendSingleVK(vk=0x%02X) firing SendInput", vk);
+
 	WORD scan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 	DWORD flags = (IsExtendedKey(vk) ? KEYEVENTF_EXTENDEDKEY : 0);
 
-	INPUT inputs[4] = {};
-	// VK-based down (Windows message queue)
+	INPUT inputs[2] = {};
+	// VK-based down — Windows posts WM_KEYDOWN AND injects scancode
+	// into the raw input stream that DirectInput observes.
 	inputs[0].type = INPUT_KEYBOARD;
 	inputs[0].ki.wVk = vk;
 	inputs[0].ki.wScan = scan;
 	inputs[0].ki.dwFlags = flags;
-	// Scancode-only down (DirectInput)
-	inputs[1].type = INPUT_KEYBOARD;
-	inputs[1].ki.wVk = 0;
-	inputs[1].ki.wScan = scan;
-	inputs[1].ki.dwFlags = KEYEVENTF_SCANCODE | flags;
-	// Scancode-only up
-	inputs[2].type = INPUT_KEYBOARD;
-	inputs[2].ki.wVk = 0;
-	inputs[2].ki.wScan = scan;
-	inputs[2].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP | flags;
 	// VK-based up
-	inputs[3].type = INPUT_KEYBOARD;
-	inputs[3].ki.wVk = vk;
-	inputs[3].ki.wScan = scan;
-	inputs[3].ki.dwFlags = flags | KEYEVENTF_KEYUP;
+	inputs[1].type = INPUT_KEYBOARD;
+	inputs[1].ki.wVk = vk;
+	inputs[1].ki.wScan = scan;
+	inputs[1].ki.dwFlags = flags | KEYEVENTF_KEYUP;
 
-	::SendInput(4, inputs, sizeof(INPUT));
+	::SendInput(2, inputs, sizeof(INPUT));
 }
 
 // Post a character to the SKSE plugin (OpenCompositeInput) for direct
@@ -490,12 +537,94 @@ static void SendSingleVK(WORD vk)
 // completely bypassing the game's broken message loop / TranslateMessage.
 static constexpr UINT WM_OC_CHAR = WM_APP + 0x4F45;
 
+// Direct-delivery function exported by PrismaUI.dll when PrismaVR is active.
+// When a Prisma text input is focused (signalled via OC_PRISMA_TEXT window
+// property), we call this instead of PostMessageW. This:
+//   1. Bypasses the Windows message loop entirely — Skyrim never sees the
+//      keystroke → no game hotkeys triggered (no more accidental inventory
+//      opens, tab-to-menu, etc. when typing in a Prisma chat box).
+//   2. Avoids all WndProc subclass chain contention (Dekana's IME refactor,
+//      other mods, Skyrim's own WndProc ordering).
+//   3. Delivers a properly-constructed Ultralight KeyEvent directly to the
+//      focused view, matching Prisma's canonical flatscreen recipe.
+// Resolved lazily once per process via GetProcAddress. Null if PrismaUI.dll
+// is not loaded (non-Prisma scenarios) or is too old to export the symbol.
+typedef void (*PrismaVR_DeliverCharFn)(wchar_t);
+typedef void (*PrismaVR_DeliverVKeyFn)(int);
+
+// Resolves both PrismaVR exports once per process. Split into two getters
+// so each symbol can be missing independently (if PrismaUI.dll is older and
+// only exports one of them — e.g., has DeliverChar but not DeliverVKey).
+static PrismaVR_DeliverCharFn GetPrismaVRDeliverChar()
+{
+	static PrismaVR_DeliverCharFn cached = nullptr;
+	static bool resolved = false;
+	if (!resolved) {
+		HMODULE hPrisma = GetModuleHandleW(L"PrismaUI.dll");
+		if (hPrisma) {
+			cached = reinterpret_cast<PrismaVR_DeliverCharFn>(
+				GetProcAddress(hPrisma, "PrismaVR_DeliverChar"));
+		}
+		resolved = true;
+		OOVR_LOGF("PrismaVR_DeliverChar resolution: hPrisma=0x%llX, fn=0x%llX",
+			(unsigned long long)(uintptr_t)hPrisma,
+			(unsigned long long)(uintptr_t)cached);
+	}
+	return cached;
+}
+
+static PrismaVR_DeliverVKeyFn GetPrismaVRDeliverVKey()
+{
+	static PrismaVR_DeliverVKeyFn cached = nullptr;
+	static bool resolved = false;
+	if (!resolved) {
+		HMODULE hPrisma = GetModuleHandleW(L"PrismaUI.dll");
+		if (hPrisma) {
+			cached = reinterpret_cast<PrismaVR_DeliverVKeyFn>(
+				GetProcAddress(hPrisma, "PrismaVR_DeliverVKey"));
+		}
+		resolved = true;
+		OOVR_LOGF("PrismaVR_DeliverVKey resolution: hPrisma=0x%llX, fn=0x%llX",
+			(unsigned long long)(uintptr_t)hPrisma,
+			(unsigned long long)(uintptr_t)cached);
+	}
+	return cached;
+}
+
 // lParam: 0 = GFxCharEvent (printable chars), 1 = GFxKeyEvent kKeyDown (control keys)
 static void PostCharToGame(wchar_t ch, LPARAM mode = 0)
 {
 	HWND hwnd = GetGameWindow();
-	if (hwnd)
-		PostMessageW(hwnd, WM_OC_CHAR, (WPARAM)ch, mode);
+	if (!hwnd) return;
+
+	// PrismaVR direct-delivery path: used when a Prisma text input has focus
+	// (indicated by the OC_PRISMA_TEXT window property, which PrismaVR sets/clears
+	// via its async focus tracking). Bypasses Windows messages entirely so Skyrim
+	// never sees the keystroke and no game hotkeys are triggered.
+	if (GetPropW(hwnd, L"OC_PRISMA_TEXT")) {
+		if (mode == 0) {
+			// Printable character (mode 0): use DeliverChar.
+			PrismaVR_DeliverCharFn deliverChar = GetPrismaVRDeliverChar();
+			if (deliverChar) {
+				deliverChar(ch);
+				return;
+			}
+		} else if (mode == 1) {
+			// Control key (mode 1): Backspace, Arrow keys, Delete, Enter, Tab, etc.
+			// Use DeliverVKey which populates the key_identifier string Chromium
+			// needs to recognize these as navigation actions inside <input> fields.
+			PrismaVR_DeliverVKeyFn deliverVKey = GetPrismaVRDeliverVKey();
+			if (deliverVKey) {
+				deliverVKey(static_cast<int>(ch));
+				return;
+			}
+		}
+		// Fall-through: PrismaUI.dll not loaded or too old — use the legacy
+		// WM_OC_CHAR PostMessage path. PrismaVR_KBSubclassProc on the other side
+		// also has a key_identifier-aware fallback for this path.
+	}
+
+	PostMessageW(hwnd, WM_OC_CHAR, (WPARAM)ch, mode);
 }
 
 // Check if a character is a dangerous action key that could cause crashes
@@ -520,15 +649,31 @@ static bool IsActionKey(wchar_t ch)
 }
 
 // Send a character key press via Windows SendInput API (with optional shift).
-// When ch != 0, we skip VK-based events and only send scancode events (for
-// DirectInput), relying on PostCharToGame for Scaleform text input. This avoids
-// double character entry: VK events produce WM_CHAR via TranslateMessage, and
-// PostCharToGame also injects a GFxCharEvent — both reach Scaleform.
-// When ch == 0 (console mode, control keys), VK events are included since
-// PostCharToGame won't fire and the console needs WM_CHAR from TranslateMessage.
-// Set postChar=false to send scancodes only (no VK, no PostCharToGame).
+//
+// Two emission modes:
+//
+//   ch != 0 (printable character): scancode-only events. VK events would also
+//     produce WM_CHAR via TranslateMessage, and PostCharToGame separately
+//     injects a GFxCharEvent — both reach Scaleform, so emitting VK in this
+//     mode would cause double character entry. PostCharToGame is the
+//     authoritative Scaleform path here; scancode-only covers DirectInput.
+//
+//   ch == 0 (control key: ESC, Backspace, Enter, Tab, arrows, etc.): VK
+//     events only. Windows synthesizes the matching scancode in the lower
+//     keyboard input stream automatically when SendInput processes a VK
+//     event, so DirectInput consumers still see the press, AND WM_KEYDOWN
+//     is posted for Scaleform/menu consumers — both paths covered with a
+//     single emission. Sending an explicit scancode-only event in addition
+//     to the VK event causes Skyrim's input pipeline to fire OnKeyDown twice
+//     per logical press, which floods Papyrus key handlers (e.g. AIAgent's
+//     OverlayStatusCycle hotkey) at ~30Hz when typing through OCU's vkey.
+//
+// Set postChar=false to suppress the PostCharToGame call — used when only
+// the DirectInput / game-hotkey path is desired (rare).
 static void SendVirtualKey(WORD vk, bool shift, wchar_t ch = 0, bool postChar = true)
 {
+	OOVR_LOGF("[VKEMIT] SendVirtualKey(vk=0x%02X shift=%d ch=0x%04X postChar=%d) prismaFocused=%d",
+	    vk, shift ? 1 : 0, (unsigned)ch, postChar ? 1 : 0, IsPrismaTextFocused() ? 1 : 0);
 	WORD scan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 	WORD shiftScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
 
@@ -538,74 +683,86 @@ static void SendVirtualKey(WORD vk, bool shift, wchar_t ch = 0, bool postChar = 
 		INPUT in = {};
 		in.type = INPUT_KEYBOARD;
 		if (!ch) {
-			// VK shift down (only when not using PostCharToGame)
+			// VK shift down — Windows also injects the scancode for DirectInput.
 			in.ki.wVk = VK_SHIFT;
 			in.ki.wScan = shiftScan;
 			in.ki.dwFlags = 0;
 			inputs.push_back(in);
+		} else {
+			// ch != 0: VK skipped to avoid WM_CHAR double-entry; scancode-only
+			// for DirectInput.
+			in.ki.wVk = 0;
+			in.ki.wScan = shiftScan;
+			in.ki.dwFlags = KEYEVENTF_SCANCODE;
+			inputs.push_back(in);
 		}
-		// Scancode shift down for DirectInput
-		in.ki.wVk = 0;
-		in.ki.wScan = shiftScan;
-		in.ki.dwFlags = KEYEVENTF_SCANCODE;
-		inputs.push_back(in);
 	}
 
 	if (!ch) {
-		// VK-based key down (only when not using PostCharToGame)
+		// Control-key path: VK events only — synthesized scancode covers
+		// DirectInput, WM_KEYDOWN covers Scaleform.
 		INPUT keyDown = {};
 		keyDown.type = INPUT_KEYBOARD;
 		keyDown.ki.wVk = vk;
 		keyDown.ki.wScan = scan;
 		keyDown.ki.dwFlags = 0;
 		inputs.push_back(keyDown);
-	}
-	// Scancode-only key down for DirectInput
-	INPUT scanDown = {};
-	scanDown.type = INPUT_KEYBOARD;
-	scanDown.ki.wVk = 0;
-	scanDown.ki.wScan = scan;
-	scanDown.ki.dwFlags = KEYEVENTF_SCANCODE;
-	inputs.push_back(scanDown);
 
-	// Scancode-only key up
-	INPUT scanUp = {};
-	scanUp.type = INPUT_KEYBOARD;
-	scanUp.ki.wVk = 0;
-	scanUp.ki.wScan = scan;
-	scanUp.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-	inputs.push_back(scanUp);
-	if (!ch) {
-		// VK-based key up (only when not using PostCharToGame)
 		INPUT keyUp = {};
 		keyUp.type = INPUT_KEYBOARD;
 		keyUp.ki.wVk = vk;
 		keyUp.ki.wScan = scan;
 		keyUp.ki.dwFlags = KEYEVENTF_KEYUP;
 		inputs.push_back(keyUp);
+	} else {
+		// Printable-character path: scancode-only for DirectInput; Scaleform
+		// gets the character via PostCharToGame below.
+		INPUT scanDown = {};
+		scanDown.type = INPUT_KEYBOARD;
+		scanDown.ki.wVk = 0;
+		scanDown.ki.wScan = scan;
+		scanDown.ki.dwFlags = KEYEVENTF_SCANCODE;
+		inputs.push_back(scanDown);
+
+		INPUT scanUp = {};
+		scanUp.type = INPUT_KEYBOARD;
+		scanUp.ki.wVk = 0;
+		scanUp.ki.wScan = scan;
+		scanUp.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+		inputs.push_back(scanUp);
 	}
 
 	if (shift) {
 		INPUT in = {};
 		in.type = INPUT_KEYBOARD;
-		// Scancode shift up
-		in.ki.wVk = 0;
-		in.ki.wScan = shiftScan;
-		in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-		inputs.push_back(in);
 		if (!ch) {
-			// VK shift up (only when not using PostCharToGame)
+			// VK shift up — synthesized scancode covers DirectInput.
 			in.ki.wVk = VK_SHIFT;
+			in.ki.wScan = shiftScan;
 			in.ki.dwFlags = KEYEVENTF_KEYUP;
+			inputs.push_back(in);
+		} else {
+			// Scancode shift up.
+			in.ki.wVk = 0;
+			in.ki.wScan = shiftScan;
+			in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
 			inputs.push_back(in);
 		}
 	}
 
-	::SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+	// Suppression gate: skip SendInput when a Prisma text field is focused —
+	// PrismaVR direct-delivery handles the keystroke, Skyrim should never
+	// see it. Outside that, SendInput fires normally; intentional MCM key-
+	// remap captures from vkey work. The single-channel emit pattern above
+	// keeps one logical press == one OnKeyDown in Papyrus.
+	if (!ShouldSuppressSkyrimInput())
+		::SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
 
 	// Post character directly to SKSE plugin for Scaleform injection.
 	// This is the ONLY path to Scaleform when ch != 0 (VK events skipped above).
 	// When postChar=false, skip this — scancode alone suffices for DirectInput.
+	// When OC_PRISMA_TEXT is set, PostCharToGame redirects to PrismaVR_DeliverChar
+	// (mode==0) or PrismaVR_DeliverVKey (mode==1) and Skyrim never sees the keystroke.
 	if (ch && postChar)
 		PostCharToGame(ch);
 }
@@ -3116,6 +3273,8 @@ void VRKeyboard::SubmitEvent(vr::EVREventType ev, wchar_t ch)
 
 void VRKeyboard::SetSendInputOnly(bool enabled)
 {
+	OOVR_LOGF("[VKMODE] SetSendInputOnly(%s) -> %s", enabled ? "true" : "false",
+	    enabled ? "PC MODE (scancodes for MCM/DirectInput)" : "VR MODE (text buffer, no scancodes)");
 	sendInputOnly = enabled;
 	// sendInputMode is always true — keyboard always uses SendInput
 	dirty = true;
