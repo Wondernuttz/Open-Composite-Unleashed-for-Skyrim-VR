@@ -418,7 +418,8 @@ bool Fsr3Upscaler::EnsureFsrContexts(uint32_t renderW, uint32_t renderH,
 		upscaleDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
 		upscaleDesc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE
 		    | FFX_UPSCALE_ENABLE_DEPTH_INVERTED
-		    | FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION;
+		    | FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION
+		    | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
 		if (jitterCancellation)
 			upscaleDesc.flags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
 		OOVR_LOGF("FSR3: Context creation flags=0x%X (jitterCancel=%s)",
@@ -457,9 +458,57 @@ bool Fsr3Upscaler::EnsureFsrContexts(uint32_t renderW, uint32_t renderH,
 	return true;
 }
 
+bool Fsr3Upscaler::EnsureWarpFsrContexts(uint32_t renderW, uint32_t renderH,
+    uint32_t outputW, uint32_t outputH)
+{
+	if (m_warpFsrContextsCreated) return true;
+
+	for (int eye = 0; eye < 2; eye++) {
+		ffxCreateContextDescUpscale upscaleDesc = {};
+		upscaleDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+		upscaleDesc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE
+		    | FFX_UPSCALE_ENABLE_DEPTH_INVERTED
+		    | FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION
+		    | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+		OOVR_LOGF("FSR3 warp: Context creation flags=0x%X", upscaleDesc.flags);
+
+		upscaleDesc.maxRenderSize = { renderW, renderH };
+		upscaleDesc.maxUpscaleSize = { outputW, outputH };
+		upscaleDesc.fpMessage = nullptr;
+
+		ffxCreateContextDescUpscaleVersion versionDesc = {};
+		versionDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+		versionDesc.version = FFX_UPSCALER_VERSION;
+
+		ffxCreateBackendDX12Desc backendDesc = {};
+		backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+		backendDesc.device = m_d3d12Device;
+
+		upscaleDesc.header.pNext = &versionDesc.header;
+		versionDesc.header.pNext = &backendDesc.header;
+
+		ffxReturnCode_t rc = m_ffxCreateContext(&m_warpFsrContext[eye], &upscaleDesc.header, nullptr);
+		if (rc != 0) {
+			OOVR_LOGF("FSR3 warp: ffxCreateContext eye=%d failed (rc=%u)", eye, rc);
+			for (int e = 0; e <= eye; e++) {
+				if (m_warpFsrContext[e] && m_ffxDestroyContext) {
+					m_ffxDestroyContext(&m_warpFsrContext[e], nullptr);
+					m_warpFsrContext[e] = nullptr;
+				}
+			}
+			return false;
+		}
+	}
+
+	m_warpFsrContextsCreated = true;
+	OOVR_LOGF("FSR3 warp: Upscaler contexts created - render=%ux%u output=%ux%u",
+	    renderW, renderH, outputW, outputH);
+	return true;
+}
+
 void Fsr3Upscaler::DestroyFsrContexts()
 {
-	if (!m_fsrContextsCreated) return;
+	if (!m_fsrContextsCreated && !m_warpFsrContextsCreated) return;
 
 	// GPU must be idle before destroying contexts
 	if (m_cmdQueue && m_d3d12Fence && m_fenceEvent) {
@@ -473,9 +522,14 @@ void Fsr3Upscaler::DestroyFsrContexts()
 			m_ffxDestroyContext(&m_fsrContext[eye], nullptr);
 			m_fsrContext[eye] = nullptr;
 		}
+		if (m_warpFsrContext[eye] && m_ffxDestroyContext) {
+			m_ffxDestroyContext(&m_warpFsrContext[eye], nullptr);
+			m_warpFsrContext[eye] = nullptr;
+		}
 	}
 
 	m_fsrContextsCreated = false;
+	m_warpFsrContextsCreated = false;
 	m_fsrConfigApplied = false;
 }
 
@@ -484,6 +538,17 @@ void Fsr3Upscaler::DestroyFsrContexts()
 // ============================================================================
 
 bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const DispatchParams& params)
+{
+	return DispatchInternal(eyeIdx, d3d11Ctx, params, false);
+}
+
+bool Fsr3Upscaler::DispatchWarp(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const DispatchParams& params)
+{
+	return DispatchInternal(eyeIdx, d3d11Ctx, params, true);
+}
+
+bool Fsr3Upscaler::DispatchInternal(int eyeIdx, ID3D11DeviceContext* d3d11Ctx,
+    const DispatchParams& params, bool warpContext)
 {
 	if (!m_ready || eyeIdx < 0 || eyeIdx > 1 || !d3d11Ctx) return false;
 
@@ -497,11 +562,18 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 	        params.outputWidth, params.outputHeight, colorFormat))
 		return false;
 
-	if (!EnsureFsrContexts(params.renderWidth, params.renderHeight,
-	        params.outputWidth, params.outputHeight, params.jitterCancellation))
-		return false;
+	if (warpContext) {
+		if (!EnsureWarpFsrContexts(params.renderWidth, params.renderHeight,
+		        params.outputWidth, params.outputHeight))
+			return false;
+	} else {
+		if (!EnsureFsrContexts(params.renderWidth, params.renderHeight,
+		        params.outputWidth, params.outputHeight, params.jitterCancellation))
+			return false;
+	}
 
 	auto& eye = m_eye[eyeIdx];
+	ffxContext* contexts = warpContext ? m_warpFsrContext : m_fsrContext;
 
 	// ── Synchronous wait: ensure previous DX12 work for this eye is complete ──
 	// Must complete before resetting command allocator or submitting new work.
@@ -594,7 +666,7 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 	auto cmdList = m_cmdList[eyeIdx];
 
 	// Apply runtime tuning once per context lifetime (reduces ghosting on thin geometry)
-	if (!m_fsrConfigApplied && m_ffxConfigure) {
+	if (!warpContext && !m_fsrConfigApplied && m_ffxConfigure) {
 		m_fsrConfigApplied = true;
 		struct { uint64_t key; float value; const char* name; } cfgEntries[] = {
 			{ FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE,
@@ -605,6 +677,8 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 			  oovr_global_configuration.Fsr3AccumulationPerFrame(), "fAccumulationAddedPerFrame" },
 			{ FFX_API_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION,
 			  oovr_global_configuration.Fsr3MinDisocclusionAccumulation(), "fMinDisocclusionAccumulation" },
+			{ FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR,
+			  oovr_global_configuration.Fsr3VelocityFactor(), "fVelocityFactor" },
 		};
 		for (auto& entry : cfgEntries) {
 			ffxConfigureDescUpscaleKeyValue cfg = {};
@@ -676,13 +750,33 @@ bool Fsr3Upscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const Dis
 	// in EnsureFsrContexts). Setting it here would accidentally enable
 	// FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ (also bit 2), causing FSR3 to treat
 	// SDR color as HDR PQ and breaking temporal accumulation.
-	dispatchDesc.flags = (params.debugMode == 1 ? FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW : 0);
+	dispatchDesc.flags = (params.debugMode == 1 ? FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW : 0)
+	    | FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
 
+
+	// DIAG: log the actual dispatch params once per ~30 stereo frames per eye
+	{
+		static int s_fsr3DispDiag[2] = { 0, 0 };
+		s_fsr3DispDiag[eyeIdx]++;
+		if (s_fsr3DispDiag[eyeIdx] % 30 == 0) {
+			OOVR_LOGF("FSR3-DISPATCH: eye=%d frame=%d jitter=(%.4f,%.4f) mvScale=(%.3f,%.3f) "
+			          "render=%ux%u upscale=%ux%u dt=%.3fms sharpening=%d sharp=%.3f reset=%d",
+			    eyeIdx, s_fsr3DispDiag[eyeIdx],
+			    dispatchDesc.jitterOffset.x, dispatchDesc.jitterOffset.y,
+			    dispatchDesc.motionVectorScale.x, dispatchDesc.motionVectorScale.y,
+			    dispatchDesc.renderSize.width, dispatchDesc.renderSize.height,
+			    dispatchDesc.upscaleSize.width, dispatchDesc.upscaleSize.height,
+			    dispatchDesc.frameTimeDelta,
+			    dispatchDesc.enableSharpening ? 1 : 0, dispatchDesc.sharpness,
+			    dispatchDesc.reset ? 1 : 0);
+		}
+	}
 
 	// Record FSR 3 commands onto our command list
-	ffxReturnCode_t rc = m_ffxDispatch(&m_fsrContext[eyeIdx], &dispatchDesc.header);
+	ffxReturnCode_t rc = m_ffxDispatch(&contexts[eyeIdx], &dispatchDesc.header);
 	if (rc != 0) {
-		OOVR_LOGF("FSR3: ffxDispatch eye=%d failed (rc=%u)", eyeIdx, rc);
+		OOVR_LOGF("%s: ffxDispatch eye=%d failed (rc=%u)",
+		    warpContext ? "FSR3 warp" : "FSR3", eyeIdx, rc);
 		cmdList->Close();
 		ctx4->Release();
 		return false;

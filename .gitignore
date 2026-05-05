@@ -34,3 +34,9 @@ CMakeCache.txt
 Thumbs.db
 desktop.ini
 .DS_Store
+/OpenCompositeSkyrimVR/build_reorder_main_vs
+/OpenCompositeSkyrimVR/build_clean_vs
+build-deploy-openvr-api.ps1
+/OpenCompositeSkyrimVR/build_codex_check_vs
+/.codex-build-ocsvr/DrvOpenXR.dir/RelWithDebInfo
+/.codex-build-ocsvr

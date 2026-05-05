@@ -229,6 +229,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, dlaaLambda);
 		CFGOPT(float, dlaaEpsilon);
 		CFGOPT(bool, fsrEnabled);
+		CFGOPT(bool, fsrNativeAA);
 		CFGOPT(float, fsrRenderScale);
 		CFGOPT(float, fsr3Sharpness);
 		CFGOPT(float, fsr3JitterScale);
@@ -237,13 +238,23 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, fsr3ReactivenessScale);
 		CFGOPT(float, fsr3AccumulationPerFrame);
 		CFGOPT(float, fsr3MinDisocclusionAccumulation);
+		CFGOPT(float, fsr3VelocityFactor);
 		CFGOPT(float, fsr3ReactiveBase);
 		CFGOPT(float, fsr3ReactiveEdgeBoost);
+		CFGOPT(float, fsr3ReactiveColorBoost);
+		CFGOPT(float, fsr3ReactiveColorThreshold);
+		CFGOPT(float, fsr3ReactiveColorScale);
 		CFGOPT(float, fsr3ReactiveDepthFalloffStart);
 		CFGOPT(float, fsr3ReactiveDepthFalloffEnd);
 		CFGOPT(bool, fsr3CameraMV);
 		CFGOPT(float, fsr3ViewToMeters);
 		CFGOPT(int, fsr3DebugMode);
+		CFGOPT(bool, fsr3PostAAEnabled);
+		CFGOPT(float, fsr3PostAALambda);
+		CFGOPT(float, fsr3PostAAEpsilon);
+		CFGOPT(bool, blueSkyDefenderEnabled);
+		CFGOPT(float, blueSkyDefenderLambda);
+		CFGOPT(float, blueSkyDefenderEpsilon);
 		CFGOPT(bool, motionVectorsEnabled);
 		CFGOPT(float, motionVectorScale);
 		CFGOPT(bool, actorMV);
@@ -262,10 +273,14 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(int, aswDebugMode);
 		CFGOPT(bool, aswCaptureEnabled);
 		CFGOPT(bool, aswForceLegacy);
+		CFGOPT(bool, aswExperimentalMode);
 		CFGOPT(bool, aswConcurrentFrameThread);
 		CFGOPT(bool, aswSpeculativeTrackingLead);
 		CFGOPT(bool, aswBufferEnabled);
+		CFGOPT(bool, aswUpscalerReset);
+		CFGOPT(bool, aswUpscalerReactiveMask);
 		CFGOPT(bool, casEnabled);
+		CFGOPT(float, casSharpness);
 		CFGOPT(float, fsrSharpness);
 		CFGOPT(bool, fsrRadiusEnabled);
 		CFGOPT(float, fsrRadius);
@@ -433,6 +448,12 @@ Config::Config()
 	}
 
 	// Post-processing: apply derived config settings after all INI files parsed
+	if (fsrNativeAA) {
+		fsrEnabled = true;
+		fsrRenderScale = 1.0f;
+		OOVR_LOG("FSR3: Native AA enabled (renderScale=1.00)");
+	}
+
 	if (dlssEnabled && !fsrEnabled) {
 		fsrRenderScale = dlss_preset_render_scale(dlssPreset);
 		OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",

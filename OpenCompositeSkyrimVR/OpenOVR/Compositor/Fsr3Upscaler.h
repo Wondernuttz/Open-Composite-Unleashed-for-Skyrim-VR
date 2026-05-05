@@ -54,6 +54,7 @@ public:
 	/// Async pipeline: submits DX12 work without waiting, returns previous frame's output.
 	/// First frame returns false (no output yet). GetOutputDX11() returns the completed output.
 	bool Dispatch(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const DispatchParams& params);
+	bool DispatchWarp(int eyeIdx, ID3D11DeviceContext* d3d11Ctx, const DispatchParams& params);
 
 	/// Get the DX11 texture containing the upscaled output for the given eye.
 	ID3D11Texture2D* GetOutputDX11(int eyeIdx) const;
@@ -70,6 +71,10 @@ private:
 	    uint32_t outputW, uint32_t outputH, DXGI_FORMAT colorFormat);
 	bool EnsureFsrContexts(uint32_t renderW, uint32_t renderH,
 	    uint32_t outputW, uint32_t outputH, bool jitterCancellation);
+	bool EnsureWarpFsrContexts(uint32_t renderW, uint32_t renderH,
+	    uint32_t outputW, uint32_t outputH);
+	bool DispatchInternal(int eyeIdx, ID3D11DeviceContext* d3d11Ctx,
+	    const DispatchParams& params, bool warpContext);
 	void DestroySharedTextures();
 	void DestroyFsrContexts();
 
@@ -134,7 +139,9 @@ private:
 
 	// FSR 3 upscaler contexts (opaque handles from high-level API)
 	ffxContext m_fsrContext[2] = {};
+	ffxContext m_warpFsrContext[2] = {};
 	bool m_fsrContextsCreated = false;
+	bool m_warpFsrContextsCreated = false;
 	bool m_fsrConfigApplied = false;
 
 	// Async pipeline state: double-buffered output with 1-frame delay

@@ -425,6 +425,23 @@ bool DlssUpscaler::Dispatch(int eyeIdx, ID3D11DeviceContext* ctx, const Dispatch
 	evalParams.InRenderSubrectDimensions.Width  = params.renderWidth;
 	evalParams.InRenderSubrectDimensions.Height = params.renderHeight;
 
+	// DIAG: log the actual dispatch params once per ~30 stereo frames per eye
+	{
+		static int s_dlssDispDiag[2] = { 0, 0 };
+		s_dlssDispDiag[eyeIdx]++;
+		if (s_dlssDispDiag[eyeIdx] % 30 == 0) {
+			OOVR_LOGF("DLSS-DISPATCH: eye=%d frame=%d jitter=(%.4f,%.4f) mvScale=(%.3f,%.3f) "
+			          "render=%ux%u output=%ux%u dt=%.3fms sharp=%.3f reset=%d",
+			    eyeIdx, s_dlssDispDiag[eyeIdx],
+			    params.jitterX, params.jitterY,
+			    params.mvScaleX, params.mvScaleY,
+			    params.renderWidth, params.renderHeight,
+			    params.outputWidth, params.outputHeight,
+			    params.deltaTimeMs,
+			    params.sharpness, params.reset ? 1 : 0);
+		}
+	}
+
 	NVSDK_NGX_Result result = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, m_handle[eyeIdx], m_params, &evalParams);
 	if (NVSDK_NGX_FAILED(result)) {
 		static int failCount = 0;
