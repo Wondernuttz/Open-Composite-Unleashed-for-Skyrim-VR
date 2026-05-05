@@ -239,6 +239,9 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, fsr3VelocityFactor);
 		CFGOPT(float, fsr3ReactiveBase);
 		CFGOPT(float, fsr3ReactiveEdgeBoost);
+		CFGOPT(float, fsr3ReactiveColorBoost);
+		CFGOPT(float, fsr3ReactiveColorThreshold);
+		CFGOPT(float, fsr3ReactiveColorScale);
 		CFGOPT(float, fsr3ReactiveDepthFalloffStart);
 		CFGOPT(float, fsr3ReactiveDepthFalloffEnd);
 		CFGOPT(bool, fsr3CameraMV);
@@ -247,6 +250,9 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(bool, fsr3PostAAEnabled);
 		CFGOPT(float, fsr3PostAALambda);
 		CFGOPT(float, fsr3PostAAEpsilon);
+		CFGOPT(bool, blueSkyDefenderEnabled);
+		CFGOPT(float, blueSkyDefenderLambda);
+		CFGOPT(float, blueSkyDefenderEpsilon);
 		CFGOPT(bool, motionVectorsEnabled);
 		CFGOPT(float, motionVectorScale);
 		CFGOPT(bool, actorMV);

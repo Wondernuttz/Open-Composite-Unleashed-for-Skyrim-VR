@@ -100,6 +100,9 @@ public:
 	inline float Fsr3VelocityFactor() const { return fsr3VelocityFactor; }
 	inline float Fsr3ReactiveBase() const { return fsr3ReactiveBase; }
 	inline float Fsr3ReactiveEdgeBoost() const { return fsr3ReactiveEdgeBoost; }
+	inline float Fsr3ReactiveColorBoost() const { return fsr3ReactiveColorBoost; }
+	inline float Fsr3ReactiveColorThreshold() const { return fsr3ReactiveColorThreshold; }
+	inline float Fsr3ReactiveColorScale() const { return fsr3ReactiveColorScale; }
 	inline float Fsr3ReactiveDepthFalloffStart() const { return fsr3ReactiveDepthFalloffStart; }
 	inline float Fsr3ReactiveDepthFalloffEnd() const { return fsr3ReactiveDepthFalloffEnd; }
 	inline bool Fsr3CameraMV() const { return fsr3CameraMV; }
@@ -108,6 +111,9 @@ public:
 	inline bool Fsr3PostAAEnabled() const { return fsr3PostAAEnabled; }
 	inline float Fsr3PostAALambda() const { return fsr3PostAALambda; }
 	inline float Fsr3PostAAEpsilon() const { return fsr3PostAAEpsilon; }
+	inline bool BlueSkyDefenderEnabled() const { return blueSkyDefenderEnabled || fsr3PostAAEnabled; }
+	inline float BlueSkyDefenderLambda() const { return blueSkyDefenderEnabled ? blueSkyDefenderLambda : fsr3PostAALambda; }
+	inline float BlueSkyDefenderEpsilon() const { return blueSkyDefenderEnabled ? blueSkyDefenderEpsilon : fsr3PostAAEpsilon; }
 
 	// DLSS 4 Super Resolution (NVIDIA only, native DX11 NGX)
 	inline bool  DlssEnabled()        const { return dlssEnabled; }
@@ -272,14 +278,20 @@ private:
 	float fsr3VelocityFactor = 1.0f; // 0.0 = improve temporal stability of bright pixels (FFX default 1.0)
 	float fsr3ReactiveBase = 0.05f;    // Depth-edge reactive mask baseline (reduces thin-geometry ghosting)
 	float fsr3ReactiveEdgeBoost = 0.20f; // Extra reactiveness at depth edges (tree silhouettes, thin geometry)
+	float fsr3ReactiveColorBoost = 0.15f; // Extra reactiveness for high-frequency foliage-like color detail
+	float fsr3ReactiveColorThreshold = 0.08f; // Luma contrast before color reactiveness starts
+	float fsr3ReactiveColorScale = 8.0f; // Ramp speed for color-edge reactiveness
 	float fsr3ReactiveDepthFalloffStart = 0.95f; // Depth where reactive mask begins fading (standard-Z, 0=near 1=far)
 	float fsr3ReactiveDepthFalloffEnd = 0.998f;  // Depth where reactive mask reaches zero (distant mountains/sky)
 	bool fsr3CameraMV = true;          // Camera MVs from depth + view-projection deltas (captures locomotion + head tracking)
 	float fsr3ViewToMeters = 0.01428f;  // Skyrim: ~70 units = 1 meter
-	int fsr3DebugMode = 0;             // 0=off, 1=FSR3 debug overlay, 2=bypass, 3=depth, 4=final MV, 5=residual MV, 6=raw bridge MV, 7=bridge fallback mask
+	int fsr3DebugMode = 0;             // 0=off, 1=FSR3 debug overlay, 2=bypass, 3=depth, 4=final MV, 5=residual MV, 6=raw bridge MV, 7=bridge fallback mask, 8=reactive mask
 	bool fsr3PostAAEnabled = false;    // Optional post-FSR spatial AA pass for testing foliage shimmer
 	float fsr3PostAALambda = 3.0f;     // Edge sensitivity for FSR3 post-AA
 	float fsr3PostAAEpsilon = 0.10f;   // Luminance threshold for FSR3 post-AA
+	bool blueSkyDefenderEnabled = false; // BlueSkyDefender spatial AA after FSR3 output
+	float blueSkyDefenderLambda = 3.0f;  // Edge sensitivity for BlueSkyDefender post-AA
+	float blueSkyDefenderEpsilon = 0.10f; // Luminance threshold for BlueSkyDefender post-AA
 
 	// Motion vectors (SKSE bridge → FSR3 / OCU ASW)
 	bool motionVectorsEnabled = true;
