@@ -1357,6 +1357,17 @@ namespace OpenCompositeConfigurator
             { "r_grip",      ("0x02", "") },        // Right grip (Shout, Cancel)
         };
 
+        // These root gameplay actions are referenced from menu contexts by symbolic
+        // aliases. Certain preset variants remap them in ways that make Skyrim VR
+        // fail controlmap context initialization, which later crashes SKSE/SkyUI
+        // when getMappedKey("Cancel", gamepad, MenuMode) runs.
+        private static readonly Dictionary<string, string[]> SafeMainGameplayControllerFields = new(StringComparer.OrdinalIgnoreCase)
+        {
+            { "Activate",  new[] { "0xff", "0xff", "0x02", "0xff", "0x02", "0xff" } },
+            { "Shout",     new[] { "0x02", "0xff", "0x07", "0xff", "0x20", "0xff" } },
+            { "Favorites", new[] { "0xff", "0xff", "0x01", "0xff", "0xff", "0x20" } },
+        };
+
         private string? _hoveredCtrlButton = null;
         private string? _selectedCtrlButton = null;
         private Label _lblCtrlButton = null!;
@@ -2659,7 +2670,7 @@ namespace OpenCompositeConfigurator
         }
 
         // Merge the chosen preset's controller fields with the user's existing
-        // keyboard / mouse / gamepad fields, line-by-line keyed on the event name.
+        // keyboard / mouse / gamepad fields, line-by-line keyed on context + event.
         //
         // Field layout (1-indexed per controlmap.txt header / 0-indexed in array):
         //   [0]  event name
@@ -2684,25 +2695,60 @@ namespace OpenCompositeConfigurator
         {
             error = "";
 
+            static string BindingKey(string context, string eventName) => $"{context}\u001f{eventName}";
+
+            static bool TryReadContextHeader(string line, out string context)
+            {
+                context = "";
+                if (!line.TrimStart().StartsWith("//"))
+                    return false;
+
+                string comment = line.TrimStart().TrimStart('/').Trim();
+                int tabIdx = comment.IndexOf('\t');
+                if (tabIdx >= 0) comment = comment[..tabIdx].Trim();
+
+                bool isContext = comment.Length > 0 && !comment.StartsWith("1st") && !comment.StartsWith("2nd") &&
+                                 !comment.StartsWith("3rd") && !comment.StartsWith("4th") && !comment.StartsWith("5th") &&
+                                 !comment.StartsWith("6th") && !comment.StartsWith("7th") && !comment.StartsWith("8th") &&
+                                 !comment.StartsWith("9th") && !comment.StartsWith("10th") && !comment.StartsWith("11th") &&
+                                 !comment.StartsWith("12th") && !comment.StartsWith("13th") && !comment.StartsWith("14th") &&
+                                 !comment.StartsWith("15th") && !comment.StartsWith("16th") && !comment.StartsWith("17th") &&
+                                 !comment.StartsWith("18th") && !comment.StartsWith("19th") && !comment.StartsWith("20th") &&
+                                 !comment.StartsWith("Blank") && !comment.StartsWith("See") &&
+                                 !comment.StartsWith("(Vive") && !comment.StartsWith("(Oculus") && !comment.StartsWith("(Windows") &&
+                                 !comment.StartsWith("\"") && !comment.StartsWith("If ");
+                if (!isContext)
+                    return false;
+
+                context = comment;
+                return true;
+            }
+
             // Step 1: harvest user's current keyboard / mouse / gamepad / their remap flags,
-            // keyed by event name from the live controlmapvr.txt. If the live file doesn't
+            // keyed by context + event from the live controlmapvr.txt. If the live file doesn't
             // exist we fall through with an empty dictionary, and the preset's own
             // keyboard fields end up applied (no merge target).
             string savePath = GetControlmapSavePath();
             var userBindings = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
             if (File.Exists(savePath))
             {
+                string currentContext = "";
                 foreach (string rawLine in File.ReadAllLines(savePath))
                 {
                     string line = rawLine.TrimEnd('\r').TrimEnd();
-                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (string.IsNullOrWhiteSpace(line)) { currentContext = ""; continue; }
+                    if (TryReadContextHeader(line, out var parsedContext))
+                    {
+                        currentContext = parsedContext;
+                        continue;
+                    }
                     if (line.TrimStart().StartsWith("//")) continue;
 
                     var fields = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
                     for (int i = 0; i < fields.Length; i++) fields[i] = fields[i].Trim();
                     if (fields.Length < 4) continue;
 
-                    userBindings[fields[0]] = fields;
+                    userBindings[BindingKey(currentContext, fields[0])] = fields;
                 }
             }
 
@@ -2735,13 +2781,30 @@ namespace OpenCompositeConfigurator
                 presetText = new StreamReader(presetStream).ReadToEnd();
             }
 
-            // Step 3: walk preset, merge keyboard fields where event name matches,
+            // Step 3: walk preset, merge keyboard fields where context + event match,
             // emit. Keep blank lines and comments verbatim.
             var output = new StringBuilder();
+            string presetContext = "";
             foreach (string rawLine in presetText.Split('\n'))
             {
                 string line = rawLine.TrimEnd('\r');
-                if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("//"))
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    presetContext = "";
+                    output.Append(line);
+                    output.Append('\n');
+                    continue;
+                }
+
+                if (TryReadContextHeader(line, out var parsedContext))
+                {
+                    presetContext = parsedContext;
+                    output.Append(line);
+                    output.Append('\n');
+                    continue;
+                }
+
+                if (line.TrimStart().StartsWith("//"))
                 {
                     output.Append(line);
                     output.Append('\n');
@@ -2759,7 +2822,13 @@ namespace OpenCompositeConfigurator
 
                 string eventName = presetFields[0];
 
-                if (userBindings.TryGetValue(eventName, out var userFields))
+                // The Favor context in Skyrim VR does not accept an Activate row.
+                // Some experimental presets included one, and that can make the
+                // engine reject the controlmap before SKSE/SkyUI ask for mappings.
+                if (presetContext == "Favor" && eventName == "Activate")
+                    continue;
+
+                if (userBindings.TryGetValue(BindingKey(presetContext, eventName), out var userFields))
                 {
                     // Keyboard / mouse / gamepad
                     if (userFields.Length > 1) presetFields[1] = userFields[1];
@@ -2772,13 +2841,34 @@ namespace OpenCompositeConfigurator
                     if (presetFields.Length > 12 && userFields.Length > 12) presetFields[12] = userFields[12];
                 }
 
+                // Skyrim VR's mouse column expects direct mouse IDs. Symbolic aliases
+                // such as !0,Tween Menu can break menu-context initialization and
+                // crash SKSE's GetMappedKey when SkyUI resolves controls.
+                if (presetFields.Length > 2 && presetFields[2].Contains('!'))
+                    presetFields[2] = "0xff";
+
+                if (TryGetSafeMainGameplayControllerFields(presetContext, eventName, out var safeControllerFields))
+                {
+                    for (int fieldOffset = 0; fieldOffset < safeControllerFields.Length; fieldOffset++)
+                    {
+                        int fieldIndex = 4 + fieldOffset;
+                        if (presetFields.Length > fieldIndex)
+                            presetFields[fieldIndex] = safeControllerFields[fieldOffset];
+                    }
+                }
+
                 output.Append(string.Join('\t', presetFields));
                 output.Append('\n');
             }
 
             try
             {
-                File.WriteAllText(savePath, output.ToString());
+                string outputText = output.ToString()
+                    .Replace("\r\n", "\n")
+                    .Replace('\r', '\n')
+                    .TrimEnd('\n')
+                    .Replace("\n", "\r\n") + "\r\n";
+                File.WriteAllText(savePath, outputText);
             }
             catch (Exception ex)
             {
@@ -3217,6 +3307,19 @@ namespace OpenCompositeConfigurator
             return (start, end);
         }
 
+        private static bool TryGetSafeMainGameplayControllerFields(string context, string actionName, out string[] fields)
+        {
+            if (context == "Main Gameplay" &&
+                SafeMainGameplayControllerFields.TryGetValue(actionName, out var safeFields))
+            {
+                fields = safeFields;
+                return true;
+            }
+
+            fields = Array.Empty<string>();
+            return false;
+        }
+
         private void SaveControlmapVR()
         {
             string filePath = GetControlmapSavePath();
@@ -3240,6 +3343,7 @@ namespace OpenCompositeConfigurator
 
             // Surgical patch: only modify specific fields on lines that need changes
             string currentContext = "";
+            const string deleteControlmapLine = "\u001F_DELETE_CONTROL_MAP_LINE";
 
             for (int i = 0; i < sourceLines.Length; i++)
             {
@@ -3276,13 +3380,17 @@ namespace OpenCompositeConfigurator
                 if (firstTab <= 0) continue;
 
                 string actionName = line[..firstTab].Trim();
+                if (currentContext == "Favor" && actionName == "Activate")
+                {
+                    sourceLines[i] = deleteControlmapLine;
+                    continue;
+                }
+
                 bool isMainGameplay = currentContext == "Main Gameplay";
                 bool needsKbChange = isMainGameplay && _keyBindings.ContainsKey(actionName);
                 bool needsMouseChange = _chkDisableMouse.Checked;
                 bool needsCtrlChange = _controllerChanges.TryGetValue(currentContext, out var ctxChanges)
                                        && ctxChanges.ContainsKey(actionName);
-
-                if (!needsKbChange && !needsMouseChange && !needsCtrlChange) continue;
 
                 // Find keyboard field bounds (field 1)
                 int kbStart = firstTab;
@@ -3295,6 +3403,9 @@ namespace OpenCompositeConfigurator
                 while (mouseStart < line.Length && line[mouseStart] == '\t') mouseStart++;
                 int mouseEnd = line.IndexOf('\t', mouseStart);
                 if (mouseEnd < 0) mouseEnd = line.Length;
+                bool needsMouseAliasFix = mouseStart < line.Length && line[mouseStart..mouseEnd].Contains('!');
+
+                if (!needsKbChange && !needsMouseChange && !needsCtrlChange && !needsMouseAliasFix) continue;
 
                 // Patch keyboard scancode (Main Gameplay only, and only if actually different)
                 if (needsKbChange && _keyBindings.TryGetValue(actionName, out int scancode))
@@ -3316,8 +3427,9 @@ namespace OpenCompositeConfigurator
                     }
                 }
 
-                // Patch mouse field (all contexts)
-                if (needsMouseChange && mouseStart < line.Length)
+                // Patch mouse field (all contexts). Symbolic aliases are unsafe in
+                // the mouse column even when mouse input itself remains enabled.
+                if ((needsMouseChange || needsMouseAliasFix) && mouseStart < line.Length)
                 {
                     line = line[..mouseStart] + "0xff" + line[mouseEnd..];
                 }
@@ -3337,10 +3449,25 @@ namespace OpenCompositeConfigurator
                     }
                 }
 
+                if (TryGetSafeMainGameplayControllerFields(currentContext, actionName, out var safeControllerFields))
+                {
+                    for (int fieldOffset = safeControllerFields.Length - 1; fieldOffset >= 0; fieldOffset--)
+                    {
+                        int fieldIdx = 4 + fieldOffset;
+                        var (fStart, fEnd) = FindFieldBounds(line, fieldIdx);
+                        if (fStart < line.Length)
+                            line = line[..fStart] + safeControllerFields[fieldOffset] + line[fEnd..];
+                    }
+                }
+
                 sourceLines[i] = line;
             }
 
-            File.WriteAllLines(filePath, sourceLines);
+            var outputLines = sourceLines.Where(line => line != deleteControlmapLine).ToList();
+            while (outputLines.Count > 0 && string.IsNullOrWhiteSpace(outputLines[^1]))
+                outputLines.RemoveAt(outputLines.Count - 1);
+
+            File.WriteAllLines(filePath, outputLines);
             _controllerChanges.Clear();
         }
 
