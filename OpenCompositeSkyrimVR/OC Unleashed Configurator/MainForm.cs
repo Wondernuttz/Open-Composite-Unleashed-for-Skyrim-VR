@@ -5,6 +5,7 @@ using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Windows.Forms;
 
 namespace OpenCompositeConfigurator
@@ -208,8 +209,28 @@ namespace OpenCompositeConfigurator
         private Label _lblKbStatus = null!;
         private Button _btnSaveBindings = null!;
         private Button _btnVRDefaults = null!;
-        private Button _btnVRIKDefaults = null!;
+        private Button _btnVRIKDefaults = null!;  // legacy, retained for binary compat — UI replaced by _cmbBindingPreset
         private Button _btnResetDefaults = null!;
+        private ComboBox _cmbBindingPreset = null!;
+        private Button _btnApplyBindingPreset = null!;
+        private Button _btnImportBindingPreset = null!;
+        private Button _btnSaveAsBindingPreset = null!;
+        private Button _btnDeleteBindingPreset = null!;
+        private Button _btnSaveControllerCombos = null!;
+
+        // User-imported presets persist between launches in app-data so users
+        // don't have to re-import every session. Live entries get loaded into
+        // _cmbBindingPreset on startup and into _userBindingPresets so Apply
+        // knows where the file lives.
+        private readonly Dictionary<string, string> _userBindingPresets = new(StringComparer.OrdinalIgnoreCase);
+
+        private static string GetUserPresetsDir()
+        {
+            string baseDir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            string dir = Path.Combine(baseDir, "OpenCompositeConfigurator", "Presets");
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
 
         private string? _selectedKeyId = null;
         private Button? _selectedKeyButton = null;
@@ -1393,12 +1414,39 @@ namespace OpenCompositeConfigurator
             };
             container.Controls.Add(_chkDisableMouse);
 
-            // Save button top right
-            _btnSaveBindings = MakeButton("Save Bindings & Combos", rightEdge - 170, y, 180, 26);
+            // Two save buttons at the top, side-by-side.
+            //   Save All Bindings → writes everything the user has edited (keyboard +
+            //     mouse + gamepad + controller fields per context) plus combos.
+            //   Save Controller + Combos → writes controller fields + combos but
+            //     preserves keyboard / mouse / gamepad from disk (companion for users
+            //     who want to ship controller refactors without bundling keyboard edits).
+            _btnSaveBindings = MakeButton("Save All Bindings to Disk", rightEdge - 200, y, 210, 26);
             _btnSaveBindings.BackColor = Color.FromArgb(40, 120, 40);
             _btnSaveBindings.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
             _btnSaveBindings.Click += BtnSaveBindings_Click;
+            var tipSave = new ToolTip { AutoPopDelay = 12000, InitialDelay = 400 };
+            tipSave.SetToolTip(_btnSaveBindings,
+                "Writes the entire controlmapvr.txt\n" +
+                "(keyboard, mouse, gamepad, AND all\n" +
+                "controller bindings) plus combos to disk.\n\n" +
+                "Restart the game to apply.");
             container.Controls.Add(_btnSaveBindings);
+
+            _btnSaveControllerCombos = MakeButton(
+                "Save Controller + Combos", rightEdge - 430, y, 220, 26);
+            _btnSaveControllerCombos.BackColor = Color.FromArgb(50, 100, 60);
+            _btnSaveControllerCombos.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            _btnSaveControllerCombos.Click += BtnSaveControllerCombos_Click;
+            var tipBottomSave = new ToolTip { AutoPopDelay = 12000, InitialDelay = 400 };
+            tipBottomSave.SetToolTip(_btnSaveControllerCombos,
+                "Saves controller bindings and combos to disk.\n\n" +
+                "Keyboard / mouse / gamepad fields are PRESERVED\n" +
+                "from your current controlmapvr.txt — only controller\n" +
+                "fields and the [combos] section of opencomposite.ini\n" +
+                "are updated.\n\n" +
+                "Use 'Save All Bindings to Disk' if you want\n" +
+                "keyboard edits committed too.");
+            container.Controls.Add(_btnSaveControllerCombos);
 
             y += 26;
 
@@ -1474,13 +1522,7 @@ namespace OpenCompositeConfigurator
             var lblCtrlSection = MakeSectionLabel("Controller Bindings", splitX + 10, y);
             container.Controls.Add(lblCtrlSection);
 
-            _btnVRIKDefaults = MakeButton("VRIK V2.1.0", rightEdge - 100, y, 100, 24);
-            _btnVRIKDefaults.BackColor = Color.FromArgb(120, 80, 40);
-            _btnVRIKDefaults.Font = new Font("Segoe UI", 8f);
-            _btnVRIKDefaults.Click += BtnVRIKDefaults_Click;
-            container.Controls.Add(_btnVRIKDefaults);
-
-            // Type dropdown
+            // Type dropdown — kept on the section-header row alongside the section label.
             container.Controls.Add(MakeLabel("Type:", splitX + 200, y + 2, 40));
             _cmbCtrlType = new ComboBox
             {
@@ -1500,6 +1542,120 @@ namespace OpenCompositeConfigurator
             if (_cmbCtrlType.Items.Count > 0) _cmbCtrlType.SelectedIndex = 0;
             _cmbCtrlType.SelectedIndexChanged += CmbCtrlType_SelectedIndexChanged;
             container.Controls.Add(_cmbCtrlType);
+
+            var tipCtrlType = new ToolTip { AutoPopDelay = 12000, InitialDelay = 400 };
+            tipCtrlType.SetToolTip(_cmbCtrlType,
+                "Picks which Skyrim input context\n" +
+                "the binding UI is editing.\n\n" +
+                "Each context (Main Gameplay, Menu Mode,\n" +
+                "Inventory, etc.) has its own set of action\n" +
+                "mappings in controlmapvr.txt.\n\n" +
+                "Click a button on the controller image to\n" +
+                "see what action is bound to it in the\n" +
+                "selected context.");
+
+            // Move Preset row down one line so it doesn't collide with the Type dropdown.
+            // This is its own visually-distinct row of preset-management controls.
+            y += 28;
+
+            // Binding preset dropdown — applies controller bindings while preserving keyboard.
+            // Replaces the old single "VRIK V2.1.0" button. Active preset persists in
+            // opencomposite.ini under [Configurator] activeBindingPreset.
+            container.Controls.Add(MakeLabel("Preset:", rightEdge - 565, y + 4, 50));
+            _cmbBindingPreset = new ComboBox
+            {
+                Location = new Point(rightEdge - 515, y),
+                Width = 145,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 55),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8f)
+            };
+            _cmbBindingPreset.Items.AddRange(new object[] {
+                "Vanilla",
+                "VR Safe",
+                "VRIK V2.1.0",
+                "VRIK Alternate",
+                "Kvite",
+                "Vanilla + Oculus Touch Hotkeys",
+            });
+            _cmbBindingPreset.SelectedIndex = 2;
+            _cmbBindingPreset.SelectedIndexChanged += (s, e) => UpdateDeletePresetEnabled();
+            container.Controls.Add(_cmbBindingPreset);
+
+            _btnApplyBindingPreset = MakeButton("Apply Preset", rightEdge - 365, y, 105, 24);
+            _btnApplyBindingPreset.BackColor = Color.FromArgb(120, 80, 40);
+            _btnApplyBindingPreset.Font = new Font("Segoe UI", 8f);
+            _btnApplyBindingPreset.Click += BtnApplyBindingPreset_Click;
+            container.Controls.Add(_btnApplyBindingPreset);
+
+            // Save As — captures the currently-applied controlmapvr.txt as a named
+            // user preset under %AppData%\OpenCompositeConfigurator\Presets\ so the
+            // user's edits survive across sessions and reappear in the dropdown.
+            _btnSaveAsBindingPreset = MakeButton("Save As…", rightEdge - 255, y, 80, 24);
+            _btnSaveAsBindingPreset.BackColor = Color.FromArgb(40, 110, 60);
+            _btnSaveAsBindingPreset.Font = new Font("Segoe UI", 8f);
+            _btnSaveAsBindingPreset.Click += BtnSaveAsBindingPreset_Click;
+            container.Controls.Add(_btnSaveAsBindingPreset);
+
+            // Import — file picker for any external controlmapvr.txt; same destination
+            // dir, same wiring as Save As, so imports and saves both appear together
+            // in the dropdown.
+            _btnImportBindingPreset = MakeButton("Import…", rightEdge - 170, y, 75, 24);
+            _btnImportBindingPreset.BackColor = Color.FromArgb(70, 90, 110);
+            _btnImportBindingPreset.Font = new Font("Segoe UI", 8f);
+            _btnImportBindingPreset.Click += BtnImportBindingPreset_Click;
+            container.Controls.Add(_btnImportBindingPreset);
+
+            // Delete — removes a user-imported / Save-As preset from disk + dropdown.
+            // Disabled when a built-in preset is selected (those are embedded in the
+            // EXE and can't be deleted from outside).
+            _btnDeleteBindingPreset = MakeButton("Delete", rightEdge - 90, y, 90, 24);
+            _btnDeleteBindingPreset.BackColor = Color.FromArgb(140, 50, 50);
+            _btnDeleteBindingPreset.ForeColor = Color.White;
+            _btnDeleteBindingPreset.Font = new Font("Segoe UI", 8f);
+            // Stay enabled at all times so the white text doesn't fade out under
+            // the disabled-button render path. The click handler already shows
+            // a friendly "built-in can't be deleted" message when needed.
+            _btnDeleteBindingPreset.Click += BtnDeleteBindingPreset_Click;
+            container.Controls.Add(_btnDeleteBindingPreset);
+
+            // Tooltips for every button on this row so users understand what each
+            // does without cluttering the labels. AutoPopDelay set high so users
+            // can actually finish reading.
+            var tipPreset = new ToolTip { AutoPopDelay = 12000, InitialDelay = 400 };
+            tipPreset.SetToolTip(_cmbBindingPreset,
+                "Built-in presets ship with the EXE.\n" +
+                "User presets (Save As / Import) live under\n" +
+                "%AppData%\\OpenCompositeConfigurator\\Presets\\\n" +
+                "and can be deleted.");
+            tipPreset.SetToolTip(_btnApplyBindingPreset,
+                "Writes the selected preset's controller bindings\n" +
+                "to your live controlmapvr.txt.\n\n" +
+                "Your keyboard / mouse / gamepad bindings\n" +
+                "are preserved (merge mode).\n\n" +
+                "Restart the game to apply.");
+            tipPreset.SetToolTip(_btnSaveAsBindingPreset,
+                "Captures your current controlmapvr.txt\n" +
+                "as a named user preset.\n\n" +
+                "Saved to:\n" +
+                "  %AppData%\\OpenCompositeConfigurator\\Presets\\\n\n" +
+                "Captures EVERYTHING in the file —\n" +
+                "keyboard, mouse, gamepad, AND controllers.\n\n" +
+                "Click 'Save All Bindings to Disk' first if you\n" +
+                "have unsaved edits in the UI.");
+            tipPreset.SetToolTip(_btnImportBindingPreset,
+                "Pick any controlmapvr.txt from disk\n" +
+                "(yours, from Nexus, from SVR's binding tool, etc.)\n" +
+                "and add it to the dropdown as a named user preset.\n\n" +
+                "Doesn't apply it — you still need to click Apply.");
+            tipPreset.SetToolTip(_btnDeleteBindingPreset,
+                "Removes the selected user preset\n" +
+                "from disk and the dropdown.\n\n" +
+                "Only works on user-saved / user-imported presets.\n" +
+                "Built-ins are embedded in the EXE\n" +
+                "and can't be deleted.");
 
             // ── Left column: Controller Combos ──
             var lblComboSection = MakeSectionLabel("Controller Combos", leftMargin, y);
@@ -2437,6 +2593,454 @@ namespace OpenCompositeConfigurator
             _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
         }
 
+        // Maps the dropdown's display name to the embedded preset resource.
+        // Adding a new entry here + bundling a new controlmapvr_<name>.txt as an
+        // embedded resource is all it takes to ship a new preset.
+        private static readonly Dictionary<string, string> BindingPresetResources = new()
+        {
+            { "Vanilla", "OpenCompositeConfigurator.controlmapvr_template.txt" },
+            { "VR Safe", "OpenCompositeConfigurator.controlmapvr_vrsafe.txt" },
+            { "VRIK V2.1.0", "OpenCompositeConfigurator.controlmapvr_vrik.txt" },
+            { "VRIK Alternate", "OpenCompositeConfigurator.controlmapvr_vrik_alternate.txt" },
+            { "Kvite", "OpenCompositeConfigurator.controlmapvr_kvite.txt" },
+            { "Vanilla + Oculus Touch Hotkeys", "OpenCompositeConfigurator.controlmapvr_oculus_optimized.txt" },
+        };
+
+        private void BtnApplyBindingPreset_Click(object? sender, EventArgs e)
+        {
+            string presetName = _cmbBindingPreset.SelectedItem?.ToString() ?? "VRIK V2.1.0";
+
+            // Resolve preset source: built-in embedded resource, or a user-imported
+            // file under %AppData%\OpenCompositeConfigurator\Presets\.
+            string? resourceName = null;
+            string? externalPath = null;
+            if (BindingPresetResources.TryGetValue(presetName, out resourceName))
+            {
+                // built-in
+            }
+            else if (_userBindingPresets.TryGetValue(presetName, out var path))
+            {
+                externalPath = path;
+            }
+            else
+            {
+                MessageBox.Show($"Unknown preset '{presetName}'", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            var result = MessageBox.Show(
+                $"Apply '{presetName}' controller bindings?\n\nYour KEYBOARD bindings will be preserved — only controller (VR) fields are replaced from the preset.\n\nUse the \"Reset to Game Defaults\" button if you want a full wholesale reset including keyboard.\n\nProceed?",
+                $"Apply {presetName} Preset",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (result != DialogResult.Yes) return;
+
+            if (!ApplyControllerPresetMergingKeyboard(resourceName, externalPath, out string error))
+            {
+                MessageBox.Show($"Failed to apply preset: {error}", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            // Persist the active preset choice in opencomposite.ini so the dropdown
+            // restores to the right value next launch.
+            _ini.Set("Configurator", "activeBindingPreset", presetName);
+            _ini.Save();
+
+            // Refresh in-memory state from the just-written controlmapvr.txt
+            _keyBindings.Clear();
+            LoadDefaultKeyBindings();
+            TryLoadControlmapVR();
+
+            _lblKbStatus.Text = $"{presetName} controller bindings applied (keyboard preserved). Restart the game to apply.";
+            _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
+        }
+
+        // Merge the chosen preset's controller fields with the user's existing
+        // keyboard / mouse / gamepad fields, line-by-line keyed on the event name.
+        //
+        // Field layout (1-indexed per controlmap.txt header / 0-indexed in array):
+        //   [0]  event name
+        //   [1]  keyboard          ← preserved from user
+        //   [2]  mouse             ← preserved from user
+        //   [3]  gamepad           ← preserved from user
+        //   [4]  Vive primary      ← from preset
+        //   [5]  Vive secondary    ← from preset
+        //   [6]  Oculus right      ← from preset
+        //   [7]  Oculus left       ← from preset
+        //   [8]  WMR primary       ← from preset
+        //   [9]  WMR secondary     ← from preset
+        //   [10] remap-keyboard    ← preserved from user
+        //   [11] remap-mouse       ← preserved from user
+        //   [12] remap-gamepad     ← preserved from user
+        //   [13..18] remap-VR      ← from preset
+        //   [19] optional binary flag
+        //
+        // Comments and blank lines pass through verbatim so context headers
+        // stay intact (Skyrim's parser uses blank lines to delimit input contexts).
+        private bool ApplyControllerPresetMergingKeyboard(string? presetResourceName, string? externalPresetPath, out string error)
+        {
+            error = "";
+
+            // Step 1: harvest user's current keyboard / mouse / gamepad / their remap flags,
+            // keyed by event name from the live controlmapvr.txt. If the live file doesn't
+            // exist we fall through with an empty dictionary, and the preset's own
+            // keyboard fields end up applied (no merge target).
+            string savePath = GetControlmapSavePath();
+            var userBindings = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+            if (File.Exists(savePath))
+            {
+                foreach (string rawLine in File.ReadAllLines(savePath))
+                {
+                    string line = rawLine.TrimEnd('\r').TrimEnd();
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (line.TrimStart().StartsWith("//")) continue;
+
+                    var fields = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
+                    for (int i = 0; i < fields.Length; i++) fields[i] = fields[i].Trim();
+                    if (fields.Length < 4) continue;
+
+                    userBindings[fields[0]] = fields;
+                }
+            }
+
+            // Step 2: read the preset — embedded resource for built-ins, or external file
+            // for user-imported presets stored under %AppData%\OpenCompositeConfigurator\Presets\.
+            string presetText;
+            if (!string.IsNullOrEmpty(externalPresetPath))
+            {
+                if (!File.Exists(externalPresetPath))
+                {
+                    error = $"User preset file not found: {externalPresetPath}";
+                    return false;
+                }
+                presetText = File.ReadAllText(externalPresetPath);
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(presetResourceName))
+                {
+                    error = "No preset source provided";
+                    return false;
+                }
+                var asm = Assembly.GetExecutingAssembly();
+                using var presetStream = asm.GetManifestResourceStream(presetResourceName);
+                if (presetStream == null)
+                {
+                    error = $"Embedded preset '{presetResourceName}' not found";
+                    return false;
+                }
+                presetText = new StreamReader(presetStream).ReadToEnd();
+            }
+
+            // Step 3: walk preset, merge keyboard fields where event name matches,
+            // emit. Keep blank lines and comments verbatim.
+            var output = new StringBuilder();
+            foreach (string rawLine in presetText.Split('\n'))
+            {
+                string line = rawLine.TrimEnd('\r');
+                if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("//"))
+                {
+                    output.Append(line);
+                    output.Append('\n');
+                    continue;
+                }
+
+                var presetFields = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 0; i < presetFields.Length; i++) presetFields[i] = presetFields[i].Trim();
+                if (presetFields.Length < 4)
+                {
+                    output.Append(line);
+                    output.Append('\n');
+                    continue;
+                }
+
+                string eventName = presetFields[0];
+
+                if (userBindings.TryGetValue(eventName, out var userFields))
+                {
+                    // Keyboard / mouse / gamepad
+                    if (userFields.Length > 1) presetFields[1] = userFields[1];
+                    if (userFields.Length > 2) presetFields[2] = userFields[2];
+                    if (userFields.Length > 3) presetFields[3] = userFields[3];
+
+                    // Their respective remap flags (11th-13th, 0-indexed [10..12])
+                    if (presetFields.Length > 10 && userFields.Length > 10) presetFields[10] = userFields[10];
+                    if (presetFields.Length > 11 && userFields.Length > 11) presetFields[11] = userFields[11];
+                    if (presetFields.Length > 12 && userFields.Length > 12) presetFields[12] = userFields[12];
+                }
+
+                output.Append(string.Join('\t', presetFields));
+                output.Append('\n');
+            }
+
+            try
+            {
+                File.WriteAllText(savePath, output.ToString());
+            }
+            catch (Exception ex)
+            {
+                error = $"Could not write {savePath}: {ex.Message}";
+                return false;
+            }
+
+            return true;
+        }
+
+        // Walks %AppData%\OpenCompositeConfigurator\Presets\ for user-imported
+        // controlmapvr.txt files and adds them to the dropdown. File stem is the
+        // preset name (e.g. "MyCustom.txt" appears as "MyCustom"). Built-ins
+        // always sort first; user presets follow.
+        private void LoadUserBindingPresets()
+        {
+            _userBindingPresets.Clear();
+            string dir = GetUserPresetsDir();
+            foreach (string path in Directory.GetFiles(dir, "*.txt"))
+            {
+                string name = Path.GetFileNameWithoutExtension(path);
+                if (string.IsNullOrEmpty(name)) continue;
+                if (BindingPresetResources.ContainsKey(name)) continue; // don't shadow built-ins
+                _userBindingPresets[name] = path;
+                if (!_cmbBindingPreset.Items.Contains(name))
+                    _cmbBindingPreset.Items.Add(name);
+            }
+        }
+
+        private void BtnImportBindingPreset_Click(object? sender, EventArgs e)
+        {
+            using var dlg = new OpenFileDialog
+            {
+                Title = "Import controlmapvr.txt as a custom preset",
+                Filter = "controlmapvr.txt|controlmapvr*.txt|All files (*.*)|*.*",
+                CheckFileExists = true,
+                Multiselect = false
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            string sourcePath = dlg.FileName;
+
+            // Validate: at least a few non-comment lines with 4+ tab-separated fields.
+            // Cheap sanity check, not a full controlmap parser.
+            int validLines = 0;
+            foreach (string rawLine in File.ReadAllLines(sourcePath))
+            {
+                string line = rawLine.TrimEnd('\r').TrimEnd();
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                if (line.TrimStart().StartsWith("//")) continue;
+                var fields = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
+                if (fields.Length >= 4) validLines++;
+                if (validLines >= 5) break;
+            }
+            if (validLines < 5)
+            {
+                MessageBox.Show(
+                    "That file doesn't look like a controlmapvr.txt — needs at least 5 non-comment lines with 4+ tab-separated fields.",
+                    "Invalid file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Ask for a preset name. Default to source filename minus extension.
+            string defaultName = Path.GetFileNameWithoutExtension(sourcePath);
+            if (string.IsNullOrWhiteSpace(defaultName) || defaultName.Equals("controlmapvr", StringComparison.OrdinalIgnoreCase))
+                defaultName = "Custom Preset";
+
+            string presetName = PromptForString(
+                "Name this preset (will appear in the dropdown):",
+                "Import Preset",
+                defaultName);
+            if (string.IsNullOrWhiteSpace(presetName)) return;
+
+            // Strip filesystem-unsafe chars; we use the name as a filename stem.
+            foreach (char c in Path.GetInvalidFileNameChars())
+                presetName = presetName.Replace(c, '_');
+
+            if (BindingPresetResources.ContainsKey(presetName))
+            {
+                MessageBox.Show($"'{presetName}' is a built-in preset name. Pick a different one.",
+                    "Name conflict", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            string destPath = Path.Combine(GetUserPresetsDir(), presetName + ".txt");
+            if (File.Exists(destPath))
+            {
+                var ow = MessageBox.Show($"A user preset named '{presetName}' already exists. Overwrite?",
+                    "Confirm overwrite", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (ow != DialogResult.Yes) return;
+            }
+
+            try
+            {
+                File.Copy(sourcePath, destPath, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not save preset: {ex.Message}", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _userBindingPresets[presetName] = destPath;
+            if (!_cmbBindingPreset.Items.Contains(presetName))
+                _cmbBindingPreset.Items.Add(presetName);
+            _cmbBindingPreset.SelectedItem = presetName;
+
+            _lblKbStatus.Text = $"Imported preset '{presetName}'. Click Apply to use it.";
+            _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
+        }
+
+        private void BtnSaveAsBindingPreset_Click(object? sender, EventArgs e)
+        {
+            // Source: the live controlmapvr.txt the game would load right now. If the
+            // user has unsaved edits in the UI, they should click "Save Bindings" first
+            // to commit them to disk; Save As is for capturing the disk state as a
+            // reusable preset.
+            string livePath = GetControlmapSavePath();
+            if (!File.Exists(livePath))
+            {
+                MessageBox.Show(
+                    "No live controlmapvr.txt to save yet. Apply a preset (or click Save Bindings) first, then come back to capture it as a named preset.",
+                    "Nothing to save",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // Default name: "<active preset> Custom" if a preset is selected, else "Custom Preset".
+            string activePreset = _cmbBindingPreset.SelectedItem?.ToString() ?? "Custom";
+            string defaultName = $"{activePreset} Custom";
+
+            string presetName = PromptForString(
+                "Name this preset (will appear in the dropdown):",
+                "Save As Preset",
+                defaultName);
+            if (string.IsNullOrWhiteSpace(presetName)) return;
+
+            foreach (char c in Path.GetInvalidFileNameChars())
+                presetName = presetName.Replace(c, '_');
+
+            if (BindingPresetResources.ContainsKey(presetName))
+            {
+                MessageBox.Show($"'{presetName}' is a built-in preset name. Pick a different one.",
+                    "Name conflict", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            string destPath = Path.Combine(GetUserPresetsDir(), presetName + ".txt");
+            if (File.Exists(destPath))
+            {
+                var ow = MessageBox.Show($"A user preset named '{presetName}' already exists. Overwrite?",
+                    "Confirm overwrite", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (ow != DialogResult.Yes) return;
+            }
+
+            try
+            {
+                File.Copy(livePath, destPath, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not save preset: {ex.Message}", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _userBindingPresets[presetName] = destPath;
+            if (!_cmbBindingPreset.Items.Contains(presetName))
+                _cmbBindingPreset.Items.Add(presetName);
+            _cmbBindingPreset.SelectedItem = presetName;
+
+            _lblKbStatus.Text = $"Saved preset '{presetName}'. It will appear in the dropdown next session too.";
+            _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
+        }
+
+        // Delete stays enabled regardless of selection so its text remains white.
+        // The click handler shows a friendly "built-in can't be deleted" message
+        // when the user clicks while a built-in is selected.
+        private void UpdateDeletePresetEnabled()
+        {
+            // Intentional no-op — kept as a hook in case we want to revisit
+            // disabled-state rendering later. The button is always enabled.
+        }
+
+        private void BtnDeleteBindingPreset_Click(object? sender, EventArgs e)
+        {
+            string presetName = _cmbBindingPreset.SelectedItem?.ToString() ?? "";
+            if (string.IsNullOrEmpty(presetName)) return;
+
+            if (BindingPresetResources.ContainsKey(presetName))
+            {
+                MessageBox.Show($"'{presetName}' is a built-in preset and can't be deleted.",
+                    "Built-in preset", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (!_userBindingPresets.TryGetValue(presetName, out var path))
+            {
+                MessageBox.Show($"Preset '{presetName}' isn't tracked in user presets — nothing to delete.",
+                    "Not found", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var confirm = MessageBox.Show(
+                $"Delete user preset '{presetName}'?\n\nThis removes the file from\n{path}\n\nYour live controlmapvr.txt is not affected.",
+                "Confirm delete", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (confirm != DialogResult.Yes) return;
+
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not delete the preset file: {ex.Message}", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _userBindingPresets.Remove(presetName);
+            _cmbBindingPreset.Items.Remove(presetName);
+            // After removal, fall back to a sensible selection — VRIK V2.1.0 default.
+            int fallback = _cmbBindingPreset.Items.IndexOf("VRIK V2.1.0");
+            _cmbBindingPreset.SelectedIndex = fallback >= 0 ? fallback : 0;
+
+            // If the deleted preset was the persisted active one, clear that too so
+            // next launch doesn't try to restore a deleted preset.
+            string activePersisted = _ini.Get("Configurator", "activeBindingPreset", "");
+            if (activePersisted.Equals(presetName, StringComparison.OrdinalIgnoreCase))
+            {
+                _ini.Set("Configurator", "activeBindingPreset", _cmbBindingPreset.SelectedItem?.ToString() ?? "");
+                _ini.Save();
+            }
+
+            _lblKbStatus.Text = $"Deleted user preset '{presetName}'.";
+            _lblKbStatus.ForeColor = Color.FromArgb(220, 180, 100);
+        }
+
+        // Tiny modal text-prompt since WinForms doesn't ship one.
+        private static string PromptForString(string prompt, string title, string defaultValue)
+        {
+            using var f = new Form
+            {
+                Width = 460,
+                Height = 160,
+                Text = title,
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MinimizeBox = false,
+                MaximizeBox = false,
+                BackColor = Color.FromArgb(30, 30, 35),
+                ForeColor = Color.White
+            };
+            var lbl = new Label { Left = 12, Top = 14, Width = 420, Text = prompt, ForeColor = Color.White };
+            var tb = new TextBox { Left = 12, Top = 40, Width = 420, Text = defaultValue, BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
+            var ok = new Button { Text = "OK", Left = 268, Top = 78, Width = 75, DialogResult = DialogResult.OK, BackColor = Color.FromArgb(120, 80, 40), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            var cancel = new Button { Text = "Cancel", Left = 357, Top = 78, Width = 75, DialogResult = DialogResult.Cancel, BackColor = Color.FromArgb(60, 60, 65), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            f.Controls.Add(lbl); f.Controls.Add(tb); f.Controls.Add(ok); f.Controls.Add(cancel);
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            return f.ShowDialog() == DialogResult.OK ? tb.Text.Trim() : "";
+        }
+
         private void BtnSaveBindings_Click(object? sender, EventArgs e)
         {
             if (string.IsNullOrEmpty(_gameDir))
@@ -2466,6 +3070,104 @@ namespace OpenCompositeConfigurator
 
                 string comboMsg = _combos.Count > 0 ? $" + {_combos.Count} combo(s)" : "";
                 _lblKbStatus.Text = $"Saved controlmapvr.txt{comboMsg}! Restart the game to apply binding changes.";
+                _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
+                _lblComboStatus.Text = _combos.Count > 0 ? "Combos saved" : "";
+                _lblComboStatus.ForeColor = Color.FromArgb(100, 200, 100);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Failed to save: {ex.Message}", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // Controller-only save companion to BtnSaveBindings_Click. Writes the full
+        // controlmapvr.txt and combos like the All-Bindings save, but then immediately
+        // overlays the keyboard / mouse / gamepad fields from a snapshot we took
+        // BEFORE the save — so any in-memory keyboard edits the user made aren't
+        // committed. Use this when the user wants their controller refactor to
+        // ship without touching the keyboard layout already on disk.
+        private void BtnSaveControllerCombos_Click(object? sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(_gameDir))
+            {
+                MessageBox.Show("Please select a game folder first (on Settings tab).", "No Folder Selected",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                string filePath = GetControlmapSavePath();
+
+                // Step 1: snapshot disk's keyboard / mouse / gamepad per action name.
+                var diskKbSnap = new Dictionary<string, (string kb, string mouse, string gamepad)>(
+                    StringComparer.OrdinalIgnoreCase);
+                if (File.Exists(filePath))
+                {
+                    foreach (string rawLine in File.ReadAllLines(filePath))
+                    {
+                        string line = rawLine.TrimEnd('\r').TrimEnd();
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        if (line.TrimStart().StartsWith("//")) continue;
+                        var fields = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
+                        if (fields.Length < 4) continue;
+                        diskKbSnap[fields[0].Trim()] = (fields[1].Trim(), fields[2].Trim(), fields[3].Trim());
+                    }
+                }
+
+                // Step 2: full in-memory save (this would write keyboard edits too).
+                SaveControlmapVR();
+
+                // Step 3: overlay keyboard fields from the snapshot back onto the saved file.
+                if (diskKbSnap.Count > 0 && File.Exists(filePath))
+                {
+                    var savedLines = File.ReadAllLines(filePath);
+                    var output = new StringBuilder();
+                    foreach (string rawLine in savedLines)
+                    {
+                        string line = rawLine.TrimEnd('\r');
+                        if (string.IsNullOrWhiteSpace(line) || line.TrimStart().StartsWith("//"))
+                        {
+                            output.Append(line);
+                            output.Append('\n');
+                            continue;
+                        }
+                        var fields = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
+                        for (int i = 0; i < fields.Length; i++) fields[i] = fields[i].Trim();
+                        if (fields.Length < 4)
+                        {
+                            output.Append(line);
+                            output.Append('\n');
+                            continue;
+                        }
+                        if (diskKbSnap.TryGetValue(fields[0], out var snap))
+                        {
+                            fields[1] = snap.kb;
+                            fields[2] = snap.mouse;
+                            fields[3] = snap.gamepad;
+                        }
+                        output.Append(string.Join('\t', fields));
+                        output.Append('\n');
+                    }
+                    File.WriteAllText(filePath, output.ToString());
+                }
+
+                // Step 4: combos go to opencomposite.ini just like the full save.
+                if (_combos.Count > 0 || _ini.GetAllInSection("combos").Count > 0)
+                {
+                    WriteCombosToIni();
+                    string iniPath = Path.Combine(_gameDir, "opencomposite.ini");
+                    _ini.Save(iniPath);
+                    if (!string.IsNullOrEmpty(_mo2ModDir))
+                    {
+                        try { _ini.Save(Path.Combine(_mo2ModDir, "opencomposite.ini")); }
+                        catch { }
+                    }
+                }
+
+                string comboMsg = _combos.Count > 0 ? $" + {_combos.Count} combo(s)" : "";
+                _lblKbStatus.Text = $"Saved controller bindings{comboMsg} (keyboard preserved). Restart the game to apply.";
                 _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
                 _lblComboStatus.Text = _combos.Count > 0 ? "Combos saved" : "";
                 _lblComboStatus.ForeColor = Color.FromArgb(100, 200, 100);
@@ -2828,7 +3530,7 @@ namespace OpenCompositeConfigurator
                 return;
             }
 
-            using var dlg = new ComboEditForm(KeyScancodes);
+            using var dlg = new ComboEditForm(KeyScancodes, BuildActionsByContext());
             if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
             {
                 _combos.Add(dlg.Result);
@@ -2838,11 +3540,38 @@ namespace OpenCompositeConfigurator
             }
         }
 
+        // Harvest the per-context action → keyboard scancode map from the parsed
+        // controlmapvr.txt. Skip actions whose keyboard field is 0xff (unbound) since
+        // a combo firing an unbound key triggers nothing useful. Multi-keybinds
+        // ("0x02,0x4F") use the FIRST scancode.
+        private Dictionary<string, List<(string action, int scancode)>> BuildActionsByContext()
+        {
+            var result = new Dictionary<string, List<(string action, int scancode)>>();
+            foreach (var ctx in _contextNames)
+            {
+                if (!_contextBindings.TryGetValue(ctx, out var actions)) continue;
+                var list = new List<(string action, int scancode)>();
+                foreach (var fields in actions)
+                {
+                    if (fields.Length < 2) continue;
+                    string actionName = fields[0];
+                    string keyboardField = fields[1];
+                    string firstHex = keyboardField.Split(',')[0].Trim();
+                    if (string.Equals(firstHex, "0xff", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!firstHex.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!int.TryParse(firstHex[2..], System.Globalization.NumberStyles.HexNumber, null, out int sc)) continue;
+                    list.Add((actionName, sc));
+                }
+                if (list.Count > 0) result[ctx] = list;
+            }
+            return result;
+        }
+
         private void EditCombo(int index)
         {
             if (index < 0 || index >= _combos.Count) return;
 
-            using var dlg = new ComboEditForm(KeyScancodes, _combos[index]);
+            using var dlg = new ComboEditForm(KeyScancodes, BuildActionsByContext(), _combos[index]);
             if (dlg.ShowDialog(this) == DialogResult.OK && dlg.Result != null)
             {
                 _combos[index] = dlg.Result;
@@ -4069,6 +4798,21 @@ namespace OpenCompositeConfigurator
             _chkDisableTriggerTouch.Checked = ParseBool(_ini.Get("", "disableTriggerTouch", "true"));
             _chkDisableTrackpad.Checked = ParseBool(_ini.Get("", "disableTrackPad", "false"));
             _chkVRIKKnuckles.Checked = ParseBool(_ini.Get("", "enableVRIKKnucklesTrackPadSupport", "false"));
+
+            // Load any user-imported presets from %AppData% before we try to restore
+            // the saved selection — otherwise a saved user-preset name wouldn't be
+            // findable in the dropdown items.
+            LoadUserBindingPresets();
+
+            // Restore the binding-preset dropdown from the persisted choice. If absent
+            // or unrecognized, keep the default (VRIK V2.1.0) chosen at construction.
+            string savedPreset = _ini.Get("Configurator", "activeBindingPreset", "");
+            if (!string.IsNullOrEmpty(savedPreset))
+            {
+                int idx = _cmbBindingPreset.Items.IndexOf(savedPreset);
+                if (idx >= 0) _cmbBindingPreset.SelectedIndex = idx;
+            }
+            UpdateDeletePresetEnabled();
             _chkGpuTiming.Checked = ParseBool(_ini.Get("", "enableGpuTiming", "true"));
             if (float.TryParse(_ini.Get("", "leftDeadZoneSize", "0.0"), out float ldz))
                 _nudLeftDeadZone.Value = (decimal)Math.Clamp(ldz, 0f, 1f);

@@ -110,6 +110,18 @@ namespace OpenCompositeConfigurator
         // Target key
         private ComboBox _cmbKey = null!;
 
+        // Target action (alternative to keyboard key) — context picker + action picker.
+        // User picks "Main Gameplay" → "Hotkey3" and the form looks up that action's
+        // keyboard scancode in the current controlmapvr.txt to use as the saved value.
+        private RadioButton _rdoTargetKey = null!;
+        private RadioButton _rdoTargetAction = null!;
+        private ComboBox _cmbActionContext = null!;
+        private ComboBox _cmbAction = null!;
+        private Label _lblActionContext = null!;
+        private Label _lblActionPick = null!;
+        private Label _lblKey = null!;
+        private Label _lblKeyHint = null!;
+
         // Buttons
         private Button _btnOk = null!;
         private Button _btnCancel = null!;
@@ -117,6 +129,10 @@ namespace OpenCompositeConfigurator
 
         // Key scancodes (passed from MainForm)
         private readonly Dictionary<string, int> _keyScancodes;
+        // Per-context action lists from controlmapvr.txt: context name → list of
+        // (actionName, keyboardScancode) for actions that have a non-0xff keyboard
+        // binding (only those can be combo targets).
+        private readonly Dictionary<string, List<(string action, int scancode)>> _actionsByContext;
 
         // Button positions on the controller image
         // Stick directions are small circles around the stick center
@@ -147,9 +163,12 @@ namespace OpenCompositeConfigurator
             { "right_stick_right", ("\u25B6",   new PointF(0.713f + 0.045f, 0.147f), true) },
         };
 
-        public ComboEditForm(Dictionary<string, int> keyScancodes, ComboEntry? existing = null)
+        public ComboEditForm(Dictionary<string, int> keyScancodes,
+                             Dictionary<string, List<(string action, int scancode)>>? actionsByContext = null,
+                             ComboEntry? existing = null)
         {
             _keyScancodes = keyScancodes;
+            _actionsByContext = actionsByContext ?? new Dictionary<string, List<(string action, int scancode)>>();
             LoadControllerImage();
             InitializeUI();
 
@@ -269,8 +288,44 @@ namespace OpenCompositeConfigurator
             Controls.Add(_nudTiming);
             y += 34;
 
-            // Target key
-            var lblKey = new Label
+            // Fire as: Key | Action — radio toggle. Default is Key (existing behavior).
+            var lblFireAs = new Label
+            {
+                Text = "Fire as:",
+                Location = new Point(leftMargin, y + 3),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(180, 200, 255),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold)
+            };
+            Controls.Add(lblFireAs);
+
+            _rdoTargetKey = new RadioButton
+            {
+                Text = "Keyboard key",
+                Location = new Point(leftMargin + 90, y + 1),
+                AutoSize = true,
+                Checked = true,
+                ForeColor = Color.White
+            };
+            _rdoTargetKey.CheckedChanged += (s, e) => UpdateTargetVisibility();
+            Controls.Add(_rdoTargetKey);
+
+            _rdoTargetAction = new RadioButton
+            {
+                Text = "Skyrim action",
+                Location = new Point(leftMargin + 230, y + 1),
+                AutoSize = true,
+                ForeColor = Color.White
+            };
+            _rdoTargetAction.CheckedChanged += (s, e) => UpdateTargetVisibility();
+            // If we have no actions data (failed to harvest from controlmap), disable
+            // the option so the user isn't stuck with an empty action list.
+            _rdoTargetAction.Enabled = _actionsByContext.Count > 0;
+            Controls.Add(_rdoTargetAction);
+            y += 28;
+
+            // Target key (existing behavior — visible when "Keyboard key" radio is selected)
+            _lblKey = new Label
             {
                 Text = "Fire Key:",
                 Location = new Point(leftMargin, y + 3),
@@ -278,7 +333,7 @@ namespace OpenCompositeConfigurator
                 ForeColor = Color.FromArgb(180, 200, 255),
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold)
             };
-            Controls.Add(lblKey);
+            Controls.Add(_lblKey);
 
             _cmbKey = new ComboBox
             {
@@ -295,7 +350,7 @@ namespace OpenCompositeConfigurator
             if (_cmbKey.Items.Count > 0) _cmbKey.SelectedIndex = 0;
             Controls.Add(_cmbKey);
 
-            var lblKeyHint = new Label
+            _lblKeyHint = new Label
             {
                 Text = "Skyrim reads this as a keyboard press",
                 Location = new Point(leftMargin + 350, y + 3),
@@ -303,7 +358,62 @@ namespace OpenCompositeConfigurator
                 ForeColor = Color.FromArgb(130, 130, 130),
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Italic)
             };
-            Controls.Add(lblKeyHint);
+            Controls.Add(_lblKeyHint);
+
+            // Target action — context picker + action picker, occupies the same row
+            // as the Fire Key dropdown. Visibility toggled by the radio.
+            _lblActionContext = new Label
+            {
+                Text = "Context:",
+                Location = new Point(leftMargin, y + 3),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(180, 200, 255),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                Visible = false
+            };
+            Controls.Add(_lblActionContext);
+
+            _cmbActionContext = new ComboBox
+            {
+                Location = new Point(leftMargin + 140, y),
+                Width = 180,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 55),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9f),
+                Visible = false
+            };
+            foreach (var ctx in _actionsByContext.Keys)
+                _cmbActionContext.Items.Add(ctx);
+            if (_cmbActionContext.Items.Count > 0) _cmbActionContext.SelectedIndex = 0;
+            _cmbActionContext.SelectedIndexChanged += (s, e) => RebuildActionList();
+            Controls.Add(_cmbActionContext);
+
+            _lblActionPick = new Label
+            {
+                Text = "Action:",
+                Location = new Point(leftMargin + 332, y + 3),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(180, 200, 255),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                Visible = false
+            };
+            Controls.Add(_lblActionPick);
+
+            _cmbAction = new ComboBox
+            {
+                Location = new Point(leftMargin + 392, y),
+                Width = 200,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(50, 50, 55),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9f),
+                Visible = false
+            };
+            Controls.Add(_cmbAction);
+            RebuildActionList();
             y += 40;
 
             // OK / Cancel
@@ -575,6 +685,32 @@ namespace OpenCompositeConfigurator
             }
         }
 
+        // Toggle visibility of the Key vs Action picker based on the radio.
+        private void UpdateTargetVisibility()
+        {
+            bool action = _rdoTargetAction.Checked;
+            _cmbKey.Visible = !action;
+            _lblKey.Visible = !action;
+            _lblKeyHint.Visible = !action;
+            _cmbActionContext.Visible = action;
+            _cmbAction.Visible = action;
+            _lblActionContext.Visible = action;
+            _lblActionPick.Visible = action;
+        }
+
+        // Repopulate the action dropdown based on the currently-selected context.
+        private void RebuildActionList()
+        {
+            _cmbAction.Items.Clear();
+            string ctx = _cmbActionContext.SelectedItem?.ToString() ?? "";
+            if (_actionsByContext.TryGetValue(ctx, out var list))
+            {
+                foreach (var (action, _) in list)
+                    _cmbAction.Items.Add(action);
+            }
+            if (_cmbAction.Items.Count > 0) _cmbAction.SelectedIndex = 0;
+        }
+
         private void BtnOk_Click(object? sender, EventArgs e)
         {
             if (_selectedButtons.Count == 0)
@@ -584,12 +720,28 @@ namespace OpenCompositeConfigurator
                 DialogResult = DialogResult.None;
                 return;
             }
-            if (_cmbKey.SelectedIndex < 0)
+
+            // Validate target based on which mode is active.
+            bool actionMode = _rdoTargetAction.Checked;
+            if (actionMode)
             {
-                MessageBox.Show("Please select a target key.",
-                    "No Key Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                DialogResult = DialogResult.None;
-                return;
+                if (_cmbAction.SelectedIndex < 0)
+                {
+                    MessageBox.Show("Please pick a context and an action.",
+                        "No Action Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    DialogResult = DialogResult.None;
+                    return;
+                }
+            }
+            else
+            {
+                if (_cmbKey.SelectedIndex < 0)
+                {
+                    MessageBox.Show("Please select a target key.",
+                        "No Key Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    DialogResult = DialogResult.None;
+                    return;
+                }
             }
 
             // Build result
@@ -599,15 +751,32 @@ namespace OpenCompositeConfigurator
             else if (_rdoLongPress.Checked) mode = "long_press";
             else mode = "press";
 
-            // Parse scancode from combo box item text
-            string itemText = _cmbKey.Items[_cmbKey.SelectedIndex]!.ToString()!;
-            int parenIdx = itemText.IndexOf("(0x");
             int scancode = 0x02;
-            if (parenIdx >= 0)
+            if (actionMode)
             {
-                string hexPart = itemText[(parenIdx + 3)..].TrimEnd(')');
-                if (int.TryParse(hexPart, System.Globalization.NumberStyles.HexNumber, null, out int parsed))
-                    scancode = parsed;
+                // Look up the chosen action's keyboard scancode in the picked
+                // context. The combo internally still stores a scancode — Skyrim
+                // sees a keyboard press, controlmap routes it to the action.
+                string ctx = _cmbActionContext.SelectedItem?.ToString() ?? "";
+                string actionName = _cmbAction.SelectedItem?.ToString() ?? "";
+                if (_actionsByContext.TryGetValue(ctx, out var list))
+                {
+                    var found = list.FirstOrDefault(t => t.action == actionName);
+                    if (!string.IsNullOrEmpty(found.action))
+                        scancode = found.scancode;
+                }
+            }
+            else
+            {
+                // Parse scancode from combo box item text (existing keyboard path)
+                string itemText = _cmbKey.Items[_cmbKey.SelectedIndex]!.ToString()!;
+                int parenIdx = itemText.IndexOf("(0x");
+                if (parenIdx >= 0)
+                {
+                    string hexPart = itemText[(parenIdx + 3)..].TrimEnd(')');
+                    if (int.TryParse(hexPart, System.Globalization.NumberStyles.HexNumber, null, out int parsed))
+                        scancode = parsed;
+                }
             }
 
             // Sort buttons: left-hand first, then right-hand
