@@ -504,13 +504,28 @@ static bool ShouldSuppressSkyrimInput()
 // single-channel emit pattern below ensures one logical press == one
 // OnKeyDown in Papyrus, killing the 30Hz dual-fire bug that previously
 // caused MCM remap to bind to the wrong key.
-static void SendSingleVK(WORD vk)
+static void SendSingleVK(WORD vk, bool pcMode = false)
 {
-	if (ShouldSuppressSkyrimInput()) {
-		OOVR_LOGF("[VKEMIT] SendSingleVK(vk=0x%02X) SUPPRESSED (Prisma focused)", vk);
+	// PC MODE always passes through to Skyrim. The user explicitly toggled
+	// the VR keyboard to PC mode (sendInputOnly), which is the "I'm sending
+	// game input now" intent — same role as a physical PC keyboard. Prisma's
+	// text-focus gate only applies in VR MODE, where the VR keyboard is
+	// primarily a Prisma typing surface.
+	//
+	// F1-F12 also bypass even in VR mode: they're game hotkeys (toggle-style
+	// — open / close panels, debug menus, etc.), never typing keys, so the
+	// gate would only break user-mapped hotkeys (e.g. F8 to toggle a Prisma
+	// test panel) without ever helping anyone type.
+	const bool isFKey = (vk >= VK_F1 && vk <= VK_F12);
+
+	if (!pcMode && !isFKey && ShouldSuppressSkyrimInput()) {
+		OOVR_LOGF("[VKEMIT] SendSingleVK(vk=0x%02X) SUPPRESSED (Prisma focused, VR mode)", vk);
 		return;
 	}
-	OOVR_LOGF("[VKEMIT] SendSingleVK(vk=0x%02X) firing SendInput", vk);
+	OOVR_LOGF("[VKEMIT] SendSingleVK(vk=0x%02X) firing SendInput%s%s",
+	    vk,
+	    pcMode ? " (PC mode)" : "",
+	    isFKey ? " (F-key bypass)" : "");
 
 	WORD scan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 	DWORD flags = (IsExtendedKey(vk) ? KEYEVENTF_EXTENDEDKEY : 0);
@@ -670,10 +685,10 @@ static bool IsActionKey(wchar_t ch)
 //
 // Set postChar=false to suppress the PostCharToGame call — used when only
 // the DirectInput / game-hotkey path is desired (rare).
-static void SendVirtualKey(WORD vk, bool shift, wchar_t ch = 0, bool postChar = true)
+static void SendVirtualKey(WORD vk, bool shift, wchar_t ch = 0, bool postChar = true, bool pcMode = false)
 {
-	OOVR_LOGF("[VKEMIT] SendVirtualKey(vk=0x%02X shift=%d ch=0x%04X postChar=%d) prismaFocused=%d",
-	    vk, shift ? 1 : 0, (unsigned)ch, postChar ? 1 : 0, IsPrismaTextFocused() ? 1 : 0);
+	OOVR_LOGF("[VKEMIT] SendVirtualKey(vk=0x%02X shift=%d ch=0x%04X postChar=%d pcMode=%d) prismaFocused=%d",
+	    vk, shift ? 1 : 0, (unsigned)ch, postChar ? 1 : 0, pcMode ? 1 : 0, IsPrismaTextFocused() ? 1 : 0);
 	WORD scan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 	WORD shiftScan = (WORD)MapVirtualKeyW(VK_SHIFT, MAPVK_VK_TO_VSC);
 
@@ -750,12 +765,15 @@ static void SendVirtualKey(WORD vk, bool shift, wchar_t ch = 0, bool postChar = 
 		}
 	}
 
-	// Suppression gate: skip SendInput when a Prisma text field is focused —
-	// PrismaVR direct-delivery handles the keystroke, Skyrim should never
-	// see it. Outside that, SendInput fires normally; intentional MCM key-
-	// remap captures from vkey work. The single-channel emit pattern above
-	// keeps one logical press == one OnKeyDown in Papyrus.
-	if (!ShouldSuppressSkyrimInput())
+	// Suppression gate: skip SendInput when a Prisma text field is focused
+	// AND we're in VR MODE — PrismaVR direct-delivery handles the keystroke,
+	// Skyrim should never see it.
+	//
+	// In PC MODE the user explicitly chose "send to game" semantics, so we
+	// always pass through. F1-F12 also bypass even in VR mode (game hotkeys).
+	const bool isFKey = (vk >= VK_F1 && vk <= VK_F12);
+	const bool gateBypassed = pcMode || isFKey;
+	if (gateBypassed || !ShouldSuppressSkyrimInput())
 		::SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
 
 	// Post character directly to SKSE plugin for Scaleform injection.
@@ -2168,14 +2186,14 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 		if (consoleActive) {
 			VkMapping mapping = CharToVK(L'`');
 			if (mapping.vk != 0)
-				SendVirtualKey(mapping.vk, mapping.needsShift, 0);
+				SendVirtualKey(mapping.vk, mapping.needsShift, 0, true, sendInputOnly || consoleActive);
 			consoleActive = false;
 			consoleDirty = true;
 			OOVR_LOG("Grip pressed with console open — sent tilde to close console");
 		}
 		if (!sendInputOnly) {
 			// Send Escape to dismiss SkyUI text input dialogs (only when game opened the keyboard)
-			SendSingleVK(VK_ESCAPE);
+			SendSingleVK(VK_ESCAPE, sendInputOnly || consoleActive);
 			PostCharToGame(VK_ESCAPE, 1);
 			SubmitEvent(VREvent_KeyboardClosed, 0);
 		}
@@ -2234,7 +2252,7 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 			// Repeat fire — play sound/haptic and send backspace
 			PlayPressSound();
 			TriggerHaptic((int)side);
-			SendSingleVK(VK_BACK);
+			SendSingleVK(VK_BACK, sendInputOnly || consoleActive);
 			if (!consoleActive) PostCharToGame(VK_BACK, 1);
 			if ((!sendInputOnly || consoleActive) && cursorPos > 0 && !text.empty()) {
 				text.erase(cursorPos - 1, 1);
@@ -2267,7 +2285,7 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 				ECaseMode target = ch == '\x02' ? ECaseMode::LOCK : ECaseMode::SHIFT;
 				caseMode = caseMode == target ? ECaseMode::LOWER : target;
 			} else if (ch == '\b') {
-				SendSingleVK(VK_BACK);
+				SendSingleVK(VK_BACK, sendInputOnly || consoleActive);
 				if (!consoleActive) PostCharToGame(VK_BACK, 1); // GFxKeyEvent — skip for console (SendInput suffices)
 				// Update internal buffer (game-opened keyboard OR console mode)
 				if ((!sendInputOnly || consoleActive) && cursorPos > 0 && !text.empty()) {
@@ -2279,7 +2297,7 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 				// Done
 				if (sendInputOnly) {
 					// PC mode: text was injected via SendInput/GFx — confirm with Enter
-					SendSingleVK(VK_RETURN);
+					SendSingleVK(VK_RETURN, true);
 					if (!consoleActive) PostCharToGame(VK_RETURN, 1);
 					constexpr UINT WM_OC_KB = WM_APP + 0x4F43;
 					HWND hwnd = GetGameWindow();
@@ -2293,10 +2311,10 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 				}
 				closed = true;
 			} else if (ch == '\t') {
-				SendSingleVK(VK_TAB);
+				SendSingleVK(VK_TAB, sendInputOnly || consoleActive);
 				PostCharToGame(VK_TAB, 1); // GFxKeyEvent for Scaleform (SkyUI needs this!)
 			} else if (ch == '\n') {
-				SendSingleVK(VK_RETURN);
+				SendSingleVK(VK_RETURN, sendInputOnly || consoleActive);
 				if (!consoleActive) PostCharToGame(VK_RETURN, 1); // GFxKeyEvent — skip for console
 				if (consoleActive) {
 					text.clear();
@@ -2304,18 +2322,18 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 					consoleDirty = true;
 				}
 			} else if (ch == '\x04') {
-				SendSingleVK(VK_UP);
+				SendSingleVK(VK_UP, sendInputOnly || consoleActive);
 			} else if (ch == '\x05') {
-				SendSingleVK(VK_DOWN);
+				SendSingleVK(VK_DOWN, sendInputOnly || consoleActive);
 			} else if (ch == '\x06') {
-				SendSingleVK(VK_LEFT);
+				SendSingleVK(VK_LEFT, sendInputOnly || consoleActive);
 			} else if (ch == '\x07') {
-				SendSingleVK(VK_RIGHT);
+				SendSingleVK(VK_RIGHT, sendInputOnly || consoleActive);
 			} else if (ch >= '\x10' && ch <= '\x1B') {
 				// F1-F12 keys: \x10=F1, \x11=F2, ..., \x1B=F12
 				int fNum = (ch - '\x10') + 1;
 				WORD vk = VK_F1 + (fNum - 1);
-				SendSingleVK(vk);
+				SendSingleVK(vk, sendInputOnly || consoleActive);
 			} else if (ch == '\x0F') {
 				// [M] key — toggle crosshair dot at gaze center
 				crosshairVisible = !crosshairVisible;
@@ -2325,10 +2343,10 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 				s_targetMode = !s_targetMode;
 				OOVR_LOGF("Target mode: %s", s_targetMode ? "ON" : "OFF");
 			} else if (ch == '\x1D') {
-				SendSingleVK(VK_END);
+				SendSingleVK(VK_END, sendInputOnly || consoleActive);
 			} else if (ch == '\x0E') {
 				// ESC — send to SkyUI/menus to cancel text input (does NOT close keyboard)
-				SendSingleVK(VK_ESCAPE);
+				SendSingleVK(VK_ESCAPE, sendInputOnly || consoleActive);
 			} else {
 				// Tilde/backtick toggles console INPUT overlay
 				if (ch == L'`' || ch == L'~') {
@@ -2340,7 +2358,7 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 					consoleDirty = true;
 					OOVR_LOGF("Console overlay: %s", consoleActive ? "OPENED" : "CLOSED");
 					// Send scancode for DirectInput console toggle (no VK, no PostCharToGame)
-					SendSingleVK(VK_OEM_3);
+					SendSingleVK(VK_OEM_3, sendInputOnly || consoleActive);
 				} else if (consoleActive) {
 					// Console mode: ONLY PostCharToGame — no scancodes at all.
 					// Scancodes produce WM_CHAR via TranslateMessage which doubles in console.
@@ -2362,7 +2380,7 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 					// (OC_KB_ACTIVE property) to prevent double entry.
 					VkMapping mapping = CharToVK(ch);
 					if (mapping.vk != 0)
-						SendVirtualKey(mapping.vk, mapping.needsShift, ch);
+						SendVirtualKey(mapping.vk, mapping.needsShift, ch, true, sendInputOnly || consoleActive);
 				}
 				// Buffer character for display (game-opened keyboard OR console mode)
 				// Skip tilde itself — it's a toggle, not console input
