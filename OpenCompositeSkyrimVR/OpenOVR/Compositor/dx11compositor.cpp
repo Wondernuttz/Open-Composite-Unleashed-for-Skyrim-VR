@@ -538,6 +538,23 @@ static void __fastcall Hook_FinishAccumPost(void* accumulator, uint32_t flags)
 
 static void InstallFinishAccumHook()
 {
+	// 2026-05-05 (Wondernuttz): hook install temporarily disabled.
+	//
+	// PR #16's MinHook patch on BSShaderAccumulator::FinishAccumulating crashed
+	// with deterministic 2-3 minute CTD on modlists running Community Shaders.
+	// CS patches the same shader-pipeline code; two MinHook patches in
+	// overlapping function bodies don't chain cleanly, corrupting register
+	// state which surfaces later as `cmp [rdi+0x10], ebx` with rdi=0x30
+	// in sksevr_1_4_15.dll+0x5B8B. Reproduced by Davey on MGO 3.9.0.3 CS
+	// variant; resolved by disabling either CS or this hook.
+	//
+	// fpRenderFinished is currently set-but-never-read elsewhere in the
+	// codebase, so skipping the hook is a no-op for current functionality.
+	// Once a coexistence strategy with CS lands (vtable hook, deferred
+	// install, or CS-aware fallback), restore the body below.
+	OOVR_LOGF("FinishAccumPost: hook install SKIPPED (CS coexistence pending fix)");
+	return;
+
 	if (s_fpFinishAccumHooked || !s_pBridge || !s_pBridge->finishAccumulatingAddr)
 		return;
 
