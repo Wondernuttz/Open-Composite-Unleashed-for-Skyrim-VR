@@ -355,7 +355,7 @@ private:
 	float dlssBiasEdgeBoost = 0.50f; // Extra bias at depth edges (foliage silhouettes)
 	float dlssBiasDepthFalloffStart = 0.95f; // Depth where bias mask begins fading (standard-Z, 0=near 1=far)
 	float dlssBiasDepthFalloffEnd = 0.99f;   // Depth where bias mask reaches zero (distant mountains/sky)
-	float dlssJitterScale  = 0.5f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
+	float dlssJitterScale  = 0.4f;   // Jitter magnitude multiplier (lower = less ghosting, less detail)
 
 	// [keyboard] section
 	bool kbShortcutEnabled = true;
