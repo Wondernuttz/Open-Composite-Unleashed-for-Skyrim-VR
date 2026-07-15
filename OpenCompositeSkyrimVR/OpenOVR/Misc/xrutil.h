@@ -1,6 +1,7 @@
 #pragma once
 
 #include "generated/interfaces/vrtypes.h"
+#include <atomic>
 #include <mutex>
 #include <openxr/openxr.h>
 #include <shared_mutex>
@@ -66,6 +67,7 @@ public:
 
 	// Set by XrBackend
 	XrTime nextPredictedFrameTime = 1;
+	std::atomic<XrDuration> nextPredictedFramePeriod{ 0 };
 
 	/**
 	 * The latest time we've observed from the runtime. This will be set before a frame is submitted, so for
@@ -83,6 +85,12 @@ public:
 	 * Returns nextPredictedFrameTime if available, otherwise returns latestTime.
 	 */
 	XrTime GetBestTime();
+
+	/**
+	 * Returns the latest OpenXR predicted display period converted to Hz,
+	 * or 0 if no frame period has been observed yet.
+	 */
+	float GetPredictedDisplayFrequencyHz();
 };
 
 class SessionLock;

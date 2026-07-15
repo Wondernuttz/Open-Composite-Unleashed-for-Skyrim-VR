@@ -120,6 +120,15 @@ XrTime XrSessionGlobals::GetBestTime()
 	return nextPredictedFrameTime > 1 ? nextPredictedFrameTime : latestTime;
 }
 
+float XrSessionGlobals::GetPredictedDisplayFrequencyHz()
+{
+	const XrDuration period = nextPredictedFramePeriod.load(std::memory_order_acquire);
+	if (period <= 0)
+		return 0.0f;
+
+	return static_cast<float>(1000000000.0 / static_cast<double>(period));
+}
+
 XrSpace xr_space_from_tracking_origin(vr::ETrackingUniverseOrigin origin)
 {
 	switch (origin) {

@@ -867,8 +867,10 @@ bool XrBackend::BeginAswWarpFrameForSplit()
 		return false;
 	}
 
-	if (aswWarpFrameState.predictedDisplayPeriod > 0)
+	if (aswWarpFrameState.predictedDisplayPeriod > 0) {
 		predictedDisplayPeriodMs = (float)(aswWarpFrameState.predictedDisplayPeriod / 1000000.0);
+		xr_gbl->nextPredictedFramePeriod.store(aswWarpFrameState.predictedDisplayPeriod, std::memory_order_release);
+	}
 
 	if (measuredWaitFrameMs > kAswWaitStallThresholdMs) {
 		aswStallCount++;
@@ -922,8 +924,10 @@ bool XrBackend::BeginRealFrameAfterAswWarp(float* outWaitMs)
 		return false;
 	}
 
-	if (aswRealFrameState.predictedDisplayPeriod > 0)
+	if (aswRealFrameState.predictedDisplayPeriod > 0) {
 		predictedDisplayPeriodMs = (float)(aswRealFrameState.predictedDisplayPeriod / 1000000.0);
+		xr_gbl->nextPredictedFramePeriod.store(aswRealFrameState.predictedDisplayPeriod, std::memory_order_release);
+	}
 
 	XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
 	OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
@@ -992,6 +996,7 @@ void XrBackend::WaitForTrackingData()
 		// Store the runtime's actual display period (nanoseconds → milliseconds)
 		if (state.predictedDisplayPeriod > 0) {
 			predictedDisplayPeriodMs = (float)(state.predictedDisplayPeriod / 1000000.0);
+			xr_gbl->nextPredictedFramePeriod.store(state.predictedDisplayPeriod, std::memory_order_release);
 		}
 
 		// xrBeginFrame stays adjacent to xrWaitFrame for consistent frame pacing.

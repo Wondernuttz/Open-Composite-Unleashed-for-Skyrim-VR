@@ -604,7 +604,15 @@ float XrHMD::GetFloatTrackedDeviceProperty(vr::ETrackedDeviceProperty prop, vr::
 
 	switch (prop) {
 	case vr::Prop_DisplayFrequency_Float:
-		return 90.0; // TODO use the real value
+		if (xr_gbl) {
+			const float frequencyHz = xr_gbl->GetPredictedDisplayFrequencyHz();
+			if (frequencyHz > 0.0f)
+				return frequencyHz;
+		}
+
+		if (pErrorL)
+			*pErrorL = vr::TrackedProp_NotYetAvailable;
+		return 0.0f;
 	case vr::Prop_LensCenterLeftU_Float:
 	case vr::Prop_LensCenterLeftV_Float:
 	case vr::Prop_LensCenterRightU_Float:
