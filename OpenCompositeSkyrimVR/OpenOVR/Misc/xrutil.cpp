@@ -2,6 +2,8 @@
 
 #include "xrutil.h"
 
+#include <cmath>
+
 #include "Drivers/Backend.h"
 #include "convert.h"
 #include "xr_ext.h"
@@ -126,7 +128,21 @@ float XrSessionGlobals::GetPredictedDisplayFrequencyHz()
 	if (period <= 0)
 		return 0.0f;
 
-	return static_cast<float>(1000000000.0 / static_cast<double>(period));
+	float hz = static_cast<float>(1000000000.0 / static_cast<double>(period));
+
+	// Prop_DisplayFrequency_Float means PANEL rate. Under runtime throttling
+	// (VD SSW, half-rate ASW modes) xrWaitFrame reports the APP period, i.e.
+	// double the panel period — snap to the nearest standard panel rate, and
+	// treat a half-rate reading as its doubled panel rate so the property
+	// doesn't swing 90 -> 45 -> 90 mid-session (Havok helpers retune off it).
+	static const float kPanelRates[] = { 60.0f, 72.0f, 80.0f, 90.0f, 120.0f, 144.0f };
+	for (float rate : kPanelRates) {
+		if (std::fabs(hz - rate) < 3.0f)
+			return rate;
+		if (std::fabs(hz * 2.0f - rate) < 3.0f)
+			return rate; // half-rate throttle observed — report the panel rate
+	}
+	return hz;
 }
 
 XrSpace xr_space_from_tracking_origin(vr::ETrackingUniverseOrigin origin)

@@ -610,9 +610,13 @@ float XrHMD::GetFloatTrackedDeviceProperty(vr::ETrackedDeviceProperty prop, vr::
 				return frequencyHz;
 		}
 
+		// Boot-time queries land here (the game and SKSE plugins read device
+		// properties during VR init, before the first xrWaitFrame). Return the
+		// classic 90 instead of 0 so fMaxTime = 1/freq consumers never divide
+		// by zero; the error code still flags it for callers that check.
 		if (pErrorL)
 			*pErrorL = vr::TrackedProp_NotYetAvailable;
-		return 0.0f;
+		return 90.0f;
 	case vr::Prop_LensCenterLeftU_Float:
 	case vr::Prop_LensCenterLeftV_Float:
 	case vr::Prop_LensCenterRightU_Float:
