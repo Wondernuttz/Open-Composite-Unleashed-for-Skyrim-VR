@@ -9,7 +9,7 @@ using System.Windows.Forms;
 
 namespace OpenCompositeConfigurator
 {
-    public class MainForm : Form
+    public partial class MainForm : Form
     {
         // INI data
         private readonly IniFile _ini = new();
@@ -25,8 +25,10 @@ namespace OpenCompositeConfigurator
         // Tab system (borderless panels with toggle buttons)
         private Button _btnTabSettings = null!;
         private Button _btnTabKeyboard = null!;
+        private Button _btnTabTextures = null!;
         private Panel _tabSettings = null!;
         private Panel _tabKeyboard = null!;
+        private Panel _tabTextures = null!;
 
         // Controller image panel
         private PictureBox _picControllers = null!;
@@ -407,6 +409,22 @@ namespace OpenCompositeConfigurator
             _btnTabKeyboard.Click += (s, e) => SwitchTab(1);
             Controls.Add(_btnTabKeyboard);
 
+            _btnTabTextures = new Button
+            {
+                Text = "Controller Textures",
+                Location = new Point(leftMargin + 225, y),
+                Size = new Size(160, 30),
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 10f),
+                ForeColor = Color.FromArgb(160, 160, 160),
+                BackColor = Color.FromArgb(35, 35, 40),
+                Cursor = Cursors.Hand,
+            };
+            _btnTabTextures.FlatAppearance.BorderSize = 0;
+            _btnTabTextures.FlatAppearance.MouseOverBackColor = Color.FromArgb(50, 50, 55);
+            _btnTabTextures.Click += (s, e) => SwitchTab(2);
+            Controls.Add(_btnTabTextures);
+
             y += 32;
 
             // Panel 1: Settings — no scrollbar
@@ -431,9 +449,21 @@ namespace OpenCompositeConfigurator
             };
             Controls.Add(_tabKeyboard);
 
+            // Panel 3: Controller Textures
+            _tabTextures = new Panel
+            {
+                Location = new Point(leftMargin, y),
+                Size = new Size(rightEdge - leftMargin, 900),
+                BackColor = Color.FromArgb(30, 30, 35),
+                AutoScroll = false,
+                Visible = false,
+            };
+            Controls.Add(_tabTextures);
+
             // Build content for each tab
             BuildSettingsTab();
             BuildKeyboardTab();
+            BuildTexturesTab();
 
             // Form size
             ClientSize = new Size(ClientSize.Width, Math.Max(_tabSettings.Bottom + 20, 1000));
@@ -2600,6 +2630,7 @@ namespace OpenCompositeConfigurator
         {
             _tabSettings.Visible = (index == 0);
             _tabKeyboard.Visible = (index == 1);
+            _tabTextures.Visible = (index == 2);
 
             // Update button styles
             _btnTabSettings.Font = new Font("Segoe UI", 10f, index == 0 ? FontStyle.Bold : FontStyle.Regular);
@@ -2609,6 +2640,10 @@ namespace OpenCompositeConfigurator
             _btnTabKeyboard.Font = new Font("Segoe UI", 10f, index == 1 ? FontStyle.Bold : FontStyle.Regular);
             _btnTabKeyboard.ForeColor = index == 1 ? Color.White : Color.FromArgb(160, 160, 160);
             _btnTabKeyboard.BackColor = index == 1 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
+
+            _btnTabTextures.Font = new Font("Segoe UI", 10f, index == 2 ? FontStyle.Bold : FontStyle.Regular);
+            _btnTabTextures.ForeColor = index == 2 ? Color.White : Color.FromArgb(160, 160, 160);
+            _btnTabTextures.BackColor = index == 2 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
