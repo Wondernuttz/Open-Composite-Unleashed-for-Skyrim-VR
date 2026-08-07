@@ -657,6 +657,24 @@ namespace OpenCompositeConfigurator
             _btnTabBody.Visible = ShowDevTools;
             Controls.Add(_btnTabBody);
 
+            _btnTabTextures = new Button
+            {
+                Text = "Controller Textures",
+                // Haptics and Body Tracking are devtools-only, so this sits
+                // where they would be when they're hidden.
+                Location = new Point(leftMargin + (ShowDevTools ? 640 : 425), y),
+                Size = new Size(150, 30),
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 10f),
+                ForeColor = Color.FromArgb(160, 160, 160),
+                BackColor = Color.FromArgb(35, 35, 40),
+                Cursor = Cursors.Hand,
+            };
+            _btnTabTextures.FlatAppearance.BorderSize = 0;
+            _btnTabTextures.FlatAppearance.MouseOverBackColor = Color.FromArgb(50, 50, 55);
+            _btnTabTextures.Click += (s, e) => SwitchTab(6);
+            Controls.Add(_btnTabTextures);
+
             y += 32;
 
             // Panel 1: Settings
@@ -725,6 +743,17 @@ namespace OpenCompositeConfigurator
             };
             Controls.Add(_tabBody);
 
+            // Panel 7: Controller Textures
+            _tabTextures = new Panel
+            {
+                Location = new Point(leftMargin, y),
+                Size = new Size(rightEdge - leftMargin, 800), // resized after content built
+                BackColor = Color.FromArgb(30, 30, 35),
+                AutoScroll = false,
+                Visible = false,
+            };
+            Controls.Add(_tabTextures);
+
             // Build content for each tab (each auto-sizes its panel)
             BuildSettingsTab();
             BuildKeyboardTab();
@@ -732,15 +761,17 @@ namespace OpenCompositeConfigurator
             BuildVideoTab();
             BuildHapticsTab();
             BuildBodyTrackingTab();
+            BuildTexturesTab();
 
             // Sync all tabs to the same height (tallest content)
-            int tallestTab = Math.Max(Math.Max(Math.Max(Math.Max(Math.Max(_tabSettings.Height, _tabKeyboard.Height), _tabGestures.Height), _tabVideo.Height), _tabHaptics.Height), _tabBody.Height);
+            int tallestTab = Math.Max(Math.Max(Math.Max(Math.Max(Math.Max(Math.Max(_tabSettings.Height, _tabKeyboard.Height), _tabGestures.Height), _tabVideo.Height), _tabHaptics.Height), _tabBody.Height), _tabTextures.Height);
             _tabSettings.Size = new Size(_tabSettings.Width, tallestTab);
             _tabKeyboard.Size = new Size(_tabKeyboard.Width, tallestTab);
             _tabGestures.Size = new Size(_tabGestures.Width, tallestTab);
             _tabVideo.Size = new Size(_tabVideo.Width, tallestTab);
             _tabHaptics.Size = new Size(_tabHaptics.Width, tallestTab);
             _tabBody.Size = new Size(_tabBody.Width, tallestTab);
+            _tabTextures.Size = new Size(_tabTextures.Width, tallestTab);
 
             // Support footer right after the tabs
             int kofiY = _tabSettings.Location.Y + tallestTab + 4;
@@ -6001,6 +6032,7 @@ namespace OpenCompositeConfigurator
             _tabVideo.Visible = (index == 3);
             _tabHaptics.Visible = (index == 4);
             _tabBody.Visible = (index == 5);
+            _tabTextures.Visible = (index == 6);
 
             // Update button styles
             _btnTabSettings.Font = new Font("Segoe UI", 10f, index == 0 ? FontStyle.Bold : FontStyle.Regular);
@@ -6026,6 +6058,10 @@ namespace OpenCompositeConfigurator
             _btnTabBody.Font = new Font("Segoe UI", 10f, index == 5 ? FontStyle.Bold : FontStyle.Regular);
             _btnTabBody.ForeColor = index == 5 ? Color.White : Color.FromArgb(160, 160, 160);
             _btnTabBody.BackColor = index == 5 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
+
+            _btnTabTextures.Font = new Font("Segoe UI", 10f, index == 6 ? FontStyle.Bold : FontStyle.Regular);
+            _btnTabTextures.ForeColor = index == 6 ? Color.White : Color.FromArgb(160, 160, 160);
+            _btnTabTextures.BackColor = index == 6 ? Color.FromArgb(50, 50, 60) : Color.FromArgb(35, 35, 40);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
