@@ -1,17 +1,16 @@
-# Writing an API layer for OCU
 
-OCU looks for OpenXR API layers in an `xrlayers/` folder next to `openvr_api.dll` and enables each
-one it finds. This is how a mod gets code in between OCU and the VR runtime without patching
-either.
+# Writing an openxr api layer for OCU
 
-The whole contract is **a manifest and the DLL it names**. OCU never opens your DLL and knows
-nothing about it at compile time.
+OpenXR has a standard extension point called an API layer: a DLL that sits between an
+application and the VR runtime and can intercept any call either of them makes.
+An openxr api layer can read and change (among others) all controller input & headset input, locations and rendered image before OCU or the game ever see it.
 
-Turn the whole mechanism off with `enableApiLayers=false` in `opencomposite.ini`.
+OCU allows you to register your dll as an openxr api layer plugin, which lets your write your own api layer that runs whenever Skyrim VR runs with OCU.
+
 
 ## The manifest
 
-Drop a `.json` file in `xrlayers/`:
+Drop a `.json` file in `xrlayers/` to register your dll as an api layer:
 
 ```json
 {
@@ -36,8 +35,7 @@ Drop a `.json` file in `xrlayers/`:
 - **`implementation_version`** — your own build number, for your own use.
 - **`description`** — a short human-readable line; it shows up in the OCU log.
 
-This is exactly the standard OpenXR explicit-layer format — the manifest schema Khronos defines,
-parsed by the OpenXR loader. OCU invents no keys of its own and reads only `name` and
+This is exactly the standard OpenXR explicit-layer format. OCU invents no keys of its own and reads only `name` and
 `library_path`, for its own checks and logging. A manifest that satisfies the loader satisfies OCU,
 and one carrying keys OCU does not know about is used as it stands rather than rejected.
 
@@ -138,51 +136,6 @@ Pitfalls, worst first:
 - **Unloading.** The loader calls `FreeLibrary` when the OpenXR instance is destroyed. With SKSE
   holding a reference the module stays mapped, which is what you want if you installed hooks — but
   don't rely on it if the plugin half didn't run.
-
-## Asking OCU to rebuild its swapchains
-
-OCU exports one function for layers:
-
-```c
-typedef void(__cdecl* PFN_OCU_InvalidateSwapchains)(void);
-
-// Ask every loaded module, rather than naming one. OCU is built as vrclient_x64.dll and is only
-// called openvr_api.dll because of where it gets deployed, so a fixed name is the fragile way.
-PFN_OCU_InvalidateSwapchains FindOcuInvalidate()
-{
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (snap == INVALID_HANDLE_VALUE)
-        return NULL;
-
-    PFN_OCU_InvalidateSwapchains fn = NULL;
-    MODULEENTRY32W me = { sizeof(me) };
-    if (Module32FirstW(snap, &me)) {
-        do {
-            fn = (PFN_OCU_InvalidateSwapchains)GetProcAddress(me.hModule, "OCU_InvalidateSwapchains");
-        } while (!fn && Module32NextW(snap, &me));
-    }
-    CloseHandle(snap);
-    return fn;   // NULL is fine — see below
-}
-```
-
-Resolve it once and cache the result; do not walk the module list per frame.
-
-It tells OCU to throw its swapchains away and create new ones on its next frame. You need this if
-you have changed what the images in those swapchains mean, because OpenXR fixes a swapchain's
-images for its lifetime — the only way to give an application different ones is to make it ask
-again.
-
-A null result from `GetProcAddress` means an OCU too old to have it. That is not an error; handle
-it by doing whatever you would do without OCU.
-
-Three things to know:
-
-- It takes effect on OCU's next frame, not immediately.
-- Safe to call from any thread, and safe to call early, before OCU has finished starting.
-- **It does not reach every swapchain OCU owns.** The game's eye buffers, overlays, and the ASW and
-  space warp paths rebuild. The keyboard, the menu laser, and the overlay trail chain do not — so
-  don't give those chains images you will need back later.
 
 ## When it doesn't load
 

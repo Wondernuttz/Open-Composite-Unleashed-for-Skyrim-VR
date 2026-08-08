@@ -33,6 +33,9 @@
     <ApplicationIcon>icon.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="OSIcon, Version=3.0.0.0, Culture=neutral, PublicKeyToken=2d4a153a84ea7847, processorArchitecture=MSIL">
+      <HintPath>..\packages\OSIcon.3.0.0.0\lib\OSIcon.dll</HintPath>
+    </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core" />
     <Reference Include="System.Xml.Linq" />
@@ -94,10 +97,8 @@
     <Content Include="icon.ico" />
   </ItemGroup>
   <ItemGroup>
-    <!-- 13.0.3, not 11.0.2: NU1903, a known high-severity advisory (GHSA-5crp-9r3c-p9vr).
-         Verified the .vrpath round-trip is byte-identical between the two. -->
     <PackageReference Include="Newtonsoft.Json">
-      <Version>13.0.3</Version>
+      <Version>11.0.2</Version>
     </PackageReference>
     <PackageReference Include="OSIcon">
       <Version>3.0.0</Version>
