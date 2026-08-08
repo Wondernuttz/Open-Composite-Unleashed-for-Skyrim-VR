@@ -60,10 +60,15 @@ public:
 	 * would be cleared by whichever submitted first, leaving the rest never rebuilding. Each
 	 * compares against its own stored copy, so they need no coordination.
 	 *
-	 * Participating owners, exhaustively: DX11Compositor (game eyes and overlays), ASWProvider,
-	 * SpaceWarpProvider. VRKeyboard, VRMenuLaser and BaseOverlay's trail chain call
-	 * xrCreateSwapchain directly and do NOT rebuild — a caller must not hand those chains images
-	 * it will later need back, because asking will not get them back.
+	 * Participating owners, exhaustively: DX11Compositor — which is both the game's eye textures
+	 * and, through BaseOverlay, every overlay — plus ASWProvider and SpaceWarpProvider.
+	 *
+	 * Everything else that owns an XrSwapchain does NOT rebuild, so a caller must not hand those
+	 * chains images it will later need back; asking will not get them back. That is VRKeyboard,
+	 * VRMenuLaser and BaseOverlay's trail chain, which all call xrCreateSwapchain themselves, and
+	 * also the DX12, OpenGL and Vulkan compositors. Those three are unreachable in Skyrim VR (a
+	 * D3D11 game, and BaseCompositor picks the subclass from the texture type the game submits)
+	 * but they are compiled, so they are listed here rather than left implied.
 	 *
 	 * Takes effect on the next frame. Safe from any thread.
 	 */

@@ -21,8 +21,7 @@ Drop a `.json` file in `xrlayers/`:
         "library_path": ".\\XR_APILAYER_YOURMOD_thing.dll",
         "api_version": "1.0",
         "implementation_version": "1",
-        "description": "What it does",
-        "ocu_priority": 100
+        "description": "What it does"
     }
 }
 ```
@@ -36,11 +35,15 @@ Drop a `.json` file in `xrlayers/`:
   newer.
 - **`implementation_version`** — your own build number, for your own use.
 - **`description`** — a short human-readable line; it shows up in the OCU log.
-- **`ocu_priority`** — optional, an integer that decides where you sit in the chain. Defaults to
-  `100`. See [Ordering](#ordering).
 
-Everything except `ocu_priority` is the standard OpenXR explicit-layer format, and the OpenXR
-loader is what parses it. OCU reads only `name`, `library_path` and `ocu_priority`.
+This is exactly the standard OpenXR explicit-layer format — the manifest schema Khronos defines,
+parsed by the OpenXR loader. OCU invents no keys of its own and reads only `name` and
+`library_path`, for its own checks and logging. A manifest that satisfies the loader satisfies OCU,
+and one carrying keys OCU does not know about is used as it stands rather than rejected.
+
+One manifest per layer. If two manifests in `xrlayers/` carry the same `name`, OCU accepts the
+first and logs the one it skipped: the loader would otherwise put your layer in the chain twice,
+as two mapped copies sharing one set of globals, the second quietly breaking the first.
 
 ### Where library_path may point
 
@@ -70,18 +73,31 @@ Khronos' `XR_APILAYER_LUNARG_api_dump` is the smallest complete example in the w
 
 ## Ordering
 
-Layers are ordered by `ocu_priority`, lowest first. **Low sits nearer the game, high sits nearer
-the runtime.** The default is `100`, so a layer that says nothing lands in the middle and you can
-go either side of it without editing anyone else's manifest.
+**Read this before you design around chain position: OCU cannot control it, and there is no setting
+for it.**
 
-| Priority | Where you land | Good for |
-|---|---|---|
-| `0`–`50` | Nearest the game | Seeing calls before anything else has altered them |
-| `100` | Default | No particular preference |
-| `150`–`200` | Nearest the runtime | Impersonating or replacing runtime behaviour |
+The reason is in the OpenXR loader rather than in OCU:
 
-Layers with the same priority are ordered by filename, so the result is always the same from run to
-run. The OCU log lists the final order.
+- `xrCreateInstance` takes a list of layer names. The loader uses that list purely as a yes/no
+  membership test — for each manifest it discovered, "did the application name this one?"
+- It then builds the chain in the order it discovered the manifest *files*, which is the order the
+  filesystem listed the folder in. The order the application gave is never read.
+
+So the thing that decides where your layer sits is **the filename of your manifest**, because that
+is what the folder listing sorts on. `10-yours.json` will sit nearer the game than `20-theirs.json`.
+
+That is an observation, not a promise. Nothing in the OpenXR specification says the loader orders by
+discovery, and nothing says a directory listing is sorted at all — it is true of the current loader
+on NTFS, which is every install this has been run on. Do not build anything that breaks if it stops
+being true.
+
+OCU adds nothing on top: it does not rename your manifest, reorder anything, or read any key that
+would let you ask. What it does do is print the order you are actually going to get, game-first,
+whenever more than one layer is installed. Look for `the chain will be, game first` in the OCU log.
+
+With one layer installed — the normal case — none of this matters. With two that genuinely must be
+ordered relative to each other, the two authors have to agree on their filenames between themselves;
+there is no mechanism here that will do it for them.
 
 ## Being an SKSE plugin as well
 
@@ -125,16 +141,32 @@ Pitfalls, worst first:
 
 ## Asking OCU to rebuild its swapchains
 
-`openvr_api.dll` exports one function for layers:
+OCU exports one function for layers:
 
 ```c
 typedef void(__cdecl* PFN_OCU_InvalidateSwapchains)(void);
 
-auto fn = (PFN_OCU_InvalidateSwapchains)GetProcAddress(
-    GetModuleHandleW(L"openvr_api.dll"), "OCU_InvalidateSwapchains");
-if (fn)
-    fn();
+// Ask every loaded module, rather than naming one. OCU is built as vrclient_x64.dll and is only
+// called openvr_api.dll because of where it gets deployed, so a fixed name is the fragile way.
+PFN_OCU_InvalidateSwapchains FindOcuInvalidate()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE)
+        return NULL;
+
+    PFN_OCU_InvalidateSwapchains fn = NULL;
+    MODULEENTRY32W me = { sizeof(me) };
+    if (Module32FirstW(snap, &me)) {
+        do {
+            fn = (PFN_OCU_InvalidateSwapchains)GetProcAddress(me.hModule, "OCU_InvalidateSwapchains");
+        } while (!fn && Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return fn;   // NULL is fine — see below
+}
 ```
+
+Resolve it once and cache the result; do not walk the module list per frame.
 
 It tells OCU to throw its swapchains away and create new ones on its next frame. You need this if
 you have changed what the images in those swapchains mean, because OpenXR fixes a swapchain's
@@ -154,10 +186,19 @@ Three things to know:
 
 ## When it doesn't load
 
-Everything fails soft. OCU only names layers the loader actually reported, so a broken manifest
-can't stop the game starting. The OCU log always says what happened — look for lines starting
-`API layers:`. It will name your manifest and the reason: bad JSON, missing `name` or
-`library_path`, a bare filename, a DLL that doesn't exist, or a path outside the game folder.
+Everything fails soft — a broken layer cannot stop the game starting. Two separate mechanisms,
+because a manifest and a DLL fail at different moments:
+
+- **A bad manifest** is rejected during discovery, before OCU names anything. The log names your
+  file and the reason: bad JSON, missing `name` or `library_path`, a bare filename, a DLL that
+  doesn't exist, a path outside the game folder, or a duplicate `name`.
+- **A DLL that won't load** cannot be caught by any check. The loader does not open it until
+  `xrCreateInstance`, and there it can fail for reasons a manifest can't reveal — a 32-bit build, a
+  truncated download, or a dependency you forgot to static-link. If that happens OCU logs it,
+  retries once with every discovered layer dropped, and carries on. The game starts; your layer
+  simply isn't there. `enableApiLayers=false` in `opencomposite.ini` stops OCU trying at all.
+
+Either way the OCU log is the place to look — every line starts `API layers:`.
 
 Two environment traps worth knowing:
 
@@ -165,4 +206,6 @@ Two environment traps worth knowing:
   manager runs as administrator, nothing is discovered. The symptom is manifests listed in the log
   but no layer enabled.
 - Setting that variable **switches off the loader's registry search for explicit layers.** Any
-  system-installed explicit layer is invisible while an `xrlayers/` folder exists.
+  system-installed explicit layer is invisible to the game while OCU has set it. OCU only sets it
+  once at least one manifest has parsed successfully, so a folder of nothing but broken manifests
+  does not cost you your system layers — but one working layer does.

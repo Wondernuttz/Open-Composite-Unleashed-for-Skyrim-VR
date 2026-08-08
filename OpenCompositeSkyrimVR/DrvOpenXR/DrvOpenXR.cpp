@@ -81,24 +81,31 @@ static void LogImplicitOpenXRLayers() {}
 // this DLL is discovered and enabled. A manifest plus the DLL it names is the entire contract -
 // no layer is known by name at compile time. See docs/API-LAYERS.md.
 //
-// Three loader behaviours this depends on, all learned the hard way:
+// Four loader behaviours this depends on, all learned the hard way:
 //   * XR_API_LAYER_PATH must be set before xrEnumerateApiLayerProperties, not merely before
 //     xrCreateInstance - the loader caches discovery on first enumeration.
 //   * The loader reads it via PlatformUtilsGetSecureEnv, which returns nothing to a
 //     high-integrity process. Under an elevated MO2 this silently finds nothing; the log lines
 //     below are how you tell (a manifest found with no layer enabled means exactly this).
 //   * Setting it suppresses the loader's registry search for explicit layers entirely, so
-//     system-wide explicit layers are invisible while xrlayers/ exists.
+//     system-wide explicit layers are invisible while xrlayers/ exists. Hence: parse first, and
+//     only set the variable if at least one manifest was usable.
+//   * enabledApiLayerNames is a membership test, not an order. The loader walks the manifest files
+//     it discovered and asks of each "did the application name this?" (api_layer_interface.cpp,
+//     ApiLayerInterface::LoadApiLayers), then builds the chain in that same discovery order. The
+//     order we hand it is never read - so chain position is decided by the manifest's filename,
+//     which is what the folder listing sorts on. That is an observation about NTFS and the
+//     loader's implementation, not a guarantee either of them makes, and OCU has no say in it.
 //
-// Every rejection below is logged and skipped. Naming a layer the loader did not report is the
-// one fatal mistake available here - xrCreateInstance would return XR_ERROR_API_LAYER_NOT_PRESENT
-// and take the game down - so the enable loop intersects against what it actually enumerated.
+// Every rejection below is logged and skipped. Two failures are not ours to prevent by validation:
+// naming a layer the loader did not report returns XR_ERROR_API_LAYER_NOT_PRESENT, so the enable
+// loop intersects against what was actually enumerated; and a layer whose DLL will not load only
+// fails at xrCreateInstance, so that call retries once without layers.
 
 struct DiscoveredLayer {
 	std::string manifest; // full path of the .json
 	std::string name; // api_layer.name, the string xrCreateInstance wants
 	std::string library; // resolved, canonical path of the layer's DLL
-	int priority = 100; // api_layer.ocu_priority; low sits nearer the application
 };
 
 #ifdef _WIN32
@@ -240,9 +247,10 @@ static bool ReadApiLayerManifest(const std::string& path, const std::string& gam
 	        && (libraryPath[1] == '\\' || libraryPath[1] == '/'));
 	const std::string resolved = CanonicalPath(absolute ? libraryPath : DirectoryOf(path) + "\\" + libraryPath);
 	if (resolved.empty()) {
-		OOVR_LOGF("API layers: %s gives library_path '%s', which does not resolve to a real path,"
-		          " skipping layer '%s'",
-		    path.c_str(), libraryPath.c_str(), name.c_str());
+		OOVR_LOGF("API layers: %s gives library_path '%s', which could not be resolved to a full"
+		          " path - either it is malformed, or the result is longer than the %d characters"
+		          " GetFullPathName is given here. Skipping layer '%s'.",
+		    path.c_str(), libraryPath.c_str(), (int)MAX_PATH, name.c_str());
 		return false;
 	}
 
@@ -263,29 +271,23 @@ static bool ReadApiLayerManifest(const std::string& path, const std::string& gam
 		return false;
 	}
 
-	// Optional. Prefixed because api_layer is a Khronos-defined object and an unprefixed "priority"
-	// could collide with something they add later.
-	int priority = 100;
-	const Json::Value& priorityValue = layer["ocu_priority"];
-	if (!priorityValue.isNull()) {
-		if (priorityValue.isInt())
-			priority = priorityValue.asInt();
-		else
-			OOVR_LOGF("API layers: %s has a non-integer ocu_priority, using the default %d for"
-			          " layer '%s'",
-			    path.c_str(), priority, name.c_str());
-	}
-
+	// Nothing else is read. api_layer is a Khronos-defined object and this is a Khronos-defined
+	// manifest; OCU adds no keys of its own to it, so a manifest that satisfies the loader
+	// satisfies OCU and there is nothing extra to write for us.
 	out.manifest = path;
 	out.name = name;
 	out.library = resolved;
-	out.priority = priority;
 	return true;
 }
 
-// Find every manifest in the folder and put the loader's search path in place. Ordered by
-// ocu_priority, low first: a low-priority layer sits nearer the application, a high one nearer the
-// runtime. Ties break on filename so the order is always deterministic.
+// Find every usable manifest in the folder, then put the loader's search path in place if there
+// was at least one.
+//
+// The result keeps the order the folder listing gave, which is the order the loader will use for
+// the chain - see the membership-test note at the top of this block. Nothing here reorders it,
+// because reordering could only ever be cosmetic: the list OCU hands to xrCreateInstance is read
+// as a set. So the manifest's filename is what decides chain position, and all this function owes
+// an author is to print the order they are actually going to get.
 static std::vector<DiscoveredLayer> DiscoverApiLayers()
 {
 	std::vector<DiscoveredLayer> found;
@@ -305,6 +307,9 @@ static std::vector<DiscoveredLayer> DiscoverApiLayers()
 		return found;
 	}
 
+	// Deliberately not sorted. This is the order the loader itself will see: it lists the same
+	// folder through the same API moments later (FileSysUtilsFindFilesInPath) and sorts no more than
+	// we do here, so keeping the raw order is what makes the order logged below the real one.
 	std::vector<std::string> manifests;
 	WIN32_FIND_DATAA entry{};
 	const HANDLE search = FindFirstFileA((layerDir + "\\*.json").c_str(), &entry);
@@ -315,10 +320,43 @@ static std::vector<DiscoveredLayer> DiscoverApiLayers()
 		} while (FindNextFileA(search, &entry));
 		FindClose(search);
 	}
-	std::sort(manifests.begin(), manifests.end());
 
 	if (manifests.empty()) {
 		OOVR_LOGF("API layers: %s exists but holds no manifests - none installed", layerDir.c_str());
+		return found;
+	}
+
+	// Parse before touching XR_API_LAYER_PATH. Reading and validating manifests is plain file
+	// reading and needs no loader, whereas setting that variable costs the game every system-wide
+	// explicit layer - so a folder holding nothing but junk must not pay that price.
+	for (const std::string& path : manifests) {
+		DiscoveredLayer layer;
+		if (!ReadApiLayerManifest(path, gameRoot, layer))
+			continue;
+
+		// The loader deduplicates manifests by neither name nor path, so two manifests naming one
+		// layer put that layer in the chain twice - two mapped copies sharing one set of globals,
+		// the second quietly breaking the first. A mod manager writing a conflict copy, a kept
+		// backup, or two mods bundling the same layer is enough to cause it.
+		const auto clash = std::find_if(found.begin(), found.end(), [&](const DiscoveredLayer& seen) {
+			return _stricmp(seen.name.c_str(), layer.name.c_str()) == 0;
+		});
+		if (clash != found.end()) {
+			OOVR_LOGF("API layers: %s names layer '%s', which was already accepted from %s -"
+			          " skipping the duplicate. Delete one of the two manifests.",
+			    path.c_str(), layer.name.c_str(), clash->manifest.c_str());
+			continue;
+		}
+
+		OOVR_LOGF("API layers: manifest %s -> layer '%s' (%s)", path.c_str(), layer.name.c_str(),
+		    layer.library.c_str());
+		found.push_back(std::move(layer));
+	}
+
+	if (found.empty()) {
+		OOVR_LOGF("API layers: %d manifest(s) in %s, none of them usable - leaving"
+		          " XR_API_LAYER_PATH alone so system-wide explicit layers stay visible",
+		    (int)manifests.size(), layerDir.c_str());
 		return found;
 	}
 
@@ -340,19 +378,19 @@ static std::vector<DiscoveredLayer> DiscoverApiLayers()
 			OOVR_LOG("API layers: failed to set XR_API_LAYER_PATH - no layers will be found");
 	}
 
-	for (const std::string& path : manifests) {
-		DiscoveredLayer layer;
-		if (!ReadApiLayerManifest(path, gameRoot, layer))
-			continue;
-		OOVR_LOGF("API layers: manifest %s -> layer '%s' priority %d (%s)", path.c_str(),
-		    layer.name.c_str(), layer.priority, layer.library.c_str());
-		found.push_back(std::move(layer));
+	// With one layer there is no order to have an opinion about, and this would be a line saying
+	// so. With two or more it is the only place an author can see where they landed - the position
+	// came from the filename the folder listing sorted on, and nobody chose it deliberately.
+	if (found.size() > 1) {
+		OOVR_LOG("API layers: more than one layer. The OpenXR loader ignores the order an"
+		         " application names layers in and uses the order it listed the manifest files in,"
+		         " so the chain will be, game first:");
+		for (size_t i = 0; i < found.size(); i++)
+			OOVR_LOGF("API layers:   %d. '%s' (%s)", (int)i + 1, found[i].name.c_str(),
+			    found[i].manifest.c_str());
+		OOVR_LOG("API layers: rename the manifests if that is the wrong way round - the listing is"
+		         " by filename.");
 	}
-
-	// Stable, so manifests is still sorted by filename underneath and equal priorities keep that
-	// order rather than whatever the filesystem happened to return.
-	std::stable_sort(found.begin(), found.end(),
-	    [](const DiscoveredLayer& a, const DiscoveredLayer& b) { return a.priority < b.priority; });
 
 	return found;
 }
@@ -554,6 +592,9 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 #ifdef XR_VALIDATION_LAYER_PATH
 	layers.push_back("XR_APILAYER_LUNARG_core_validation");
 #endif
+	// Everything up to here is ours and stays named on the retry below; everything after it comes
+	// from xrlayers/ and is what the retry drops.
+	const size_t builtinLayerCount = layers.size();
 
 	// An explicit layer does nothing until the application names it, so this loop is the switch.
 	// Only ever name one the loader reported - see the fatal case above. The c_str()s stay valid
@@ -563,15 +604,15 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 		if (availableLayers.count(layer.name)) {
 			layers.push_back(layer.name.c_str());
 			enabledLayers++;
-			OOVR_LOGF("API layers: enabling '%s' (priority %d)", layer.name.c_str(), layer.priority);
+			OOVR_LOGF("API layers: enabling '%s'", layer.name.c_str());
 		} else {
 			OOVR_LOGF("API layers: '%s' (%s) was not picked up by the loader, skipping it",
 			    layer.name.c_str(), layer.manifest.c_str());
 		}
 	}
 	if (!discoveredLayers.empty())
-		OOVR_LOGF("API layers: %d of %d enabled, listed above in chain order - the first is nearest"
-		          " the game, the last nearest the runtime",
+		OOVR_LOGF("API layers: %d of %d enabled. The loader decides their chain order from the order"
+		          " it listed the manifest files in, not from the order named here.",
 		    enabledLayers, (int)discoveredLayers.size());
 
 	XrInstanceCreateInfo createInfo{};
@@ -591,16 +632,42 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	createInfo.next = &androidInfo;
 #endif
 
-	// Not OOVR_FAILED_XR_ABORT: when layers are enabled they are by far the likeliest cause of a
-	// failure here, and the bare error code sends people looking at their runtime instead.
+	// Not a straight OOVR_FAILED_XR_ABORT, because this is where a bad third-party layer would
+	// otherwise take the game down. Enumeration only reads JSON; the loader does not open a layer's
+	// DLL until here, so a layer that validated and enumerated perfectly can still fail to load - a
+	// 32-bit build, a truncated download, a dependency it forgot to static-link - and if no other
+	// layer loaded, that failure is what xrCreateInstance returns. Nothing OCU can check up front
+	// catches it.
+	//
+	// The rest of this feature promises a broken layer cannot stop the game starting, so honour that
+	// promise here: drop the discovered layers and try once more. "Starts, layer disabled, log names
+	// it" instead of "won't start, and OCU gets the blame".
 	{
-		const XrResult instanceResult = xrCreateInstance(&createInfo, &xr_instance);
+		XrResult instanceResult = xrCreateInstance(&createInfo, &xr_instance);
+
 		if (XR_FAILED(instanceResult) && enabledLayers > 0) {
-			OOVR_LOGF("API layers: xrCreateInstance failed (%d) with %d layer(s) enabled. They are"
-			          " the first thing to suspect - set enableApiLayers=false in opencomposite.ini"
-			          " to start without them.",
+			OOVR_LOGF("API layers: xrCreateInstance failed (%d) with %d layer(s) enabled. One of them"
+			          " could not be loaded - the loader logs a warning naming it just above."
+			          " Retrying without them.",
 			    instanceResult, enabledLayers);
+
+			xr_instance = XR_NULL_HANDLE;
+			createInfo.enabledApiLayerCount = (uint32_t)builtinLayerCount;
+			createInfo.enabledApiLayerNames = builtinLayerCount > 0 ? layers.data() : nullptr;
+
+			instanceResult = xrCreateInstance(&createInfo, &xr_instance);
+			if (XR_SUCCEEDED(instanceResult)) {
+				OOVR_LOGF("API layers: started with all %d of them disabled. The game runs normally;"
+				          " whatever those layers do is not happening. Fix or remove the layer, or"
+				          " set enableApiLayers=false in opencomposite.ini to stop trying.",
+				    enabledLayers);
+				enabledLayers = 0;
+			} else {
+				OOVR_LOGF("API layers: still failed (%d) without them, so they were not the cause",
+				    instanceResult);
+			}
 		}
+
 		OOVR_FAILED_XR_ABORT(instanceResult);
 		if (enabledLayers > 0)
 			OOVR_LOGF("API layers: instance created with %d layer(s) loaded", enabledLayers);

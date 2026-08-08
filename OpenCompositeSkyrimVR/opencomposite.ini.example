@@ -97,6 +97,12 @@
 ; Default: false
 ;initUsingVulkan=false
 
+; Discover and enable the OpenXR API layers whose manifests are in the xrlayers folder
+; next to openvr_api.dll. Costs nothing when that folder does not exist. Set to false to
+; start without them, which is the first thing to try if a layer mod stops the game.
+; Default: true
+;enableApiLayers=true
+
 ; Enable cubemap support when the application requests it.
 ; Default: true
 ;enableAppRequestedCubemap=true

@@ -661,8 +661,9 @@ if (WIN32)
 endif()
 
 # Runs tests/xrlayers-fixtures/ through the same jsoncpp and the same validation predicates as
-# DrvOpenXR::ReadApiLayerManifest, plus the game-folder containment cases. Excluded from normal
-# builds; see docs/API-LAYERS-TESTING.md.
+# DrvOpenXR::ReadApiLayerManifest, plus the game-folder containment and duplicate-name cases.
+# Excluded from normal builds, as OCURuntimeSemanticsSelfTest above is; the test's own header
+# comment has the build and run lines.
 if (WIN32)
 	add_executable(OCUApiLayerManifestSelfTest EXCLUDE_FROM_ALL
 		tests/ApiLayerManifestSelfTest.cpp

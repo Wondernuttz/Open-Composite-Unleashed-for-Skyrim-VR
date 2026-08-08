@@ -3,11 +3,12 @@
 // DrvOpenXR::ReadApiLayerManifest can't be linked directly - it is static, and reaching it would
 // mean dragging in the whole OpenXR backend. Instead this runs the fixtures through the same
 // vendored jsoncpp with the same predicates, and copies the two containment helpers verbatim.
-// The duplication is the point: if the production code changes and this stops agreeing with it,
-// the fixtures table in docs/API-LAYERS-TESTING.md is what needs revisiting.
+// The duplication is the point, and also the maintenance cost: if ReadApiLayerManifest gains or
+// reorders a rejection, Classify() below and the kFixtures table have to follow it.
 //
-// Build (excluded from normal builds):  cmake --build <dir> --target OCUApiLayerManifestSelfTest
-// Run:                                  <dir>/tests/OCUApiLayerManifestSelfTest.exe
+// Excluded from normal builds, the same as OCURuntimeSemanticsSelfTest next to it in CMakeLists.
+//   Build:  cmake --build <dir> --target OCUApiLayerManifestSelfTest
+//   Run:    <dir>/tests/OCUApiLayerManifestSelfTest.exe        exit 0 = pass
 
 #include <json/json.h>
 #include <windows.h>
@@ -45,8 +46,10 @@ static bool PathIsWithin(const std::string& root, const std::string& path)
 
 // ── Manifest validation, mirroring ReadApiLayerManifest's rejection order ──────────────────────
 
-// The short tag each fixture is expected to produce.
-static std::string Classify(const std::string& path)
+// The short tag each fixture is expected to produce. gameRoot is the folder the fixtures pretend to
+// be installed under - the fixture directory itself - so the containment rejections are reached
+// through the fixtures rather than only through hand-written paths further down.
+static std::string Classify(const std::string& path, const std::string& gameRoot)
 {
 	std::ifstream stream(path);
 	if (!stream.is_open())
@@ -70,61 +73,95 @@ static std::string Classify(const std::string& path)
 	if (lib.find_first_of("\\/") == std::string::npos)
 		return "bare-filename";
 
+	// Absolute as-is, otherwise relative to the manifest - the loader's own rule.
+	const bool absolute = (lib.size() >= 2 && lib[1] == ':')
+	    || (lib.size() >= 2 && (lib[0] == '\\' || lib[0] == '/') && (lib[1] == '\\' || lib[1] == '/'));
+	const size_t slash = path.find_last_of("\\/");
+	const std::string manifestDir = slash == std::string::npos ? std::string{} : path.substr(0, slash);
+	const std::string resolved = CanonicalPath(absolute ? lib : manifestDir + "\\" + lib);
+	if (resolved.empty())
+		return "unresolvable";
+
+	if (!PathIsWithin(gameRoot, resolved))
+		return "outside-root";
+
+	// The existence check that comes next in production is deliberately not mirrored: no fixture
+	// ships a DLL, so it would reject all of them and tell us nothing.
 	return "parsed";
-}
-
-// ocu_priority as ReadApiLayerManifest reads it: absent or the wrong type both mean the default.
-static int ClassifyPriority(const std::string& path)
-{
-	std::ifstream stream(path);
-	Json::CharReaderBuilder builder;
-	Json::Value root;
-	std::string errors;
-	if (!stream.is_open() || !Json::parseFromStream(builder, stream, &root, &errors))
-		return 100;
-
-	const Json::Value& value = root["api_layer"]["ocu_priority"];
-	return value.isInt() ? value.asInt() : 100;
 }
 
 struct FixtureCase {
 	const char* file;
 	const char* expected;
-	int priority;
 };
 
-// Every fixture, and the stage it must be rejected at. "parsed" means it survives parsing and
-// goes on to the containment and existence checks, which need a real game folder.
+// Every fixture, and the stage it must be rejected at. "parsed" means it survives every check the
+// fixtures can exercise - only the existence of the DLL is left, which no fixture ships.
 static const FixtureCase kFixtures[] = {
-	{ "01-valid-reference.json", "parsed", 100 },
-	{ "02-malformed-json.json", "bad-json", 100 },
-	{ "03-missing-fields.json", "bad-fields", 100 },
-	{ "04-no-api-layer-node.json", "bad-fields", 100 },
-	{ "05-missing-dll.json", "parsed", 100 },
-	{ "06-escapes-game-root.json", "parsed", 100 },
-	{ "07-absolute-outside.json", "parsed", 100 },
-	{ "08-bare-filename.json", "bare-filename", 100 },
-	{ "09-empty-name.json", "empty-field", 100 },
-	{ "10-wrong-types.json", "bad-fields", 100 },
-	{ "11-empty-file.json", "bad-json", 100 },
-	{ "12-priority-explicit.json", "parsed", 25 },
-	{ "13-priority-wrong-type.json", "parsed", 100 },
+	{ "01-valid-reference.json", "parsed" },
+	{ "02-malformed-json.json", "bad-json" },
+	{ "03-missing-fields.json", "bad-fields" },
+	{ "04-no-api-layer-node.json", "bad-fields" },
+	{ "05-missing-dll.json", "parsed" },
+	{ "06-escapes-game-root.json", "outside-root" },
+	{ "07-absolute-outside.json", "outside-root" },
+	{ "08-bare-filename.json", "bare-filename" },
+	{ "09-empty-name.json", "empty-field" },
+	{ "10-wrong-types.json", "bad-fields" },
+	{ "11-empty-file.json", "bad-json" },
+	{ "12-unknown-extra-key.json", "parsed" },
 };
 
 static void ManifestTests()
 {
+	// The fixtures stand in for a game folder, so a fixture's ".\\thing.dll" is contained and
+	// "..\\..\\..\\Windows\\..." is not, exactly as it would be in a real install.
+	const std::string gameRoot = CanonicalPath(OCU_FIXTURE_DIR);
+
 	printf("Manifest validation (%s)\n", OCU_FIXTURE_DIR);
 	for (const FixtureCase& c : kFixtures) {
 		const std::string full = std::string(OCU_FIXTURE_DIR) + "\\" + c.file;
-		const std::string got = Classify(full);
-		const int priority = ClassifyPriority(full);
-		const bool ok = got == c.expected && priority == c.priority;
-		printf("  %-30s %-14s prio %-4d %s\n", c.file, got.c_str(), priority,
-		    ok ? "ok" : "*** FAIL ***");
+		const std::string got = Classify(full, gameRoot);
+		const bool ok = got == c.expected;
+		printf("  %-30s %-14s %s\n", c.file, got.c_str(), ok ? "ok" : "*** FAIL ***");
 		if (!ok) {
-			printf("      expected %s prio %d\n", c.expected, c.priority);
+			printf("      expected %s\n", c.expected);
 			failures++;
 		}
+	}
+}
+
+// ── Duplicate names ───────────────────────────────────────────────────────────────────────────
+
+// Mirrors the accepted-names check in DiscoverApiLayers. Two manifests naming one layer would put
+// it in the chain twice - the loader deduplicates by neither name nor path - so the second is
+// dropped. Case-insensitive, because a manifest is written by hand and the copy may not match.
+static void DuplicateNameTests()
+{
+	printf("\nDuplicate layer names\n");
+
+	const std::vector<std::string> accepted = { "XR_APILAYER_FIXTURE_valid" };
+	struct Case {
+		const char* candidate;
+		bool duplicate;
+	};
+	static const Case cases[] = {
+		{ "XR_APILAYER_FIXTURE_valid", true },
+		{ "xr_apilayer_fixture_valid", true },
+		{ "XR_APILAYER_FIXTURE_VALID", true },
+		{ "XR_APILAYER_FIXTURE_valid2", false },
+		{ "XR_APILAYER_FIXTURE_other", false },
+	};
+
+	for (const Case& c : cases) {
+		bool got = false;
+		for (const std::string& seen : accepted)
+			if (_stricmp(seen.c_str(), c.candidate) == 0)
+				got = true;
+		printf("  %-32s %-10s %s\n", c.candidate, got ? "DUPLICATE" : "new",
+		    got == c.duplicate ? "ok" : "*** FAIL ***");
+		if (got != c.duplicate)
+			failures++;
 	}
 }
 
@@ -162,6 +199,7 @@ static void ContainmentTests()
 int main()
 {
 	ManifestTests();
+	DuplicateNameTests();
 	ContainmentTests();
 	printf("\n%s\n", failures == 0 ? "PASS - all cases as expected" : "FAIL");
 	return failures == 0 ? 0 : 1;

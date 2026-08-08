@@ -4249,6 +4249,11 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 	// Something below us asked for our swapchains to be discarded — see
 	// Compositor::InvalidateSwapchains. Falls through to the rebuild below rather than taking a
 	// path of its own, so this is the same code that runs on a render target size change.
+	//
+	// The generation is recorded here, before the rebuild, where ASWProvider and SpaceWarpProvider
+	// record theirs only after one succeeds. Deliberate, not an oversight: those two continue the
+	// frame after a failed rebuild, so they must retry it next frame, whereas the rebuild below
+	// aborts the process if it fails and there is no next frame to retry in.
 	const uint32_t currentGeneration = SwapchainGeneration();
 	const bool invalidated = (currentGeneration != swapchainGeneration);
 	if (invalidated) {
