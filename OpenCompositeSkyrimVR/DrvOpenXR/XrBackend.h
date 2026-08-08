@@ -59,6 +59,12 @@ private:
 	std::unique_ptr<XrHMD> hmd = std::make_unique<XrHMD>();
 	std::unique_ptr<XrController> hand_left;
 	std::unique_ptr<XrController> hand_right;
+
+	// PumpEvents retries UpdateInteractionProfile every frame until a controller shows up, which
+	// with no controllers attached (a headset with the controllers asleep, say)
+	// means logging "no interaction profile" forever - tens of megabytes over a long load, each
+	// line flushed. Log the transition, not the state. Indexed by XrController::XrControllerType.
+	bool noProfileLogged[2] = { false, false };
 	// Unadvertised HTCX role readers used as raw inputs by the network/camera
 	// mux. GetDevice never returns these, so a physical tracker has one public
 	// identity and canonical waist/foot serials remain OCU-NET1/2/3.

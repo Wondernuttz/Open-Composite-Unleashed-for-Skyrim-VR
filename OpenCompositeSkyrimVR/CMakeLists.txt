@@ -70,6 +70,32 @@ include_external_msproject(
 	PLATFORM "AnyCPU"
 )
 
+# RuntimeSwitcher takes its NuGet packages through PackageReference, which needs a restore before
+# the first build. Visual Studio does that implicitly; `cmake --build` runs MSBuild against
+# ALL_BUILD.vcxproj without -restore and doesn't, so on a clean clone the C# build fails with
+# CS0246 on Newtonsoft and OSIcon.
+#
+# This has to happen at configure time, not as a build target. MSBuild reads obj/project.assets.json
+# while *evaluating* the project, so a restore triggered during the build comes too late to affect
+# the build that triggered it. A no-op restore costs a couple of seconds and works offline from the
+# package cache. A failure here is not fatal - only the C# project needs it.
+if (WIN32 AND CMAKE_VS_MSBUILD_COMMAND)
+	execute_process(
+		COMMAND "${CMAKE_VS_MSBUILD_COMMAND}"
+			"${CMAKE_SOURCE_DIR}/RuntimeSwitcher/RuntimeSwitcher.csproj"
+			-t:restore -v:quiet -nologo
+		RESULT_VARIABLE RUNTIME_SWITCHER_RESTORE_RESULT
+		OUTPUT_VARIABLE RUNTIME_SWITCHER_RESTORE_OUTPUT
+		ERROR_VARIABLE RUNTIME_SWITCHER_RESTORE_OUTPUT
+	)
+	if (RUNTIME_SWITCHER_RESTORE_RESULT EQUAL 0)
+		message(STATUS "RuntimeSwitcher: NuGet packages restored")
+	else ()
+		message(WARNING "RuntimeSwitcher: NuGet restore failed, the C# project will not build:\n"
+			"${RUNTIME_SWITCHER_RESTORE_OUTPUT}")
+	endif ()
+endif ()
+
 # === MinHook (x86/x64 API hooking for OVR perf stats interception) ===
 if (WIN32)
 	add_subdirectory(libs/minhook)
@@ -228,7 +254,7 @@ add_library(DrvOpenXR STATIC
 	${GENERATED_DIR}/static_bases.gen.h
 )
 target_include_directories(DrvOpenXR PUBLIC DrvOpenXR/pub ${CMAKE_BINARY_DIR})
-target_include_directories(DrvOpenXR PRIVATE DrvOpenXR OpenOVR)
+target_include_directories(DrvOpenXR PRIVATE DrvOpenXR OpenOVR ${XrDir}/src/external/jsoncpp/include)
 target_link_libraries(DrvOpenXR PUBLIC OpenVR ${XrLib} ${glmLib} d3d12.lib dxgi.lib)
 target_compile_definitions(DrvOpenXR PRIVATE ${GRAPHICS_API_SUPPORT_FLAGS} -D_CRT_SECURE_NO_WARNINGS)
 source_group(Public REGULAR_EXPRESSION DrvOpenXR/pub/*)
@@ -631,5 +657,22 @@ if (WIN32)
 		${CMAKE_CURRENT_SOURCE_DIR})
 	target_link_libraries(OCURuntimeSemanticsSelfTest PRIVATE ws2_32)
 	set_target_properties(OCURuntimeSemanticsSelfTest PROPERTIES
+		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
+
+# Runs tests/xrlayers-fixtures/ through the same jsoncpp and the same validation predicates as
+# DrvOpenXR::ReadApiLayerManifest, plus the game-folder containment cases. Excluded from normal
+# builds; see docs/API-LAYERS-TESTING.md.
+if (WIN32)
+	add_executable(OCUApiLayerManifestSelfTest EXCLUDE_FROM_ALL
+		tests/ApiLayerManifestSelfTest.cpp
+		${XrDir}/src/external/jsoncpp/src/lib_json/json_reader.cpp
+		${XrDir}/src/external/jsoncpp/src/lib_json/json_value.cpp
+		${XrDir}/src/external/jsoncpp/src/lib_json/json_writer.cpp)
+	target_include_directories(OCUApiLayerManifestSelfTest PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR} ${XrDir}/src/external/jsoncpp/include)
+	target_compile_definitions(OCUApiLayerManifestSelfTest PRIVATE
+		OCU_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/xrlayers-fixtures")
+	set_target_properties(OCUApiLayerManifestSelfTest PROPERTIES
 		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 endif()

@@ -1,0 +1,10 @@
+{
+    "_comment": "Right keys, wrong JSON types. jsoncpp will not throw, but isString() is false.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": 42,
+        "library_path": [".\\XR_APILAYER_FIXTURE_valid.dll"],
+        "api_version": "1.0",
+        "implementation_version": "1"
+    }
+}

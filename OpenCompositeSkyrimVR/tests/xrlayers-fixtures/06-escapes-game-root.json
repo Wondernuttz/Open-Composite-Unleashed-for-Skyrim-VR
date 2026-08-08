@@ -1,0 +1,11 @@
+{
+    "_comment": "Climbs out of the game folder with ..\\ - must be refused by the containment check.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_escapes",
+        "library_path": "..\\..\\..\\Windows\\System32\\version.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Relative path escaping the game folder"
+    }
+}

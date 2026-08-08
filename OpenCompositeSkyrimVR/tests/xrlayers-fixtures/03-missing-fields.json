@@ -1,0 +1,9 @@
+{
+    "_comment": "Valid JSON, but api_layer.library_path is absent.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_nofields",
+        "api_version": "1.0",
+        "implementation_version": "1"
+    }
+}

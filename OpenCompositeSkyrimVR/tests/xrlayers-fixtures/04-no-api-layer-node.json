@@ -1,0 +1,7 @@
+{
+    "_comment": "Valid JSON, no api_layer object at all. A runtime manifest dropped in by mistake looks like this.",
+    "file_format_version": "1.0.0",
+    "runtime": {
+        "library_path": ".\\some_runtime.dll"
+    }
+}

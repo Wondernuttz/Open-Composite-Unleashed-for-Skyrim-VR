@@ -8,15 +8,22 @@
 #include "../OpenOVR/Misc/android_api.h"
 #include "../OpenOVR/Misc/xr_ext.h"
 #include "../OpenOVR/Reimpl/BaseInput.h"
+#include "ASWProvider.h"
 #include "SpaceWarpProvider.h"
 #include "XrBackend.h"
 #include "generated/static_bases.gen.h"
 
+#include <json/json.h>
+
+#include <algorithm>
 #include <chrono>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 static XrBackend* currentBackend;
 static bool initialised = false;
@@ -68,6 +75,269 @@ static void LogImplicitOpenXRLayers()
 }
 #else
 static void LogImplicitOpenXRLayers() {}
+#endif
+
+// OpenXR API layers shipped alongside OCU: any manifest (*.json) in the xrlayers/ folder next to
+// this DLL is discovered and enabled. A manifest plus the DLL it names is the entire contract -
+// no layer is known by name at compile time. See docs/API-LAYERS.md.
+//
+// Three loader behaviours this depends on, all learned the hard way:
+//   * XR_API_LAYER_PATH must be set before xrEnumerateApiLayerProperties, not merely before
+//     xrCreateInstance - the loader caches discovery on first enumeration.
+//   * The loader reads it via PlatformUtilsGetSecureEnv, which returns nothing to a
+//     high-integrity process. Under an elevated MO2 this silently finds nothing; the log lines
+//     below are how you tell (a manifest found with no layer enabled means exactly this).
+//   * Setting it suppresses the loader's registry search for explicit layers entirely, so
+//     system-wide explicit layers are invisible while xrlayers/ exists.
+//
+// Every rejection below is logged and skipped. Naming a layer the loader did not report is the
+// one fatal mistake available here - xrCreateInstance would return XR_ERROR_API_LAYER_NOT_PRESENT
+// and take the game down - so the enable loop intersects against what it actually enumerated.
+
+struct DiscoveredLayer {
+	std::string manifest; // full path of the .json
+	std::string name; // api_layer.name, the string xrCreateInstance wants
+	std::string library; // resolved, canonical path of the layer's DLL
+};
+
+#ifdef _WIN32
+// The directory part of a path, with "..\" and friends resolved. Empty if it can't be resolved.
+static std::string CanonicalPath(const std::string& path)
+{
+	char full[MAX_PATH]{};
+	const DWORD len = GetFullPathNameA(path.c_str(), static_cast<DWORD>(std::size(full)), full, nullptr);
+	if (len == 0 || len >= std::size(full))
+		return {};
+	return full;
+}
+
+static std::string DirectoryOf(const std::string& path)
+{
+	const size_t slash = path.find_last_of("\\/");
+	return slash == std::string::npos ? std::string{} : path.substr(0, slash);
+}
+
+// Both canonical, both without a trailing separator. The boundary check stops C:\Game matching
+// C:\GameOther.
+static bool PathIsWithin(const std::string& root, const std::string& path)
+{
+	if (root.empty() || path.size() <= root.size())
+		return false;
+	if (_strnicmp(root.c_str(), path.c_str(), root.size()) != 0)
+		return false;
+	return path[root.size()] == '\\' || path[root.size()] == '/';
+}
+
+// Whole value, however long. Empty if unset - a fixed buffer would silently truncate, and the
+// caller writes this variable back.
+static std::string ReadEnvironmentVariable(const char* name)
+{
+	DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
+	if (needed == 0)
+		return {};
+	std::string value(needed, '\0');
+	const DWORD len = GetEnvironmentVariableA(name, value.data(), needed);
+	if (len == 0 || len >= needed)
+		return {};
+	value.resize(len);
+	return value;
+}
+
+// Is `entry` already one of the ';'-separated paths in `list`? Compared canonically, so casing,
+// trailing separators and '/' vs '\' don't produce a spurious miss.
+static bool PathListContains(const std::string& list, const std::string& entry)
+{
+	const std::string wanted = CanonicalPath(entry);
+	if (wanted.empty())
+		return false;
+
+	for (size_t at = 0; at <= list.size();) {
+		const size_t end = list.find(';', at);
+		std::string one = list.substr(at, end == std::string::npos ? std::string::npos : end - at);
+		at = (end == std::string::npos) ? list.size() + 1 : end + 1;
+
+		while (!one.empty() && (one.back() == '\\' || one.back() == '/'))
+			one.pop_back();
+		if (one.empty())
+			continue;
+		if (_stricmp(CanonicalPath(one).c_str(), wanted.c_str()) == 0)
+			return true;
+	}
+	return false;
+}
+
+// The folder holding the running executable.
+static std::string GameRootFolder()
+{
+	char exePath[MAX_PATH]{};
+	if (GetModuleFileNameA(nullptr, exePath, static_cast<DWORD>(std::size(exePath))) == 0)
+		return {};
+	return CanonicalPath(DirectoryOf(exePath));
+}
+
+// The xrlayers folder next to this DLL, or empty if we can't work out where we live.
+static std::string ApiLayerFolder()
+{
+	char dllPath[MAX_PATH]{};
+	HMODULE self = nullptr;
+	if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	        reinterpret_cast<LPCSTR>(&ApiLayerFolder), &self)
+	    || GetModuleFileNameA(self, dllPath, static_cast<DWORD>(std::size(dllPath))) == 0) {
+		OOVR_LOG("API layers: could not locate our own DLL, skipping layer discovery");
+		return {};
+	}
+
+	const std::string dir = DirectoryOf(dllPath);
+	if (dir.empty())
+		return {};
+	return dir + "\\xrlayers";
+}
+
+// Read one manifest and work out where its DLL is. A broken third-party layer must never stop the
+// game starting, so everything here skips rather than aborts.
+static bool ReadApiLayerManifest(const std::string& path, const std::string& gameRoot, DiscoveredLayer& out)
+{
+	std::ifstream stream(path);
+	if (!stream.is_open()) {
+		OOVR_LOGF("API layers: cannot open %s, skipping", path.c_str());
+		return false;
+	}
+
+	Json::CharReaderBuilder builder;
+	Json::Value root;
+	std::string errors;
+	if (!Json::parseFromStream(builder, stream, &root, &errors) || root.isNull()) {
+		OOVR_LOGF("API layers: %s is not valid JSON (%s), skipping", path.c_str(), errors.c_str());
+		return false;
+	}
+
+	const Json::Value& layer = root["api_layer"];
+	if (!layer.isObject() || !layer["name"].isString() || !layer["library_path"].isString()) {
+		OOVR_LOGF("API layers: %s has no api_layer.name / api_layer.library_path, skipping", path.c_str());
+		return false;
+	}
+
+	const std::string name = layer["name"].asString();
+	const std::string libraryPath = layer["library_path"].asString();
+	if (name.empty() || libraryPath.empty()) {
+		OOVR_LOGF("API layers: %s has an empty name or library_path, skipping", path.c_str());
+		return false;
+	}
+
+	// The loader would accept a bare filename here and hand it to the normal DLL search order,
+	// which reaches well outside the game folder. We can't confine that, so we don't allow it.
+	if (libraryPath.find_first_of("\\/") == std::string::npos) {
+		OOVR_LOGF("API layers: %s gives library_path '%s' as a bare filename - it must be a path"
+		          " (e.g. \".\\\\%s\"), skipping layer '%s'",
+		    path.c_str(), libraryPath.c_str(), libraryPath.c_str(), name.c_str());
+		return false;
+	}
+
+	// Absolute as-is, otherwise relative to the manifest - the loader's own rule.
+	const bool absolute = (libraryPath.size() >= 2 && libraryPath[1] == ':')
+	    || (libraryPath.size() >= 2 && (libraryPath[0] == '\\' || libraryPath[0] == '/')
+	        && (libraryPath[1] == '\\' || libraryPath[1] == '/'));
+	const std::string resolved = CanonicalPath(absolute ? libraryPath : DirectoryOf(path) + "\\" + libraryPath);
+	if (resolved.empty()) {
+		OOVR_LOGF("API layers: %s gives library_path '%s', which does not resolve to a real path,"
+		          " skipping layer '%s'",
+		    path.c_str(), libraryPath.c_str(), name.c_str());
+		return false;
+	}
+
+	// A layer must ship inside the game folder, so it stays within the mod manager's view and an
+	// uninstall is complete. A sanity boundary, not a security one - a junction would defeat it.
+	if (!PathIsWithin(gameRoot, resolved)) {
+		OOVR_LOGF("API layers: %s points at %s, which is outside the game folder (%s) -"
+		          " skipping layer '%s'",
+		    path.c_str(), resolved.c_str(), gameRoot.c_str(), name.c_str());
+		return false;
+	}
+
+	// The loader would reject this manifest too, so say so - a half-installed mod otherwise looks
+	// like a layer that is present and silently doing nothing.
+	if (GetFileAttributesA(resolved.c_str()) == INVALID_FILE_ATTRIBUTES) {
+		OOVR_LOGF("API layers: %s names %s, which does not exist - skipping layer '%s'",
+		    path.c_str(), resolved.c_str(), name.c_str());
+		return false;
+	}
+
+	out.manifest = path;
+	out.name = name;
+	out.library = resolved;
+	return true;
+}
+
+// Find every manifest in the folder and put the loader's search path in place. Sorted by
+// filename so the chain order is deterministic and a mod can steer it with a numeric prefix;
+// earlier files sit nearer the application, later ones nearer the runtime.
+static std::vector<DiscoveredLayer> DiscoverApiLayers()
+{
+	std::vector<DiscoveredLayer> found;
+
+	const std::string layerDir = ApiLayerFolder();
+	if (layerDir.empty())
+		return found;
+
+	const std::string gameRoot = GameRootFolder();
+	if (gameRoot.empty()) {
+		OOVR_LOG("API layers: could not determine the game folder, skipping layer discovery");
+		return found;
+	}
+
+	if (GetFileAttributesA(layerDir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+		OOVR_LOGF("API layers: no xrlayers folder at %s - none installed", layerDir.c_str());
+		return found;
+	}
+
+	std::vector<std::string> manifests;
+	WIN32_FIND_DATAA entry{};
+	const HANDLE search = FindFirstFileA((layerDir + "\\*.json").c_str(), &entry);
+	if (search != INVALID_HANDLE_VALUE) {
+		do {
+			if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+				manifests.push_back(layerDir + "\\" + entry.cFileName);
+		} while (FindNextFileA(search, &entry));
+		FindClose(search);
+	}
+	std::sort(manifests.begin(), manifests.end());
+
+	if (manifests.empty()) {
+		OOVR_LOGF("API layers: %s exists but holds no manifests - none installed", layerDir.c_str());
+		return found;
+	}
+
+	// Prepend rather than overwrite - other tools (and OCU's own validation-layer path) use this.
+	//
+	// The already-listed test compares canonicalised entries, not raw text. It has to: the loader
+	// deduplicates manifests by neither name nor path, so listing the same folder twice inserts
+	// every layer in it into the chain twice, and two copies of one layer DLL share its globals.
+	// Someone who set XR_API_LAYER_PATH by hand to debug a layer - the likeliest way this variable
+	// is ever already set - would rarely type the exact casing GetModuleFileName returns.
+	const std::string existing = ReadEnvironmentVariable("XR_API_LAYER_PATH");
+	if (PathListContains(existing, layerDir)) {
+		OOVR_LOGF("API layers: %s already on XR_API_LAYER_PATH", layerDir.c_str());
+	} else {
+		const std::string value = existing.empty() ? layerDir : layerDir + ";" + existing;
+		if (SetEnvironmentVariableA("XR_API_LAYER_PATH", value.c_str()))
+			OOVR_LOGF("API layers: XR_API_LAYER_PATH = %s", value.c_str());
+		else
+			OOVR_LOG("API layers: failed to set XR_API_LAYER_PATH - no layers will be found");
+	}
+
+	for (const std::string& path : manifests) {
+		DiscoveredLayer layer;
+		if (!ReadApiLayerManifest(path, gameRoot, layer))
+			continue;
+		OOVR_LOGF("API layers: manifest %s -> layer '%s' (%s)", path.c_str(), layer.name.c_str(),
+		    layer.library.c_str());
+		found.push_back(std::move(layer));
+	}
+
+	return found;
+}
+#else
+static std::vector<DiscoveredLayer> DiscoverApiLayers() { return {}; }
 #endif
 
 #ifdef _WIN32
@@ -152,6 +422,13 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	OOVR_FALSE_ABORT(SetEnvironmentVariableA("XR_CORE_VALIDATION_FILE_NAME", XR_VALIDATION_FILE_NAME));
 	OOVR_LOGF("Set OpenXR validation file path: %s", XR_VALIDATION_FILE_NAME);
 #endif
+
+	// Has to precede the enumeration below - the loader caches layer discovery on first use
+	std::vector<DiscoveredLayer> discoveredLayers;
+	if (oovr_global_configuration.EnableApiLayers())
+		discoveredLayers = DiscoverApiLayers();
+	else
+		OOVR_LOG("API layers: disabled by enableApiLayers=false");
 
 	// Enumerate the available extensions
 	uint32_t availableExtensionsCount;
@@ -253,20 +530,36 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 		OOVR_LOG("XR_FB_space_warp extension available and enabled");
 	}
 
-	const char* const layers[] = {
+	std::vector<const char*> layers;
 #ifdef XR_VALIDATION_LAYER_PATH
-		"XR_APILAYER_LUNARG_core_validation",
+	layers.push_back("XR_APILAYER_LUNARG_core_validation");
 #endif
-		nullptr // Dummy value since MSVC gets upset if there's nothing in this array
-	};
+
+	// An explicit layer does nothing until the application names it, so this loop is the switch.
+	// Only ever name one the loader reported - see the fatal case above. The c_str()s stay valid
+	// because discoveredLayers is not touched again before xrCreateInstance returns.
+	int enabledLayers = 0;
+	for (const DiscoveredLayer& layer : discoveredLayers) {
+		if (availableLayers.count(layer.name)) {
+			layers.push_back(layer.name.c_str());
+			enabledLayers++;
+			OOVR_LOGF("API layers: enabling '%s'", layer.name.c_str());
+		} else {
+			OOVR_LOGF("API layers: '%s' (%s) was not picked up by the loader, skipping it",
+			    layer.name.c_str(), layer.manifest.c_str());
+		}
+	}
+	if (!discoveredLayers.empty())
+		OOVR_LOGF("API layers: %d of %d enabled, in application-first order",
+		    enabledLayers, (int)discoveredLayers.size());
 
 	XrInstanceCreateInfo createInfo{};
 	createInfo.type = XR_TYPE_INSTANCE_CREATE_INFO;
 	createInfo.applicationInfo = appInfo;
 	createInfo.enabledExtensionNames = extensions.data();
 	createInfo.enabledExtensionCount = extensions.size();
-	createInfo.enabledApiLayerNames = layers;
-	createInfo.enabledApiLayerCount = (sizeof(layers) / sizeof(const char*)) - 1; // Subtract the dummy value
+	createInfo.enabledApiLayerNames = layers.data();
+	createInfo.enabledApiLayerCount = layers.size();
 
 #if ANDROID
 	if (!OpenComposite_Android_Create_Info) {
