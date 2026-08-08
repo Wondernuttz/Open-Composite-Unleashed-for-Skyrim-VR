@@ -1,0 +1,12 @@
+{
+    "_comment": "ocu_priority is a string, not an integer. Must fall back to the default 100 and still parse - a bad priority is not worth rejecting a layer over.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_badpriority",
+        "library_path": ".\\XR_APILAYER_FIXTURE_badpriority.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Priority is the wrong type",
+        "ocu_priority": "first"
+    }
+}

@@ -2,8 +2,6 @@
 
 #include "compositor.h"
 
-#include "../OpenCompositeInterface.h"
-
 #include <atomic>
 
 Compositor::~Compositor()
@@ -33,22 +31,5 @@ uint32_t Compositor::SwapchainGeneration()
 	return g_swapchainGeneration.load();
 }
 
-// The exported C ABI lives here, not in a file of its own: a dllexport in a static library only
-// reaches the DLL if the linker pulls its object file in, and this one is pulled in
-// unconditionally because every compositor derives from Compositor.
-
-static const OpenCompositeInterface g_interface = {
-	sizeof(OpenCompositeInterface),
-	OPENCOMPOSITE_INTERFACE_VERSION,
-	&Compositor::InvalidateSwapchains,
-};
-
-extern "C" __declspec(dllexport) const OpenCompositeInterface* OpenComposite_GetInterface(
-    uint32_t minimumVersion)
-{
-	// A consumer built against a newer header than this build is asking for something we cannot
-	// promise the layout of. Saying no is the only honest answer, and it degrades cleanly.
-	if (minimumVersion > OPENCOMPOSITE_INTERFACE_VERSION)
-		return nullptr;
-	return &g_interface;
-}
+// The OCU_InvalidateSwapchains export that reaches this lives in OCOVR/openvr_api.cpp, next to the
+// other OCU_ exports - it has to be in the DLL's own sources, not in a static library.

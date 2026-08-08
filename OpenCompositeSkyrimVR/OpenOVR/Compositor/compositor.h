@@ -53,7 +53,8 @@ public:
 	/**
 	 * Throw away the swapchains of every participating owner and build fresh ones on the next
 	 * submitted frame. The same thing we do on our own initiative when the game's submitted
-	 * texture changes size or format, asked for from outside — see OpenCompositeInterface.h.
+	 * texture changes size or format, asked for from outside. Reached from a mod through the
+	 * OCU_InvalidateSwapchains export; see docs/API-LAYERS.md.
 	 *
 	 * A counter rather than a flag, because the owners are independent and a consumed-once flag
 	 * would be cleared by whichever submitted first, leaving the rest never rebuilding. Each

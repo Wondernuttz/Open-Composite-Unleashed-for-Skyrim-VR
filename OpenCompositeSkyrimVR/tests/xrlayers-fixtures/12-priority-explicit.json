@@ -1,0 +1,12 @@
+{
+    "_comment": "An explicit ocu_priority. Parses, and the priority must be read as 25.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_priority",
+        "library_path": ".\\XR_APILAYER_FIXTURE_priority.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Sits near the application",
+        "ocu_priority": 25
+    }
+}

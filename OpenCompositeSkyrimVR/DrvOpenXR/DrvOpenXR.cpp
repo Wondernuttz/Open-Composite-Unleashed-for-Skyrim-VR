@@ -98,6 +98,7 @@ struct DiscoveredLayer {
 	std::string manifest; // full path of the .json
 	std::string name; // api_layer.name, the string xrCreateInstance wants
 	std::string library; // resolved, canonical path of the layer's DLL
+	int priority = 100; // api_layer.ocu_priority; low sits nearer the application
 };
 
 #ifdef _WIN32
@@ -262,15 +263,29 @@ static bool ReadApiLayerManifest(const std::string& path, const std::string& gam
 		return false;
 	}
 
+	// Optional. Prefixed because api_layer is a Khronos-defined object and an unprefixed "priority"
+	// could collide with something they add later.
+	int priority = 100;
+	const Json::Value& priorityValue = layer["ocu_priority"];
+	if (!priorityValue.isNull()) {
+		if (priorityValue.isInt())
+			priority = priorityValue.asInt();
+		else
+			OOVR_LOGF("API layers: %s has a non-integer ocu_priority, using the default %d for"
+			          " layer '%s'",
+			    path.c_str(), priority, name.c_str());
+	}
+
 	out.manifest = path;
 	out.name = name;
 	out.library = resolved;
+	out.priority = priority;
 	return true;
 }
 
-// Find every manifest in the folder and put the loader's search path in place. Sorted by
-// filename so the chain order is deterministic and a mod can steer it with a numeric prefix;
-// earlier files sit nearer the application, later ones nearer the runtime.
+// Find every manifest in the folder and put the loader's search path in place. Ordered by
+// ocu_priority, low first: a low-priority layer sits nearer the application, a high one nearer the
+// runtime. Ties break on filename so the order is always deterministic.
 static std::vector<DiscoveredLayer> DiscoverApiLayers()
 {
 	std::vector<DiscoveredLayer> found;
@@ -329,10 +344,15 @@ static std::vector<DiscoveredLayer> DiscoverApiLayers()
 		DiscoveredLayer layer;
 		if (!ReadApiLayerManifest(path, gameRoot, layer))
 			continue;
-		OOVR_LOGF("API layers: manifest %s -> layer '%s' (%s)", path.c_str(), layer.name.c_str(),
-		    layer.library.c_str());
+		OOVR_LOGF("API layers: manifest %s -> layer '%s' priority %d (%s)", path.c_str(),
+		    layer.name.c_str(), layer.priority, layer.library.c_str());
 		found.push_back(std::move(layer));
 	}
+
+	// Stable, so manifests is still sorted by filename underneath and equal priorities keep that
+	// order rather than whatever the filesystem happened to return.
+	std::stable_sort(found.begin(), found.end(),
+	    [](const DiscoveredLayer& a, const DiscoveredLayer& b) { return a.priority < b.priority; });
 
 	return found;
 }
@@ -543,14 +563,15 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 		if (availableLayers.count(layer.name)) {
 			layers.push_back(layer.name.c_str());
 			enabledLayers++;
-			OOVR_LOGF("API layers: enabling '%s'", layer.name.c_str());
+			OOVR_LOGF("API layers: enabling '%s' (priority %d)", layer.name.c_str(), layer.priority);
 		} else {
 			OOVR_LOGF("API layers: '%s' (%s) was not picked up by the loader, skipping it",
 			    layer.name.c_str(), layer.manifest.c_str());
 		}
 	}
 	if (!discoveredLayers.empty())
-		OOVR_LOGF("API layers: %d of %d enabled, in application-first order",
+		OOVR_LOGF("API layers: %d of %d enabled, listed above in chain order - the first is nearest"
+		          " the game, the last nearest the runtime",
 		    enabledLayers, (int)discoveredLayers.size());
 
 	XrInstanceCreateInfo createInfo{};
@@ -570,7 +591,20 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	createInfo.next = &androidInfo;
 #endif
 
-	OOVR_FAILED_XR_ABORT(xrCreateInstance(&createInfo, &xr_instance));
+	// Not OOVR_FAILED_XR_ABORT: when layers are enabled they are by far the likeliest cause of a
+	// failure here, and the bare error code sends people looking at their runtime instead.
+	{
+		const XrResult instanceResult = xrCreateInstance(&createInfo, &xr_instance);
+		if (XR_FAILED(instanceResult) && enabledLayers > 0) {
+			OOVR_LOGF("API layers: xrCreateInstance failed (%d) with %d layer(s) enabled. They are"
+			          " the first thing to suspect - set enableApiLayers=false in opencomposite.ini"
+			          " to start without them.",
+			    instanceResult, enabledLayers);
+		}
+		OOVR_FAILED_XR_ABORT(instanceResult);
+		if (enabledLayers > 0)
+			OOVR_LOGF("API layers: instance created with %d layer(s) loaded", enabledLayers);
+	}
 
 #ifdef _DEBUG
 	XrDebugUtilsMessengerCreateInfoEXT dbgCreateInfo{};
