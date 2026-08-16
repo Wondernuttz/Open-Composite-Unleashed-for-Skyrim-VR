@@ -1,0 +1,12 @@
+{
+    "_comment": "Keys OCU does not recognise are ignored, not rejected. ocu_priority is the concrete case: OCU used to read it and no longer does, so manifests written for an older build must keep parsing rather than turn into a layer that silently vanishes.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_extrakey",
+        "library_path": ".\\XR_APILAYER_FIXTURE_extrakey.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Carries a key from an older OCU",
+        "ocu_priority": 25
+    }
+}

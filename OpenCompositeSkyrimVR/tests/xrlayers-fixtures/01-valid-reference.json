@@ -1,0 +1,11 @@
+{
+    "_comment": "The shape a real layer ships. Only manifest here that should reach 'enabling'.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_valid",
+        "library_path": ".\\XR_APILAYER_FIXTURE_valid.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Valid manifest, DLL alongside it"
+    }
+}

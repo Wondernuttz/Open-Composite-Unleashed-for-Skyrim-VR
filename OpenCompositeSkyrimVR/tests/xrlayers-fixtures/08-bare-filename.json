@@ -1,0 +1,11 @@
+{
+    "_comment": "The loader would hand this to the normal DLL search order, which we cannot confine. Refused.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_bare",
+        "library_path": "version.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Bare filename with no path separator"
+    }
+}

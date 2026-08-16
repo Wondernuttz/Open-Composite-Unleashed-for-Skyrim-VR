@@ -1,5 +1,6 @@
 #include "SpaceWarpProvider.h"
 
+#include "../OpenOVR/Compositor/compositor.h"
 #include "../OpenOVR/Misc/xr_ext.h"
 #include "../OpenOVR/logging.h"
 
@@ -143,12 +144,49 @@ void SpaceWarpProvider::Shutdown()
 	OOVR_LOG("SpaceWarp: Shutdown");
 }
 
+bool SpaceWarpProvider::RebuildSwapchainsIfInvalidated()
+{
+	const uint32_t current = Compositor::SwapchainGeneration();
+	if (current == m_swapchainGeneration)
+		return true;
+
+	OOVR_LOGF("SpaceWarp: swapchain generation %u -> %u - rebuilding", m_swapchainGeneration,
+	    current);
+
+	DestroySwapchain(&m_mvSwapchain);
+	DestroySwapchain(&m_depthSwapchain);
+
+	const uint32_t stereoWidth = m_perEyeWidth * 2;
+	if (!CreateSwapchain(stereoWidth, m_perEyeHeight, DXGI_FORMAT_R16G16_FLOAT, &m_mvSwapchain, &m_mvImage)
+	    || !CreateSwapchain(stereoWidth, m_perEyeHeight, DXGI_FORMAT_R32_FLOAT, &m_depthSwapchain, &m_depthImage)) {
+		// XrBackend chains GetLayerInfo() on IsReady() alone, and those structs still name the
+		// chains just destroyed. Clearing m_ready is what stops a dead handle reaching xrEndFrame.
+		OOVR_LOG("SpaceWarp: swapchain rebuild failed - disabling space warp");
+		m_ready = false;
+		return false;
+	}
+
+	// The info structs cache both handles. Depth is repointed every frame further down, the motion
+	// vector one only here - so without this it would still name the destroyed chain.
+	for (int eye = 0; eye < 2; eye++) {
+		m_info[eye].motionVectorSubImage.swapchain = m_mvSwapchain;
+		m_info[eye].depthSubImage.swapchain = m_depthSwapchain;
+	}
+
+	// Only once the chains actually exist, so a failure is retried rather than skipped.
+	m_swapchainGeneration = current;
+	return true;
+}
+
 bool SpaceWarpProvider::SubmitFrame(ID3D11DeviceContext* ctx,
     ID3D11Texture2D* mvTex, const D3D11_BOX mvRegions[2],
     ID3D11Texture2D* depthTex, const D3D11_BOX depthRegions[2],
     float nearZ, float farZ)
 {
 	if (!m_ready) return false;
+
+	if (!RebuildSwapchainsIfInvalidated())
+		return false;
 
 	// --- Smooth nearZ/farZ to prevent frame-to-frame depth judder ---
 	// Exponential moving average: 90% old + 10% new. Prevents sudden jumps

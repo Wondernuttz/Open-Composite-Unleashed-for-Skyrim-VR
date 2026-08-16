@@ -2443,6 +2443,8 @@ void XrBackend::UpdateInteractionProfile()
 			for (const std::unique_ptr<InteractionProfile>& profile : InteractionProfile::GetProfileList()) {
 				if (profile->GetPath() == path_name) {
 					OOVR_LOGF("%s - Using interaction profile: %s", info.pathstr, path_name);
+					// Arm the "no profile" log again, so losing this controller is reported
+					noProfileLogged[(int)info.hand] = false;
 					info.controller = std::make_unique<XrController>(info.hand, *profile);
 					hmd->SetInteractionProfile(profile.get());
 					BaseSystem* system = GetUnsafeBaseSystem();
@@ -2467,7 +2469,11 @@ void XrBackend::UpdateInteractionProfile()
 			}
 		} else {
 			// interaction profile lost/not detected
-			OOVR_LOGF("%s - No interaction profile detected", info.pathstr);
+			if (!noProfileLogged[(int)info.hand]) {
+				noProfileLogged[(int)info.hand] = true;
+				OOVR_LOGF("%s - No interaction profile detected (will not repeat until it changes)",
+				    info.pathstr);
+			}
 			if (info.controller) {
 				info.controller.reset();
 				BaseSystem* system = GetUnsafeBaseSystem();

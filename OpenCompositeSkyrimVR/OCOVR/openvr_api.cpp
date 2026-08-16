@@ -21,6 +21,7 @@
 #include "DrvOpenXR.h"
 
 // For the OCU_CombatHaptic export (SKSE plugin -> controller rumble)
+#include "Compositor/compositor.h"
 #include "Reimpl/BaseInput.h"
 #include "generated/static_bases.gen.h"
 #ifdef _WIN32
@@ -493,6 +494,21 @@ extern "C" __declspec(dllexport) void OCU_CombatHaptic(int hand, int kind, unsig
 
 	// Hands are fixed OpenVR device indices under OCU: left=1, right=2
 	input->TriggerLegacyHapticPulse(hand == 0 ? 1 : 2, (uint64_t)durationMicros * 1000, amplitude);
+}
+
+// Ask OCU to throw away its swapchains and build fresh ones on the next submitted frame. Resolved
+// via GetProcAddress on openvr_api.dll, same as OCU_CombatHaptic above; a null result just means
+// an OCU too old to offer it, which is not an error.
+//
+// The reason to want this is that the images an OpenXR swapchain hands out are fixed for its
+// lifetime, so something below OCU that has changed what those images mean has no way to say so
+// except by making OCU ask again. OCU already rebuilds on its own initiative when the game changes
+// render target size; this is the same path.
+//
+// See docs/API-LAYERS.md for which swapchains this reaches - it is not all of them.
+extern "C" __declspec(dllexport) void OCU_InvalidateSwapchains()
+{
+	Compositor::InvalidateSwapchains();
 }
 
 VR_INTERFACE void* VRClientCoreFactory(const char* pInterfaceName, int* pReturnCode)

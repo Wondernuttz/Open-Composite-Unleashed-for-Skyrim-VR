@@ -1,0 +1,11 @@
+{
+    "_comment": "Absolute path to somewhere else entirely - must be refused by the containment check.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_absolute",
+        "library_path": "C:\\Windows\\System32\\version.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Absolute path outside the game folder"
+    }
+}

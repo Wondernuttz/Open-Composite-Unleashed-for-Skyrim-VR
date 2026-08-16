@@ -1,5 +1,6 @@
 #include "ASWProvider.h"
 
+#include "../OpenOVR/Compositor/compositor.h"
 #include "../OpenOVR/Misc/xr_ext.h"
 #include "../OpenOVR/Misc/Config.h"
 #include "../OpenOVR/logging.h"
@@ -794,9 +795,49 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 	return true;
 }
 
+bool ASWProvider::RebuildSwapchainsIfInvalidated()
+{
+	const uint32_t current = Compositor::SwapchainGeneration();
+	if (current == m_swapchainGeneration)
+		return true;
+
+	OOVR_LOGF("ASW: swapchain generation %u -> %u - rebuilding", m_swapchainGeneration, current);
+
+	if (m_outputSwapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(m_outputSwapchain);
+		m_outputSwapchain = {};
+	}
+	m_outputSwapchainImages.clear();
+
+	if (m_depthSwapchain != XR_NULL_HANDLE) {
+		xrDestroySwapchain(m_depthSwapchain);
+		m_depthSwapchain = {};
+	}
+	m_depthSwapchainImages.clear();
+
+	if (!CreateOutputSwapchain(m_eyeWidth * 2, m_eyeHeight)) {
+		// The old chain is already gone, so there is nothing to fall back to. Stop rather than
+		// leave m_ready set over a null handle we would retry against for the rest of the session.
+		OOVR_LOG("ASW: output swapchain rebuild failed - disabling ASW");
+		m_ready = false;
+		return false;
+	}
+	if (!CreateDepthSwapchain(m_eyeWidth * 2, m_eyeHeight)) {
+		// Same as at init: ASW works without depth, the runtime just loses the depth attachment.
+		OOVR_LOG("ASW: depth swapchain rebuild failed (non-fatal - depth layer disabled)");
+	}
+
+	// Only once the chains actually exist, so a failure is retried rather than skipped.
+	m_swapchainGeneration = current;
+	return true;
+}
+
 bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx)
 {
 	if (!m_ready || !m_hasCachedFrame) return false;
+
+	if (!RebuildSwapchainsIfInvalidated())
+		return false;
 
 	// Acquire output swapchain
 	XrSwapchainImageAcquireInfo acquireInfo = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };

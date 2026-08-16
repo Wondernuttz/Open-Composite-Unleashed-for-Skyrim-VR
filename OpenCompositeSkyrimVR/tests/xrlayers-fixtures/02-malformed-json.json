@@ -1,0 +1,9 @@
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_malformed",
+        "library_path": ".\\whatever.dll",
+        "api_version": "1.0"
+        "implementation_version": "1"
+    }
+}

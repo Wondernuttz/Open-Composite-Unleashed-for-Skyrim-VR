@@ -50,8 +50,39 @@ public:
 	// Set for overlay compositors — post-processing is designed for game eye textures only.
 	bool isOverlay = false;
 
+	/**
+	 * Throw away the swapchains of every participating owner and build fresh ones on the next
+	 * submitted frame. The same thing we do on our own initiative when the game's submitted
+	 * texture changes size or format, asked for from outside. Reached from a mod through the
+	 * OCU_InvalidateSwapchains export; see docs/API-LAYERS.md.
+	 *
+	 * A counter rather than a flag, because the owners are independent and a consumed-once flag
+	 * would be cleared by whichever submitted first, leaving the rest never rebuilding. Each
+	 * compares against its own stored copy, so they need no coordination.
+	 *
+	 * Participating owners, exhaustively: DX11Compositor — which is both the game's eye textures
+	 * and, through BaseOverlay, every overlay — plus ASWProvider and SpaceWarpProvider.
+	 *
+	 * Everything else that owns an XrSwapchain does NOT rebuild, so a caller must not hand those
+	 * chains images it will later need back; asking will not get them back. That is VRKeyboard,
+	 * VRMenuLaser and BaseOverlay's trail chain, which all call xrCreateSwapchain themselves, and
+	 * also the DX12, OpenGL and Vulkan compositors. Those three are unreachable in Skyrim VR (a
+	 * D3D11 game, and BaseCompositor picks the subclass from the texture type the game submits)
+	 * but they are compiled, so they are listed here rather than left implied.
+	 *
+	 * Takes effect on the next frame. Safe from any thread.
+	 */
+	static void InvalidateSwapchains();
+
+	/** The current value. A compositor rebuilds when this stops matching what it built against. */
+	static uint32_t SwapchainGeneration();
+
 protected:
 	XrSwapchain chain = XR_NULL_HANDLE;
+
+	// What SwapchainGeneration() read when the current chain was built. Zero unless something has
+	// asked for a rebuild, so a compositor that never reads it behaves exactly as it always has.
+	uint32_t swapchainGeneration = 0;
 
 	// The request used to create the current swapchain. This can be used to check if the swapchain needs recreating.
 	XrSwapchainCreateInfo createInfo{};

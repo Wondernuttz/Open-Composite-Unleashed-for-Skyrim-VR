@@ -22,6 +22,7 @@ public:
 	inline bool EnableHiddenMeshFix() const { return enableHiddenMeshFix; }
 	inline bool InvertUsingShaders() const { return invertUsingShaders; }
 	inline bool InitUsingVulkan() const { return initUsingVulkan; }
+	inline bool EnableApiLayers() const { return enableApiLayers; }
 	float HiddenMeshVerticalScale() const { return hiddenMeshVerticalScale; }
 	inline bool LogAllOpenVRCalls() const { return logAllOpenVRCalls; }
 	inline bool EnableAudioSwitch() const { return enableAudioSwitch; }
@@ -285,6 +286,10 @@ private:
 	bool enableHiddenMeshFix = true;
 	bool invertUsingShaders = false;
 	bool initUsingVulkan = false;
+
+	// Discover and enable every OpenXR API layer whose manifest is in the xrlayers/ folder next
+	// to this DLL. Costs nothing when the folder isn't there, which is the normal case.
+	bool enableApiLayers = true;
 	float hiddenMeshVerticalScale = 1.0f;
 	bool logAllOpenVRCalls = false;
 	bool enableAudioSwitch = false;

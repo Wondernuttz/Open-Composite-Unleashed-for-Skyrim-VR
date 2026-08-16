@@ -1,0 +1,11 @@
+{
+    "_comment": "Fields present but empty. An empty layer name would otherwise be handed to xrCreateInstance.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "",
+        "library_path": ".\\XR_APILAYER_FIXTURE_valid.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Empty name"
+    }
+}

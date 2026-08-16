@@ -1,0 +1,11 @@
+{
+    "_comment": "Well-formed, points inside the game folder, but the DLL is not there. The half-installed-mod case.",
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FIXTURE_missingdll",
+        "library_path": ".\\XR_APILAYER_FIXTURE_does_not_exist.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Manifest shipped without its DLL"
+    }
+}

@@ -70,6 +70,14 @@ public:
 	/// Returns pointer to the filled struct for the given eye.
 	XrCompositionLayerSpaceWarpInfoFB* GetLayerInfo(int eye) { return &m_info[eye]; }
 
+	/**
+	 * Answer Compositor::InvalidateSwapchains for the chains this provider owns. Also repoints the
+	 * handles cached in the layer-info structs at Initialize.
+	 *
+	 * False means a needed rebuild failed and space warp has switched itself off; skip the frame.
+	 */
+	bool RebuildSwapchainsIfInvalidated();
+
 private:
 	bool CreateSwapchain(uint32_t width, uint32_t height, int64_t format,
 	    XrSwapchain* outChain, ID3D11Texture2D** outImage);
@@ -77,6 +85,9 @@ private:
 
 	bool m_ready = false;
 	uint32_t m_perEyeWidth = 0, m_perEyeHeight = 0;
+
+	// What Compositor::SwapchainGeneration() read when the current chains were built.
+	uint32_t m_swapchainGeneration = 0;
 
 	// Stereo-combined XR swapchains (both eyes side-by-side, width = perEye * 2)
 	XrSwapchain m_mvSwapchain = {};

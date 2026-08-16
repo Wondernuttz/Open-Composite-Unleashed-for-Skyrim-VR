@@ -71,6 +71,15 @@ public:
 	/// Get the depth XR swapchain for the warped frame (for XR_KHR_composition_layer_depth).
 	XrSwapchain GetDepthSwapchain() const { return m_depthSwapchain; }
 
+	/**
+	 * Answer Compositor::InvalidateSwapchains for the chains this provider owns independently of
+	 * the eye compositor. Only the XR swapchains: the compute shader and staging textures are
+	 * unaffected by anything downstream.
+	 *
+	 * False means a needed rebuild failed and ASW has switched itself off; skip the frame.
+	 */
+	bool RebuildSwapchainsIfInvalidated();
+
 	/// False while the depth cache runs at a different resolution than the eye
 	/// (external render scale). The parallax warp still works (shader samples
 	/// depth by UV), or when reversed submit bounds require shader-side depth
@@ -240,6 +249,9 @@ private:
 	// Stereo-combined XR swapchain for depth (R32_FLOAT, both eyes side-by-side)
 	XrSwapchain m_depthSwapchain = {};
 	std::vector<ID3D11Texture2D*> m_depthSwapchainImages;
+
+	// What Compositor::SwapchainGeneration() read when the current chains were built.
+	uint32_t m_swapchainGeneration = 0;
 
 	// Cached pose/FOV/depth from real frame
 	XrPosef m_cachedPose[2] = {};
