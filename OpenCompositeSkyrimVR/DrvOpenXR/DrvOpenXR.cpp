@@ -191,7 +191,7 @@ static void CreateSystemID()
 
 IBackend* DrvOpenXR::CreateOpenXRBackend()
 {
-	OOVR_LOG("OCU runtime build: 4.3.7-foveation-geometry-hotfix1 / foveation-geometry-v3-fixed-separate + rdm-depth-scope-v3 / eye-presets-v3-performance-1x1-2x2-4x2 + gaze-upload-v3 / DAPA menu-pause-v1 / DAPA mask-frame-v1 + exact-mask-v1 / terrain-depth-guard-v1 / cutout-material-guard-v1 / ring-debug-v2-quads / runtime-route-v2 / first-stereo-frame-v1 / controller-index-v1 / moving-gaze-v2 + effect-foveation-v1 / Index-grip-touch-v1 / input-recovery-v5 / DAPA render-permission-v4 + GPU timing v1");
+	OOVR_LOG("OCU runtime build: 4.3.7-foveation-debug-hotfix1 / fixed-ring-no-timeout-v1 / foveation-geometry-v3-fixed-separate + rdm-depth-scope-v3 / eye-presets-v3-performance-1x1-2x2-4x2 + gaze-upload-v3 / DAPA menu-pause-v1 / DAPA mask-frame-v1 + exact-mask-v1 / terrain-depth-guard-v1 / cutout-material-guard-v1 / ring-debug-v2-quads / runtime-route-v2 / first-stereo-frame-v1 / controller-index-v1 / moving-gaze-v2 + effect-foveation-v1 / Index-grip-touch-v1 / input-recovery-v5 / DAPA render-permission-v4 + GPU timing v1");
 	LogRuntimeProcessIdentity();
 	// TODO handle something like Unity which stops and restarts the instance
 	if (initialised) {

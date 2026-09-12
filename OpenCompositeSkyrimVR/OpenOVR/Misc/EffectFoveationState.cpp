@@ -79,8 +79,12 @@ Snapshot State::ReadForPresentation(std::int64_t now) const
 {
     std::lock_guard<std::mutex> guard(mutex);
     const double age = double(now) - double(presentation.publicationQpc);
+    // Fixed rings describe the rendered frame's static profile, not a gaze
+    // sample that can become stale while a long frame finishes. The next
+    // BeginFrame or a rejected Publish still clears them immediately.
     if (presentation.qpcFrequency <= 0 || age < 0 ||
-        age > double(presentation.qpcFrequency) * 0.5)
+        (presentation.mode == Mode::EyeTracked &&
+            age > double(presentation.qpcFrequency) * 0.5))
         return Disabled(snapshot.frameId, now, snapshot.qpcFrequency);
     return presentation;
 }

@@ -15,6 +15,8 @@ public:
     Result Query(std::uint32_t requestedVersion, std::uint32_t outputBytes,
         Snapshot* output) const;
     // Diagnostic presentation only; never exposed through the renderer API.
+    // Fixed profiles last until the next frame/publication decision; tracked
+    // profiles also expire by age so old gaze is not displayed as current.
     Snapshot ReadForPresentation(std::int64_t now) const;
 
 private:

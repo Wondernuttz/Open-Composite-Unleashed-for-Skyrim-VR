@@ -1,3 +1,8 @@
+4.3.7 fixed-ring diagnostic follow-up (2026-09-12)
+- Fixed and gaze-loss fallback debug rings no longer turn into an amber X solely because a rendered frame took over 500 milliseconds. The next frame still clears the profile before menu, missing-geometry or other disabled decisions; invalid profiles and clocks remain rejected.
+- Eye-tracked diagnostic gaze still expires after 500 milliseconds. Rendering eligibility, CSX compatibility, DAPA timing, settings and GPU work are unchanged. This removes a misleading indicator, not a demonstrated cause of every reported gameplay dropout.
+- Runtime marker: 4.3.7-foveation-debug-hotfix1 / fixed-ring-no-timeout-v1. The separately packaged Hotfix 5 hashes below identify the earlier drop.
+
 4.3.7 Hotfix 5 (2026-09-12)
 - Full alpha test package combining the current runtime, SKSE plugin and Configurator. See doc/4.3.7-Hotfix-5.md for component identities, validation and remaining headset checks.
 - Fixed and gaze-loss fallback foveation now use the validated scene-depth route for separate submitted eye images. RDM can use valid scene depth without a shared submitted color texture; existing draw and viewport guards remain.

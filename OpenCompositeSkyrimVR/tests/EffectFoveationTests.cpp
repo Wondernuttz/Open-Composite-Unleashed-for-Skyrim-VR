@@ -115,6 +115,52 @@ static void CheckContract()
     Check(ClockTicks() > 0 && ClockFrequency() > 0, "monotonic publication clock available");
 }
 
+static void CheckPresentationLifetime()
+{
+    constexpr std::int64_t frequency = 10000000;
+    const auto tracked = Profile(100);
+    auto fixed = tracked;
+    fixed.mode = Mode::Fixed;
+    State state;
+    state.BeginFrame(fixed.publicationQpc, frequency);
+    Check(state.Publish(fixed), "fixed presentation fixture publishes");
+    for (const auto delay : {frequency / 2, frequency / 2 + 1, frequency, frequency * 30}) {
+        const auto displayed = state.ReadForPresentation(fixed.publicationQpc + delay);
+        Check(displayed.mode == Mode::Fixed && displayed.frameId == Read(state).frameId &&
+            displayed.publicationQpc == fixed.publicationQpc,
+            "fixed rings survive a long rendering frame without extending renderer state");
+    }
+    state.Clear(fixed.publicationQpc + 1);
+    Check(Read(state).mode == Mode::Disabled &&
+        state.ReadForPresentation(fixed.publicationQpc + frequency).mode == Mode::Fixed,
+        "submitted fixed rings remain visible while renderer API stays closed");
+    Check(state.ReadForPresentation(fixed.publicationQpc - 1).mode == Mode::Disabled,
+        "fixed presentation still rejects a backwards clock");
+
+    state.BeginFrame(fixed.publicationQpc + frequency * 31, frequency);
+    Check(state.ReadForPresentation(fixed.publicationQpc + frequency * 31).mode == Mode::Disabled,
+        "menu or missing-geometry frame immediately clears old fixed rings");
+    Check(state.Publish(tracked), "tracked presentation fixture publishes");
+    Check(state.ReadForPresentation(tracked.publicationQpc + frequency / 2).mode == Mode::EyeTracked,
+        "tracked rings remain valid at the expiry boundary");
+    Check(state.ReadForPresentation(tracked.publicationQpc + frequency / 2 + 1).mode == Mode::Disabled,
+        "stale tracked rings still expire after half a second");
+
+    state.BeginFrame(fixed.publicationQpc, frequency);
+    Check(state.Publish(fixed) &&
+        state.ReadForPresentation(fixed.publicationQpc + frequency).mode == Mode::Fixed,
+        "gaze-loss fixed fallback follows fixed presentation lifetime");
+    auto bad = fixed;
+    bad.fovTangents[0][1] = bad.fovTangents[0][0];
+    Check(!state.Publish(bad) &&
+        state.ReadForPresentation(fixed.publicationQpc + frequency).mode == Mode::Disabled,
+        "invalid replacement immediately clears fixed presentation");
+    state.BeginFrame(fixed.publicationQpc, 0);
+    Check(!state.Publish(fixed) &&
+        state.ReadForPresentation(fixed.publicationQpc).mode == Mode::Disabled,
+        "invalid clock frequency cannot create fixed rings");
+}
+
 static void CheckConcurrentReaders()
 {
     State state;
@@ -161,6 +207,7 @@ static void CheckConcurrentReaders()
 int main()
 {
     CheckContract();
+    CheckPresentationLifetime();
     CheckConcurrentReaders();
     std::printf("Effect foveation ABI/state tests: %u failures\n", failures.load());
     return failures == 0 ? 0 : 1;
