@@ -267,6 +267,7 @@ void DapaCapture::Queue(ID3D11DeviceContext* ctx,ID3D11Texture2D* source,Image& 
 ID3D11ComputeShader* DapaCapture::BeginEye(int eye,ID3D11DeviceContext* ctx,
     ID3D11Texture2D* real,ID3D11Texture2D* depth,const float* constants,
     int64_t realTime,int64_t predictedTime,bool flip,const float* cachedPose,const float* targetPose,const float* fov,ID3D11Texture2D* bodyMask) {
+	if constexpr (!DapaCaptureControl::Enabled) return nullptr;
     if(state==State::Armed && eye==0 && Clock::now()>=armedAt) {
         if(shaderCode.empty())return nullptr; // normal game warp continues during CPU compilation
         try {

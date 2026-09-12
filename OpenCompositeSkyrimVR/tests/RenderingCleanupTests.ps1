@@ -22,9 +22,10 @@ foreach ($symbol in @('g_aimPoses.matrix', 'oovr_laser_calibration::ApplyToPoseM
     if (!$backend.Contains($symbol)) { throw "Missing retained behavior: $symbol" }
 }
 $compositor = Get-Content -Raw -LiteralPath (Join-Path $sourceRoot 'OpenOVR/Compositor/dx11compositor.cpp')
-foreach ($symbol in @('InstallSceneTargetHooks', 'Hook_ClearDepthStencilView', 'SyncVRSForRenderTargets', 'TryApplyPendingDensityMask', 'ExtractDepthToR32F', 'EnsureReactiveMaskResources')) {
+foreach ($symbol in @('InstallSceneTargetHooks', 'RDMRenderScope::NotifyTargets', 'SyncVRSForRenderTargets', 'densityMaskManager.Arm', 'ExtractDepthToR32F', 'EnsureReactiveMaskResources')) {
     if (!$compositor.Contains($symbol)) { throw "Missing retained rendering path: $symbol" }
 }
+if ($compositor -match 'TryApplyPendingDensityMask|Hook_ClearDepthStencilView|ApplyDepthMask\(') { throw 'Unsafe original-depth RDM seeding remains in compositor' }
 foreach ($relative in @('DrvOpenXR/SpaceWarpProvider.h', 'DrvOpenXR/SpaceWarpProvider.cpp')) {
     if (Test-Path -LiteralPath (Join-Path $sourceRoot $relative)) { throw "Retired provider source remains: $relative" }
 }

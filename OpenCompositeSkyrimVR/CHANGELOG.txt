@@ -1,7 +1,32 @@
+4.3.7 Hotfix 5 (2026-09-12)
+- Full alpha test package combining the current runtime, SKSE plugin and Configurator. See doc/4.3.7-Hotfix-5.md for component identities, validation and remaining headset checks.
+- Fixed and gaze-loss fallback foveation now use the validated scene-depth route for separate submitted eye images. RDM can use valid scene depth without a shared submitted color texture; existing draw and viewport guards remain.
+- Added the moving-eye popup with the PugDragon detail preview. Quality, Balanced, Performance and Aggressive apply complete size/rate profiles; Performance is the fresh-install/reset default. Saved profiles remain authoritative.
+- Accumulated gaze movement now triggers rate-map updates. DAPA suspends for gameplay menus including Favorites and resumes from a fresh real stereo pair.
+- Includes earlier terrain/cutout protection, separate debug-ring overlays, controller/session recovery, Index grip/trackpad routing, RaceMenu keyboard recovery, DAPA mask lifetime/exact-pixel protection and the optional CSX integration contracts.
+- The separate-eye routing adds no GPU pass or full-frame copy. Normal VRS/RDM costs remain; no new Skyrim FPS or AMD/headset validation claim is made.
+
+4.3.4 Test 7 (2026-09-10)
+- RDM color-pass handoff: preserve original depth/stencil; mask a private copy only for eligible depth-equal opaque color passes.
+- Reconstruct affected MRTs before shader, compute, copy and command-list consumers; protect depth edges, blending, alpha/discard and unsupported passes.
+- Restore the original DSV before CSX post-draw callbacks. Resume RDM on the next eligible draw; preserve DAPA tuning and Test 6 VRS protection.
+- Hardware and software GPU probes cover color/MRT reconstruction and byte-identical original depth. Skyrim/AMD headset performance still needs validation.
+
 # Changelog
+
+## 10 September 2026 - 4.3.4 Test 6 VRS color coverage
+
+- Added shader-specific full-rate protection for pixel discard/dither, depth or coverage output, UAV writes, dynamic linkage and alpha-to-coverage. Ordinary opaque shaders retain fixed/eye-tracked NVIDIA VRS; protection releases immediately on the next compatible shader.
+- Capture shader bytecode during early D3D11 initialization and on the game device. Classifications attach to shader objects, support stripped bytecode, and cannot survive object destruction/address reuse. Pre-existing unclassified shaders run full rate individually.
+- Track shader/blend changes, ClearState and context-state swaps before rendering. Deferred command lists run full rate and restore the previous immediate-context decision after playback. No new GPU copies, waits, flushes or shader compilation during state changes.
+- Hardware regression reproduces 7,680 missing expected pixels in each half-rate control; production hooks restore all 16,384 expected pixels. Opaque stereo shading reduction, immediate recovery, state restoration and resize/session tests pass on RTX 5070 Ti.
+- New runtime marker and per-frame throttled diagnostics identify effective coarse/protected/unclassified state transitions. DAPA tuning, gaze geometry, RDM depth handoff, CSX and SKSE binaries are unchanged. Skyrim/headset confirmation of the reported artifacts remains required.
 
 ## 6 September 2026 - DAPA and diagnostic logging update
 
+- Added support for the exact CSX AIO VR 1595cffd build and validated all six supported DLLs. Added startup discovery for byte-identical known draw functions relocated within the shader DLL; changed code still requires validation. No new per-frame scanning or GPU work.
+- Added a once-per-session in-game warning after loading when DAPA player/body/held-item mask startup fails. Logs identify the actual draw-hook owner without automatically blaming Community Shaders. ENB binaries and live AMD behavior are not yet qualified.
+- Removed MapMenu from OCU's managed interaction targets, retaining only a native-map exclusion guard. Removed console code that hid Skyrim's shared native pointer without restoring it. Skyrim owns the map laser and clicks; OCU's white console selection remains.
 - Follow-up compatibility update: validated Treatid's published CSX 3.19 PR20/PR21 accepted-draw functions, added a complete five-binary regression mode, and made unsupported-owner startup failures explicitly report inactive body correction and the owner offset. No additional frame work. Deployed to local MO2 and Nexus staging; live AMD/CSX validation remains outstanding.
 - Fixed the DAPA accepted-draw adapter rejecting the verified regular CSX 3.18 and 3.19 binaries. Select the exact validated owner contract at startup, retaining Paintball support and all CSX suppression decisions. No additional per-frame scan, GPU pass or timing change. Other rebuilt/forked binaries are not automatically accepted; see doc/DAPA-CSX-Compatibility-2026-09-06.md.
 - Follow-up: moved routine keyboard/haptic/key-injection, gesture/combo, laser/menu and eye-pose diagnostics behind logging. First failures remain visible with per-call-site throttling on high-frequency failure paths. Starting/completed keyboard text is no longer logged. No input/rendering behavior changes.

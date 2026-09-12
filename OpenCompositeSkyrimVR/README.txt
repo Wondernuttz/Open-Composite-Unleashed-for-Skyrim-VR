@@ -83,17 +83,17 @@ Both controllers work simultaneously with independent laser beams and cursor dot
 
 ## Building From Source
 
-This is a fork of [OpenComposite](https://gitlab.com/znixian/OpenOVR) (yehorb/edge branch).
+The current repository contains separate runtime, SKSE plugin and desktop-tool projects. Start with the Windows toolchain and SDK setup in [BUILDING.md](../BUILDING.md) at the repository root. Some required vendor SDK import libraries and the external CommonLibVR source tree are not supplied by cloning this repository alone.
 
-```
-git clone https://github.com/Wondernuttz/OpenCompositeSkyrimVR.git
-cd OpenCompositeSkyrimVR
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release --target OCOVR
+```powershell
+git clone https://github.com/Wondernuttz/Open-Composite-Unleashed-for-Skyrim-VR.git
+Set-Location Open-Composite-Unleashed-for-Skyrim-VR
+# Complete the dependency setup in BUILDING.md before configuring.
+cmake -S OpenCompositeSkyrimVR -B OpenCompositeSkyrimVR/build -G "Visual Studio 18 2026" -A x64 -DOCU_DAPA_CAPTURE=OFF
+cmake --build OpenCompositeSkyrimVR/build --config Release --target OCOVR --parallel
 ```
 
-The output DLL is at `build/bin/Release/vrclient_x64.dll`. Rename it to `openvr_api.dll` and place it in your Skyrim VR game folder.
+The runtime output is `OpenCompositeSkyrimVR/build/bin/Release/vrclient_x64.dll`, packaged as `root/openvr_api.dll` for the MO2 mod. The current SKSE source is the nested `OpenCompositeInput- Skyrim SKSE/OpenCompositeInput` project. BUILDING.md documents its build and the Configurator/Keyboard Studio publish locations; building the runtime alone does not update those components.
 
 ## Credits
 

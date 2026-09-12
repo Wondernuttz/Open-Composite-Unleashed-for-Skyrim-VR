@@ -9,11 +9,14 @@
 #include "generated/GVRClientCore.gen.h"
 
 #include "Misc/Config.h"
+#include "Misc/EffectFoveationState.h"
 #include "Misc/debug_helper.h"
 #include "steamvr_abi.h"
 #include <functional>
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 
 // Specific to OCOVR
 #include "Drivers/Backend.h"
@@ -37,6 +40,32 @@ static uint32_t current_init_token = 1;
 static EVRApplicationType current_apptype;
 
 static alternativeCoreFactory_t alternativeCoreFactory = nullptr;
+// Once this process selects OCU, late plugin client-core requests must not
+// hand the running game over to a different runtime via apps-config.json.
+static std::atomic<bool> ocuClientCoreSelected{false};
+// Serialize the first preference read, native DLL load and direct OCU init.
+// An atomic OCU flag alone does not stop an in-flight native preference read
+// from loading SteamVR after another caller has selected OCU.
+static std::mutex clientCoreRoutingMutex;
+static thread_local bool selectingClientCore = false;
+
+struct ClientCoreSelectionScope {
+	ClientCoreSelectionScope() { selectingClientCore = true; }
+	~ClientCoreSelectionScope() { selectingClientCore = false; }
+};
+
+static bool SelectOCUClientCoreForInit()
+{
+	// Loading a native runtime can call back through a plugin on this thread.
+	// Reject that recursive selection instead of deadlocking on our mutex.
+	if (selectingClientCore)
+		return false;
+	std::lock_guard<std::mutex> routeLock(clientCoreRoutingMutex);
+	if (alternativeCoreFactory)
+		return false;
+	ocuClientCoreSelected.store(true, std::memory_order_release);
+	return true;
+}
 
 OC_NORETURN void ERR(string msg)
 {
@@ -267,6 +296,9 @@ VR_INTERFACE uint32_t VR_CALLTYPE VR_InitInternal(EVRInitError* peError, EVRAppl
 
 VR_INTERFACE uint32_t VR_CALLTYPE VR_InitInternal2(EVRInitError* peError, EVRApplicationType eApplicationType, const char* pStartupInfo)
 {
+#ifdef _WIN32
+	OOVR_LOGF("OpenVR init request: appType=%d running=%d caller=%s", int(eApplicationType), int(running), GetCallerModulePath(_ReturnAddress()));
+#endif
 	BaseClientCore::appType = eApplicationType;
 	*peError = VRInitError_None;
 
@@ -324,6 +356,11 @@ VR_INTERFACE uint32_t VR_CALLTYPE VR_InitInternal2(EVRInitError* peError, EVRApp
 
 	if (running)
 		ERR("Cannot init VR: Already running!");
+	if (!SelectOCUClientCoreForInit()) {
+		OOVR_LOG("OpenVR init refused: this process already selected the alternative runtime client core");
+		*peError = VRInitError_Init_AlreadyRunning;
+		return 0;
+	}
 
 #ifndef OC_XR_PORT
 	ovr::Setup();
@@ -404,6 +441,7 @@ VR_INTERFACE const char* VR_CALLTYPE VR_RuntimePath()
 // Isolated so the SEH wrapper below contains no C++ objects requiring unwinding (MSVC C2712).
 static void ShutdownInternalImpl()
 {
+	ocu_effect_foveation::Clear();
 	// Reset interfaces
 	// Do this first, while the OVR session is still available in case they
 	//  need to use it for cleanup.
@@ -464,6 +502,16 @@ extern "C" __declspec(dllexport) int OCU_DebugLoggingEnabled()
 	return oovr_global_configuration.DebugLogging() ? 1 : 0;
 }
 
+// Optional effect-quality data only: querying does not enable VRS, RDM,
+// upscaling or a CSX/Open Shaders/ENB feature.
+extern "C" __declspec(dllexport) std::uint32_t OCU_GetEffectFoveationV1(
+    std::uint32_t requestedVersion, std::uint32_t outputBytes,
+    ocu_effect_foveation::Snapshot* output)
+{
+	return static_cast<std::uint32_t>(ocu_effect_foveation::GetState().Query(
+	    requestedVersion, outputBytes, output));
+}
+
 extern "C" __declspec(dllexport) void OCU_CombatHaptic(int hand, int kind, unsigned int durationMicros)
 {
 	if (!oovr_global_configuration.Haptics())
@@ -504,20 +552,35 @@ extern "C" __declspec(dllexport) void OCU_CombatHaptic(int hand, int kind, unsig
 
 VR_INTERFACE void* VRClientCoreFactory(const char* pInterfaceName, int* pReturnCode)
 {
-	if (alternativeCoreFactory) {
-	use_alt:
-		return alternativeCoreFactory(pInterfaceName, pReturnCode);
+	if (selectingClientCore) {
+		if (pReturnCode)
+			*pReturnCode = VRInitError_Init_AlreadyRunning;
+		return nullptr;
 	}
-
-	bool shouldUseOC = BaseClientCore::CheckAppEnabled();
-	if (!shouldUseOC) {
-		alternativeCoreFactory = PlatformGetAlternativeCoreFactory();
-
-		// TODO use a more descriptive error message
-		OOVR_FALSE_ABORT(alternativeCoreFactory);
-
-		goto use_alt;
+#ifdef _WIN32
+	OOVR_LOGF("OpenVR client-core request: %s OCUselected=%d caller=%s", pInterfaceName,
+		int(ocuClientCoreSelected.load(std::memory_order_acquire)), GetCallerModulePath(_ReturnAddress()));
+#endif
+	alternativeCoreFactory_t selectedAlternative = nullptr;
+	{
+		std::lock_guard<std::mutex> routeLock(clientCoreRoutingMutex);
+		if (!ocuClientCoreSelected.load(std::memory_order_acquire)) {
+			if (!alternativeCoreFactory) {
+				ClientCoreSelectionScope selectionScope;
+				if (BaseClientCore::CheckAppEnabled()) {
+					ocuClientCoreSelected.store(true, std::memory_order_release);
+				} else {
+					alternativeCoreFactory = PlatformGetAlternativeCoreFactory();
+					OOVR_FALSE_ABORT(alternativeCoreFactory);
+				}
+			}
+			selectedAlternative = alternativeCoreFactory;
+		}
 	}
+	// Call foreign runtime code outside our selection lock. Ownership is now
+	// pinned, so direct OCU init cannot create a second backend in this process.
+	if (selectedAlternative)
+		return selectedAlternative(pInterfaceName, pReturnCode);
 
 	*pReturnCode = VRInitError_None;
 

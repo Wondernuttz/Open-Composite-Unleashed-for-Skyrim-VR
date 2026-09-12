@@ -1,5 +1,77 @@
 # DAPA CSX accepted-draw compatibility — 6 September 2026
 
+## Code-location discovery and visible failures — 6 September follow-up
+
+Startup first tries the exact contracts below, then inspects the actual chained
+CommunityShaders owner for an identical known full function at a different RVA.
+The fallback requires a matching PE unwind function boundary/size, the same
+image module, executable image memory, and the full machine-code SHA-256 before
+rebasing the two verified draw offsets. This is not a wildcard byte scan or a
+normalized-displacement matcher: changed instructions, including RIP-relative
+operands, still require independent validation. Lee's reference changes are
+handled by his new exact contract, not by this fallback.
+
+If mask startup remains unavailable, a once-per-session game-thread message box
+appears after new-game/save load with DAPA enabled. It states that body/held-item
+correction is inactive while world correction remains enabled and names the log
+to collect. Failure output is not behind verbose logging. Hook rejection logs
+identify the actual owner module instead of blaming CSX merely because it is
+loaded. The notice reports startup failure, not proof of subsequent pixel coverage.
+
+The six-DLL matrix passes with extra code-rebasing and wrong-module/boundary/hash
+negative tests. Native map and notification source-contract checks also pass.
+Message-box appearance still needs live Skyrim verification. There is no new
+per-frame matching, polling or GPU work.
+
+### ENB audit limits
+
+OCU's native engine path already calls the current context DrawIndexed dispatch
+instead of retaining/overwriting D3D vtable slots. It uses Skyrim's published
+context rather than assuming a proxy's returned immediate context is identical.
+The mask still requires matching scene depth and captures/restores D3D state.
+Those checks matter for ENB/wrappers, but do not establish compatibility with a
+particular ENB binary. An unknown engine-call owner is preserved and rejected,
+not routed through CSX's private acceptance contract.
+
+The official ENB VR download index lists 0.495, 0.457 and 0.375. On this audit,
+their pages were readable but the linked ZIP requests returned HTTP 403. No ENB
+wrapper DLL was found in the searched Downloads/MO2 files. None of these ENB
+binaries was installed, executed, patched or qualified. Obtain the official
+archives manually for further local binary inspection and live wrapper tests;
+do not describe synthetic mutable-dispatch/state tests as all-ENB validation.
+
+## Lee's exact AIO build — 6 September follow-up
+
+The user-supplied `CSX_AIO-VR-main-VR-1595cffd-Release.7z` contains
+`CommunityShaders.dll` SHA-256
+`B5D674790EED6D1FECB52088478512651FB6EE1455BD513C6B367BF9A3C1D338`.
+The previous five-contract adapter rejects this binary. Its accepted-draw
+owner is at RVA `10E240`, size `386` hex, with whole-function SHA-256
+`81F40849D98FFC1B84B68A6C0C86F5A87106155006A678E9E210C197D14B13B6`.
+The native draw sites are `10E2AC` (fast path) and `10E582` (after suppression).
+
+Disassembly shows 226 instructions, the same owner-relative branch structure,
+register/stack argument setup, and caller marker `DBDDF9` as PR21. There are
+34 raw instruction differences; normalizing RIP-relative references and external
+call destinations yields no instruction differences. This is a structural
+comparison of the owner, not proof that all referenced CSX functions are identical.
+Both accepted draw instructions and the suppression branch were reviewed directly.
+The owner moved by `-380` hex relative to PR21, and the changed references also
+change its hash. Rejection was an unrecognized layout, not proof of incompatible
+draw semantics or an AMD-specific failure.
+
+This adds a sixth exact startup contract. Runtime masking, GPU passes and
+unknown-build rejection remain unchanged. Run the complete matrix with all six
+DLLs, including this user-supplied fixture. The older deployment and validation
+entries below describe previous builds and their validation scope.
+Lee's live mask coverage, ghosting and AMD frame times still require verification.
+
+Local validation passed: Release plugin/test build, all six actual DLL mappings
+and twelve draw-instruction fixtures, changed-byte rejection and complete rollback,
+and both-eye WARP/local NVIDIA hardware mask/depth/state tests. All six original
+DLL fixture hashes remained unchanged. These are adapter and synthetic GPU tests,
+not execution of Lee's complete CSX rendering pipeline or live AMD qualification.
+
 ## Treatid follow-up update
 
 Deployment: both local OCU MO2 folders and the Nexus staging folder/4.3.1 ZIP,

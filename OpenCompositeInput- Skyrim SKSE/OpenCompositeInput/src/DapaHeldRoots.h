@@ -29,7 +29,7 @@ public:
         return {published[0].load(std::memory_order_acquire),
                 published[1].load(std::memory_order_acquire)};
     }
-    bool Matches(Node* node,const Snapshot& snapshot) const {
+    bool Matches(const Node* node,const Snapshot& snapshot) const {
         if(!node || (node!=snapshot[0] && node!=snapshot[1]))return false;
         std::scoped_lock lock(mutex);
         return node==pins[0].get() || node==pins[1].get();

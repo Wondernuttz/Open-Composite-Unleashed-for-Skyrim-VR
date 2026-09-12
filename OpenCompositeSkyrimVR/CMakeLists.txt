@@ -202,6 +202,8 @@ add_library(DrvOpenXR STATIC
 
 	DrvOpenXR/XrBackend.cpp
 	DrvOpenXR/XrBackend.h
+	DrvOpenXR/FoveationDebugOverlay.cpp
+	DrvOpenXR/FoveationDebugOverlay.h
 
 	DrvOpenXR/XrTrackedDevice.cpp
 	DrvOpenXR/XrTrackedDevice.h
@@ -261,6 +263,7 @@ endif ()
 set(OVR_PCH_EXCLUDED
 	OpenOVR/Misc/ini.c
 	OpenOVR/Misc/lodepng.cpp
+	OpenOVR/Misc/EffectFoveationState.cpp
 )
 
 add_library(OCCore STATIC
@@ -274,7 +277,14 @@ add_library(OCCore STATIC
 	OpenOVR/Compositor/DlssUpscaler.cpp
 	OpenOVR/Compositor/DlssUpscaler.h
 	OpenOVR/Compositor/VRSManager.cpp
+	OpenOVR/Compositor/VRSShaderGuard.cpp
+	OpenOVR/Compositor/VRSShaderGuard.h
+	OpenOVR/Compositor/ExactPixelShader.h
+	OpenOVR/Compositor/VRSAlphaCoverageScope.cpp
+	OpenOVR/Compositor/VRSAlphaCoverageScope.h
 	OpenOVR/Compositor/VRSManager.h
+	OpenOVR/Compositor/RDMRenderScope.cpp
+	OpenOVR/Compositor/RDMRenderScope.h
 	OpenOVR/Compositor/DensityMaskManager.cpp
 	OpenOVR/Compositor/DensityMaskManager.h
 	OpenOVR/Compositor/VRSGaze.h
@@ -635,6 +645,11 @@ add_custom_command(TARGET OCOVR
 # semantic transitions. It is excluded from normal builds and compiles the
 # production sources through narrow test-only hooks (no UDP thread or sleeps).
 if (WIN32)
+	add_executable(OCUInputSessionRecoveryTest EXCLUDE_FROM_ALL tests/InputSessionRecoveryTests.cpp)
+	target_include_directories(OCUInputSessionRecoveryTest PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR} ${XrDir}/include)
+	set_target_properties(OCUInputSessionRecoveryTest PROPERTIES
+		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 	add_executable(OCURuntimeSemanticsSelfTest EXCLUDE_FROM_ALL
 		tests/RuntimeSemanticsSelfTest.cpp
 		OpenOVR/Misc/NetworkTrackers.cpp
@@ -654,15 +669,178 @@ if (WIN32)
 	set_target_properties(OCUVRSGazeSelfTest PROPERTIES
 		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+	add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/tests/FoveationConfigProduction.inl"
+		COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ExtractFoveationConfigTest.py"
+			"${CMAKE_CURRENT_SOURCE_DIR}/OpenOVR/Misc/Config.cpp" "${CMAKE_BINARY_DIR}/tests/FoveationConfigProduction.inl"
+		DEPENDS tests/ExtractFoveationConfigTest.py OpenOVR/Misc/Config.cpp VERBATIM)
+	add_executable(OCUFoveationConfigTest EXCLUDE_FROM_ALL tests/FoveationConfigTests.cpp
+		"${CMAKE_BINARY_DIR}/tests/FoveationConfigProduction.inl")
+	target_include_directories(OCUFoveationConfigTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/tests")
+	set_target_properties(OCUFoveationConfigTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+	add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/tests/FoveationGeometryProduction.inl"
+		COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ExtractFoveationGeometryTest.py"
+			"${CMAKE_CURRENT_SOURCE_DIR}/OpenOVR/Compositor/dx11compositor.cpp"
+			"${CMAKE_BINARY_DIR}/tests/FoveationGeometryProduction.inl"
+		DEPENDS tests/ExtractFoveationGeometryTest.py OpenOVR/Compositor/dx11compositor.cpp VERBATIM)
+	add_executable(OCUFoveationGeometryTest EXCLUDE_FROM_ALL tests/FoveationGeometryTests.cpp
+		OpenOVR/Misc/EffectFoveationState.cpp "${CMAKE_BINARY_DIR}/tests/FoveationGeometryProduction.inl")
+	target_compile_definitions(OCUFoveationGeometryTest PRIVATE NOMINMAX)
+	target_include_directories(OCUFoveationGeometryTest PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/tests" "${XrDir}/include")
+	target_link_libraries(OCUFoveationGeometryTest PRIVATE d3d11)
+	set_target_properties(OCUFoveationGeometryTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+	add_executable(OCUEffectFoveationSelfTest EXCLUDE_FROM_ALL
+		tests/EffectFoveationTests.cpp OpenOVR/Misc/EffectFoveationState.cpp)
+	target_compile_definitions(OCUEffectFoveationSelfTest PRIVATE NOMINMAX)
+	target_include_directories(OCUEffectFoveationSelfTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+	set_target_properties(OCUEffectFoveationSelfTest PROPERTIES
+		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/nvapi/nvapi.h")
+		add_executable(OCUDapaMaskVRSD3D11Test EXCLUDE_FROM_ALL
+			tests/DapaMaskVRSInteractionTests.cpp OpenOVR/Compositor/VRSManager.cpp
+			OpenOVR/Compositor/VRSShaderGuard.cpp)
+		target_compile_definitions(OCUDapaMaskVRSD3D11Test PRIVATE NOMINMAX OC_HAS_NVAPI)
+		target_include_directories(OCUDapaMaskVRSD3D11Test PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR} OpenOVR ${CMAKE_BINARY_DIR} libs/nvapi libs/minhook/include)
+		target_link_libraries(OCUDapaMaskVRSD3D11Test PRIVATE OpenVR OpenXR glm d3d11 d3dcompiler dxgi minhook
+			${CMAKE_CURRENT_SOURCE_DIR}/libs/nvapi/amd64/nvapi64.lib)
+		set_target_properties(OCUDapaMaskVRSD3D11Test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+		add_executable(OCUVRSTerrainDepthD3D11Test EXCLUDE_FROM_ALL
+			tests/VRSTerrainDepthD3D11Tests.cpp OpenOVR/Compositor/VRSManager.cpp
+			OpenOVR/Compositor/VRSShaderGuard.cpp)
+		target_compile_definitions(OCUVRSTerrainDepthD3D11Test PRIVATE NOMINMAX OC_HAS_NVAPI)
+		target_include_directories(OCUVRSTerrainDepthD3D11Test PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR} OpenOVR ${CMAKE_BINARY_DIR} libs/nvapi libs/minhook/include)
+		target_link_libraries(OCUVRSTerrainDepthD3D11Test PRIVATE OpenVR OpenXR glm d3d11 d3dcompiler dxgi minhook
+			${CMAKE_CURRENT_SOURCE_DIR}/libs/nvapi/amd64/nvapi64.lib)
+		set_target_properties(OCUVRSTerrainDepthD3D11Test PROPERTIES
+			RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+		add_executable(OCUVRSAlphaCoverageD3D11Test EXCLUDE_FROM_ALL
+			tests/VRSAlphaCoverageD3D11Tests.cpp OpenOVR/Compositor/VRSManager.cpp
+			OpenOVR/Compositor/VRSShaderGuard.cpp OpenOVR/Compositor/VRSAlphaCoverageScope.cpp
+			OpenOVR/Compositor/RDMRenderScope.cpp OpenOVR/Compositor/DensityMaskManager.cpp)
+		target_compile_definitions(OCUVRSAlphaCoverageD3D11Test PRIVATE NOMINMAX OC_HAS_NVAPI)
+		target_include_directories(OCUVRSAlphaCoverageD3D11Test PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR} OpenOVR ${CMAKE_BINARY_DIR} libs/nvapi libs/minhook/include)
+		target_link_libraries(OCUVRSAlphaCoverageD3D11Test PRIVATE OpenVR OpenXR glm d3d11 d3dcompiler dxgi dxguid minhook
+			${CMAKE_CURRENT_SOURCE_DIR}/libs/nvapi/amd64/nvapi64.lib)
+		set_target_properties(OCUVRSAlphaCoverageD3D11Test PROPERTIES
+			RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+		add_executable(OCUVRSSceneD3D11Test EXCLUDE_FROM_ALL
+			tests/VRSSceneD3D11Tests.cpp OpenOVR/Compositor/VRSManager.cpp)
+		target_compile_definitions(OCUVRSSceneD3D11Test PRIVATE NOMINMAX OC_HAS_NVAPI)
+		target_include_directories(OCUVRSSceneD3D11Test PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR} OpenOVR ${CMAKE_BINARY_DIR} libs/nvapi)
+		target_link_libraries(OCUVRSSceneD3D11Test PRIVATE OpenVR OpenXR glm d3d11 d3dcompiler dxgi
+			${CMAKE_CURRENT_SOURCE_DIR}/libs/nvapi/amd64/nvapi64.lib)
+		set_target_properties(OCUVRSSceneD3D11Test PROPERTIES
+			RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+		add_executable(OCUVRSProjectionUploadD3D11Test EXCLUDE_FROM_ALL
+			tests/VRSProjectionUploadD3D11Tests.cpp)
+		target_compile_definitions(OCUVRSProjectionUploadD3D11Test PRIVATE NOMINMAX OC_HAS_NVAPI)
+		target_include_directories(OCUVRSProjectionUploadD3D11Test PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR} OpenOVR ${CMAKE_BINARY_DIR} libs/nvapi)
+		target_link_libraries(OCUVRSProjectionUploadD3D11Test PRIVATE OpenVR OpenXR glm d3d11 dxgi dxguid
+			${CMAKE_CURRENT_SOURCE_DIR}/libs/nvapi/amd64/nvapi64.lib)
+		set_target_properties(OCUVRSProjectionUploadD3D11Test PROPERTIES
+			RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+		add_executable(OCUVRSCoverageD3D11Test EXCLUDE_FROM_ALL
+			tests/VRSCoverageD3D11Tests.cpp OpenOVR/Compositor/VRSManager.cpp
+			OpenOVR/Compositor/VRSShaderGuard.cpp)
+		target_compile_definitions(OCUVRSCoverageD3D11Test PRIVATE NOMINMAX OC_HAS_NVAPI)
+		target_include_directories(OCUVRSCoverageD3D11Test PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR} OpenOVR ${CMAKE_BINARY_DIR} libs/nvapi libs/minhook/include)
+		target_link_libraries(OCUVRSCoverageD3D11Test PRIVATE OpenVR OpenXR glm d3d11 d3dcompiler dxgi minhook
+			${CMAKE_CURRENT_SOURCE_DIR}/libs/nvapi/amd64/nvapi64.lib)
+		set_target_properties(OCUVRSCoverageD3D11Test PROPERTIES
+			RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+	endif()
+	add_executable(OCUVRSTerrainGuardTest EXCLUDE_FROM_ALL
+		tests/VRSTerrainGuardTests.cpp OpenOVR/Compositor/VRSShaderGuard.cpp)
+	target_compile_definitions(OCUVRSTerrainGuardTest PRIVATE NOMINMAX OCU_VRS_GUARD_SELF_TEST)
+	target_include_directories(OCUVRSTerrainGuardTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} libs/minhook/include)
+	target_link_libraries(OCUVRSTerrainGuardTest PRIVATE d3d11 d3dcompiler dxgi minhook)
+	set_target_properties(OCUVRSTerrainGuardTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    add_executable(OCURDMHandoffD3D11Test EXCLUDE_FROM_ALL
+        tests/RDMHandoffD3D11Tests.cpp OpenOVR/Compositor/RDMRenderScope.cpp
+        OpenOVR/Compositor/DensityMaskManager.cpp OpenOVR/Compositor/VRSShaderGuard.cpp)
+    target_compile_definitions(OCURDMHandoffD3D11Test PRIVATE NOMINMAX)
+    target_include_directories(OCURDMHandoffD3D11Test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} libs/minhook/include)
+    target_link_libraries(OCURDMHandoffD3D11Test PRIVATE d3d11 d3dcompiler dxgi dxguid minhook)
+    set_target_properties(OCURDMHandoffD3D11Test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+	# The producer lives in the sibling SKSE project. Extract its real lifecycle
+	# functions instead of duplicating a mock of their clear/publication policy.
+	set(OCU_DAPA_MASK_PRODUCER_SOURCE
+		"${CMAKE_CURRENT_SOURCE_DIR}/../OpenCompositeInput- Skyrim SKSE/OpenCompositeInput/src/DapaPlayerMask.inl"
+		CACHE FILEPATH "SKSE player-mask source for the DAPA lifecycle regression")
+	if(EXISTS "${OCU_DAPA_MASK_PRODUCER_SOURCE}")
+		add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/tests/DapaMaskLifecycleProduction.inc"
+			COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ExtractDapaMaskLifecycleTest.py"
+				"${CMAKE_CURRENT_SOURCE_DIR}/OpenOVR/Compositor/dx11compositor.cpp"
+				"${OCU_DAPA_MASK_PRODUCER_SOURCE}" "${CMAKE_BINARY_DIR}/tests/DapaMaskLifecycleProduction.inc"
+			DEPENDS tests/ExtractDapaMaskLifecycleTest.py OpenOVR/Compositor/dx11compositor.cpp
+				"${OCU_DAPA_MASK_PRODUCER_SOURCE}" VERBATIM)
+		add_executable(OCUDapaMaskLifecycleD3D11Test EXCLUDE_FROM_ALL
+			tests/DapaMaskLifecycleD3D11Tests.cpp "${CMAKE_BINARY_DIR}/tests/DapaMaskLifecycleProduction.inc")
+		target_compile_definitions(OCUDapaMaskLifecycleD3D11Test PRIVATE NOMINMAX)
+		target_include_directories(OCUDapaMaskLifecycleD3D11Test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_BINARY_DIR}/tests")
+		target_link_libraries(OCUDapaMaskLifecycleD3D11Test PRIVATE d3d11 d3dcompiler)
+		set_target_properties(OCUDapaMaskLifecycleD3D11Test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+	endif()
+    add_executable(OCURDMPackedResolveTest EXCLUDE_FROM_ALL tests/RDMPackedResolveTests.cpp OpenOVR/Compositor/DensityMaskManager.cpp)
+    target_compile_definitions(OCURDMPackedResolveTest PRIVATE NOMINMAX)
+    target_include_directories(OCURDMPackedResolveTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(OCURDMPackedResolveTest PRIVATE d3d11 d3dcompiler dxgi dxguid)
+    set_target_properties(OCURDMPackedResolveTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 	add_executable(OCUDensityMaskD3D11Test EXCLUDE_FROM_ALL
 		tests/DensityMaskD3D11Tests.cpp
 		OpenOVR/Compositor/DensityMaskManager.cpp)
 	target_compile_definitions(OCUDensityMaskD3D11Test PRIVATE NOMINMAX)
 	target_include_directories(OCUDensityMaskD3D11Test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-	target_link_libraries(OCUDensityMaskD3D11Test PRIVATE d3d11 d3dcompiler)
+	target_link_libraries(OCUDensityMaskD3D11Test PRIVATE d3d11 d3dcompiler dxgi dxguid)
 	set_target_properties(OCUDensityMaskD3D11Test PROPERTIES
 		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+	add_executable(OCUFoveationDebugOverlayTest EXCLUDE_FROM_ALL
+		tests/FoveationDebugOverlayTests.cpp DrvOpenXR/FoveationDebugOverlay.cpp)
+	target_compile_definitions(OCUFoveationDebugOverlayTest PRIVATE NOMINMAX SUPPORT_DX11)
+	target_include_directories(OCUFoveationDebugOverlayTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${XrDir}/include)
+	target_link_libraries(OCUFoveationDebugOverlayTest PRIVATE d3d11)
+	set_target_properties(OCUFoveationDebugOverlayTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+	add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/tests/EyeGazeSamplerProduction.inc"
+		COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ExtractEyeGazeSamplerTest.py"
+			"${CMAKE_CURRENT_SOURCE_DIR}/OpenOVR/Reimpl/BaseInput.cpp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/OpenOVR/Misc/xrutil.cpp" "${CMAKE_BINARY_DIR}/tests/EyeGazeSamplerProduction.inc"
+		DEPENDS tests/ExtractEyeGazeSamplerTest.py OpenOVR/Reimpl/BaseInput.cpp OpenOVR/Misc/xrutil.cpp VERBATIM)
+	add_executable(OCUEyeGazeSamplerTest EXCLUDE_FROM_ALL
+		tests/EyeGazeSamplerTests.cpp "${CMAKE_BINARY_DIR}/tests/EyeGazeSamplerProduction.inc")
+	target_include_directories(OCUEyeGazeSamplerTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${XrDir}/include "${CMAKE_BINARY_DIR}/tests")
+	set_target_properties(OCUEyeGazeSamplerTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 	add_executable(OCUDapaTimingTest EXCLUDE_FROM_ALL tests/DapaTimingTests.cpp)
+	set(OCU_DAPA_MENU_GENERATED
+		"${CMAKE_BINARY_DIR}/tests/DapaMenuBridge.inc" "${CMAKE_BINARY_DIR}/tests/DapaMenuProvider.inc"
+		"${CMAKE_BINARY_DIR}/tests/DapaMenuCacheAdmission.inc" "${CMAKE_BINARY_DIR}/tests/DapaMenuScheduler.inc")
+	add_custom_command(OUTPUT ${OCU_DAPA_MENU_GENERATED}
+		COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ExtractDapaMenuTest.py"
+			"${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/tests"
+		DEPENDS tests/ExtractDapaMenuTest.py OpenOVR/Compositor/dx11compositor.cpp
+			DrvOpenXR/ASWProvider.h DrvOpenXR/ASWProvider.cpp DrvOpenXR/XrBackend.cpp VERBATIM)
+	add_executable(OCUDapaMenuTest EXCLUDE_FROM_ALL tests/DapaMenuTests.cpp ${OCU_DAPA_MENU_GENERATED})
+	target_include_directories(OCUDapaMenuTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${XrDir}/include "${CMAKE_BINARY_DIR}/tests")
+	set_target_properties(OCUDapaMenuTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+	add_executable(OCUDapaGpuTimingTest EXCLUDE_FROM_ALL tests/DapaGpuTimingTests.cpp)
+	target_compile_definitions(OCUDapaGpuTimingTest PRIVATE NOMINMAX)
+	target_include_directories(OCUDapaGpuTimingTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+	target_link_libraries(OCUDapaGpuTimingTest PRIVATE d3d11)
+	set_target_properties(OCUDapaGpuTimingTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+	add_executable(OCUDapaDepthTransferTest EXCLUDE_FROM_ALL tests/DapaDepthTransferTests.cpp)
+	target_compile_definitions(OCUDapaDepthTransferTest PRIVATE NOMINMAX)
+	target_include_directories(OCUDapaDepthTransferTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+	target_link_libraries(OCUDapaDepthTransferTest PRIVATE d3d11)
+	set_target_properties(OCUDapaDepthTransferTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 	add_executable(OCULoggingPolicyTest EXCLUDE_FROM_ALL tests/LoggingPolicyTests.cpp)
 	target_include_directories(OCULoggingPolicyTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 	set_target_properties(OCULoggingPolicyTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

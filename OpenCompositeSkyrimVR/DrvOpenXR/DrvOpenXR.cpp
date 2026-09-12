@@ -22,6 +22,61 @@ static bool initialised = false;
 static std::shared_ptr<BaseInput> sessionInputKeepalive;
 
 #ifdef _WIN32
+static std::string DiagnosticUtf8(const wchar_t* value)
+{
+	const int length = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+	if (length <= 0) return "<unavailable>";
+	std::string result(static_cast<size_t>(length), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, value, -1, result.data(), length, nullptr, nullptr);
+	result.pop_back();
+	return result;
+}
+
+static std::string DiagnosticModulePath(HMODULE module)
+{
+	wchar_t path[4096]{};
+	const DWORD length = GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path)));
+	if (!length || length >= std::size(path)) return "<unavailable-or-truncated>";
+	return DiagnosticUtf8(path);
+}
+
+static std::string DiagnosticEnvironmentPath(const wchar_t* name)
+{
+	wchar_t value[4096]{};
+	const DWORD length = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+	if (!length) return "<unset-or-empty>";
+	if (length >= std::size(value)) return "<truncated>";
+	return DiagnosticUtf8(value);
+}
+
+// Capture process identity from inside Skyrim, where MO2's virtual filesystem
+// and environment apply. An external collector may resolve different DLL files.
+static void LogRuntimeProcessIdentity()
+{
+	SYSTEMTIME utc{};
+	GetSystemTime(&utc);
+	HMODULE module = nullptr;
+	const bool foundModule = GetModuleHandleExW(
+	    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	    reinterpret_cast<LPCWSTR>(&LogRuntimeProcessIdentity), &module) != FALSE;
+	const auto executable = DiagnosticModulePath(nullptr);
+	const auto ownModule = foundModule ? DiagnosticModulePath(module) : "<unavailable>";
+	OOVR_LOGF("OCU process identity: pid=%lu utc=%04u-%02u-%02uT%02u:%02u:%02u.%03uZ executable=%s module=%s",
+	    GetCurrentProcessId(), utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute,
+	    utc.wSecond, utc.wMilliseconds, executable.c_str(), ownModule.c_str());
+	wchar_t activeRuntime[4096]{};
+	DWORD bytes = sizeof(activeRuntime);
+	const auto registryResult = RegGetValueW(HKEY_LOCAL_MACHINE,
+	    L"SOFTWARE\\Khronos\\OpenXR\\1", L"ActiveRuntime",
+	    RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, activeRuntime, &bytes);
+	const auto configuredRuntime = registryResult == ERROR_SUCCESS
+	    ? DiagnosticUtf8(activeRuntime) : "<unavailable>";
+	const auto runtimeOverride = DiagnosticEnvironmentPath(L"XR_RUNTIME_JSON");
+	const auto openVRPath = DiagnosticEnvironmentPath(L"VR_OVERRIDE");
+	OOVR_LOGF("OCU runtime selection: registryActiveRuntime=%s registryResult=%ld XR_RUNTIME_JSON=%s VR_OVERRIDE=%s (configured paths; actual OpenXR runtime identity follows)",
+	    configuredRuntime.c_str(), registryResult, runtimeOverride.c_str(), openVRPath.c_str());
+}
+
 // xrEnumerateApiLayerProperties only reports EXPLICIT layers. The layers that
 // silently wrap every xr* call — the Vive/Oculus/WMR runtime compat shims that
 // cause teardown crashes and phantom device identity — are IMPLICIT and invisible
@@ -66,6 +121,7 @@ static void LogImplicitOpenXRLayers()
 	LogImplicitOpenXRLayersFromHive(HKEY_CURRENT_USER, "HKCU");
 }
 #else
+static void LogRuntimeProcessIdentity() {}
 static void LogImplicitOpenXRLayers() {}
 #endif
 
@@ -135,6 +191,8 @@ static void CreateSystemID()
 
 IBackend* DrvOpenXR::CreateOpenXRBackend()
 {
+	OOVR_LOG("OCU runtime build: 4.3.7-foveation-geometry-hotfix1 / foveation-geometry-v3-fixed-separate + rdm-depth-scope-v3 / eye-presets-v3-performance-1x1-2x2-4x2 + gaze-upload-v3 / DAPA menu-pause-v1 / DAPA mask-frame-v1 + exact-mask-v1 / terrain-depth-guard-v1 / cutout-material-guard-v1 / ring-debug-v2-quads / runtime-route-v2 / first-stereo-frame-v1 / controller-index-v1 / moving-gaze-v2 + effect-foveation-v1 / Index-grip-touch-v1 / input-recovery-v5 / DAPA render-permission-v4 + GPU timing v1");
+	LogRuntimeProcessIdentity();
 	// TODO handle something like Unity which stops and restarts the instance
 	if (initialised) {
 		OOVR_ABORT("Cannot double-initialise OpenXR");
@@ -379,9 +437,17 @@ void DrvOpenXR::SetupSession()
 	xr_gbl = new XrSessionGlobals();
 
 	// Print the current version for diagnostic purposes
-	OOVR_LOGF("Started OpenXR session on runtime '%s', hand tracking supported: %d, eye gaze supported: %d",
+	OOVR_LOGF("Started OpenXR session on system '%s', hand tracking supported: %d, eye gaze supported: %d",
 	    xr_gbl->systemProperties.systemName, xr_gbl->handTrackingProperties.supportsHandTracking,
 	    xr_gbl->eyeGazeProperties.supportsEyeGazeInteraction);
+	OOVR_LOGF("Eye gaze session capability: requested=%d extensionEnabled=%d systemSupports=%d; foveation backend=%s fixedEnabled=%d",
+	    oovr_global_configuration.VrsEyeTracked(), xr_extEyeGazeInteraction,
+	    xr_gbl->eyeGazeProperties.supportsEyeGazeInteraction,
+	    oovr_global_configuration.FoveatedBackend().c_str(), oovr_global_configuration.VrsFixedEnabled());
+	if (oovr_global_configuration.VrsEyeTracked() && xr_extEyeGazeInteraction &&
+	    !xr_gbl->eyeGazeProperties.supportsEyeGazeInteraction) {
+		OOVR_LOG("Eye gaze unavailable: extension enabled, but the active system reports no eye-gaze support. Check headset eye-tracking hardware, calibration and the active runtime/driver's gaze forwarding.");
+	}
 
 	// Attach inputs early so implicit layers (like VD) see an attached
 	// action set before the first xrSyncActions / xrWaitFrame.
@@ -404,6 +470,7 @@ void DrvOpenXR::SetupSession()
 
 void DrvOpenXR::ShutdownSession()
 {
+	OOVR_DEBUG_LOGF("[INPUT-TRACE] Session shutdown requested session=%p", (void*)xr_session.get());
 	BackendManager* instance = BackendManager::InstancePtr();
 	// Is it already being shut down?
 	// Note that this is indirectly called by the XrBackend destructor, which will have
@@ -433,6 +500,7 @@ void DrvOpenXR::ShutdownSession()
 	}
 
 	OOVR_FAILED_XR_ABORT(xrDestroySession(xr_session.get()));
+	OOVR_DEBUG_LOGF("[INPUT-TRACE] Session destroyed session=%p", (void*)xr_session.get());
 	xr_session.reset();
 
 	// Delete xr_gbl AFTER session is fully destroyed — PumpEvents() and other

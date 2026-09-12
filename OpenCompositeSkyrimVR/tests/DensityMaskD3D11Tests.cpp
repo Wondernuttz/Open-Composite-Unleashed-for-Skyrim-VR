@@ -1,4 +1,5 @@
 #include <d3d11.h>
+#include <dxgi.h>
 #include <wrl/client.h>
 #include <array>
 #include <vector>
@@ -37,11 +38,11 @@ static std::vector<unsigned char> Read(ID3D11Device* dev, ID3D11DeviceContext* c
     ctx->Unmap(staging.Get(), 0); return result;
 }
 
-static void Run(D3D_DRIVER_TYPE driver, UINT width, UINT height)
+static void Run(D3D_DRIVER_TYPE driver, UINT width, UINT height, IDXGIAdapter* adapter = nullptr)
 {
     ComPtr<ID3D11Device> dev; ComPtr<ID3D11DeviceContext> ctx;
     D3D_FEATURE_LEVEL level{};
-    HR(D3D11CreateDevice(nullptr, driver, nullptr, 0, nullptr, 0,
+    HR(D3D11CreateDevice(adapter, driver, nullptr, 0, nullptr, 0,
         D3D11_SDK_VERSION, &dev, &level, &ctx));
     DensityMaskManager manager;
     Require(manager.Initialize(dev.Get()), "production shader initialization failed");
@@ -164,11 +165,24 @@ static void Run(D3D_DRIVER_TYPE driver, UINT width, UINT height)
 int main()
 {
     try {
-        for (auto driver : {D3D_DRIVER_TYPE_WARP, D3D_DRIVER_TYPE_HARDWARE}) {
-            Run(driver, 128, 64);
-            Run(driver, 134, 70);
-            Run(driver, 130, 66);
+        Run(D3D_DRIVER_TYPE_WARP, 128, 64);
+        Run(D3D_DRIVER_TYPE_WARP, 134, 70);
+        Run(D3D_DRIVER_TYPE_WARP, 130, 66);
+        ComPtr<IDXGIFactory1> factory;
+        HR(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
+        unsigned hardwareCount = 0;
+        for (UINT index = 0;; ++index) {
+            ComPtr<IDXGIAdapter1> adapter;
+            if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 desc{}; HR(adapter->GetDesc1(&desc));
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+            std::printf("Testing RDM GPU: %ls vendor=0x%04X\n", desc.Description, desc.VendorId);
+            Run(D3D_DRIVER_TYPE_UNKNOWN, 128, 64, adapter.Get());
+            Run(D3D_DRIVER_TYPE_UNKNOWN, 134, 70, adapter.Get());
+            Run(D3D_DRIVER_TYPE_UNKNOWN, 130, 66, adapter.Get());
+            ++hardwareCount;
         }
+        Require(hardwareCount > 0, "no hardware adapters tested");
     }
     catch (const std::exception& e) { std::fprintf(stderr, "FAIL: %s\n", e.what()); return 1; }
     return 0;

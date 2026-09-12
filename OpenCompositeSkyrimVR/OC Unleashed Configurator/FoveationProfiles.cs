@@ -7,6 +7,9 @@ internal readonly record struct FoveationRadii(decimal Inner, decimal Mid);
 
 internal static class FoveationProfiles
 {
+    public const int DefaultEyePreset = 2;
+    public const int AggressiveEyePreset = 4; // Keep existing preset and Custom indices stable.
+    public static readonly string[] EyePresetNames = { "Quality", "Balanced", "Performance", "Custom", "Aggressive" };
     public static readonly string[] RateChoices = { "1x1", "1x2", "2x1", "2x2", "2x4", "4x2", "4x4" };
     public static string ValidRate(string value) => Array.IndexOf(RateChoices, value) >= 0 ? value : "1x1";
     public static string EffectiveRate(string value, bool compatibility, bool favorHorizontal)
@@ -24,9 +27,9 @@ internal static class FoveationProfiles
     // Keep defaults/range rules aligned with OpenOVR/Misc/FoveationProfiles.h.
     public static FoveationRadii Preset(bool eyeTracked, int index) => (eyeTracked, index) switch
     {
-        (true, 0) => new(0.60m, 0.80m),
-        (true, 2) => new(0.40m, 0.60m),
-        (true, _) => new(0.50m, 0.70m),
+        (true, 0) => new(0.30m, 0.65m),
+        (true, 1) => new(0.22m, 0.45m),
+        (true, _) => new(0.20m, 0.40m),
         (false, 1) => new(0.60m, 0.80m),
         (false, 2) => new(0.50m, 0.70m),
         _ => new(0.70m, 0.85m)
@@ -41,7 +44,7 @@ internal static class FoveationProfiles
     public static FoveationRadii Read(IniFile ini, bool eyeTracked)
     {
         string prefix = eyeTracked ? "vrsEye" : "vrsFixed";
-        var defaults = Preset(eyeTracked, eyeTracked ? 1 : 0);
+        var defaults = Preset(eyeTracked, eyeTracked ? DefaultEyePreset : 0);
         decimal read(string key, string legacyKey, decimal fallback, decimal max)
         {
             foreach (string candidate in new[] { ini.Get("", key, ""), ini.Get("", legacyKey, "") })

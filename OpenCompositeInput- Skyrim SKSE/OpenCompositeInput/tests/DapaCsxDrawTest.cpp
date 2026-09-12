@@ -81,6 +81,17 @@ const DapaCsxDraw::Build* AdapterTest(const wchar_t* path) {
     Check(build!=nullptr,"installed CSX has no validated owner contract");
     auto* owner=reinterpret_cast<void*>(base+build->ownerRva);
     std::printf("Testing %s\n",build->name);
+    auto relocatedTemplate=*build;
+    relocatedTemplate.ownerRva+=0x100;
+    for(auto& site:relocatedTemplate.sites)site.rva+=0x100;
+    DapaCsxDraw::Build rebased{};
+    Check(DapaCsxDraw::RebaseKnownOwner(relocatedTemplate,base,owner,rebased),"known code rejected solely for relocated template address");
+    Check(rebased.ownerRva==build->ownerRva && rebased.sites[0].rva==build->sites[0].rva && rebased.sites[1].rva==build->sites[1].rva,"relocated draw offsets incorrect");
+    Check(!DapaCsxDraw::RebaseKnownOwner(*build,base+1,owner,rebased),"wrong module accepted");
+    Check(!DapaCsxDraw::RebaseKnownOwner(*build,base,static_cast<uint8_t*>(owner)+1,rebased),"interior instruction accepted as owner");
+    auto corrupted=*build;corrupted.ownerSha256[0]^=1;
+    Check(!DapaCsxDraw::RebaseKnownOwner(corrupted,base,owner,rebased),"unverified code accepted by rebasing");
+    std::puts("PASS code discovery: full function at actual owner, rebased sites, module/boundary/hash refusal");
     DapaCsxDraw::Adapter adapter;
     Check(adapter.Prepare(base,owner,reinterpret_cast<uintptr_t>(&Accepted)),"actual CSX adapter prepare");
     Check(adapter.Install(),"actual CSX observer install");

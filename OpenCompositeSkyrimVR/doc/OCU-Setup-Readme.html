@@ -822,7 +822,7 @@
       <details id="tab-bindings" class="tab-reference">
         <summary>Bindings Tab</summary>
         <div>
-          <div class="warn">Binding edits are not saved by <strong>Save opencomposite.ini</strong>. Use <strong>Save All Bindings</strong>, then restart Skyrim VR.</div>
+          <div class="warn">To keep a custom controller layout: edit the buttons, click <strong>Save Custom…</strong>, and give it a name. This saves your current edits too. Restart Skyrim VR to use the changes.</div>
           <ul class="setting-list">
             <li><strong>Keyboard Type:</strong> selects the Skyrim input context being edited, such as gameplay, menus, or inventory. Each context has independent mappings.</li>
             <li><strong>Disable Mouse Bindings (VR):</strong> unbinds the mouse column in the VR control map to prevent conflicting desktop-style mouse actions.</li>
@@ -834,8 +834,8 @@
             <li><strong>Controller Type:</strong> selects the input context for controller editing, independently of the keyboard Type selector.</li>
             <li><strong>Button / Action:</strong> click a dot on the controller picture and assign its Skyrim action for the selected context. Fixed trackpad translations are displayed but are not separately remappable.</li>
             <li><strong>Preset:</strong> selects a built-in or user-saved controller layout.</li>
-            <li><strong>Apply Preset:</strong> merges the selected preset's controller bindings into the live control map while preserving keyboard, mouse, and gamepad mappings.</li>
-            <li><strong>Save As:</strong> captures the entire current control map as a named user preset. Save pending UI edits first.</li>
+            <li><strong>Use Preset:</strong> use the selected controller layout. Keyboard, mouse, gamepad mappings and combos stay unchanged.</li>
+            <li><strong>Save Custom…:</strong> save the edits currently shown in the editor and store a named preset in one step. No separate save is needed. Presets restore controller mappings; combos remain separate installation settings.</li>
             <li><strong>Remove:</strong> deletes a user-created preset. Built-in presets are embedded and cannot be removed.</li>
             <li><strong>Controller Combos:</strong> maps a button chord or one-to-four-tap sequence to a keyboard key. If the same button has multiple tap counts, OCU waits through the configured tap window so it can resolve the intended count.</li>
             <li><strong>Controller:</strong> changes the Configurator picture and dot layout between Quest Touch, Index Knuckles, and PSVR2 Sense. Click its adjacent Save button to retain the choice.</li>
@@ -1018,8 +1018,8 @@
       <p>All of these live in <code>opencomposite.ini</code> and most are exposed in the Configurator's DAPA panel. The existing <code>asw*</code> key names are retained for compatibility with older configurations.</p>
       <ul>
         <li><code>aswWarpStrength</code>: master strength. 0 shows the cached frame with no correction, 1 is full correction. Default 1.0.</li>
-        <li><code>aswTranslationScale</code>: how strongly head position changes (leaning, stepping) are corrected on synthetic frames. Default 1.0.</li>
-        <li><code>aswRotationScale</code>: stick-turn correction. Default 0 (off) because the runtime already handles rotation. If turning judders, try 0.5. If it doubles, the sign is backwards for your setup.</li>
+        <li><code>aswTranslationScale</code>: optional extra headset-position correction (leaning, stepping). Default 0.0. Game locomotion uses its own setting below.</li>
+        <li><code>aswRotationScale</code>: stick-turn correction. Default 1.0. Tracked headset rotation remains with the runtime independently of this setting.</li>
         <li><code>aswLocoScale</code>: stick locomotion correction so the world does not rubber-band while you run. Default 1.0.</li>
         <li><code>aswDepthScale</code>: parallax intensity from the depth buffer. Lower it if near geometry wobbles. Default 1.0.</li>
         <li><code>aswEdgeFadeWidth</code>: fades warp at depth edges to hide stretching artifacts. Higher = wider fade. Default 3.0.</li>

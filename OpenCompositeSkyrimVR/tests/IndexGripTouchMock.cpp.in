@@ -1,0 +1,208 @@
+#include <windows.h>
+#include <openxr/openxr.h>
+#include "generated/interfaces/vrtypes.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include "OpenOVR/Misc/smooth_input.h"
+#include "OpenOVR/Misc/Input/IndexTrackpadRouting.h"
+using namespace vr;
+struct ITrackedDevice {
+    enum HandType { HAND_LEFT, HAND_RIGHT, HAND_NONE };
+    HandType hand=HAND_NONE;
+    HandType GetHand() const { return hand; }
+};
+struct VRSkeletalSummaryData_t { float flFingerCurl[5]{}; };
+/*ACTION_STRUCT*/
+#define OOVR_FAILED_XR_ABORT(expr) do { if ((expr) != XR_SUCCESS) throw std::runtime_error(#expr); } while (0)
+#define OOVR_FAILED_XR_SOFT_ABORT(expr) OOVR_FAILED_XR_ABORT(expr)
+#define OOVR_LOG_ONCE(...) do {} while (0)
+#define OOVR_FALSE_ABORT(expr) do { if (!(expr)) throw std::runtime_error(#expr); } while (0)
+#define OOVR_ABORTF(...) throw std::runtime_error("invalid binding")
+#define strcpy_arr(dst, src) strcpy_s(dst, src)
+XrInstance xr_instance = reinterpret_cast<XrInstance>(1);
+struct Session { XrSession get() const { return reinterpret_cast<XrSession>(2); } } xr_session;
+struct Sample { XrActionType type; bool active=false, boolean=false; float scalar=0; std::string name; };
+std::map<XrAction, Sample> samples;
+std::map<std::string, XrPath> xrPaths;
+unsigned actionStateReads=0;
+std::vector<XrAction> hapticActions;
+XRAPI_ATTR XrResult XRAPI_CALL xrStringToPath(XrInstance, const char* path, XrPath* result) {
+    if (!xrPaths.count(path)) xrPaths[path] = xrPaths.size()+1;
+    *result = xrPaths.at(path); return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrCreateActionSet(XrInstance, const XrActionSetCreateInfo*, XrActionSet* result) {
+    *result = reinterpret_cast<XrActionSet>(1); return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrCreateAction(XrActionSet, const XrActionCreateInfo* info, XrAction* result) {
+    *result = reinterpret_cast<XrAction>(samples.size()+1);
+    samples[*result] = {info->actionType, false, false, 0, info->actionName}; return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(XrSession, const XrActionStateGetInfo* info, XrActionStateBoolean* result) {
+    ++actionStateReads;
+    auto& sample = samples.at(info->action);
+    if (sample.type != XR_ACTION_TYPE_BOOLEAN_INPUT) return XR_ERROR_ACTION_TYPE_MISMATCH;
+    result->isActive=sample.active; result->currentState=sample.boolean; return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateFloat(XrSession, const XrActionStateGetInfo* info, XrActionStateFloat* result) {
+    ++actionStateReads;
+    auto& sample = samples.at(info->action);
+    if (sample.type != XR_ACTION_TYPE_FLOAT_INPUT) return XR_ERROR_ACTION_TYPE_MISMATCH;
+    result->isActive=sample.active; result->currentState=sample.scalar; return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrApplyHapticFeedback(XrSession, const XrHapticActionInfo* info, const XrHapticBaseHeader*) {
+    hapticActions.push_back(info->action); return XR_SUCCESS;
+}
+class InteractionProfile {
+public:
+    /*BINDING_STRUCT*/
+    LegacyBindings paths{};
+    std::string kind="index";
+    void Configure(const std::string& value) { kind=value; paths={}; /*PROFILE_ASSIGNMENTS*/ }
+    const LegacyBindings* GetLegacyBindings(const std::string&) const { return &paths; }
+    bool IsInputPathValid(const std::string& path) const {
+        return path.find("/input/squeeze/value") != std::string::npos || path.find("/input/squeeze/force") != std::string::npos || path.find("/input/squeeze/click") != std::string::npos;
+    }
+    std::string GetPath() const { return kind=="index" ? "/interaction_profiles/valve/index_controller" : "/interaction_profiles/oculus/touch_controller"; }
+    void AddLegacyBindings(const LegacyControllerActions&, std::vector<XrActionSuggestedBinding>&) const;
+};
+/*BINDINGS*/
+struct Device : ITrackedDevice { InteractionProfile profile; const InteractionProfile* GetInteractionProfile() const { return &profile; } } devices[2], hmd;
+bool devicePresent[2]={true,true};
+struct BackendManager {
+    static BackendManager& Instance() { static BackendManager instance; return instance; }
+    Device* GetDevice(vr::TrackedDeviceIndex_t index) {
+        if (index==0) return &hmd;
+        if (index>2 || !devicePresent[index-1]) return nullptr;
+        return &devices[index-1];
+    }
+};
+struct Configuration {
+    bool smoothing=false, swap=false, vrik=false, disablePad=false;
+    bool DisableTriggerTouch() const { return false; }
+    bool DisableThumbrestTouch() const { return true; }
+    bool EnableInputSmoothing() const { return smoothing; }
+    bool SwapThumbsticks() const { return swap; }
+    bool EnableVRIKKnucklesTrackPadSupport() const { return vrik; }
+    bool DisableTrackPad() const { return disablePad; }
+    unsigned IndexTrackpadCustomRegions() const { return 0; }
+    float LeftDeadZoneSize() const { return 0; }
+    float LeftDeadZoneXSize() const { return 0; }
+    float LeftDeadZoneYSize() const { return 0; }
+    float RightDeadZoneSize() const { return 0; }
+    float RightDeadZoneXSize() const { return 0; }
+    float RightDeadZoneYSize() const { return 0; }
+    bool WalkInPlaceEnabled() const { return false; }
+    float HapticStrength() const { return 1; }
+} oovr_global_configuration;
+struct Global { struct { bool supportsHandTracking=false; } handTrackingProperties; } globals;
+Global* xr_gbl=&globals;
+SmoothInput smoothInput(3);
+XrAction xr_rightStickX_action, xr_leftStickX_action, xr_leftStickY_action;
+float g_ocuTrackpadY[2]{}; bool g_ocuTrackpadTouch[2]{}, g_ocuTrackpadClick[2]{};
+struct CameraLegCalibration { static bool CapturesInput() { return false; } };
+void RememberPhysicalMove(float) {}
+float GetWalkInPlaceStickY() { return 0; }
+float GetWalkInPlaceTurnX() { return 0; }
+class BaseInput {
+public:
+    LegacyControllerActions legacyControllers[2]{};
+    XrActionSet legacyInputsSet{};
+    void CreateEyeGazeAction() {}
+    void CreateLegacyActions();
+    bool GetLegacyControllerState(vr::TrackedDeviceIndex_t, vr::VRControllerState_t*);
+    int DeviceIndexToHandId(vr::TrackedDeviceIndex_t);
+    void TriggerLegacyHapticPulse(vr::TrackedDeviceIndex_t, uint64_t, float);
+    EVRInputError getRealSkeletalSummary(ITrackedDevice::HandType, VRSkeletalSummaryData_t*) { return VRInputError_None; }
+    void getEstimatedSkeletalSummary(ITrackedDevice::HandType, VRSkeletalSummaryData_t*) {}
+};
+/*CREATE_ACTIONS*/
+/*DEVICE_ROUTING*/
+/*CONTROLLER_STATE*/
+/*HAPTIC_PULSE*/
+
+int main() {
+    unsigned checks=0;
+    auto check=[&](bool ok,const char* message) { ++checks; if(!ok) { std::cerr<<"FAIL: "<<message<<std::endl; throw std::runtime_error(message); } };
+    BaseInput input;
+    input.CreateLegacyActions();
+    devices[0].hand=ITrackedDevice::HAND_LEFT;
+    devices[1].hand=ITrackedDevice::HAND_RIGHT;
+    for (int hand=0;hand<2;++hand) {
+        check(input.DeviceIndexToHandId(hand+1)==hand,"connected controller keeps its physical hand");
+        input.TriggerLegacyHapticPulse(hand+1,1000000,1);
+        check(hapticActions.back()==input.legacyControllers[hand].haptic,"connected haptics keep their physical hand");
+    }
+    auto rejectDevice=[&](vr::TrackedDeviceIndex_t index) {
+        VRControllerState_t disconnected{};
+        const auto readsBefore=actionStateReads;
+        const auto pulsesBefore=hapticActions.size();
+        check(input.DeviceIndexToHandId(index)==-1,"missing or non-controller device must not alias the left hand");
+        check(!input.GetLegacyControllerState(index,&disconnected),"missing or non-controller state rejected");
+        check(actionStateReads==readsBefore,"rejected device cannot query another hand's actions");
+        input.TriggerLegacyHapticPulse(index,1000000,1);
+        check(hapticActions.size()==pulsesBefore,"rejected device cannot pulse another hand");
+    };
+    rejectDevice(0); // A real non-controller device, not a null pointer.
+    rejectDevice(999);
+    for (int hand=0;hand<2;++hand) {
+        devicePresent[hand]=false;
+        rejectDevice(hand+1);
+        check(input.DeviceIndexToHandId(2-hand)==1-hand,"one missing hand leaves the other routed correctly");
+        devicePresent[hand]=true;
+        check(input.DeviceIndexToHandId(hand+1)==hand,"reconnected controller restores its own routing");
+    }
+    const auto grip=ButtonMaskFromId(k_EButton_Grip), axis=ButtonMaskFromId(k_EButton_Axis2);
+    for(int hand=0;hand<2;++hand) {
+        const auto& ctrl=input.legacyControllers[hand];
+        check(samples.at(ctrl.gripTouch).type==XR_ACTION_TYPE_BOOLEAN_INPUT,"touch action must be boolean");
+        check(samples.at(ctrl.gripTouch).name==std::string("legacy-")+(hand==0?"left":"right")+"-grip-touch","touch action has independent per-hand identity");
+        for(const std::string profile:{"index","touch","vive"}) {
+            devices[hand].profile.Configure(profile);
+            std::vector<XrActionSuggestedBinding> bindings;
+            devices[hand].profile.AddLegacyBindings(ctrl,bindings);
+            bool touchBound=false;
+            for(auto& b:bindings) {
+                if(b.action==ctrl.gripTouch) { touchBound=true; check(b.binding==xrPaths.at(ctrl.handPath+"/input/squeeze/value"),"touch must use value, not force"); }
+                if(b.action==ctrl.gripClick && profile=="index") check(b.binding==xrPaths.at(ctrl.handPath+"/input/squeeze/force"),"press keeps force binding");
+            }
+            check(touchBound==(profile=="index"),"only Index suggests capacitive grip touch");
+        }
+    }
+    // Runtime supplies thresholded boolean values; OCU must preserve touch and
+    // force as independent signals for every relevant user-option combination.
+    for(bool smoothing:{false,true}) for(bool swap:{false,true}) for(bool vrik:{false,true}) for(bool disable:{false,true}) {
+        oovr_global_configuration={smoothing,swap,vrik,disable};
+        for(int hand=0;hand<2;++hand) {
+            for(auto& entry:samples) { entry.second.active=false; entry.second.boolean=false; entry.second.scalar=0; }
+            smoothInput=SmoothInput(3);
+            for(auto& device:devices) device.profile.Configure("index");
+            auto& ctrl=input.legacyControllers[hand];
+            auto& touch=samples.at(ctrl.gripTouch); auto& press=samples.at(ctrl.gripClick);
+            touch.active=press.active=true;
+            VRControllerState_t state{}, other{};
+            auto read=[&]() { check(input.GetLegacyControllerState(hand+1,&state),"controller read succeeds"); };
+            read(); check(!(state.ulButtonTouched&grip) && !(state.ulButtonPressed&grip),"open hand is idle");
+            touch.boolean=true; samples.at(ctrl.grip).active=true; samples.at(ctrl.grip).scalar=1;
+            read(); check((state.ulButtonTouched&(grip|axis))==(grip|axis),"light touch reaches HIGGS and Axis2");
+            check(!(state.ulButtonPressed&(grip|axis)),"light touch cannot shout or become a squeeze press");
+            input.GetLegacyControllerState(2-hand,&other); check(!(other.ulButtonTouched&grip),"touch cannot cross hands when sticks are swapped");
+            press.boolean=true; read(); check((state.ulButtonPressed&(grip|axis))==(grip|axis),"squeeze remains available while touching");
+            touch.boolean=false; press.boolean=false; samples.at(ctrl.grip).scalar=0;
+            read(); check(!(state.ulButtonTouched&(grip|axis)),"release is immediate despite peak-hold input smoothing");
+            touch.boolean=true; touch.active=false; read(); check(!(state.ulButtonTouched&(grip|axis)),"inactive/disconnected source cannot stick touched");
+            touch.active=true; read(); check(state.ulButtonTouched&grip,"touch recovers when source returns");
+            devices[hand].profile.Configure("touch"); read(); check(!(state.ulButtonTouched&(grip|axis)),"profile switch cannot leak old Index touch to Quest");
+            devices[hand].profile.Configure("index"); read(); check(state.ulButtonTouched&grip,"Index can return without stale controller classification");
+        }
+    }
+    VRControllerState_t state{};
+    check(!input.GetLegacyControllerState(999,&state),"unknown controller rejected");
+    std::cout<<"PASS: "<<checks<<" checks; production device routing, haptics, action creation, profile suggestions, controller state and smoothing under an OpenXR mock\n";
+}

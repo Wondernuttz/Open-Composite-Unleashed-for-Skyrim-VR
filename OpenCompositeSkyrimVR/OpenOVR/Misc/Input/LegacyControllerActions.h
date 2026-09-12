@@ -23,7 +23,7 @@ struct LegacyControllerActions {
 	// saves us from having to implement hysteresis (and the runtime probably knows what the appropriate thresholds are better
 	// than we do) and generally gives more flexibility on exotic hardware, as the user can rebind them separately.
 	XrAction trigger, triggerClick, triggerTouch; // Axis1
-	XrAction grip, gripClick; // Axis2
+	XrAction grip, gripClick, gripTouch; // Axis2; touch is independent of squeeze force
 
 	XrAction thumbrestTouch; // Capacitive thumbrest sensor (Quest Touch)
 

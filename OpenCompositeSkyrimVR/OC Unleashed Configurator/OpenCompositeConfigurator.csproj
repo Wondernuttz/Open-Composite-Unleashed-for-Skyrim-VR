@@ -8,6 +8,7 @@
     <RootNamespace>OpenCompositeConfigurator</RootNamespace>
     <Nullable>enable</Nullable>
     <AssemblyName>OC Unleashed Configurator for Skyrim VR</AssemblyName>
+    <Version>4.3.7-eye-editor-preview6</Version>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -22,6 +23,7 @@
     <EmbeddedResource Include="Resources\psvr2_sense.png" />
     <EmbeddedResource Include="Resources\kofi.png" />
     <EmbeddedResource Include="Resources\Bluefox.png" />
+    <EmbeddedResource Include="Resources\DragonPug.png" />
     <EmbeddedResource Include="Resources\FO4Fox.png" />
     <EmbeddedResource Include="controlmapvr_template.txt" />
     <EmbeddedResource Include="controlmapvr_vrsafe.txt" />

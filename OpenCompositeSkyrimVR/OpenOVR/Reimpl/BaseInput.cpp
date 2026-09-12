@@ -40,6 +40,8 @@
 using namespace vr;
 
 #include "../DrvOpenXR/XrBackend.h"
+#include "../InputTrace.h"
+#include "../Misc/Input/IndexTrackpadRouting.h"
 #include "../DrvOpenXR/DapaCaptureTelemetry.h"
 
 // On Android, the application must supply a function to load the contents of a file
@@ -871,6 +873,7 @@ void BaseInput::DestroyEyeGazeSpace()
 	eyeGazeViewPoses[0] = { { 0, 0, 0, 1 }, { 0, 0, 0 } };
 	eyeGazeViewPoses[1] = { { 0, 0, 0, 1 }, { 0, 0, 0 } };
 	eyeGazeViewPosesValid = false;
+	eyeGazeLiveReported = false;
 }
 
 void BaseInput::ResetEyeGazeActionHandle()
@@ -880,6 +883,9 @@ void BaseInput::ResetEyeGazeActionHandle()
 
 void BaseInput::PrepareForSessionShutdown()
 {
+	OOVR_DEBUG_LOGF("[INPUT-TRACE] Detach session=%p: clearing controller action spaces", (void*)attachedSession);
+	attachedSession = XR_NULL_HANDLE;
+	runtimeSyncFocus.Reset();
 	// XrAction and XrActionSet belong to the instance and remain valid across
 	// xrDestroySession. XrSpace belongs to the session, so destroy it while the
 	// old session is still alive and force BindInputsForSession to recreate it.
@@ -938,6 +944,9 @@ void BaseInput::BindInputsForSession()
 		return;
 	}
 	OOVR_FAILED_XR_ABORT(attachRes);
+	attachedSession = xr_session.get();
+	OOVR_DEBUG_LOGF("[INPUT-TRACE] Attach session=%p sets=%u legacy=%d result=%d",
+	    (void*)attachedSession, attachInfo.countActionSets, usingLegacyInput, (int)attachRes);
 
 	// OpenXR permits action-space creation before action-set attachment, but
 	// Pico's Steam path rejects the otherwise-valid pose action as an invalid
@@ -1312,6 +1321,7 @@ void BaseInput::CreateLegacyActions()
 		// return 0.0 or 1.0 depending on the button status. OpenXR 1.0 § 11.4.
 		create(&ctrl.grip, "grip", "Grip", XR_ACTION_TYPE_FLOAT_INPUT);
 		create(&ctrl.gripClick, "grip-click", "Grip (Digital)", XR_ACTION_TYPE_BOOLEAN_INPUT);
+		create(&ctrl.gripTouch, "grip-touch", "Grip (Touch)", XR_ACTION_TYPE_BOOLEAN_INPUT);
 		create(&ctrl.trigger, "trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT);
 		create(&ctrl.triggerTouch, "trigger-touch", "Trigger (Touch)", XR_ACTION_TYPE_BOOLEAN_INPUT);
 		create(&ctrl.triggerClick, "trigger-click", "Trigger (Digital)", XR_ACTION_TYPE_BOOLEAN_INPUT);
@@ -1407,11 +1417,11 @@ void BaseInput::CreateEyeGazeSpace()
 bool BaseInput::SampleEyeGazeDirection(XrTime displayTime, XrVector3f& gazeDirection,
     XrPosef eyeViewPoses[2], XrTime& sampleTime)
 {
-	auto logState = [](int state, const char* description) {
+	auto logState = [](int state, const char* description, XrResult result = XR_SUCCESS) {
 		if (!oovr_debug_logging_enabled()) {
 			if (state == 8 || state == 9) return; // Routine valid gaze samples.
 			if (state == 2 || state == 4 || state == 7) {
-				OOVR_LOG_LIMITEDF(5000, "Eye gaze failure: %s", description);
+				OOVR_LOG_LIMITEDF(5000, "Eye gaze failure: %s; result=%d", description, (int)result);
 			} else {
 				// Keep each unavailable-state warning once; blinks/focus loss
 				// must not produce repeated tracking chatter in normal mode.
@@ -1429,7 +1439,7 @@ bool BaseInput::SampleEyeGazeDirection(XrTime displayTime, XrVector3f& gazeDirec
 		const auto now = std::chrono::steady_clock::now();
 		if (state != lastLoggedState &&
 		    (lastLoggedState < 0 || now - lastLog >= std::chrono::seconds(1))) {
-			OOVR_LOGF("Eye gaze sample state: %s", description);
+			OOVR_LOGF("Eye gaze sample state: %s; result=%d", description, (int)result);
 			lastLoggedState = state;
 			lastLog = now;
 		}
@@ -1456,7 +1466,7 @@ bool BaseInput::SampleEyeGazeDirection(XrTime displayTime, XrVector3f& gazeDirec
 	XrActionStatePose state{ XR_TYPE_ACTION_STATE_POSE };
 	XrResult result = xrGetActionStatePose(session, &stateInfo, &state);
 	if (XR_FAILED(result)) {
-		logState(2, "unavailable (xrGetActionStatePose failed)");
+		logState(2, "unavailable (xrGetActionStatePose failed)", result);
 		return false;
 	}
 	if (!state.isActive) {
@@ -1469,7 +1479,7 @@ bool BaseInput::SampleEyeGazeDirection(XrTime displayTime, XrVector3f& gazeDirec
 	location.next = &gazeTime;
 	result = xrLocateSpace(eyeGazeSpace, xr_gbl->viewSpace, displayTime, &location);
 	if (XR_FAILED(result)) {
-		logState(4, "unavailable (xrLocateSpace failed)");
+		logState(4, "unavailable (xrLocateSpace failed)", result);
 		return false;
 	}
 	// Foveation consumes a ray direction. Do not reject a standards-compliant
@@ -1558,10 +1568,18 @@ bool BaseInput::SampleEyeGazeDirection(XrTime displayTime, XrVector3f& gazeDirec
 		}
 	}
 	sampleTime = gazeTime.time;
+	// A normal-level log must prove that gaze reached OCU, not just that an
+	// optional extension was enabled. Log once per session, never every frame.
+	if (!eyeGazeLiveReported) {
+		eyeGazeLiveReported = true;
+		OOVR_LOGF("Eye gaze LIVE: active pose and valid orientation received; system='%s' sampleTime=%s. Rendering activation is reported separately by Foveation mode/backend.",
+		    xr_gbl->systemProperties.systemName,
+		    gazeTime.time == 0 ? "unavailable (accepted)" : "runtime-provided (accepted)");
+	}
 	logState(gazeTime.time == 0 ? 8 : 9,
 	    gazeTime.time == 0 ?
 	        "LIVE (valid orientation; runtime does not expose precise sample time)" :
-	        "LIVE (valid fresh orientation and runtime sample time)");
+	        "LIVE (valid orientation and runtime sample time)");
 	return true;
 }
 
@@ -1663,7 +1681,9 @@ EVRInputError BaseInput::UpdateActionState(VR_ARRAY_COUNT(unSetCount) VRActiveAc
 	XrActionsSyncInfo syncInfo = { XR_TYPE_ACTIONS_SYNC_INFO };
 	syncInfo.activeActionSets = aas;
 	syncInfo.countActiveActionSets = unSetCount + 1;
-	const XrResult syncResult = xrSyncActions(xr_session.get(), &syncInfo);
+	const XrSession syncedSession = xr_session.get();
+	const XrResult syncResult = xrSyncActions(syncedSession, &syncInfo);
+	TraceActionSync(syncedSession, syncResult, false);
 	OOVR_FAILED_XR_ABORT(syncResult);
 	UpdateDapaCaptureGesture(syncResult == XR_SUCCESS);
 	syncSerial++;
@@ -1681,10 +1701,58 @@ void BaseInput::InternalUpdate()
 	XrActionsSyncInfo syncInfo = { XR_TYPE_ACTIONS_SYNC_INFO };
 	syncInfo.activeActionSets = &aas;
 	syncInfo.countActiveActionSets = 1;
-	const XrResult syncResult = xrSyncActions(xr_session.get(), &syncInfo);
+	const XrSession syncedSession = xr_session.get();
+	const XrResult syncResult = xrSyncActions(syncedSession, &syncInfo);
+	TraceActionSync(syncedSession, syncResult, true);
 	OOVR_FAILED_XR_SOFT_ABORT(syncResult);
 	UpdateDapaCaptureGesture(syncResult == XR_SUCCESS);
 	syncSerial++;
+}
+
+void BaseInput::TraceActionSync(XrSession syncedSession, XrResult result, bool legacy)
+{
+	// Keep the actual API session/result paired even if a session changes between
+	// the call and this observation. Track it regardless of the diagnostic checkbox.
+	runtimeSyncFocus.Observe(syncedSession == xr_session.get() && AreActionsAttachedToSession(syncedSession)
+	        ? syncedSession : XR_NULL_HANDLE,
+	    result, InputNowMs());
+	const bool debug = oovr_debug_logging_enabled();
+	// Failure reporting is never gated by the checkbox. Existing abort/soft-abort
+	// handling remains in the caller; this adds the session and input-path context.
+	if (!debug && !XR_FAILED(result)) return;
+	const auto now = OcuLogging::NowMs();
+	const auto session = xr_session.get();
+	thread_local OcuInputTrace::ChangeGate syncTrace[2];
+	if (syncTrace[legacy].Allow(true, { OcuInputTrace::Handle(session), OcuInputTrace::Code(result),
+	        OcuInputTrace::Handle(attachedSession), 0, 0 }, now)) {
+		OOVR_LOGF("[INPUT-TRACE] Sync session=%p path=%s attached=%d result=%s(%d)",
+		    (void*)session, legacy ? "legacy" : "actions", AreActionsAttachedToSession(session),
+		    OcuInputTrace::Result(result), (int)result);
+	}
+	if (!debug || !AreActionsAttachedToSession(session)) return;
+	// Query action activity at most once per second, only with logging enabled.
+	// These are read-only snapshots of the last sync, not additional sync calls.
+	thread_local uint64_t nextSampleMs = 0;
+	if (now < nextSampleMs) return;
+	nextSampleMs = now + 1000;
+	thread_local OcuInputTrace::ChangeGate handTrace[2];
+	for (int hand = 0; hand < 2; ++hand) {
+		const auto& ctrl = legacyControllers[hand];
+		XrActionStateGetInfo get{ XR_TYPE_ACTION_STATE_GET_INFO };
+		XrActionStatePose grip{ XR_TYPE_ACTION_STATE_POSE }, aim{ XR_TYPE_ACTION_STATE_POSE };
+		get.action = ctrl.gripPoseAction;
+		const XrResult gripResult = get.action ? xrGetActionStatePose(session, &get, &grip) : XR_ERROR_HANDLE_INVALID;
+		get.action = ctrl.aimPoseAction;
+		const XrResult aimResult = get.action ? xrGetActionStatePose(session, &get, &aim) : XR_ERROR_HANDLE_INVALID;
+		const uint64_t bits = (grip.isActive ? 1u : 0u) | (aim.isActive ? 2u : 0u)
+		    | (ctrl.gripPoseSpace ? 4u : 0u) | (ctrl.aimPoseSpace ? 8u : 0u);
+		if (handTrace[hand].Allow(true, { OcuInputTrace::Handle(session), OcuInputTrace::Code(gripResult),
+		        OcuInputTrace::Code(aimResult), bits, 0 }, now)) {
+			OOVR_LOGF("[INPUT-TRACE] Actions session=%p hand=%s gripActive=%d aimActive=%d gripSpace=%p aimSpace=%p gripResult=%d aimResult=%d",
+			    (void*)session, hand == 0 ? "left" : "right", grip.isActive, aim.isActive,
+			    (void*)ctrl.gripPoseSpace, (void*)ctrl.aimPoseSpace, (int)gripResult, (int)aimResult);
+		}
+	}
 }
 
 void BaseInput::UpdateDapaCaptureGesture(bool focused)
@@ -3101,7 +3169,10 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 	// Thumbrest touch maps to DPad_Up so users can bind it when explicitly enabled.
 	bindButton(disableThumbrestTouch ? XR_NULL_HANDLE : ctrl.thumbrestTouch, XR_NULL_HANDLE, vr::k_EButton_DPad_Up, hand, inputSmoothingEnabled);
 
-	bool enableVRIKKnucklesTrackPadSupport = oovr_global_configuration.EnableVRIKKnucklesTrackPadSupport();
+	auto* physicalDevice = BackendManager::Instance().GetDevice(controllerDeviceIndex);
+	const auto* physicalProfile = physicalDevice ? physicalDevice->GetInteractionProfile() : nullptr;
+	const bool isIndexController = physicalProfile && physicalProfile->GetPath() == "/interaction_profiles/valve/index_controller";
+	bool enableVRIKKnucklesTrackPadSupport = isIndexController && oovr_global_configuration.EnableVRIKKnucklesTrackPadSupport();
 	if (enableVRIKKnucklesTrackPadSupport) {
 		// VRIK binds knuckles trackpad click to "A" button touch in SteamVR controllers settings, this code replicates that behavior
 		bindButton(ctrl.btnA, XR_NULL_HANDLE, vr::k_EButton_A, hand, inputSmoothingEnabled);
@@ -3140,6 +3211,14 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 		return as.isActive ? as.currentState : false;
 	};
 
+	// HIGGS GripInputMethod=0 (Index Auto) or 2 consumes the legacy Grip touched bit.
+	// Keep runtime-thresholded capacitive touch separate from force/click and from
+	// peak-hold input smoothing, so opening the hand releases it immediately.
+	// Gate on the physical profile, independent of the selected controller picture,
+	// swapped sticks and VRIK trackpad routing. Other profiles leave this unbound.
+	if (isIndexController && readBool(ctrl.gripTouch))
+		state->ulButtonTouched |= ButtonMaskFromId(k_EButton_Grip) | ButtonMaskFromId(k_EButton_Axis2);
+
 	// Trackpad state exported for the VR keyboard swipe shortcut and gesture
 	// recognizer (BaseOverlay). On controllers without a trackpad the actions
 	// are null and these stay 0.
@@ -3161,14 +3240,13 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 		getInfo.action = ctrl.trackPadClick;
 		OOVR_FAILED_XR_ABORT(xrGetActionStateBoolean(xr_session.get(), &getInfo, &xs));
 
-		float valueTrackPadY = readFloat(ctrl.trackPadY);
-		if (valueTrackPadY <= 0.0f) {
-			state->ulButtonPressed |= (uint64_t)(xs.currentState != 0) << vr::k_EButton_A;
-			state->ulButtonPressed |= (uint64_t)(false) << vr::k_EButton_ApplicationMenu;
-		} else {
-			state->ulButtonPressed |= (uint64_t)(xs.currentState != 0) << vr::k_EButton_ApplicationMenu;
-			state->ulButtonPressed |= (uint64_t)(false) << vr::k_EButton_A;
-		}
+		XrActionStateFloat yState{ XR_TYPE_ACTION_STATE_FLOAT };
+		getInfo.action = ctrl.trackPadY;
+		OOVR_FAILED_XR_ABORT(xrGetActionStateFloat(xr_session.get(), &getInfo, &yState));
+		static_assert(vr::k_EButton_DPad_Right == 5 && vr::k_EButton_DPad_Down == 6);
+		state->ulButtonPressed |= OcuIndexTrackpad::PressMask(hand, yState.currentState,
+		    xs.isActive && yState.isActive, xs.currentState != 0, false, false,
+		    isIndexController ? oovr_global_configuration.IndexTrackpadCustomRegions() : 0u);
 	}
 
 	VRControllerAxis_t& thumbstick = state->rAxis[0];
@@ -3328,7 +3406,7 @@ int BaseInput::DeviceIndexToHandId(vr::TrackedDeviceIndex_t idx)
 {
 	ITrackedDevice* dev = BackendManager::Instance().GetDevice(idx);
 	if (!dev)
-		return false;
+		return -1;
 
 	ITrackedDevice::HandType hand = dev->GetHand();
 

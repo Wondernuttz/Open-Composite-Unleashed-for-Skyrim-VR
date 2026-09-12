@@ -3,7 +3,10 @@
 //
 
 #include "XrBackend.h"
+#include "../OpenOVR/InputTrace.h"
 #include "DapaTiming.h"
+#include "FoveationDebugOverlay.h"
+#include "../OpenOVR/Misc/EffectFoveationState.h"
 #include "generated/interfaces/vrtypes.h"
 
 #ifdef _WIN32
@@ -50,6 +53,7 @@
 #include "../OpenOVR/Misc/Config.h"
 #include "../OpenOVR/Misc/LaserCalibration.h"
 #include "ASWProvider.h"
+#include "DapaCaptureControl.h"
 
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 #include <d3d11.h>
@@ -537,6 +541,7 @@ void XrBackend::WaitForTrackingData()
 	// Make sure the OpenXR session is active before doing anything else, and if not then skip
 	if (!sessionActive) {
 		renderingFrame = false;
+		realFrameShouldRender = false;
 		return;
 	}
 
@@ -563,10 +568,12 @@ void XrBackend::WaitForTrackingData()
 		}
 
 		xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
+		realFrameShouldRender = state.shouldRender == XR_TRUE;
 
 		// Store the runtime's actual display period (nanoseconds → milliseconds)
 		if (state.predictedDisplayPeriod > 0) {
 			predictedDisplayPeriodMs = (float)(state.predictedDisplayPeriod / 1000000.0);
+			dapaPeriodBaseline.Observe(predictedDisplayPeriodMs);
 			xr_gbl->nextPredictedFramePeriod.store(state.predictedDisplayPeriod, std::memory_order_release);
 		}
 
@@ -601,6 +608,15 @@ void XrBackend::StoreEyeTexture(
 {
 	CheckOrInitCompositors(texture);
 
+	// WaitGetPoses may have begun a frame on the temporary graphics session.
+	// CheckOrInitCompositors replaces that session and clears renderingFrame.
+	// Begin the replacement frame before copying either eye, otherwise the
+	// first submitted eye is dropped and the first projection is incomplete.
+	if (deferredRenderingStart && usingApplicationGraphicsAPI) {
+		deferredRenderingStart = false;
+		WaitForTrackingData();
+	}
+
 	XrCompositionLayerProjectionView& layer = projectionViews[eye];
 	layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
 
@@ -622,16 +638,6 @@ void XrBackend::StoreEyeTexture(
 
 	// TODO store view somewhere and use it for submitting our frame
 
-	// If WaitGetPoses was called before the first texture was submitted, we're in a kinda weird state
-	// The application will expect it can submit it's frames (and we do too) however xrBeginFrame was
-	// never called for this session - it was called for the early session, then when the first texture
-	// was published we switched to that, but this new session hasn't had xrBeginFrame called yet.
-	// To get around this, we set a flag if we should begin a frame but are still in the early session. At
-	// this point we can check for that flag and call xrBeginFrame a second time, on the right session.
-	if (deferredRenderingStart && usingApplicationGraphicsAPI) {
-		deferredRenderingStart = false;
-		WaitForTrackingData();
-	}
 }
 
 void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
@@ -710,6 +716,37 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 		headers = &app_layer;
 	}
 
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	std::vector<const XrCompositionLayerBaseHeader*> debugLayers;
+	const XrCompositionLayerBaseHeader* debugHeaders[FoveationDebugOverlay::LayerCount]{};
+	if (oovr_global_configuration.FoveationDebugRings() && app_layer) {
+		const auto& limits = xr_gbl->systemProperties.graphicsProperties;
+		const auto* binding = static_cast<const XrBaseInStructure*>(GetCurrentGraphicsBinding());
+		if (binding && binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR &&
+		    uint32_t(layer_count) <= limits.maxLayerCount &&
+		    limits.maxLayerCount - uint32_t(layer_count) >= FoveationDebugOverlay::LayerCount &&
+		    limits.maxSwapchainImageWidth >= 1024 && limits.maxSwapchainImageHeight >= 512) {
+			if (!foveationDebugOverlay) foveationDebugOverlay = std::make_unique<FoveationDebugOverlay>();
+			const auto profile = ocu_effect_foveation::GetState().ReadForPresentation(ocu_effect_foveation::ClockTicks());
+			const auto* d3d = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(binding);
+			if (foveationDebugOverlay->Update(xr_session.get(), d3d->device, profile) &&
+			    foveationDebugOverlay->PositionOverScene(mainLayer)) {
+				for (uint32_t eye = 0; eye < FoveationDebugOverlay::LayerCount; ++eye)
+					debugHeaders[eye] = foveationDebugOverlay->Layer(eye);
+			}
+			OOVR_LOG_LIMITEDF(5000, "Eye-tracking rings: %s (diagnostic profile boundaries, not a shading-coverage proof)", foveationDebugOverlay->Status());
+			if (debugHeaders[0] && debugHeaders[1]) {
+				debugLayers.assign(headers, headers + layer_count);
+				for (auto* header : debugHeaders) debugLayers.push_back(header);
+				headers = debugLayers.data();
+				layer_count = static_cast<int>(debugLayers.size());
+			}
+		} else {
+			OOVR_LOG_LIMITEDF(5000, "Eye-tracking rings unavailable: D3D11 graphics and two spare OpenXR composition layers required");
+		}
+	}
+#endif
+
 	// It's ok if no layers have been added at this point,
 	// it will just cause the display to be blanked
 	info.layers = headers;
@@ -724,6 +761,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	// Compositor time: measure xrEndFrame duration
 	QueryPerformanceCounter(&endFrameStart);
 	const XrResult realEndResult = xrEndFrame(xr_session.get(), &info);
+	const auto realEndDone = DapaTiming::Clock::now();
 	OOVR_FAILED_XR_SOFT_ABORT(realEndResult);
 	QueryPerformanceCounter(&endFrameEnd);
 	if (qpcInitialized) {
@@ -826,17 +864,33 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 		uint64_t real = 0, synthetic = 0, errors = 0, empty = 0, attempts = 0;
 		uint64_t held = 0;
 		double waitMs = 0, endMs = 0, maxEndMs = 0;
+		uint64_t samples = 0, runtimeHidden = 0, syntheticHidden = 0;
+		double appMs = 0, maxAppMs = 0, realWaitMs = 0, maxRealWaitMs = 0;
+		double realEndMs = 0, maxRealEndMs = 0, intervalMs = 0, maxIntervalMs = 0;
 	};
 	static DapaStats dapaStats;
 	static auto statsStart = std::chrono::steady_clock::now();
 	if (DapaTiming::Accepted(realEndResult) && app_layer) ++dapaStats.real;
 	else if (!DapaTiming::Accepted(realEndResult)) ++dapaStats.errors;
+	if (app_layer) {
+		++dapaStats.samples;
+		dapaStats.appMs += measuredCpuFrameMs;
+		dapaStats.maxAppMs = std::max(dapaStats.maxAppMs, double(measuredCpuFrameMs));
+		dapaStats.realWaitMs += measuredWaitFrameMs;
+		dapaStats.maxRealWaitMs = std::max(dapaStats.maxRealWaitMs, double(measuredWaitFrameMs));
+		dapaStats.realEndMs += measuredEndFrameMs;
+		dapaStats.maxRealEndMs = std::max(dapaStats.maxRealEndMs, double(measuredEndFrameMs));
+		dapaStats.intervalMs += measuredFrameIntervalMs;
+		dapaStats.maxIntervalMs = std::max(dapaStats.maxIntervalMs, double(measuredFrameIntervalMs));
+		if (!realFrameShouldRender) ++dapaStats.runtimeHidden;
+	}
 	const auto recoveryNow = std::chrono::steady_clock::now();
 	static auto recoveryLast = recoveryNow;
 	const double recoveryElapsedMs = std::chrono::duration<double, std::milli>(recoveryNow - recoveryLast).count();
 	recoveryLast = recoveryNow;
-	recovery.Advance(recoveryElapsedMs);
-	pacing.Advance(recoveryElapsedMs);
+	recovery.Advance(recoveryElapsedMs, recoveryNow);
+	pacing.HoldRealFrame(recoveryNow);
+	const float dapaTimingPeriodMs = static_cast<float>(dapaPeriodBaseline.Get());
 	auto aswTrouble = [&](const char* what, float ms) {
 		++dapaStats.errors;
 		recovery.Trouble();
@@ -844,12 +898,12 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 		    what, ms, recovery.backoffMs, recovery.level);
 	};
 	auto observePacing = [&](float waitMs, float endMs) {
-		if (pacing.Observe(waitMs, endMs, oovr_global_configuration.ASWEndSpikeMs(), predictedDisplayPeriodMs)) {
+		if (pacing.Observe(waitMs, endMs, oovr_global_configuration.ASWEndSpikeMs(), dapaTimingPeriodMs)) {
 			static auto lastPacingLog = std::chrono::steady_clock::now() - std::chrono::seconds(2);
 			const auto now = std::chrono::steady_clock::now();
 			if (now - lastPacingLog >= std::chrono::seconds(1)) {
 				lastPacingLog = now;
-				OOVR_LOGF("DAPA PACING: wait=%.1fms end=%.1fms; yielding %.1fms to real frames (timing guard)",
+				OOVR_LOGF("DAPA PACING: wait=%.1fms end=%.1fms; yielding up to %.1fms / one real frame, then retry (timing guard)",
 				    waitMs, endMs, pacing.backoffMs);
 			}
 		}
@@ -859,9 +913,9 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	// VD has routine isolated end-spikes even at native 90 that shouldn't park ASW.
 	static constexpr double kAswCanaryMs = 90.0;
 	{
-		// Spike thresholds are calibrated at 90Hz (11.1ms period); scale with actual refresh
+		// Scale thresholds with the session baseline, not missed-frame multiples.
 		float canaryMs = static_cast<float>(DapaTiming::EndPressureLimitMs(
-		    oovr_global_configuration.ASWEndSpikeMs(), predictedDisplayPeriodMs));
+		    oovr_global_configuration.ASWEndSpikeMs(), dapaTimingPeriodMs));
 		if (canaryMs > 0.0f && measuredEndFrameMs > canaryMs) {
 			// Canary only acts in auto mode (gates re-entry after trouble). With auto off,
 			// injection policy is purely backoff-driven — inject whenever clean.
@@ -892,29 +946,30 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	static float s_aswLastWarpWaitMs = 0.0f; // sum of warp slot waits this frame (injection block below)
 	static bool lastDapaEnabled = false;
 	static bool lastDapaAuto = false;
-	static float lastDapaPeriod = 0.0f;
-	if (lastDapaEnabled != oovr_global_configuration.ASWEnabled() ||
-	    lastDapaAuto != oovr_global_configuration.ASWAutoNative() ||
-	    std::abs(lastDapaPeriod - predictedDisplayPeriodMs) > 0.05f) {
+	if (dapaResetPending || lastDapaEnabled != oovr_global_configuration.ASWEnabled() ||
+	    lastDapaAuto != oovr_global_configuration.ASWAutoNative()) {
 		recovery = {};
 		pacing = {};
 		s_aswIntervalEma = s_aswIdleEma = s_aswLastWarpWaitMs = 0.0f;
 		s_aswEngaged = true;
 		lastDapaEnabled = oovr_global_configuration.ASWEnabled();
 		lastDapaAuto = oovr_global_configuration.ASWAutoNative();
-		lastDapaPeriod = predictedDisplayPeriodMs;
-		OOVR_LOGF("DAPA CONFIG: enabled=%d auto=%d runtimePeriod=%.3fms (%.2fHz) translation=%.3f loco=%.3f; build=recovery-v2",
-		    (int)lastDapaEnabled, (int)lastDapaAuto, predictedDisplayPeriodMs,
-		    1000.0 / DapaTiming::PeriodMs(predictedDisplayPeriodMs),
-		    oovr_global_configuration.ASWTranslationScale(), oovr_global_configuration.ASWLocoScale());
+		dapaResetPending = false;
+		OOVR_LOGF("DAPA CONFIG: enabled=%d auto=%d runtimePeriod=%.3fms baseline=%.3fms translation=%.3f loco=%.3f; build=render-permission-v4 captureCompiled=%d",
+		    (int)lastDapaEnabled, (int)lastDapaAuto, predictedDisplayPeriodMs, dapaTimingPeriodMs,
+		    oovr_global_configuration.ASWTranslationScale(), oovr_global_configuration.ASWLocoScale(), int(DapaCaptureControl::Enabled));
 	}
 	{
-		float period = (predictedDisplayPeriodMs > 0.0f) ? predictedDisplayPeriodMs : 11.1f;
+		float period = dapaTimingPeriodMs;
 		if (measuredFrameIntervalMs > 0.0f && measuredFrameIntervalMs < 200.0f)
 			s_aswIntervalEma = (s_aswIntervalEma <= 0.0f) ? measuredFrameIntervalMs
 			                                              : s_aswIntervalEma * 0.92f + measuredFrameIntervalMs * 0.08f;
 
-		if (!oovr_global_configuration.ASWAutoNative()) {
+		if (!oovr_global_configuration.ASWEnabled()) {
+			s_aswEngaged = false;
+			s_aswIntervalEma = s_aswIdleEma = 0.0f;
+			recovery.forceRelease = false;
+		} else if (!oovr_global_configuration.ASWAutoNative()) {
 			s_aswEngaged = true; // legacy: always pin while enabled
 			recovery.forceRelease = false;
 		} else if (!s_aswEngaged) {
@@ -936,7 +991,8 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 			// Chronic backpressure: go native and stay there longer each time this zone proves hostile
 			recovery.forceRelease = false;
 			s_aswEngaged = false;
-			recovery.dwellMs = recovery.backoffMs = 0.0;
+			recovery.dwellMs = 0.0;
+			recovery.Clear();
 			recovery.level = 0;
 			recovery.engageHoldMs = std::min(120000.0, recovery.engageHoldMs * 4.0);
 			OOVR_LOGF("ASW AUTO: chronic backpressure — native, re-engage hold %.0fms", recovery.engageHoldMs);
@@ -972,11 +1028,26 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 	}
 	// The next real frame must not inherit a warp wait from a skipped attempt.
 	s_aswLastWarpWaitMs = 0.0f;
-	const bool canInject = oovr_global_configuration.ASWEnabled() && sessionActive && s_aswEngaged
-	    && recovery.backoffMs == 0.0 && pacing.backoffMs == 0.0
+	// VISIBLE sessions may still render: use the real wait's permission, not focus.
+	const bool runtimeAllowsSynthetic = sessionActive && realFrameShouldRender;
+	const bool prepareInjection = oovr_global_configuration.ASWEnabled() && runtimeAllowsSynthetic && s_aswEngaged
+	    && recovery.backoffMs == 0.0
 	    && (!oovr_global_configuration.ASWAutoNative() || recovery.level == 0 || recovery.realCleanMs >= kAswCanaryMs);
+	const bool canInject = prepareInjection && pacing.backoffMs == 0.0;
+	// Re-read the menu signal after the real submit and before claiming a slot.
+	// Once claimed, finish that one in-flight slot normally; canceling its layers
+	// can flash black. The next boundary invalidates the pair and stops DAPA.
+	auto refreshDapaMenuPause = []() {
+		if (!g_aswProvider) return false;
+		const bool paused = OCBridge_DapaMenuPaused();
+		g_aswProvider->SetPaused(paused);
+		return paused;
+	};
+	refreshDapaMenuPause();
+	// A one-frame pacing yield keeps caching REAL frames. Invalidating here would
+	// add a cache warm-up gap and reset motion history every time pressure occurs.
 	if (g_aswProvider)
-		g_aswProvider->SetInjectionWanted(canInject && !g_aswProvider->IsPaused());
+		g_aswProvider->SetInjectionWanted(prepareInjection && !g_aswProvider->IsPaused());
 	if (!canInject) ++dapaStats.held;
 
 	if (g_aswProvider && g_aswProvider->IsReady() && g_aswProvider->HasCachedFrame()
@@ -994,24 +1065,30 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 			s_aswLastWarpWaitMs = 0.0f;
 			// Claim only one slot. No synthetic frame is used as another warp's input.
 			for (int aswInj = 0; aswInj < s_aswInjectCount; aswInj++) {
+			if (refreshDapaMenuPause())
+				break;
 			if (recovery.backoffMs > 0.0)
 				break; // trouble on a previous injection this frame — stop claiming slots
 
 			// 1. Claim next display slot (measure time — xrWaitFrame can block the game)
-			auto t0 = std::chrono::high_resolution_clock::now();
+			auto t0 = DapaTiming::Clock::now();
 			XrFrameWaitInfo aswWaitInfo{ XR_TYPE_FRAME_WAIT_INFO };
 			XrFrameState aswState{ XR_TYPE_FRAME_STATE };
 			++dapaStats.attempts;
 			XrResult res = xrWaitFrame(xr_session.get(), &aswWaitInfo, &aswState);
-			auto t1 = std::chrono::high_resolution_clock::now();
+			auto t1 = DapaTiming::Clock::now();
 			float waitMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
 			s_aswLastWarpWaitMs += waitMs; // feeds the auto-native idle estimate
 			dapaStats.waitMs += waitMs;
 
 			if (XR_SUCCEEDED(res)) {
+				// A synthetic wait may expose the base cadence while real frames run
+				// at a multiple. Learn it for subsequent decisions, without a reset.
+				dapaPeriodBaseline.Observe(double(aswState.predictedDisplayPeriod) * 1e-6);
 				// Preserve the 90Hz tolerance in display intervals at every refresh rate.
-				if (waitMs > DapaTiming::StallLimitMs(predictedDisplayPeriodMs)
+				if (waitMs > DapaTiming::StallLimitMs(dapaTimingPeriodMs)
 				    || aswState.shouldRender != XR_TRUE || res != XR_SUCCESS) {
+					if (aswState.shouldRender != XR_TRUE) ++dapaStats.syntheticHidden;
 					// Submit empty frame to keep runtime in sync, then back off
 					XrFrameBeginInfo aswBeginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
 					const XrResult beginResult = xrBeginFrame(xr_session.get(), &aswBeginInfo);
@@ -1021,12 +1098,16 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 					aswEndInfo.layers = nullptr;
 					aswEndInfo.layerCount = 0;
 					if (XR_SUCCEEDED(beginResult)) {
+						const auto emptyEndStart = DapaTiming::Clock::now();
 						const XrResult emptyResult = xrEndFrame(xr_session.get(), &aswEndInfo);
+						const float emptyEndMs = std::chrono::duration<float, std::milli>(DapaTiming::Clock::now() - emptyEndStart).count();
+						dapaStats.endMs += emptyEndMs;
+						dapaStats.maxEndMs = std::max(dapaStats.maxEndMs, double(emptyEndMs));
 						++dapaStats.empty;
-						if (!DapaTiming::Accepted(emptyResult)) aswTrouble("empty xrEndFrame error/status", 0);
+						if (!DapaTiming::Accepted(emptyResult)) aswTrouble("empty xrEndFrame error/status", emptyEndMs);
 					} else aswTrouble("xrBeginFrame error", 0);
 					if (res != XR_SUCCESS) aswTrouble("xrWaitFrame status", waitMs);
-					else if (waitMs > DapaTiming::StallLimitMs(predictedDisplayPeriodMs)) observePacing(waitMs, 0);
+					else if (waitMs > DapaTiming::StallLimitMs(dapaTimingPeriodMs)) observePacing(waitMs, 0);
 					aswCtx->Release();
 					goto asw_done;
 				}
@@ -1034,6 +1115,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 				// 2. Begin frame
 				XrFrameBeginInfo aswBeginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
 				res = xrBeginFrame(xr_session.get(), &aswBeginInfo);
+				const auto tBeginDone = DapaTiming::Clock::now();
 
 				if (XR_SUCCEEDED(res)) {
 					// 3. Get new head pose at the new predicted display time
@@ -1045,6 +1127,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 					uint32_t viewCount = 0;
 					XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
 					XrResult locateRes = xrLocateViews(xr_session.get(), &locateInfo, &viewState, XruEyeCount, &viewCount, views);
+					const auto tLocateDone = DapaTiming::Clock::now();
 
 					// 4. Warp cached frame with actor translation and stick yaw; tracked head rotation belongs to ATW.
 					bool warpOk = true;
@@ -1070,9 +1153,9 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 					}
 
 					// 5. Submit warped frame to XR swapchain
-					auto tWarpDone = std::chrono::high_resolution_clock::now();
-					bool submitOk = warpOk && g_aswProvider->SubmitWarpedOutput(aswCtx, predictedDisplayPeriodMs);
-					auto tSubmitDone = std::chrono::high_resolution_clock::now();
+					auto tWarpDone = DapaTiming::Clock::now();
+					bool submitOk = warpOk && g_aswProvider->SubmitWarpedOutput(aswCtx, dapaTimingPeriodMs);
+					auto tSubmitDone = DapaTiming::Clock::now();
 					if (submitOk) {
 						// 6. Build projection layer — use CACHED pose so runtime ATW corrects to current
 						XrCompositionLayerProjectionView warpedViews[2] = {};
@@ -1107,12 +1190,15 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 						warpedLayer.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
 						warpedLayer.views = warpedViews;
 						warpedLayer.viewCount = 2;
+						const bool syntheticDebug = debugHeaders[0] && foveationDebugOverlay &&
+							foveationDebugOverlay->PositionOverScene(warpedLayer);
 
 						// Build ASW layer array: warped projection + overlay layers from real frame
 						// (overlay layers = keyboard quad, laser beams, etc. at index 1+ of headers)
 						std::vector<XrCompositionLayerBaseHeader const*> aswLayers;
 						aswLayers.push_back((XrCompositionLayerBaseHeader*)&warpedLayer);
 						for (int i = 1; i < layer_count; i++) {
+							if (!syntheticDebug && (headers[i] == debugHeaders[0] || headers[i] == debugHeaders[1])) continue;
 							aswLayers.push_back(headers[i]);
 						}
 
@@ -1122,9 +1208,9 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 						aswEndInfo.layers = aswLayers.data();
 						aswEndInfo.layerCount = (uint32_t)aswLayers.size();
 
-						auto tEndStart = std::chrono::high_resolution_clock::now();
+						auto tEndStart = DapaTiming::Clock::now();
 						XrResult endRes = xrEndFrame(xr_session.get(), &aswEndInfo);
-						auto tEndDone = std::chrono::high_resolution_clock::now();
+						auto tEndDone = DapaTiming::Clock::now();
 						g_aswProvider->CaptureSubmission(aswState.predictedDisplayTime, endRes);
 						{
 							static int s = 0;
@@ -1140,8 +1226,8 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 							static auto s_lastAswLatencyLog = std::chrono::steady_clock::now() - std::chrono::seconds(2);
 							auto now = std::chrono::steady_clock::now();
 							const bool stageStall=warpUs>2000 || submitUs>2000
-							    || double(waitUs)/1000>DapaTiming::StallLimitMs(predictedDisplayPeriodMs)
-							    || double(endUs)/1000>DapaTiming::EndPressureLimitMs(12.0,predictedDisplayPeriodMs);
+							    || double(waitUs)/1000>DapaTiming::StallLimitMs(dapaTimingPeriodMs)
+							    || double(endUs)/1000>DapaTiming::EndPressureLimitMs(12.0,dapaTimingPeriodMs);
 							if (oovr_global_configuration.DebugLogging() && (stageStall || totalUs>8000)
 							    && now-s_lastAswLatencyLog>std::chrono::seconds(1)) {
 								s_lastAswLatencyLog = now;
@@ -1149,6 +1235,13 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 								    (long long)waitUs, (long long)warpUs, (long long)submitUs,
 								    (long long)endUs, (long long)totalUs, (int)endRes,measuredEndFrameMs,
 								    int(g_aswProvider->CaptureBusy()),int(g_aswProvider->CaptureRecording()));
+								OOVR_LOGF("DAPA FRAME TIMING: realPeriod=%.3fms syntheticPeriod=%.3fms baseline=%.3fms targetStep=%.3fms sinceRealEnd=%.3fms begin=%.3fms locate=%.3fms layerBuild=%.3fms",
+								    predictedDisplayPeriodMs, double(aswState.predictedDisplayPeriod) * 1e-6, dapaTimingPeriodMs,
+								    double(aswState.predictedDisplayTime - info.displayTime) * 1e-6,
+								    std::chrono::duration<double, std::milli>(tEndStart - realEndDone).count(),
+								    std::chrono::duration<double, std::milli>(tBeginDone - t1).count(),
+								    std::chrono::duration<double, std::milli>(tLocateDone - tBeginDone).count(),
+								    std::chrono::duration<double, std::milli>(tEndStart - tSubmitDone).count());
 							}
 
 							const float endMs = (float)endUs / 1000.0f;
@@ -1158,7 +1251,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 								++dapaStats.synthetic;
 								observePacing(waitMs, endMs);
 								// A cooldown cannot count as successful injection time.
-								recovery.CleanInjection(std::min(recoveryElapsedMs, 2.0 * DapaTiming::PeriodMs(predictedDisplayPeriodMs)));
+								recovery.CleanInjection(std::min(recoveryElapsedMs, 2.0 * dapaTimingPeriodMs));
 							} else aswTrouble("synthetic xrEndFrame error/status", endMs);
 						}
 					} else {
@@ -1169,8 +1262,14 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 						aswEndInfo.displayTime = aswState.predictedDisplayTime;
 						aswEndInfo.layers = nullptr;
 						aswEndInfo.layerCount = 0;
-						xrEndFrame(xr_session.get(), &aswEndInfo);
+						const auto emptyEndStart = DapaTiming::Clock::now();
+						const XrResult emptyResult = xrEndFrame(xr_session.get(), &aswEndInfo);
+						const float emptyEndMs = std::chrono::duration<float, std::milli>(DapaTiming::Clock::now() - emptyEndStart).count();
+						dapaStats.endMs += emptyEndMs;
+						dapaStats.maxEndMs = std::max(dapaStats.maxEndMs, double(emptyEndMs));
 						++dapaStats.empty;
+						if (!DapaTiming::Accepted(emptyResult))
+							OOVR_LOGF("DAPA: failed warp cleanup xrEndFrame result=%d duration=%.2fms (already in error recovery)", int(emptyResult), emptyEndMs);
 					}
 				} else aswTrouble("xrBeginFrame error", 0);
 			} else {
@@ -1185,25 +1284,37 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 		}
 	}
 asw_done:
-	// Suppress next-frame cache copies while held; re-entry requests a fresh cache.
-	if (g_aswProvider && (recovery.backoffMs > 0 || pacing.backoffMs > 0))
+	// API-error recovery stops cache work; short pacing yields preserve history.
+	if (g_aswProvider && recovery.backoffMs > 0)
 		g_aswProvider->SetInjectionWanted(false);
 	{
 		const auto now = std::chrono::steady_clock::now();
 		const double seconds = std::chrono::duration<double>(now - statsStart).count();
 		if (seconds >= 5.0) {
 			if (oovr_global_configuration.ASWEnabled() && oovr_global_configuration.DebugLogging()) {
-				const char* state = !sessionActive ? "inactive" : !g_aswProvider ? "no-provider"
+				const char* state = !sessionActive ? "inactive" : !runtimeAllowsSynthetic ? "runtime-not-rendering"
+				    : !g_aswProvider ? "no-provider"
 				    : !g_aswProvider->IsReady() ? "not-ready" : g_aswProvider->IsPaused() ? "paused"
 				    : recovery.backoffMs > 0 ? "error-backoff" : pacing.backoffMs > 0 ? "pacing-yield"
 				    : !s_aswEngaged ? "auto-native" : !canInject ? "waiting-clean-real-frame"
-				    : !g_aswProvider->HasCachedFrame() ? "waiting-cache" : "injecting";
+				    : !g_aswProvider->HasCachedFrame() ? "waiting-cache"
+				    : dapaStats.synthetic == 0 && dapaStats.syntheticHidden > 0 ? "runtime-declined-synthetic" : "injecting";
 				OOVR_LOGF("DAPA STATUS: %s runtime=%.2fHz period=%.3fms window=%.2fs realAccepted=%.1f/s syntheticAccepted=%.1f/s attempts=%llu errors=%llu empty=%llu held=%llu errorHold=%.0fms pacingHold=%.0fms waitCpuTotal=%.1fms endCpuTotal=%.1fms maxEndCpu=%.1fms (submitted, NOT presented FPS)",
 				    state, 1000.0 / DapaTiming::PeriodMs(predictedDisplayPeriodMs), predictedDisplayPeriodMs, seconds,
 				    dapaStats.real / seconds, dapaStats.synthetic / seconds,
 				    (unsigned long long)dapaStats.attempts, (unsigned long long)dapaStats.errors,
 				    (unsigned long long)dapaStats.empty, (unsigned long long)dapaStats.held,
 				    recovery.backoffMs, pacing.backoffMs, dapaStats.waitMs, dapaStats.endMs, dapaStats.maxEndMs);
+				OOVR_LOGF("DAPA TIMING POLICY: baseline=%.3fms (fastest observed this session, not panel Hz) pacingMax=25ms/one real frame captureCompiled=%d",
+				    dapaTimingPeriodMs, int(DapaCaptureControl::Enabled));
+				const double samples = double(std::max<uint64_t>(1, dapaStats.samples));
+				OOVR_LOGF("DAPA REAL TIMING: appToSubmit=%.2f/%.2fms realWait=%.2f/%.2fms realEnd=%.2f/%.2fms interval=%.2f/%.2fms (mean/max CPU wall times; appToSubmit includes game work and eye copies, NOT GPU timings) realNoRender=%llu syntheticNoRender=%llu sessionState=%d",
+				    dapaStats.appMs / samples, dapaStats.maxAppMs,
+				    dapaStats.realWaitMs / samples, dapaStats.maxRealWaitMs,
+				    dapaStats.realEndMs / samples, dapaStats.maxRealEndMs,
+				    dapaStats.intervalMs / samples, dapaStats.maxIntervalMs,
+				    (unsigned long long)dapaStats.runtimeHidden, (unsigned long long)dapaStats.syntheticHidden,
+				    int(sessionState));
 			}
 			dapaStats = {};
 			statsStart = now;
@@ -1468,7 +1579,12 @@ void XrBackend::ForceBoundsVisible(bool status)
 
 bool XrBackend::IsInputAvailable()
 {
-	return sessionState == XR_SESSION_STATE_FOCUSED;
+	if (sessionState == XR_SESSION_STATE_FOCUSED) return true;
+	// Bridge recovery can begin a real session without receiving its state events.
+	// Use fresh successful action sync as proof, not a guessed FOCUSED state.
+	const auto* input = GetUnsafeBaseInput();
+	return sessionActive && OcuInputSession::CanQueryProfiles(sessionState, sessionActive)
+	    && input && input->HasFocusedActionSync(xr_session.get());
 }
 
 void XrBackend::PumpEvents()
@@ -1781,7 +1897,8 @@ void XrBackend::PumpEvents()
 		    quickStartArmed);
 	}
 	// Poll for OpenXR events
-	// TODO filter by session?
+	// Drain the queue before querying profiles. A profile change may precede a
+	// visibility/focus event, and old-session events must not affect its replacement.
 	while (true) {
 		XrEventDataBuffer ev = { XR_TYPE_EVENT_DATA_BUFFER };
 		XrResult res;
@@ -1793,7 +1910,16 @@ void XrBackend::PumpEvents()
 
 		if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
 			auto* changed = (XrEventDataSessionStateChanged*)&ev;
-			OOVR_FALSE_ABORT(changed->session == xr_session.get());
+			if (!OcuInputSession::Matches(xr_session.get(), changed->session)) {
+				if (oovr_debug_logging_enabled()) {
+					OOVR_LOG_LIMITEDF(1000, "[INPUT-TRACE] Ignored stale state event: eventSession=%p currentSession=%p state=%s",
+					    (void*)changed->session, (void*)xr_session.get(), OcuInputTrace::State(changed->state));
+				}
+				continue;
+			}
+			if (sessionState != changed->state
+			    && (changed->state == XR_SESSION_STATE_READY || changed->state == XR_SESSION_STATE_FOCUSED))
+				interactionProfileRetry.Request();
 			sessionState = changed->state;
 
 			// Monado bug: it returns 0 for this value (at least for the first two states)
@@ -1802,9 +1928,14 @@ void XrBackend::PumpEvents()
 				xr_gbl->latestTime = changed->time;
 
 			OOVR_LOGF("Switch to OpenXR state %d", sessionState);
+			OOVR_DEBUG_LOGF("[INPUT-TRACE] State session=%p state=%s eventTime=%lld attached=%d leftResolved=%d rightResolved=%d",
+			    (void*)xr_session.get(), OcuInputTrace::State(sessionState), (long long)changed->time,
+			    input && input->AreActionsAttachedToSession(xr_session.get()), !!hand_left, !!hand_right);
 
 			switch (sessionState) {
 			case XR_SESSION_STATE_READY: {
+				// A delayed READY can follow a successful bridge-startup recovery.
+				if (sessionActive) break;
 				OOVR_LOG("Hit ready state, begin session...");
 				// Start the session running - this means we're supposed to start submitting frames
 				XrSessionBeginInfo beginInfo{ XR_TYPE_SESSION_BEGIN_INFO };
@@ -1817,7 +1948,8 @@ void XrBackend::PumpEvents()
 				// End the session. The session is still valid and we can still query some information
 				// from it, but we're not allowed to submit frames anymore. This is done when the engagement
 				// sensor detects the user has taken off the headset, for example.
-				OOVR_FAILED_XR_ABORT(xrEndSession(xr_session.get()));
+				if (sessionActive)
+					OOVR_FAILED_XR_ABORT(xrEndSession(xr_session.get()));
 				sessionActive = false;
 				renderingFrame = false;
 				break;
@@ -1840,50 +1972,53 @@ void XrBackend::PumpEvents()
 				break;
 			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
-			interactionProfileRefreshPending = !UpdateInteractionProfile();
-			nextInteractionProfileRetry = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-			break;
+			const auto* changed = reinterpret_cast<const XrEventDataInteractionProfileChanged*>(&ev);
+			if (OcuInputSession::Matches(xr_session.get(), changed->session))
+				interactionProfileRetry.Request();
+			else if (oovr_debug_logging_enabled()) {
+				OOVR_LOG_LIMITEDF(1000, "[INPUT-TRACE] Ignored stale profile event: eventSession=%p currentSession=%p",
+				    (void*)changed->session, (void*)xr_session.get());
+			}
 		}
 
 	} // while loop
 
-	/*
-	   We check for AreActionsLoaded here because:
-	   1. Games using legacy input call xrSyncActions every frame anyway, so the runtime should
-	      give us an interaction profile without us forcing it
-	   2. Games using an action manifest should be calling UpdateActionState every frame, which calls xrSyncActions.
-	      This means the only games we wouldn't be able to confidently grab an interaction profile from
-	      would be ones where an action manifest is loaded but UpdateActionState is not being called
-	      (because the game checks IsTrackedDeviceConnected or something),
-	      and hopefully no game like that exists.
-	   Some runtimes do not instantly return an interaction profile, and some
-	   SteamVR controller drivers can publish the two hands on different frames.
-	   Do not rely solely on the change event: retry the current session after
-	   input focus until both hands have independently resolved.
-
-	   Note that we check that the session is focused because this means that the application
-	   has already submitted a frame, that frame is visible, and we have input focus.
-	   Waiting until the application has input focus allows us to avoid unnecessarily restarting the
-	   session when we can't even receive input anyway, as well as before the session is restarted for
-	   the temporary session.
-	 */
-	if (sessionState == XR_SESSION_STATE_FOCUSED && input && input->AreActionsLoaded()
-	    && (interactionProfileRefreshPending || !hand_left || !hand_right)) {
-		const auto now = std::chrono::steady_clock::now();
-		if (now >= nextInteractionProfileRetry) {
-			interactionProfileRefreshPending = !UpdateInteractionProfile();
-			nextInteractionProfileRetry = now + std::chrono::seconds(1);
+	// xrGetCurrentInteractionProfile requires attached actions, NOT input focus.
+	// Resolve hands independently even if no change event arrives during startup
+	// or session recreation. xrSyncActions still enforces focus for actual input.
+	// Retry at most once/second when unresolved; events/wake request an immediate check.
+	const auto now = std::chrono::steady_clock::now();
+	if (input && interactionProfileRetry.Due(now, sessionState,
+	        input->AreActionsAttachedToSession(xr_session.get()), !!hand_left, !!hand_right, sessionActive)) {
+		interactionProfileRetry.Complete(now, UpdateInteractionProfile());
+	}
+	if (oovr_debug_logging_enabled()) {
+		const bool attached = input && input->AreActionsAttachedToSession(xr_session.get());
+		const bool running = OcuInputSession::CanQueryProfiles(sessionState, sessionActive);
+		const char* reason = !input ? "waiting-for-input-system" : !attached ? "waiting-for-current-session-attachment"
+		    : !running ? "waiting-for-running-session" : (!hand_left || !hand_right) ? "retrying-unresolved-profiles"
+		    : !IsInputAvailable() ? "profiles-resolved-waiting-for-runtime-focus" : "profiles-resolved-input-focused";
+		thread_local OcuInputTrace::ChangeGate recoveryTrace;
+		if (recoveryTrace.Allow(true, { OcuInputTrace::Handle(xr_session.get()), (uint64_t)sessionState,
+		        attached ? 1u : 0u, (hand_left ? 1u : 0u) | (hand_right ? 2u : 0u), input ? 1u : 0u }, OcuLogging::NowMs())) {
+			OOVR_LOGF("[INPUT-TRACE] Recovery v5 session=%p state=%s begun=%d attached=%d leftResolved=%d rightResolved=%d reason=%s",
+			    (void*)xr_session.get(), OcuInputTrace::State(sessionState), sessionActive, attached, !!hand_left, !!hand_right, reason);
 		}
 	}
 }
 
 void XrBackend::OnSessionCreated()
 {
+	dapaPeriodBaseline = {};
+	dapaResetPending = true;
+	realFrameShouldRender = false;
+	predictedDisplayPeriodMs = 0.0f;
+	OOVR_DEBUG_LOGF("[INPUT-TRACE] Session created/reset session=%p graphics=%s",
+	    (void*)xr_session.get(), usingApplicationGraphicsAPI ? "application" : "temporary");
 	sessionState = XR_SESSION_STATE_UNKNOWN;
 	sessionActive = false;
 	renderingFrame = false;
-	interactionProfileRefreshPending = true;
-	nextInteractionProfileRetry = {};
+	interactionProfileRetry.Request();
 	interactionProfileStateReported[0] = false;
 	interactionProfileStateReported[1] = false;
 	lastReportedInteractionProfiles[0] = XR_NULL_PATH;
@@ -1891,12 +2026,13 @@ void XrBackend::OnSessionCreated()
 
 	PumpEvents();
 
-	// Wait until we transition to the idle state.
-	// This sets the time, so OpenXR calls which use that will work correctly.
-	while (sessionState == XR_SESSION_STATE_UNKNOWN) {
+	// Bound missing IDLE/READY delivery, including IDLE followed by a lost READY.
+	// Normal runtimes begin through PumpEvents. No synthetic focus/pose state.
+	OcuInputSession::StartupWait startup(std::chrono::steady_clock::now());
+	while (startup.Waiting(std::chrono::steady_clock::now(), sessionState, sessionActive)) {
 		const int durationMs = 250;
 
-		OOVR_LOGF("No session transition yet received, waiting %dms ...", durationMs);
+		OOVR_LOG_LIMITEDF(1000, "OpenXR startup: waiting for READY (state=%d)", sessionState);
 
 #ifdef _WIN32
 		Sleep(durationMs);
@@ -1907,6 +2043,28 @@ void XrBackend::OnSessionCreated()
 
 		PumpEvents();
 	}
+	if (!sessionActive && (sessionState == XR_SESSION_STATE_UNKNOWN || sessionState == XR_SESSION_STATE_IDLE)) {
+		bool compatibilityPlatform = true;
+#ifdef _WIN32
+		const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+		compatibilityPlatform = ntdll && GetProcAddress(ntdll, "wine_get_version");
+#endif
+		XrInstanceProperties properties{ XR_TYPE_INSTANCE_PROPERTIES };
+		const bool compatible = xrGetInstanceProperties(xr_instance, &properties) == XR_SUCCESS &&
+		    OcuInputSession::NeedsBridgeStartupRecovery(compatibilityPlatform, properties.runtimeName);
+		if (startup.ClaimRecovery(std::chrono::steady_clock::now(), sessionState, sessionActive, compatible)) {
+			// The runtime may already be READY even though its bridge lost the event.
+			// Ask once; a rejection leaves the session inactive for ordinary events.
+			XrSessionBeginInfo beginInfo{ XR_TYPE_SESSION_BEGIN_INFO };
+			beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+			const auto result = xrBeginSession(xr_session.get(), &beginInfo);
+			sessionActive = result == XR_SUCCESS || result == XR_ERROR_SESSION_RUNNING;
+			OOVR_LOGF("OpenXR bridge startup recovery v1: runtime=%s session=%p result=%d active=%d; focus remains event-driven",
+			    properties.runtimeName, (void*)xr_session.get(), int(result), int(sessionActive));
+		}
+		if (!sessionActive)
+			OOVR_LOG("OpenXR startup wait expired; session inactive, continuing to poll for its READY event");
+	}
 
 	// OVR perf hook disabled: MinHook + mutex per-frame overhead causes micro stutter.
 	// if (InitOVRPerfHook()) {
@@ -1916,6 +2074,9 @@ void XrBackend::OnSessionCreated()
 
 void XrBackend::PrepareForSessionShutdown()
 {
+#if defined(SUPPORT_DX11)
+	foveationDebugOverlay.reset();
+#endif
 	// Body-tracker actions live in the instance-owned legacy action set, while
 	// their XrSpaces belong to this session. Destroy only the spaces here;
 	// published device objects and device->role haptic routing remain stable and
@@ -1984,7 +2145,17 @@ bool XrBackend::UpdateInteractionProfile()
 		XrInteractionProfileState state{ XR_TYPE_INTERACTION_PROFILE_STATE };
 		XrPath path;
 		OOVR_FAILED_XR_ABORT(xrStringToPath(xr_instance, info.pathstr, &path));
-		OOVR_FAILED_XR_ABORT(xrGetCurrentInteractionProfile(xr_session.get(), path, &state));
+		const XrResult profileResult = xrGetCurrentInteractionProfile(xr_session.get(), path, &state);
+		if (oovr_debug_logging_enabled() || XR_FAILED(profileResult)) {
+			thread_local OcuInputTrace::ChangeGate profileTrace[2];
+			if (profileTrace[info.index].Allow(true, { OcuInputTrace::Handle(xr_session.get()), state.interactionProfile,
+			        OcuInputTrace::Code(profileResult), 0, 0 }, OcuLogging::NowMs())) {
+				OOVR_LOGF("[INPUT-TRACE] Profile session=%p hand=%s profilePathId=%llu result=%s(%d)",
+				    (void*)xr_session.get(), info.pathstr, (unsigned long long)state.interactionProfile,
+				    OcuInputTrace::Result(profileResult), (int)profileResult);
+			}
+		}
+		OOVR_FAILED_XR_ABORT(profileResult);
 
 		// Resolve each hand independently. Previously an already-created controller
 		// on one hand masked an unsupported/missing profile on the other hand, which
@@ -2072,7 +2243,7 @@ bool XrBackend::UpdateInteractionProfile()
 			}
 			if (!interactionProfileStateReported[info.index]
 			    || lastReportedInteractionProfiles[info.index] != XR_NULL_PATH) {
-				OOVR_LOGF("%s - No interaction profile detected; OCU will retry after input focus", info.pathstr);
+				OOVR_LOGF("%s - No interaction profile detected; OCU will retry while the session runs (state=%d)", info.pathstr, sessionState);
 			}
 			deactivateController(info);
 			lastReportedInteractionProfiles[info.index] = XR_NULL_PATH;

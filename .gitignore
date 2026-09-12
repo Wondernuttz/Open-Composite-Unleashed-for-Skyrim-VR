@@ -52,3 +52,8 @@ BodyTracking/Captures/
 # Local analysis and calibration captures (never publish)
 /.analysis/
 /OpenCompositeSkyrimVR/art/live-*.png
+
+# Local publication helpers and Python bytecode
+/.publish-links/
+__pycache__/
+*.pyc

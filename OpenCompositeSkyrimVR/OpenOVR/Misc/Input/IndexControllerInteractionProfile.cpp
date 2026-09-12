@@ -75,6 +75,9 @@ IndexControllerInteractionProfile::IndexControllerInteractionProfile()
 	this->bindingsLegacy.grip = "input/squeeze/value";
 	// "force" is used for gripClick to prevent activating grip button as soon as controller is touched
 	this->bindingsLegacy.gripClick = "input/squeeze/force";
+	// Index exposes capacitive grip/proximity through squeeze/value, with force separate.
+	// OpenXR applies device-specific threshold/hysteresis to this boolean action (section 11.4).
+	this->bindingsLegacy.gripTouch = "input/squeeze/value";
 
 	this->bindingsLegacy.haptic = "output/haptic";
 
@@ -83,6 +86,8 @@ IndexControllerInteractionProfile::IndexControllerInteractionProfile()
 
 	this->bindingsLegacy.trackPadTouch = "input/trackpad/touch";
 	this->bindingsLegacy.trackPadClick = "input/trackpad/force";
+	this->bindingsLegacy.trackPadX = "input/trackpad/x";
+	this->bindingsLegacy.trackPadY = "input/trackpad/y";
 
 	hmdPropertiesMap = {
 		{ vr::Prop_ManufacturerName_String, "Valve" },

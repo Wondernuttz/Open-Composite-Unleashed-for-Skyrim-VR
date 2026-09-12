@@ -4,12 +4,16 @@
 #include "DapaTiming.h"
 #include "DapaMotion.h"
 #include "DapaCapture.h"
+#include "DapaDepthTransfer.h"
+#include "DapaGpuTiming.h"
 #include <d3d11.h>
 #include <vector>
 
 // Forward declaration — ASWProvider is accessed from XrBackend for frame injection
 class ASWProvider;
 extern ASWProvider* g_aswProvider;
+// Shared SKSE bridge menu state, independent of render-target readiness.
+bool OCBridge_DapaMenuPaused();
 
 class ASWProvider {
 public:
@@ -101,7 +105,16 @@ public:
 	void CaptureSubmission(XrTime time, XrResult result) { m_capture.Submission(time, int(result)); }
 	void SampleLocomotionYaw(XrTime time, float yaw, bool turning) { m_turn.Sample(time,yaw,turning); }
 	void SetWarpDisplayTime(XrTime time) { m_warpDisplayTime = time; }
-	void SetPaused(bool paused) { m_paused = paused; }
+	void SetPaused(bool paused)
+	{
+		if (paused && !m_paused) {
+			// Menus can arrive after a stereo pair was cached. Discard that pair
+			// and its motion history now; closing the menu must capture anew.
+			m_injectionWanted = false;
+			InvalidateCachedFrame();
+		}
+		m_paused = paused;
+	}
 	bool IsPaused() const { return m_paused; }
 
 	// Auto-native: XrBackend signals whether injection will run; compositor skips
@@ -116,6 +129,8 @@ public:
 	bool IsInjectionWanted() const { return m_injectionWanted; }
 
 private:
+	DapaGpuTiming m_gpuTiming;
+	DapaGpuTiming::Scope MeasureGpu(ID3D11DeviceContext* ctx, DapaGpuTiming::Stage stage);
 	bool CreateComputeShader(ID3D11Device* device);
 	bool CreateStagingTextures(ID3D11Device* device);
 	bool CreateOutputSwapchain(uint32_t width, uint32_t height);
@@ -181,7 +196,8 @@ private:
 	bool m_depthSubmittedThisFrame = false;
 	std::vector<ID3D11Texture2D*> m_outputSwapchainImages; // all swapchain images
 
-	// Stereo-combined XR swapchain for depth (R32_FLOAT, both eyes side-by-side)
+	// Runtime-negotiated depth; full-atlas transfer also supports D32_FLOAT.
+	DapaDepthTransfer m_depthTransfer;
 	XrSwapchain m_depthSwapchain = {};
 	std::vector<ID3D11Texture2D*> m_depthSwapchainImages;
 

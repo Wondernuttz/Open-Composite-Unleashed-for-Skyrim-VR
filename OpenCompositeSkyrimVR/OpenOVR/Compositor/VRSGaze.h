@@ -157,11 +157,18 @@ inline Center Smooth(const Center& previous, const Center& target, float dtSecon
 {
 	if (!hasPrevious || !std::isfinite(dtSeconds) || dtSeconds <= 0.0f || dtSeconds > 0.1f)
 		return target;
-	const float alpha = 1.0f - std::exp(-2.0f * 3.14159265358979323846f * cutoffHz * dtSeconds);
-	return {
-		previous.x + alpha * (target.x - previous.x),
-		previous.y + alpha * (target.y - previous.y)
-	};
+	const float dx = target.x - previous.x;
+	const float dy = target.y - previous.y;
+	const float distance = std::hypot(dx, dy);
+	// Saccades follow the current sample; filtering small tracker noise may
+	// leave at most 0.2% of an eye texture between the gaze and ring center.
+	constexpr float snapDistance = 0.03f;
+	constexpr float maxLag = 0.002f;
+	if (!std::isfinite(distance) || distance >= snapDistance)
+		return target;
+	const float residual = std::exp(-2.0f * 3.14159265358979323846f * cutoffHz * dtSeconds);
+	const float boundedResidual = distance > maxLag ? std::min(residual, maxLag / distance) : residual;
+	return { target.x - boundedResidual * dx, target.y - boundedResidual * dy };
 }
 
 } // namespace ocu_vrs_gaze

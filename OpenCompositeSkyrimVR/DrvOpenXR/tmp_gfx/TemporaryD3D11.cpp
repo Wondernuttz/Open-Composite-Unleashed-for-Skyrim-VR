@@ -5,6 +5,7 @@
 #if defined(SUPPORT_DX11)
 
 #include "TemporaryD3D11.h"
+#include "../../OpenOVR/Compositor/VRSShaderGuard.h"
 
 static IDXGIAdapter1* d3d_get_adapter(const LUID& adapter_luid)
 {
@@ -51,6 +52,11 @@ TemporaryD3D11::TemporaryD3D11()
 	    D3D11_SDK_VERSION, &device, nullptr, nullptr);
 
 	OOVR_FAILED_DX_ABORT(createDeviceRes);
+
+	// Capture during OpenVR initialization rather than waiting for the first
+	// submitted eye. Any shaders created earlier remain full-rate individually.
+	OOVR_LOGF("Foveation shader guard v1: early shader capture %s",
+	    ocu_vrs_guard::InstallShaderCapture(device) ? "installed" : "unavailable");
 
 	d3dInfo = XrGraphicsBindingD3D11KHR{ XR_TYPE_GRAPHICS_BINDING_D3D11_KHR };
 	d3dInfo.device = device;

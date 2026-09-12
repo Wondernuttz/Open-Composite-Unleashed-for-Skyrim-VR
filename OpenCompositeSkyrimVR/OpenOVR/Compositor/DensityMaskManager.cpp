@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <d3dcompiler.h>
+#include <d3d11_1.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -35,6 +36,7 @@ uint2 RingSize(float distanceToCenter) {
 )HLSL"
 
 constexpr char kMaskShader[] = R"HLSL(
+Texture2D<float> SceneDepth : register(t0);
 cbuffer MaskCB : register(b0) {
     float depthOut;
     float3 radius;
@@ -42,7 +44,7 @@ cbuffer MaskCB : register(b0) {
     float2 projectionCenter;
     float2 eyeOrigin;
     float compatibilityMode;
-    float padding;
+    float protectDepthEdges;
     uint4 ringRates;
 };
 )HLSL" OCU_RDM_RATE_HELPERS R"HLSL(
@@ -59,6 +61,10 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET {
     float2 clusterEnd = (floor(local * 0.125) + 1.0) * 8.0;
     if (any(clusterEnd > round(8.0 / invClusterResolution)))
         discard;
+    if (protectDepthEdges > 0.5) {
+        int2 cluster = int2(local) / 8 + int2(int(protectDepthEdges)-1, 0);
+        if (SceneDepth.Load(int3(cluster, 0)) < 0.5) discard;
+    }
     float2 block = floor(local * 0.125) * invClusterResolution;
     float distanceToCenter = length(block - projectionCenter) * 2.0;
     uint2 halfCoord = uint2(max(local, 0.0) * 0.5);
@@ -66,7 +72,7 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET {
     if (ringRates.w != 0u) {
         uint2 size = RingSize(distanceToCenter);
         if (all((halfCoord % size) == uint2(0u, 0u))) discard;
-        return 0.0;
+        return 1.0;
     }
 
     // Discarded mask pixels retain the game's clear depth and are rendered.
@@ -76,21 +82,22 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET {
     if (compatibilityMode > 0.5 || distanceToCenter < radius.y) {
         if ((halfCoord.x & 1u) == (halfCoord.y & 1u))
             discard;
-        return 0.0;
+        return 1.0;
     }
     if (distanceToCenter < radius.z) {
         if (!((halfCoord.x & 1u) != 0u || (halfCoord.y & 1u) != 0u))
             discard;
-        return 0.0;
+        return 1.0;
     }
     if (!((halfCoord.x & 3u) != 0u || (halfCoord.y & 3u) != 0u))
         discard;
-    return 0.0;
+    return 1.0;
 }
 )HLSL";
 
 constexpr char kReconstructShader[] = R"HLSL(
 Texture2D<float4> Source : register(t0);
+Texture2D<float> Coverage : register(t1);
 
 cbuffer ReconstructCB : register(b0) {
     float2 eyeOrigin;
@@ -117,6 +124,8 @@ int2 ClampToEye(int2 p) {
 
 float4 PS(float4 position : SV_POSITION) : SV_TARGET {
     int2 pixel = int2(position.xy);
+    if (projectionPadding.x > 0.5 && Coverage.Load(int3(pixel, 0)) < 0.5)
+        return Source.Load(int3(pixel, 0));
     int2 local = pixel - int2(eyeOrigin);
     if (any((floor(float2(local) * 0.125) + 1.0) * 8.0 > eyeSize))
         return Source.Load(int3(ClampToEye(pixel), 0));
@@ -202,6 +211,15 @@ DXGI_FORMAT TypedColorFormat(DXGI_FORMAT format)
 	case DXGI_FORMAT_R10G10B10A2_TYPELESS:
 	case DXGI_FORMAT_R10G10B10A2_UNORM:
 		return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
+    case DXGI_FORMAT_R8G8_UNORM: return DXGI_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_R16_FLOAT: return DXGI_FORMAT_R16_FLOAT;
+    case DXGI_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R11G11B10_FLOAT: return DXGI_FORMAT_R11G11B10_FLOAT;
+    case DXGI_FORMAT_R16G16_FLOAT: return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32G32_FLOAT: return DXGI_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return DXGI_FORMAT_R32G32B32A32_FLOAT;
 	case DXGI_FORMAT_R16G16B16A16_TYPELESS:
 	case DXGI_FORMAT_R16G16B16A16_FLOAT:
 		return DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -235,16 +253,27 @@ struct PipelineState {
 	UINT scissorCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
 	ID3D11Buffer* vsCB = nullptr;
 	ID3D11Buffer* psCB = nullptr;
-	ID3D11ShaderResourceView* psSRV = nullptr;
+    ID3D11DeviceContext1* context1 = nullptr;
+    UINT vsFirst = 0, vsCount = 0, psFirst = 0, psCount = 0;
+    ID3D11ShaderResourceView* psSRVs[9] = {};
+    ID3D11ClassInstance* classes[5][D3D11_SHADER_MAX_INTERFACES]{};
+    UINT classCounts[5]{};
+    ID3D11Predicate* predicate = nullptr;
+    BOOL predicateValue = FALSE;
 	ID3D11SamplerState* psSampler = nullptr;
 
 	void Capture(ID3D11DeviceContext* ctx)
 	{
-		ctx->VSGetShader(&vs, nullptr, nullptr);
-		ctx->PSGetShader(&ps, nullptr, nullptr);
-		ctx->GSGetShader(&gs, nullptr, nullptr);
-		ctx->HSGetShader(&hs, nullptr, nullptr);
-		ctx->DSGetShader(&ds, nullptr, nullptr);
+        classCounts[0] = D3D11_SHADER_MAX_INTERFACES;
+        ctx->VSGetShader(&vs, classes[0], &classCounts[0]);
+        classCounts[1] = D3D11_SHADER_MAX_INTERFACES;
+        ctx->PSGetShader(&ps, classes[1], &classCounts[1]);
+        classCounts[2] = D3D11_SHADER_MAX_INTERFACES;
+        ctx->GSGetShader(&gs, classes[2], &classCounts[2]);
+        classCounts[3] = D3D11_SHADER_MAX_INTERFACES;
+        ctx->HSGetShader(&hs, classes[3], &classCounts[3]);
+        classCounts[4] = D3D11_SHADER_MAX_INTERFACES;
+        ctx->DSGetShader(&ds, classes[4], &classCounts[4]);
 		ctx->IAGetInputLayout(&inputLayout);
 		ctx->IAGetPrimitiveTopology(&topology);
 		ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
@@ -264,21 +293,29 @@ struct PipelineState {
 		ctx->OMGetBlendState(&blendState, blendFactor, &sampleMask);
 		ctx->RSGetViewports(&viewportCount, viewports);
 		ctx->RSGetScissorRects(&scissorCount, scissors);
-		ctx->VSGetConstantBuffers(0, 1, &vsCB);
-		ctx->PSGetConstantBuffers(0, 1, &psCB);
-		ctx->PSGetShaderResources(0, 1, &psSRV);
+        ctx->QueryInterface(IID_PPV_ARGS(&context1));
+        if (context1) {
+            context1->VSGetConstantBuffers1(0, 1, &vsCB, &vsFirst, &vsCount);
+            context1->PSGetConstantBuffers1(0, 1, &psCB, &psFirst, &psCount);
+        } else {
+            ctx->VSGetConstantBuffers(0, 1, &vsCB);
+            ctx->PSGetConstantBuffers(0, 1, &psCB);
+        }
+        ctx->PSGetShaderResources(0, 9, psSRVs);
+        ctx->GetPredication(&predicate, &predicateValue);
+        ctx->SetPredication(nullptr, FALSE);
 		ctx->PSGetSamplers(0, 1, &psSampler);
 	}
 
 	void Restore(ID3D11DeviceContext* ctx)
 	{
-		ID3D11ShaderResourceView* nullSRV = nullptr;
-		ctx->PSSetShaderResources(0, 1, &nullSRV);
-		ctx->VSSetShader(vs, nullptr, 0);
-		ctx->PSSetShader(ps, nullptr, 0);
-		ctx->GSSetShader(gs, nullptr, 0);
-		ctx->HSSetShader(hs, nullptr, 0);
-		ctx->DSSetShader(ds, nullptr, 0);
+        ID3D11ShaderResourceView* nullSRVs[9]{};
+        ctx->PSSetShaderResources(0, 9, nullSRVs);
+        ctx->VSSetShader(vs, classes[0], classCounts[0]);
+        ctx->PSSetShader(ps, classes[1], classCounts[1]);
+        ctx->GSSetShader(gs, classes[2], classCounts[2]);
+        ctx->HSSetShader(hs, classes[3], classCounts[3]);
+        ctx->DSSetShader(ds, classes[4], classCounts[4]);
 		ctx->IASetInputLayout(inputLayout);
 		ctx->IASetPrimitiveTopology(topology);
 		// RTV and pixel-UAV slots overlap; restoring eight RTVs erases shader UAVs.
@@ -289,13 +326,17 @@ struct PipelineState {
 		ctx->RSSetState(rasterizer);
 		ctx->OMSetDepthStencilState(depthState, stencilRef);
 		ctx->OMSetBlendState(blendState, blendFactor, sampleMask);
-		if (viewportCount)
-			ctx->RSSetViewports(viewportCount, viewports);
-		if (scissorCount)
-			ctx->RSSetScissorRects(scissorCount, scissors);
-		ctx->VSSetConstantBuffers(0, 1, &vsCB);
-		ctx->PSSetConstantBuffers(0, 1, &psCB);
-		ctx->PSSetShaderResources(0, 1, &psSRV);
+        ctx->RSSetViewports(viewportCount, viewports);
+        ctx->RSSetScissorRects(scissorCount, scissors);
+        if (context1) {
+            context1->VSSetConstantBuffers1(0, 1, &vsCB, &vsFirst, &vsCount);
+            context1->PSSetConstantBuffers1(0, 1, &psCB, &psFirst, &psCount);
+        } else {
+            ctx->VSSetConstantBuffers(0, 1, &vsCB);
+            ctx->PSSetConstantBuffers(0, 1, &psCB);
+        }
+        ctx->PSSetShaderResources(0, 9, psSRVs);
+        ctx->SetPredication(predicate, predicateValue);
 		ctx->PSSetSamplers(0, 1, &psSampler);
 	}
 
@@ -317,7 +358,11 @@ struct PipelineState {
 		ReleasePtr(blendState);
 		ReleasePtr(vsCB);
 		ReleasePtr(psCB);
-		ReleasePtr(psSRV);
+        for (auto*& srv : psSRVs) ReleasePtr(srv);
+        for (unsigned s = 0; s < 5; ++s)
+            for (UINT i = 0; i < classCounts[s]; ++i) ReleasePtr(classes[s][i]);
+        ReleasePtr(predicate);
+        ReleasePtr(context1);
 		ReleasePtr(psSampler);
 	}
 };
@@ -330,6 +375,11 @@ bool SameRegion(const DensityMaskManager::EyeRegion& a,
 }
 
 } // namespace
+
+#include "RDMPackedResolve.inl"
+#include "RDMDepthGuide.inl"
+
+DensityMaskManager::DensityMaskManager() = default;
 
 DensityMaskManager::~DensityMaskManager()
 {
@@ -465,9 +515,8 @@ bool DensityMaskManager::PrepareStereoTarget(ID3D11Texture2D* target, int width,
 		return false;
 	}
 
-	const bool targetChanged = target != sceneTarget || width != renderWidth || height != renderHeight ||
-	    !SameRegion(leftEye, eyeRegions[0]) || !SameRegion(rightEye, eyeRegions[1]) ||
-	    desc.Format != resourceFormat;
+	const bool targetChanged = !sourceCopy || !sourceSRV || !reconstructed || !reconstructedRTV ||
+        width != renderWidth || height != renderHeight || desc.Format != resourceFormat;
 	if (targetChanged) {
 		ReleaseColorResources();
 		if (!CreateColorResources(desc))
@@ -546,7 +595,8 @@ void DensityMaskManager::EndFrameMasking()
 	armed = false;
 }
 
-bool DensityMaskManager::ApplyDepthMask(ID3D11DepthStencilView* dsv, float clearDepth)
+bool DensityMaskManager::ApplyDepthMask(ID3D11DepthStencilView* dsv, float clearDepth,
+    ID3D11RenderTargetView* coverage, ID3D11ShaderResourceView* sceneDepth)
 {
 	if (!available || !armed || !dsv)
 		return false;
@@ -574,20 +624,22 @@ bool DensityMaskManager::ApplyDepthMask(ID3D11DepthStencilView* dsv, float clear
 
 	PipelineState state;
 	state.Capture(context);
-	const bool left = DrawMaskForEye(dsv, 0, clearDepth);
-	const bool right = DrawMaskForEye(dsv, 1, clearDepth);
+	const bool left = DrawMaskForEye(dsv, 0, clearDepth, coverage, sceneDepth);
+	const bool right = DrawMaskForEye(dsv, 1, clearDepth, coverage, sceneDepth);
 	state.Restore(context);
 	maskAppliedThisFrame = left && right;
 	return maskAppliedThisFrame;
 }
 
-bool DensityMaskManager::DrawMaskForEye(ID3D11DepthStencilView* dsv, int eye, float clearDepth)
+bool DensityMaskManager::DrawMaskForEye(ID3D11DepthStencilView* dsv, int eye, float clearDepth,
+    ID3D11RenderTargetView* coverage, ID3D11ShaderResourceView* sceneDepth)
 {
 	MaskConstants constants = {};
 	constants.ringRates[0] = static_cast<unsigned>(patternSettings.rates.inner);
 	constants.ringRates[1] = static_cast<unsigned>(patternSettings.rates.mid);
 	constants.ringRates[2] = static_cast<unsigned>(patternSettings.rates.outer);
 	constants.ringRates[3] = patternSettings.customEyeRates ? 1u : 0u;
+    constants.padding = sceneDepth ? float(1 + (eye == 1 ? (eyeRegions[0].width+7)/8 : 0)) : 0.0f;
 	constants.depthOut = clearDepth < 0.5f ? 1.0f : 0.0f;
 	constants.radius[0] = patternSettings.innerRadius;
 	constants.radius[1] = std::max(constants.radius[0], patternSettings.midRadius);
@@ -615,7 +667,8 @@ bool DensityMaskManager::DrawMaskForEye(ID3D11DepthStencilView* dsv, int eye, fl
 	context->PSSetConstantBuffers(0, 1, &maskCB);
 	context->IASetInputLayout(nullptr);
 	context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	context->OMSetRenderTargets(0, nullptr, dsv);
+    context->OMSetRenderTargets(coverage ? 1 : 0, coverage ? &coverage : nullptr, dsv);
+    context->PSSetShaderResources(0, 1, &sceneDepth);
 	context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
 	context->OMSetDepthStencilState(maskDepthState, 0);
 	context->RSSetState(rasterizerState);
@@ -661,13 +714,14 @@ ID3D11Texture2D* DensityMaskManager::ReconstructStereo(ID3D11Texture2D* source, 
 	return reconstructed;
 }
 
-bool DensityMaskManager::DrawReconstructionForEye(int eye)
+bool DensityMaskManager::DrawReconstructionForEye(int eye, ID3D11ShaderResourceView* coverage)
 {
 	ReconstructConstants constants = {};
 	constants.ringRates[0] = static_cast<unsigned>(patternSettings.rates.inner);
 	constants.ringRates[1] = static_cast<unsigned>(patternSettings.rates.mid);
 	constants.ringRates[2] = static_cast<unsigned>(patternSettings.rates.outer);
 	constants.ringRates[3] = patternSettings.customEyeRates ? 1u : 0u;
+	constants.projectionPadding[0] = coverage ? 1.0f : 0.0f;
 	constants.eyeOrigin[0] = static_cast<float>(eyeRegions[eye].left);
 	constants.eyeOrigin[1] = static_cast<float>(eyeRegions[eye].top);
 	constants.eyeSize[0] = static_cast<float>(eyeRegions[eye].width);
@@ -692,7 +746,8 @@ bool DensityMaskManager::DrawReconstructionForEye(int eye)
 	context->GSSetShader(nullptr, nullptr, 0);
 	context->HSSetShader(nullptr, nullptr, 0);
 	context->DSSetShader(nullptr, nullptr, 0);
-	context->PSSetShaderResources(0, 1, &sourceSRV);
+    ID3D11ShaderResourceView* inputs[2] = {sourceSRV, coverage};
+    context->PSSetShaderResources(0, 2, inputs);
 	context->PSSetSamplers(0, 1, &samplerState);
 	context->PSSetConstantBuffers(0, 1, &reconstructCB);
 	context->IASetInputLayout(nullptr);
@@ -718,6 +773,22 @@ bool DensityMaskManager::DrawReconstructionForEye(int eye)
 	return true;
 }
 
+bool DensityMaskManager::ResolveColor(ID3D11Texture2D* source,
+    ID3D11ShaderResourceView* coverage, unsigned eyes)
+{
+    if (!available || !armed || source != sceneTarget || !coverage) return false;
+    PipelineState state;
+    state.Capture(context);
+    context->CopyResource(sourceCopy, source);
+    context->CopyResource(reconstructed, source);
+    bool ok = true;
+    for (int eye = 0; eye < 2; ++eye)
+        if (eyes & (1u << eye)) ok = DrawReconstructionForEye(eye, coverage) && ok;
+    if (ok) context->CopyResource(source, reconstructed);
+    state.Restore(context);
+    return ok;
+}
+
 void DensityMaskManager::ReleaseColorResources()
 {
 	ReleasePtr(sourceCopy);
@@ -730,11 +801,18 @@ void DensityMaskManager::ReleaseColorResources()
 
 void DensityMaskManager::Shutdown()
 {
+	EndDepthGuide();
+	ReleasePtr(guideTexture); ReleasePtr(guideRTV); ReleasePtr(guideSRV);
+	ReleasePtr(guidePS); ReleasePtr(guideCB); ReleasePtr(guideInvalidateDepth);
+	guideWidth = guideHeight = guideDraws = 0;
 	armed = false;
 	maskAppliedThisFrame = false;
 	reconstructedThisFrame = false;
 	sceneTarget = nullptr;
 	ReleaseColorResources();
+	ReleasePackedResources();
+	for (auto*& shader : gatherShaders) ReleasePtr(shader);
+	for (auto*& shader : scatterShaders) ReleasePtr(shader);
 	ReleasePtr(maskVS);
 	ReleasePtr(reconstructVS);
 	ReleasePtr(maskPS);

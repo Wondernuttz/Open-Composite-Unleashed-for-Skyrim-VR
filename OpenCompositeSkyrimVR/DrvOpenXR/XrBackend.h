@@ -5,6 +5,8 @@
 #pragma once
 
 #include "XrDriverPrivate.h"
+#include "InputSessionRecovery.h"
+#include "DapaTiming.h"
 
 #include "XrController.h"
 #include "XrGenericTracker.h"
@@ -71,6 +73,9 @@ private:
 
 	void CheckOrInitCompositors(const vr::Texture_t* tex);
 	std::unique_ptr<Compositor> compositors[XruEyeCount];
+#if defined(SUPPORT_DX11)
+	std::unique_ptr<class FoveationDebugOverlay> foveationDebugOverlay;
+#endif
 
 	/**
 	 * Updates the current interaction profile in use according to the runtime.
@@ -80,8 +85,7 @@ private:
 	 * Called from PumpEvents on an INTERACTION_PROFILE_CHANGED event.
 	 */
 	bool UpdateInteractionProfile();
-	bool interactionProfileRefreshPending = true;
-	std::chrono::steady_clock::time_point nextInteractionProfileRetry{};
+	OcuInputSession::ProfileRetry interactionProfileRetry;
 	XrPath lastReportedInteractionProfiles[2] = { XR_NULL_PATH, XR_NULL_PATH };
 	bool interactionProfileStateReported[2] = { false, false };
 
@@ -142,6 +146,9 @@ private:
 	float measuredCpuFrameMs = 0.0f; // app CPU time (WaitGetPoses return → Submit call)
 	float measuredFrameIntervalMs = 0.0f; // frame-to-frame interval
 	float predictedDisplayPeriodMs = 0.0f; // runtime-reported frame interval (from xrWaitFrame)
+	DapaTiming::PeriodBaseline dapaPeriodBaseline;
+	bool dapaResetPending = true;
+	bool realFrameShouldRender = false;
 	float compositorOverheadMs = 0.0f; // estimated compositor GPU time (residual calculation)
 
 

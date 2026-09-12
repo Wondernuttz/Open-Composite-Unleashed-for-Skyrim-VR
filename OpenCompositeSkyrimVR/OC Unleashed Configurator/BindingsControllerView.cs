@@ -43,7 +43,7 @@ namespace OpenCompositeConfigurator
         private Dictionary<string, (string display, PointF pos, bool isStickDir)> _activeControllerButtons = new();
 
         // Index knuckles defaults, baked from the hand-calibrated layout
-        // (ControllerDotLayouts.json, 2026-07-04). The JSON override still
+        // (ControllerDotLayouts.json, 2026-09-11). The JSON override still
         // wins if the user recalibrates with Move Dots.
         private static readonly Dictionary<string, (string display, PointF pos, bool isStickDir)> ControllerButtonsKnuckles = new()
         {
@@ -62,8 +62,10 @@ namespace OpenCompositeConfigurator
             // Index trackpad: the touch oval under the stick, Touch has no
             // equivalent. Click acts as A (lower half) / B-Menu (upper half),
             // or as the VRIK gesture input when VRIK Knuckles trackpad mode is on.
-            { "l_trackpad",  ("L Trackpad",    new PointF(0.297f, 0.133f), false) },
-            { "r_trackpad",  ("R Trackpad",    new PointF(0.697f, 0.151f), false) },
+            { "l_trackpad_upper", ("L Trackpad Upper", new PointF(0.3082449f, 0.09549072f), false) },
+            { "l_trackpad_lower", ("L Trackpad Lower", new PointF(0.27628574f, 0.17771883f), false) },
+            { "r_trackpad_upper", ("R Trackpad Upper", new PointF(0.68056935f, 0.1193634f), false) },
+            { "r_trackpad_lower", ("R Trackpad Lower", new PointF(0.70773464f, 0.17771883f), false) },
             // Left stick directions
             { "left_stick_up",    ("L Stick Up",    new PointF(0.238f, 0.056f), true) },
             { "left_stick_down",  ("L Stick Down",  new PointF(0.235f, 0.146f), true) },
@@ -77,33 +79,34 @@ namespace OpenCompositeConfigurator
         };
 
         // PlayStation VR2 Sense defaults for the front-facing controller
-        // artwork. The logical ids intentionally remain Oculus-compatible:
+        // artwork, calibrated by the user on 2026-09-11.
+        // The logical ids intentionally remain Oculus-compatible:
         // Square/Triangle are left primary/secondary and Cross/Circle are
         // right primary/secondary. XR_KHR_generic_controller translates the
         // physical PSVR2 inputs to those same ids at runtime.
         private static readonly Dictionary<string, (string display, PointF pos, bool isStickDir)> ControllerButtonsPsvr2 = new()
         {
             // Left Sense controller
-            { "left_stick",  ("L Stick Click",  new PointF(0.309f, 0.129f), false) },
+            { "left_stick",  ("L Stick Click",  new PointF(0.30901858f, 0.060190395f), false) },
             { "x_button",    ("Square Button",   new PointF(0.363f, 0.186f), false) },
             { "y_button",    ("Triangle Button", new PointF(0.379f, 0.099f), false) },
             { "l_trigger",   ("L2 Trigger",      new PointF(0.405f, 0.245f), false) },
             { "l_grip",      ("L1 Grip",         new PointF(0.322f, 0.618f), false) },
             // Right Sense controller
-            { "right_stick", ("R Stick Click", new PointF(0.689f, 0.127f), false) },
-            { "a_button",    ("Cross Button",  new PointF(0.603f, 0.188f), false) },
+            { "right_stick", ("R Stick Click", new PointF(0.6896552f, 0.06288036f), false) },
+            { "a_button",    ("Cross Button",  new PointF(0.6366048f, 0.1893088f), false) },
             { "b_button",    ("Circle Button", new PointF(0.621f, 0.101f), false) },
             { "r_trigger",   ("R2 Trigger",    new PointF(0.595f, 0.245f), false) },
             { "r_grip",      ("R1 Grip",       new PointF(0.678f, 0.618f), false) },
             // Stick directions are deliberately compact around the visible caps.
-            { "left_stick_up",    ("L Stick Up",    new PointF(0.309f, 0.086f), true) },
-            { "left_stick_down",  ("L Stick Down",  new PointF(0.309f, 0.172f), true) },
-            { "left_stick_left",  ("L Stick Left",  new PointF(0.279f, 0.129f), true) },
-            { "left_stick_right", ("L Stick Right", new PointF(0.339f, 0.129f), true) },
-            { "right_stick_up",    ("R Stick Up",    new PointF(0.689f, 0.084f), true) },
-            { "right_stick_down",  ("R Stick Down",  new PointF(0.689f, 0.170f), true) },
-            { "right_stick_left",  ("R Stick Left",  new PointF(0.659f, 0.127f), true) },
-            { "right_stick_right", ("R Stick Right", new PointF(0.719f, 0.127f), true) },
+            { "left_stick_up",    ("L Stick Up",    new PointF(0.30901858f, 0.006391052f), true) },
+            { "left_stick_down",  ("L Stick Down",  new PointF(0.30901858f, 0.1166797f), true) },
+            { "left_stick_left",  ("L Stick Left",  new PointF(0.28249338f, 0.065570325f), true) },
+            { "left_stick_right", ("L Stick Right", new PointF(0.33421752f, 0.06288036f), true) },
+            { "right_stick_up",    ("R Stick Up",    new PointF(0.69098145f, 0.009081019f), true) },
+            { "right_stick_down",  ("R Stick Down",  new PointF(0.69098145f, 0.11129977f), true) },
+            { "right_stick_left",  ("R Stick Left",  new PointF(0.66445625f, 0.065570325f), true) },
+            { "right_stick_right", ("R Stick Right", new PointF(0.7161804f, 0.065570325f), true) },
         };
 
         private static string DotLayoutPath => Path.Combine(AppContext.BaseDirectory, "ControllerDotLayouts.json");
@@ -160,7 +163,7 @@ namespace OpenCompositeConfigurator
             _ => _controllerImage,
         };
 
-        internal static bool IsTrackpadButton(string? id) => id == "l_trackpad" || id == "r_trackpad";
+        internal static bool IsTrackpadButton(string? id) => TrackpadRegion(id) >= 0;
 
         // Grips and triggers are big physical targets, they keep the full
         // Oculus circle size even on knuckles.
@@ -183,6 +186,7 @@ namespace OpenCompositeConfigurator
         }
         private float HitRadiusFor(string key, bool isStickDir)
         {
+            if (IsTrackpadButton(key)) return 0.018f;
             if (IsFullSizeDot(key)) return isStickDir ? 0.025f : 0.04f;
             return _controllerModelKey switch
             {
@@ -397,6 +401,17 @@ namespace OpenCompositeConfigurator
                 foreach (var kv in layout)
                 {
                     if (kv.Value.Length < 2) continue;
+                    // Preserve calibrated old trackpad centers when splitting them.
+                    if (kv.Key is "l_trackpad" or "r_trackpad")
+                    {
+                        foreach (string half in new[] { "upper", "lower" })
+                        {
+                            string splitKey = kv.Key + "_" + half;
+                            if (!layout.ContainsKey(splitKey) && _activeControllerButtons.TryGetValue(splitKey, out var split))
+                                _activeControllerButtons[splitKey] = (split.display,
+                                    new PointF(kv.Value[0], kv.Value[1] + (half == "upper" ? -0.020f : 0.020f)), false);
+                        }
+                    }
                     if (_activeControllerButtons.TryGetValue(kv.Key, out var entry))
                         _activeControllerButtons[kv.Key] = (entry.display, new PointF(kv.Value[0], kv.Value[1]), entry.isStickDir);
                 }

@@ -8,6 +8,10 @@
 #include <RE/B/BSTEvent.h>
 #include <RE/B/BookMenu.h>         // Physical book/note model + native menu state
 #include <RE/C/ControlMap.h>
+#include <RE/C/ConfirmAndNameCallback.h>
+#include <RE/F/FxDelegateArgs.h>
+#include "RaceMenuKeyboardRecovery.h"
+#include "RaceMenuNativeInput.h"
 #include <RE/G/GFxEvent.h>
 #include <RE/G/GFxValue.h>
 // [EXPERIMENTAL — DISABLED] These headers were used by the VR laser→Scaleform
@@ -23,6 +27,7 @@ namespace RE { class GASGlobalContext; } // Forward decl needed by GFxMovieRoot.
 #include <RE/I/IMenu.h>             // Still needed: MenuWatcher accesses IMenu for OC_MENU_ACTIVE
 #include <RE/M/MenuCursor.h>        // Laser cursor pump v2: cursor feedback + visibility (game singleton, NOT Scaleform)
 #include <RE/M/MenuOpenCloseEvent.h>
+#include <RE/M/Misc.h>             // Once-per-session DAPA startup failure message
 #include <RE/N/NiNode.h>            // Laser cursor pump v2: uiNode plane export
 #include <RE/B/BSTriShape.h>        // Actual Scaleform render mesh + model bound
 #include <RE/B/bhkPickData.h>       // Console ref pick: havok ray into the world
@@ -39,6 +44,8 @@ namespace RE { class GASGlobalContext; } // Forward decl needed by GFxMovieRoot.
 #include <RE/P/PlayerCharacter.h>
 #include <RE/B/BSRenderPass.h>
 #include <RE/R/Renderer.h>
+#include <RE/R/RaceSexMenu.h>
+#include <RE/R/RaceSexMenu.h>
 #include <RE/S/State.h>             // Map beam: engine-owned default white texture
 // BSShaderAccumulator: use raw offsets to avoid header dependency issues.
 // VTable REL::VariantID(304459, 254680, 0x18fd880)
@@ -93,8 +100,12 @@ namespace RE { class GASGlobalContext; } // Forward decl needed by GFxMovieRoot.
 #include "DapaEngineDraw.h"
 #include "DapaAcceptedDraw.h"
 #include "DapaCsxDraw.h"
+#include "DapaCsxApi.h"
 #include "DapaHiggs.h"
 #include "DapaSpellWheel.h"
+#include "DapaCrossbow.h"
+#include "DapaGeometryOwnership.h"
+#include <RE/B/BSFadeNode.h>
 #include <atomic>
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -992,7 +1003,6 @@ namespace
 		"Journal Menu",
 		"InventoryMenu",
 		"MagicMenu",
-		"MapMenu",
 		"TweenMenu",
 		"ContainerMenu",
 		"BarterMenu",
@@ -1027,6 +1037,7 @@ namespace
 	// inactive tick to distinguish closing and reopening the same menu.
 	std::uint32_t g_menuPlaneGeneration = 0;
 	bool g_statsMenuOpen = false; // StatsMenu opens ON TOP of TweenMenu — laser must go dormant
+	bool g_mapMenuOpen = false; // Native-only exclusion, never an OCU interaction target.
 
 	class MenuInputIntentWatcher : public RE::BSTEventSink<RE::InputEvent*>
 	{
@@ -1114,7 +1125,7 @@ namespace
 				break;
 			}
 		}
-		bool anyActive = topTrackedMenu != nullptr && !g_statsMenuOpen;
+		bool anyActive = topTrackedMenu != nullptr && !g_statsMenuOpen && !g_mapMenuOpen;
 		bool gamePaused = ui->GameIsPaused();
 
 		// Begin write (odd counter = writing)
@@ -1125,9 +1136,18 @@ namespace
 		g_pTransform->mapPointerValid = 0;
 
 		// Allow WASD when ANY menu is active OR game is paused (kPausesGame menu like text boxes)
-		g_pTransform->active = anyActive || gamePaused;
+		g_pTransform->active = anyActive || gamePaused || g_mapMenuOpen;
 		SKSE::log::debug("  SharedMem write: anyActive={}, gamePaused={}, active={}",
 		    anyActive, gamePaused, g_pTransform->active);
+
+		if (g_mapMenuOpen) {
+			// Exclusion sentinel only: the runtime must suppress even a stale
+			// underlying menu or the calibration override. No map plane is exported.
+			strcpy_s(g_pTransform->menuName, "MapMenu");
+			g_pTransform->hasPerspective = false;
+			g_pTransform->updateCounter++;
+			return;
+		}
 
 		if (!anyActive) {
 			g_pTransform->menuName[0] = '\0';
@@ -1168,6 +1188,13 @@ namespace
 				return RE::BSEventNotifyControl::kContinue;
 
 			std::string_view name = a_event->menuName.c_str();
+
+			// Observe lifecycle solely to disable OCU. Never register the map as
+			// an interaction target or inspect its movie, geometry, or native laser.
+			if (name == "MapMenu") {
+				g_mapMenuOpen = a_event->opening;
+				UpdateMenuTransform();
+			}
 
 			// Track specific menus for laser pointer system
 			bool isTracked = false;
@@ -2077,6 +2104,143 @@ namespace
 			}
 		}
 		return false;
+	}
+
+	// FxDelegateArgs contains only the semantic parameters. The response ID is
+	// separate, exactly as FxDelegate::Callback strips it off GameDelegate calls.
+	bool InvokeNativeMenuCallback(RE::IMenu& menu, RE::GFxMovieView& movie,
+	    const char* method, const RE::GFxValue* values, std::uint32_t count)
+	{
+		if (menu.uiMovie.get() != &movie || !menu.fxDelegate)
+			return false;
+		const auto* entry = menu.fxDelegate->callbacks.GetAlt(method);
+		if (!entry || !entry->handler || !entry->callback)
+			return false;
+		// Keep the owner alive if the callback closes its menu synchronously.
+		auto owner = entry->handler;
+		const auto callback = entry->callback;
+		RE::GFxValue responseID;
+		responseID.SetNumber(0.0);
+		RE::FxDelegateArgs args(responseID, owner.get(), &movie, values, count);
+		callback(args);
+		return true;
+	}
+
+	ocu::RaceMenuKeyboardRecovery g_raceKeyboardRecovery;
+	// Only our semantic laser click sets this; native controller confirmations
+	// continue through the game's callback without any recovery being armed.
+	thread_local bool g_laserMessageBoxDispatch = false;
+	using ConfirmAndNameRun = void (*)(RE::ConfirmAndNameCallback*, RE::IMessageBoxCallback::Message);
+	ConfirmAndNameRun g_originalConfirmAndNameRun = nullptr;
+	thread_local RE::FxDelegateHandler::CallbackFn* g_observedRaceKeyboardCallback = nullptr;
+	thread_local bool g_raceNativeKeyboardRequested = false;
+
+	void ObserveRaceNativeKeyboard(const RE::FxDelegateArgs& args)
+	{
+		g_raceNativeKeyboardRequested = true;
+		g_raceKeyboardRecovery.NativeRequest(reinterpret_cast<std::uintptr_t>(args.GetMovie()));
+		if (auto* callback = g_observedRaceKeyboardCallback)
+			callback(args);
+	}
+
+	void HookedConfirmAndName(RE::ConfirmAndNameCallback* self, RE::IMessageBoxCallback::Message message)
+	{
+		auto* ui = RE::UI::GetSingleton();
+		auto menu = ui ? ui->GetMenu("RaceSex Menu") : nullptr;
+		if (!g_laserMessageBoxDispatch || message != RE::IMessageBoxCallback::Message::kUnk0 ||
+		    !menu || menu.get() != self->menu || !menu->uiMovie || !menu->fxDelegate) {
+			g_originalConfirmAndNameRun(self, message);
+			return;
+		}
+		auto movie = menu->uiMovie;
+		auto delegate = menu->fxDelegate;
+		g_raceKeyboardRecovery.ConfirmAccepted(
+		    reinterpret_cast<std::uintptr_t>(movie.get()), GetTickCount64());
+
+		// The native VR route invokes ShowVirtualKeyboard directly, bypassing
+		// BSVirtualKeyboardDevice::Start. Observe that actual callback while the
+		// confirmation runs. This can merely arm a deferred Accept-release:
+		// observing it must not consume the keyboard recovery state.
+		auto* keyboard = delegate->callbacks.GetAlt("ShowVirtualKeyboard");
+		auto* originalKeyboard = keyboard ? keyboard->callback : nullptr;
+		auto* previousObserver = g_observedRaceKeyboardCallback;
+		g_observedRaceKeyboardCallback = originalKeyboard;
+		g_raceNativeKeyboardRequested = false;
+		if (keyboard && originalKeyboard)
+			keyboard->callback = ObserveRaceNativeKeyboard;
+		const bool onStack = menu->OnStack();
+		g_originalConfirmAndNameRun(self, message);
+		// Re-resolve after the callback: registering an AS handler may rehash it.
+		keyboard = delegate->callbacks.GetAlt("ShowVirtualKeyboard");
+		if (keyboard && keyboard->callback == ObserveRaceNativeKeyboard)
+			keyboard->callback = originalKeyboard;
+		g_observedRaceKeyboardCallback = previousObserver;
+		SKSE::log::info("RACEMENU laser naming confirmed onStack={} nativeKeyboardRequested={}",
+		    onStack, g_raceNativeKeyboardRequested);
+	}
+
+	void RecoverRaceMenuKeyboard(RE::UI& ui, bool canInspect)
+	{
+		// A modal can temporarily change the native stack flags. The open/close
+		// event lifetime is authoritative for discarding an accepted request.
+		if (!g_activeTrackedMenus.contains("RaceSex Menu")) {
+			g_raceKeyboardRecovery = {};
+			return;
+		}
+		// Do not inspect a movie behind another modal, MapMenu, or StatsMenu.
+		if (!canInspect || ui.IsMenuOpen("MessageBoxMenu"))
+			return;
+		auto menu = ui.GetMenu<RE::RaceSexMenu>();
+		if (!menu || !menu->uiMovie)
+			return;
+		auto movie = menu->uiMovie;
+		RE::GFxValue panel, textEntry, enabled;
+		const bool desktopNaming = GetRaceMenuPanel(*movie, panel) &&
+		    panel.GetMember("textEntry", &textEntry) &&
+		    (textEntry.IsObject() || textEntry.IsDisplayObject()) &&
+		    textEntry.GetMember("enabled", &enabled) && enabled.IsBool() &&
+		    enabled.GetBool() && DisplayObjectIsUsable(textEntry);
+		bool keyboardBusy;
+		{
+			std::lock_guard<std::mutex> lock(g_callbackMutex);
+			keyboardBusy = g_waitingForKeyboard;
+		}
+		keyboardBusy = keyboardBusy || (g_gameHwnd &&
+		    GetPropW(g_gameHwnd, L"OC_KB_ACTIVE") != nullptr);
+		if (!g_raceKeyboardRecovery.Observe(reinterpret_cast<std::uintptr_t>(movie.get()),
+		        desktopNaming, keyboardBusy, g_pTransform->laserTriggerHeld != 0,
+		        GetTickCount64()))
+			return;
+
+		// In Skyrim VR, ShowVirtualKeyboard arms a flag. RaceSexMenu's
+		// ProcessButton opens the overlay only when it sees Accept released.
+		// The laser's atomic MessageBox click consumes that physical gesture,
+		// leaving the flag armed indefinitely. Finish the native handoff once,
+		// after physical release and with the confirmation modal gone.
+		// If the normal native release already ran, the flag is clear and this
+		// targeted release is a no-op, including while its overlay is queued.
+		const bool nativeRequestObserved = g_raceKeyboardRecovery.NativeRequestObserved();
+		const bool dispatched = nativeRequestObserved || InvokeNativeMenuCallback(
+		    *menu, *movie, "ShowVirtualKeyboard", nullptr, 0);
+		auto* events = RE::UserEvents::GetSingleton();
+		auto* handler = menu->AsMenuEventHandler();
+		bool nativeHandlerAccepted = false;
+		if (dispatched && events && handler) {
+			// Deliver directly to this naming handler. No global input queue,
+			// mouse coordinates, controller press, or click on the editor.
+			auto* release = RE::ButtonEvent::Create(
+			    RE::INPUT_DEVICE::kKeyboard, events->accept, 0, 0.0f, 0.01f);
+			if (release) {
+				// CommonLib's ordinary virtual call targets flat slot 5, a
+				// no-op in VR. Use the actual VR button-handler slot (8).
+				nativeHandlerAccepted = ocu::DispatchRaceMenuButton(handler, release);
+				// Create uses Skyrim's allocator; release its string before free.
+				release->SetUserEvent(RE::BSFixedString());
+				RE::free(release);
+			}
+		}
+		SKSE::log::info("RACEMENU naming release v4 desktopNaming={} nativeRequestObserved={} nativeCallback={} nativeHandlerAccepted={}",
+		    desktopNaming, nativeRequestObserved, dispatched, nativeHandlerAccepted);
 	}
 
 	bool GetRaceMenuButtonPanelTarget(RE::GFxMovieView& movie,
@@ -3925,17 +4089,20 @@ namespace
 		if (buttonIndex < 0)
 			return false;
 
-		char primaryPath[160]{};
-		char fallbackPath[160]{};
-		std::snprintf(primaryPath, sizeof(primaryPath),
-		    "_root.MessageMenu.Buttons.Button%d", buttonIndex);
-		std::snprintf(fallbackPath, sizeof(fallbackPath),
-		    "_root.MessageMenu.ButtonContainer.Button%d", buttonIndex);
 		RE::GFxValue button;
-		if ((!movie.GetVariable(&button, primaryPath) ||
-		        (!button.IsObject() && !button.IsDisplayObject())) &&
-		    (!movie.GetVariable(&button, fallbackPath) ||
-		        (!button.IsObject() && !button.IsDisplayObject()))) {
+		bool found = false;
+		// Match all four hierarchies supported by hit testing.
+		for (const char* parent : { "_root.MessageMenu.Buttons", "_root.MessageMenu.ButtonContainer",
+		         "_root.Menu_mc.Buttons", "_root.Menu_mc.ButtonContainer" }) {
+			char path[160]{};
+			std::snprintf(path, sizeof(path), "%s.Button%d", parent, buttonIndex);
+			if (movie.GetVariable(&button, path) &&
+			    (button.IsObject() || button.IsDisplayObject())) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
 			return false;
 		}
 
@@ -3956,16 +4123,20 @@ namespace
 			return focused;
 		}
 
-		// VRMessageBox replaces Button.handlePress with an empty function, so a
-		// synthetic Return can play the focused sound without reaching buttonPress.
-		// Its ClickCallback is the canonical mouse route into GameDelegate.
-		RE::GFxValue event;
-		movie.CreateObject(&event);
-		event.SetMember("target", button);
-		const bool invoked = movie.Invoke("_root.MessageMenu.ClickCallback",
-		    nullptr, &event, 1);
-		SKSE::log::debug("LASER MessageBox {} button={} focus={} callback={}",
-		    activate ? "ACTIVATE" : "FOCUS", buttonIndex, focused, invoked);
+		// VRMessageBox.ClickCallback only parses ButtonN._name then forwards N to
+		// buttonPress. Supply the already resolved index directly; an AS Invoke
+		// success alone does not establish that the native callback was reached.
+		auto* ui = RE::UI::GetSingleton();
+		auto menu = ui ? ui->GetMenu("MessageBoxMenu") : nullptr;
+		RE::GFxValue index;
+		index.SetNumber(static_cast<double>(buttonIndex));
+		const bool previousLaserDispatch = g_laserMessageBoxDispatch;
+		g_laserMessageBoxDispatch = true;
+		const bool invoked = menu && InvokeNativeMenuCallback(
+		    *menu, movie, "buttonPress", &index, 1);
+		g_laserMessageBoxDispatch = previousLaserDispatch;
+		SKSE::log::info("LASER MessageBox ACTIVATE button={} focus={} nativeCallback={}",
+		    buttonIndex, focused, invoked);
 		return invoked;
 	}
 
@@ -4431,10 +4602,12 @@ namespace
 		bool statsOpen = ui && ui->IsMenuOpen("StatsMenu");
 		// Geometry, hover, and activation must all key off the same advertised
 		// top movie. An underlying open menu must not override the active plane.
-		bool mapOpen = strcmp(g_pTransform->menuName, "MapMenu") == 0;
+		bool mapOpen = g_mapMenuOpen;
 		bool dialogueOpen = strcmp(g_pTransform->menuName, "Dialogue Menu") == 0;
 		bool journalOpen = strcmp(g_pTransform->menuName, "Journal Menu") == 0;
 		bool raceMenuOpen = strcmp(g_pTransform->menuName, "RaceSex Menu") == 0;
+		if (ui)
+			RecoverRaceMenuKeyboard(*ui, raceMenuOpen && !statsOpen && !mapOpen);
 		// MapMenu is entirely Skyrim-owned. OCU does not inspect its native pointer,
 		// scene graph, input handlers, or Scaleform movie, and publishes no custom
 		// map laser. This preserves the original Skyrim VR map laser unchanged.
@@ -4476,6 +4649,7 @@ namespace
 			s_planeStableFrames = 0;
 			s_gfxMousePrimed = false;
 			s_laserOwnsFocus = false;
+			s_cursorShown = false; // Forget OCU ownership; do not hide Skyrim's cursor later.
 			return;
 		}
 		if (!raceMenuOpen)
@@ -5721,10 +5895,10 @@ namespace
 
 		auto pc = RE::PlayerCharacter::GetSingleton();
 		auto vrData = pc ? pc->GetVRNodeData() : nullptr;
-		if (!g_consoleOpen.load(std::memory_order_acquire)) {
+		if (g_mapMenuOpen || !g_consoleOpen.load(std::memory_order_acquire)) {
 			if (s_sessionActive) {
 				publishNoHits();
-				SKSE::log::debug("Console world laser closed; flat pointer ownership released");
+				SKSE::log::debug("Console world laser inactive; OCU hit state cleared");
 			}
 			s_sessionActive = false;
 			s_lastFrameSequence = 0;
@@ -5735,12 +5909,8 @@ namespace
 		if (!g_pConsoleLaser || !pc || !pc->Is3DLoaded() || !vrData)
 			return;
 
-		// Hide the flat console pointer only. Normal Scaleform menus own their
-		// cursor visibility separately and are not modified here.
-		if (auto mc = RE::MenuCursor::GetSingleton())
-			mc->SetCursorVisibility(false);
-		if (vrData->UIPointerGeo)
-			vrData->UIPointerGeo->SetAppCulled(true);
+		// Skyrim owns native cursor and UIPointerGeo visibility. Hiding either
+		// here can leak into MapMenu after console close. Only manage OCU's ray.
 
 		uint8_t rayValid[2] = {};
 		float rayOriginFromHmd[2][3] = {};
@@ -5946,7 +6116,7 @@ namespace
 					});
 				}
 				// Match the live controller ray while console is open. When closed,
-				// retain a cheap ~10Hz cleanup tick to restore native pointer state.
+				// retain a cheap ~10Hz cleanup tick to clear OCU's console hit state.
 				if (g_consoleOpen.load(std::memory_order_acquire)) {
 					consolePickTick = 0;
 					if (!g_consolePickTaskPending.exchange(true, std::memory_order_acq_rel)) {
@@ -6438,6 +6608,20 @@ namespace
 
 	void InstallVirtualKeyboardHook()
 	{
+		// Observe only the game's naming confirmation, rather than guessing that
+		// any OK button over RaceMenu is permission to open a keyboard.
+		REL::Relocation<std::uintptr_t> namingVtable{ RE::ConfirmAndNameCallback::VTABLE[0] };
+		auto* namingSlot = reinterpret_cast<std::uintptr_t*>(namingVtable.address()) + 1;
+		DWORD namingProtect = 0;
+		if (VirtualProtect(namingSlot, sizeof(*namingSlot), PAGE_EXECUTE_READWRITE, &namingProtect)) {
+			g_originalConfirmAndNameRun = reinterpret_cast<ConfirmAndNameRun>(*namingSlot);
+			*namingSlot = reinterpret_cast<std::uintptr_t>(&HookedConfirmAndName);
+			VirtualProtect(namingSlot, sizeof(*namingSlot), namingProtect, &namingProtect);
+			SKSE::log::info("RaceMenu ConfirmAndName callback observed for laser keyboard recovery");
+		} else {
+			SKSE::log::error("Could not observe RaceMenu ConfirmAndName callback (error: {})", GetLastError());
+		}
+
 		auto inputMgr = RE::BSInputDeviceManager::GetSingleton();
 		if (!inputMgr) {
 			SKSE::log::error("Failed to get BSInputDeviceManager singleton");
@@ -6925,6 +7109,7 @@ namespace
 		case SKSE::MessagingInterface::kDataLoaded:
 			SyncDiagnosticLogging();
 			DapaSpellWheel::Initialize();
+			DapaCrossbow::Initialize();
 			SKSE::log::info("Game data loaded, installing hooks");
 			InstallWndProcHook();
 			InstallVirtualKeyboardHook();
@@ -6960,7 +7145,10 @@ namespace
 
 		case SKSE::MessagingInterface::kPostLoadGame:
 		case SKSE::MessagingInterface::kNewGame:
-			if (IsDapaEnabledInGameIni())InstallSetupGeometryHook();
+			if (IsDapaEnabledInGameIni()) {
+				InstallSetupGeometryHook();
+				PlayerMask::NotifyUnavailableAfterLoad();
+			}
 			DapaHiggs::SetEnabled(PlayerMask::ready.load(std::memory_order_acquire));
 			FindAndStoreNiCamera();  // Retry after scene graph is fully loaded
 			if (g_diagnosticLogging.load(std::memory_order_relaxed)) TestRendererShadowState();
@@ -7010,7 +7198,9 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	SetupLogging();
 
 	SKSE::log::info("OpenCompositeInput v3.2.0 loaded");
+	SKSE::log::info("OCU SKSE package: 4.3.7-custom-eye-test-hotfix4 / DAPA exact-mask-v1 / accepted-draw-api-v1 / held-geometry ownership");
 	SKSE::log::info("  VR keyboard bridge + Scaleform char injection + menu state tracking");
+		SKSE::log::info("  RaceMenu keyboard test: confirmed-naming-v4 / VR-button-slot-8");
 	SKSE::log::info("  + Render target bridge (MV + depth) for FSR 2/3 integration");
 	SKSE::log::info("  + Laser cursor pump v2 (Scaleform-free: uiNode plane + BSInputEventQueue)");
 	SKSE::log::info("  + Event-driven Scaleform laser input (30 Hz moving, zero idle probes)");

@@ -19,6 +19,7 @@
 #include "Misc/Input/LegacyControllerActions.h"
 #include "Misc/smooth_input.h"
 #include "../../DrvOpenXR/DapaCaptureControl.h"
+#include "../../DrvOpenXR/InputSessionRecovery.h"
 
 typedef vr::EVRSkeletalTrackingLevel OOVR_EVRSkeletalTrackingLevel;
 
@@ -409,7 +410,15 @@ public: // INTERNAL FUNCTIONS
 	void TriggerBodyTrackerHapticPulse(vr::TrackedDeviceIndex_t deviceIndex, uint64_t durationNanos);
 
 	bool AreActionsLoaded();
+	bool AreActionsAttachedToSession(XrSession session) const
+	{
+		return session != XR_NULL_HANDLE && attachedSession == session;
+	}
 	bool IsRestartingSession();
+	bool HasFocusedActionSync(XrSession session) const
+	{
+		return AreActionsAttachedToSession(session) && runtimeSyncFocus.Confirmed(session, InputNowMs());
+	}
 
 	/**
 	 * Get a number that increments each time xrSyncActions is called. Can be used to check if a cached input value
@@ -721,6 +730,9 @@ private:
 	uint64_t syncSerial = 0;
 
 	bool hasLoadedActions = false;
+	XrSession attachedSession = XR_NULL_HANDLE;
+	OcuInputSession::SyncFocus runtimeSyncFocus;
+	void TraceActionSync(XrSession syncedSession, XrResult result, bool legacy);
 	std::string loadedActionsPath;
 	bool usingLegacyInput = false;
 	Registry<ActionSet> actionSets;
@@ -743,6 +755,7 @@ private:
 		{ { 0, 0, 0, 1 }, { 0, 0, 0 } }
 	};
 	bool eyeGazeViewPosesValid = false;
+	bool eyeGazeLiveReported = false;
 	void CreateEyeGazeAction();
 	void CreateEyeGazeSpace();
 	void DestroyEyeGazeSpace();

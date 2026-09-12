@@ -19,7 +19,7 @@ namespace OpenCompositeConfigurator
     /// Region produce stair-stepped pill edges; painting the curve directly
     /// keeps every size smooth and gives active buttons the keyboard-key look.
     /// </summary>
-    internal sealed class ModernPillButton : Button
+    internal class ModernPillButton : Button
     {
         private bool _hovered;
         private bool _pressed;
@@ -260,12 +260,7 @@ namespace OpenCompositeConfigurator
                 graphics.DrawPath(outline, path);
 
             Rectangle textBounds = Rectangle.Inflate(ClientRectangle, -9, -2);
-            TextRenderer.DrawText(graphics, Text, Font, textBounds, text,
-                TextFormatFlags.HorizontalCenter
-                | TextFormatFlags.VerticalCenter
-                | TextFormatFlags.SingleLine
-                | TextFormatFlags.EndEllipsis
-                | TextFormatFlags.NoPrefix);
+            DrawContent(graphics, textBounds, text);
 
             if (Enabled && _shinePosition >= 0f)
             {
@@ -276,13 +271,7 @@ namespace OpenCompositeConfigurator
                 graphics.SetClip(path);
                 using GraphicsPath textBand = CreateShineBand(centerX, 22f, Height);
                 graphics.SetClip(textBand, CombineMode.Intersect);
-                TextRenderer.DrawText(graphics, Text, Font, textBounds,
-                    Color.FromArgb(238, 255, 242),
-                    TextFormatFlags.HorizontalCenter
-                    | TextFormatFlags.VerticalCenter
-                    | TextFormatFlags.SingleLine
-                    | TextFormatFlags.EndEllipsis
-                    | TextFormatFlags.NoPrefix);
+                DrawContent(graphics, textBounds, Color.FromArgb(238, 255, 242));
                 graphics.Restore(textShineState);
             }
 
@@ -294,6 +283,18 @@ namespace OpenCompositeConfigurator
                 using var focusPen = new Pen(Color.FromArgb(95, text), 1f);
                 graphics.DrawPath(focusPen, focusPath);
             }
+        }
+
+        // Specialized buttons can add an icon while retaining the shared pill,
+        // hover/pressed/focus treatment, and clipped shine pass.
+        protected virtual void DrawContent(Graphics graphics, Rectangle bounds, Color color)
+        {
+            TextRenderer.DrawText(graphics, Text, Font, bounds, color,
+                TextFormatFlags.HorizontalCenter
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.SingleLine
+                | TextFormatFlags.EndEllipsis
+                | TextFormatFlags.NoPrefix);
         }
 
         private static GraphicsPath RoundedRectangle(RectangleF bounds, float radius)

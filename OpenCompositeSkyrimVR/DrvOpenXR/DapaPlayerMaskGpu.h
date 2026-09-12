@@ -2,6 +2,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include "../OpenOVR/Compositor/ExactPixelShader.h"
 
 // Render-thread only. Replay just the current draw's geometry into raw depth.
 // No game colour/depth writes, shader replacement in the game, or CPU readback.
@@ -26,10 +27,14 @@ public:
         if(FAILED(D3DCompile(code,sizeof(code)-1,"DapaBodyMask",nullptr,nullptr,"main","ps_5_0",
             D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&blob,&errors)))return false;
         if(FAILED(device->CreatePixelShader(blob->GetBufferPointer(),blob->GetBufferSize(),nullptr,&shader)))return false;
+        if(!ocu_exact_pixels::Mark(shader.Get()))return false;
         static constexpr char visibleCode[] = "Texture2D<float> sceneDepth:register(t0); float main(float4 p:SV_Position):SV_Target { return sceneDepth.Load(int3(int2(p.xy),0)); }";
         if(FAILED(D3DCompile(visibleCode,sizeof(visibleCode)-1,"DapaVisibleBodyMask",nullptr,nullptr,"main","ps_5_0",
             D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&blob,&errors)))return false;
         if(FAILED(device->CreatePixelShader(blob->GetBufferPointer(),blob->GetBufferSize(),nullptr,&visibleDepthShader)))return false;
+        // These values are compared against scene depth within 2e-6 by DAPA.
+        // Coarse VRS would broadcast one pixel's depth across neighboring pixels.
+        if(!ocu_exact_pixels::Mark(visibleDepthShader.Get()))return false;
         D3D11_DEPTH_STENCIL_DESC ds{};
         ds.DepthEnable=FALSE;ds.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ZERO;
         if(FAILED(device->CreateDepthStencilState(&ds,&noDepth)))return false;

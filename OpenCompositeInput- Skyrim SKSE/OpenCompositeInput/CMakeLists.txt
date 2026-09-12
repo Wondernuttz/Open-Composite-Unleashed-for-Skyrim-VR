@@ -60,6 +60,7 @@ set(SOURCES
     src/Main.cpp
     src/DapaHiggs.cpp
     src/DapaSpellWheel.cpp
+    src/DapaCrossbow.cpp
 )
 
 # Create the SKSE plugin DLL
@@ -94,7 +95,13 @@ target_link_libraries(DapaHookStartupTest PRIVATE minhook_skse d3d11 dxgi)
 add_executable(DapaEngineDrawTest EXCLUDE_FROM_ALL tests/DapaEngineDrawTest.cpp)
 add_executable(DapaHiggsTest EXCLUDE_FROM_ALL tests/DapaHiggsTest.cpp)
 add_executable(DapaSpellWheelTest EXCLUDE_FROM_ALL tests/DapaSpellWheelTest.cpp)
+add_executable(DapaGeometryOwnershipTest EXCLUDE_FROM_ALL tests/DapaGeometryOwnershipTest.cpp)
 add_executable(DapaCsxDrawTest EXCLUDE_FROM_ALL tests/DapaCsxDrawTest.cpp)
+add_executable(DapaCsxApiTest EXCLUDE_FROM_ALL tests/DapaCsxApiTest.cpp)
+add_executable(RaceMenuKeyboardRecoveryTest EXCLUDE_FROM_ALL tests/RaceMenuKeyboardRecoveryTest.cpp)
+add_executable(RaceMenuNativeInputTest EXCLUDE_FROM_ALL tests/RaceMenuNativeInputTest.cpp)
+target_link_libraries(RaceMenuNativeInputTest PRIVATE CommonLibSSE::CommonLibSSE)
+target_precompile_headers(RaceMenuNativeInputTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/PCH.h")
 target_link_libraries(DapaCsxDrawTest PRIVATE bcrypt d3d11 d3dcompiler dxgi)
 target_link_libraries(${PROJECT_NAME} PRIVATE bcrypt)
 

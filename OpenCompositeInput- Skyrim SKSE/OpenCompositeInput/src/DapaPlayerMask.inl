@@ -8,10 +8,37 @@ namespace PlayerMask {
     DapaVtableSlot hooks[4];
     std::array<DapaEngineDraw::Hook,DapaEngineDraw::sites.size()> engineHooks{};
     DapaCsxDraw::Adapter csxAdapter;
+    DapaCsxApi::Client csxApi;
     bool csxPrepared=false;
     uint64_t csxAccepted=0,csxPlayerAccepted=0;
     std::atomic<bool> ready=false;
     bool attempted=false;
+    bool warningShown=false; // Accessed only by queued game-thread notifications.
+    std::string startupFailure="Player/body correction could not initialize.";
+
+    std::string ModuleAt(const void* address) {
+        HMODULE module=nullptr;
+        if(!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCSTR>(address),&module))return "unidentified hook/trampoline";
+        char path[MAX_PATH]{};
+        if(!GetModuleFileNameA(module,path,MAX_PATH))return "unidentified module";
+        return path;
+    }
+    void NotifyUnavailableAfterLoad() {
+        // No render-thread UI calls, polling, or per-frame log traffic. Startup
+        // may fail at DataLoaded; present the result only after loading a game.
+        SKSE::GetTaskInterface()->AddTask([] {
+            if(warningShown || ready.load(std::memory_order_acquire))return;
+            warningShown=true;
+            const std::string message="OCU DAPA compatibility warning\n\n"+startupFailure+
+                "\n\nPlayer/body/held-item correction is inactive; hands and weapons may ghost. "
+                "World correction remains enabled.\n\n"
+                "Check OpenCompositeInput.log in the Skyrim VR SKSE log folder for draw-hook details. "
+                "Include that log and your renderer DLL when reporting this.";
+            SKSE::log::error("DAPA compatibility notification: {}",startupFailure);
+            RE::DebugMessageBox(message.c_str());
+        });
+    }
     ID3D11DeviceContext* immediate=nullptr;
     // Classification is scoped to the render pass, never cached by mesh/buffer size.
     thread_local bool owned=false;
@@ -19,35 +46,62 @@ namespace PlayerMask {
     uint64_t draws=0,classified=0;
     uint64_t higgsClassified=0;
     uint64_t spellWheelClassified=0;
+    uint64_t vrArrowClassified=0;
+    uint64_t crossbowClassified=0;
+    uint64_t vrEquipmentClassified=0;
     uint64_t setups=0,callbacks=0,ownedCallbacks=0;
     // Only counters on draw rejection; no per-draw logging/timing/readback.
     std::array<uint64_t,8> rejected{};
     std::array<uint64_t,DapaEngineDraw::sites.size()> siteDraws{};
     std::chrono::steady_clock::time_point lastLog{};
 
-    bool IsPlayer(RE::BSRenderPass* pass) {
+    bool IsPlayerGeometry(const RE::NiAVObject* geometry) {
         auto* player=RE::PlayerCharacter::GetSingleton();
-        if(!player || !pass || !pass->geometry)return false;
-        auto* first=player->Get3D(true);auto* third=player->Get3D(false);
+        if(!player || !geometry)return false;
+        const auto* vr=player->GetVRNodeData();
+        const DapaGeometryOwnership::Roots<RE::NiAVObject> roots{
+            player->Get3D(true),player->Get3D(false),
+            vr?vr->ArrowNode.get():nullptr,
+            vr?vr->ArrowHoldNode.get():nullptr,
+            vr?vr->ArrowSnapNode.get():nullptr,
+            {vr?vr->LeftWeaponOffsetNode.get():nullptr,vr?vr->RightWeaponOffsetNode.get():nullptr,
+             vr?vr->LeftCrossbowOffsetNode.get():nullptr,vr?vr->RightCrossbowOffsetNode.get():nullptr,
+             vr?vr->LeftMeleeWeaponOffsetNode.get():nullptr,vr?vr->RightMeleeWeaponOffsetNode.get():nullptr,
+             vr?vr->LeftStaffWeaponOffsetNode.get():nullptr,vr?vr->RightStaffWeaponOffsetNode.get():nullptr,
+             vr?vr->LeftShieldOffsetNode.get():nullptr,vr?vr->RightShieldOffsetNode.get():nullptr,
+             vr?vr->BowRotationNode.get():nullptr}};
         const auto held=DapaHiggs::roots.Read();
-        // Live ancestry handles armor equips, sex/race/model changes and VRIK's
-        // third-person body without retaining freed geometry pointers.
-        RE::NiAVObject* node=pass->geometry;
+        // VR's arrow containers live below PlayerWorldNode, outside both body
+        // skeletons. Read them afresh so ammo/model changes and detach on fire
+        // cannot leave a cached mesh classified as hand-attached geometry.
         const RE::TESObjectREFR* reference=nullptr;
-        for(unsigned depth=0;node && depth<64;++depth,node=node->parent) {
-            if(node==first || node==third)return true;
-            if(DapaHiggs::roots.Matches(node,held)) {++higgsClassified;return true;}
-            // Same nearest-owner semantics as CommonLib NiAVObject::GetUserData,
-            // folded into our existing bounded walk (VR's declared member).
-            if(!reference)reference=node->userData;
+        const auto kind=DapaGeometryOwnership::Classify(geometry,roots,
+            [&](const RE::NiAVObject* node){return DapaHiggs::roots.Matches(node,held);},reference);
+        switch(kind) {
+        case DapaGeometryOwnership::Kind::Player:return true;
+        case DapaGeometryOwnership::Kind::Held:++higgsClassified;return true;
+        case DapaGeometryOwnership::Kind::AttachedArrow:
+            if(++vrArrowClassified==1)
+                SKSE::log::info("DAPA VR ARROW MASK v1: first live held/nocked arrow geometry classified");
+            return true;
+        case DapaGeometryOwnership::Kind::AttachedEquipment:
+            if(++vrEquipmentClassified==1)
+                SKSE::log::info("DAPA VR EQUIPMENT MASK v1: first native controller-attached weapon/shield geometry classified");
+            return true;
+        case DapaGeometryOwnership::Kind::None:break;
         }
         if(DapaSpellWheel::Owns(reference)) {++spellWheelClassified;return true;}
+        if(DapaCrossbow::Owns(reference)) {
+            if(++crossbowClassified==1)
+                SKSE::log::info("DAPA CROSSBOW MASK v1: first hand-positioned reload bolt geometry classified");
+            return true;
+        }
         return false;
     }
     template<int Type> void __fastcall Setup(void* shader,RE::BSRenderPass* pass,uint32_t flags) {
         owned=false;
         originalSetup[Type](shader,pass,flags);
-        owned=IsPlayer(pass);
+        owned=pass && IsPlayerGeometry(pass->geometry);
         if(owned && ++classified==1)
             SKSE::log::info("DAPA BODY MASK v4: first player-owned geometry detected ({} shader)",Type==0?"lighting":"effect");
         if((++setups & 0x1ffff)==0 && g_diagnosticLogging.load(std::memory_order_relaxed)) {
@@ -58,13 +112,16 @@ namespace PlayerMask {
     template<int Type> void __fastcall Restore(void* shader,RE::BSRenderPass* pass,uint32_t flags) {
         owned=false;originalRestore[Type](shader,pass,flags);
     }
-    bool Prepare(ID3D11DeviceContext* ctx,bool playerDraw) {
+    bool Prepare(ID3D11DeviceContext* ctx,bool playerDraw,ID3D11Texture2D* apiSceneDepth=nullptr) {
         if(!playerDraw)return false;
         ++ownedCallbacks;
         if(ctx!=immediate) {++rejected[0];return false;}
         if(!ready.load(std::memory_order_acquire) || !g_pBridge) {++rejected[1];return false;}
         auto resources=AcquirePublishedBridgeResources();
         if(!resources.depthTexture || !resources.d3dDevice) {++rejected[2];return false;}
+        // v1 API must describe the same canonical packed-stereo scene consumed
+        // by OCU's depth bridge; never silently treat a capture texture as scene.
+        if(apiSceneDepth && apiSceneDepth!=resources.depthTexture) {++rejected[4];return false;}
         Microsoft::WRL::ComPtr<ID3D11DepthStencilView> dsv;
         ctx->OMGetRenderTargets(0,nullptr,&dsv);
         if(!dsv) {++rejected[3];return false;}
@@ -91,7 +148,7 @@ namespace PlayerMask {
         if(!g_diagnosticLogging.load(std::memory_order_relaxed))return;
         const auto now=std::chrono::steady_clock::now();
         if(now-lastLog>std::chrono::seconds(5)) {
-            SKSE::log::debug("DAPA BODY MASK v4: ownedPasses={} maskDraws={} HIGGS-ownedPasses={} SpellWheel-ownedPasses={} (live ownership, no IB guessing)",classified,draws,higgsClassified,spellWheelClassified);
+            SKSE::log::debug("DAPA BODY MASK v4: ownedPasses={} maskDraws={} HIGGS-ownedPasses={} SpellWheel-ownedPasses={} VR-arrow-ownedPasses={} crossbow-reload-ownedPasses={} VR-equipment-ownedPasses={} (live ownership, no IB guessing)",classified,draws,higgsClassified,spellWheelClassified,vrArrowClassified,crossbowClassified,vrEquipmentClassified);
             lastLog=now;
         }
     }
@@ -132,6 +189,27 @@ namespace PlayerMask {
                 }
             });
     }
+    void ApiFault(void*) {
+        startupFailure="The accepted-draw API consumer encountered an exception and stopped body-mask delivery.";
+        ready.store(false,std::memory_order_release);
+        SKSE::log::error("DAPA BODY MASK: {}; no hot switch to legacy hooks",startupFailure);
+        NotifyUnavailableAfterLoad(); // Schedules UI on the game thread, never invokes it here.
+    }
+    void __cdecl ApiAccepted(const CSXAcceptedDrawAPI::Draw* event,void*) {
+        if(!ready.load(std::memory_order_acquire))return;
+        ++csxAccepted;
+        if(!IsPlayerGeometry(static_cast<const RE::BSGeometry*>(event->geometry)))return;
+        ++classified;
+        if(!Prepare(event->context,true,event->sceneDepth))return;
+        uint32_t replayResult=CSXAcceptedDrawAPI::Failed;
+        const bool restored=gpu.Replay(event->context,[&] {
+            replayResult=event->replay(event->replayToken);
+        });
+        if(!restored || replayResult!=CSXAcceptedDrawAPI::Success) {++rejected[6];return;}
+        Publish();
+        if(++csxPlayerAccepted==1)
+            SKSE::log::info("DAPA BODY MASK API v1: first player-owned accepted scene draw MASKED");
+    }
     template<size_t Site> uintptr_t Callback() {
         if constexpr(DapaEngineDraw::sites[Site].instanced)return reinterpret_cast<uintptr_t>(&Instanced<Site>);
         else return reinterpret_cast<uintptr_t>(&Draw<Site>);
@@ -156,6 +234,7 @@ namespace PlayerMask {
     }
     void RollBack() {
         ready.store(false,std::memory_order_release);
+        if(!csxApi.Stop())SKSE::log::error("DAPA BODY MASK: API unsubscribe failed; consumer inactive");
         if(!csxAdapter.Remove())
             SKSE::log::error("DAPA BODY MASK v4: CSX observer rollback failed; Win32={}",csxAdapter.error);
         for(auto& hook:engineHooks)if(!hook.Remove())
@@ -189,35 +268,57 @@ void InstallSetupGeometryHook() {
     // returned by a device proxy. The draw filter must match Skyrim's caller.
     immediate=resources.d3dContext;immediate->AddRef();
     if(immediate->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE) {
+        startupFailure="The renderer supplied a deferred context; DAPA requires Skyrim's immediate draw context.";
         SKSE::log::error("DAPA BODY MASK v4: renderer context is deferred; body correction inactive");return;
     }
     if(!gpu.Initialize(resources.d3dDevice)) {
+        startupFailure="DAPA's GPU mask shader/state initialization failed.";
         SKSE::log::error("DAPA BODY MASK v4: GPU shader/state initialization failed; body correction inactive");return;
     }
+    // Prefer a versioned, full-coverage provider. Never install the engine,
+    // geometry or private CSX hooks when the API route owns mask delivery.
+    const auto shaderModule=GetModuleHandleW(L"CommunityShaders.dll");
+    const auto query=shaderModule ? reinterpret_cast<CSXAcceptedDrawAPI::QueryFn>(
+        GetProcAddress(shaderModule,CSXAcceptedDrawAPI::ExportName)) : nullptr;
+    const auto apiResult=csxApi.Connect(query,immediate,&ApiAccepted,nullptr,&ApiFault);
+    if(apiResult==DapaCsxApi::ConnectResult::Connected) {
+        ready.store(true,std::memory_order_release);
+        SKSE::log::info("DAPA BODY MASK: accepted-draw API v1 registered; private CSX/engine/geometry patches bypassed; awaiting coverage verification");
+        SKSE::log::info("DAPA VR ARROW MASK v1 / VR EQUIPMENT MASK v1: native arrow and controller equipment ancestry enabled");
+        return;
+    }
+    if(apiResult!=DapaCsxApi::ConnectResult::Missing)
+        SKSE::log::warn("DAPA BODY MASK: proposed accepted-draw API unavailable/incompatible (result={}); trying verified legacy adapter",static_cast<int>(apiResult));
     const auto imageBase=REL::Module::get().base();
     const auto callbackAddresses=Callbacks(std::make_index_sequence<DapaEngineDraw::sites.size()>{});
     // Validate every site BEFORE changing any executable instruction.
     for(size_t i=0;i<engineHooks.size();++i) {
         const auto& site=DapaEngineDraw::sites[i];
         if(!engineHooks[i].Prepare(site,reinterpret_cast<uint8_t*>(imageBase+site.rva))) {
+            startupFailure="An engine draw-call patch is incompatible with DAPA. The renderer/mod responsible is not yet identified.";
             SKSE::log::error("DAPA BODY MASK v4: mesh call signature/chain rejected at RVA 0x{:X}, Win32={}; no engine patches applied",site.rva,engineHooks[i].error);return;
         }
     }
-    // An opaque owner is never bypassed. Only the verified CSX owner has an
-    // accepted-draw contract; a different owner must be integrated explicitly.
+    // Inspect the actual owner. ENB/proxy hooks must not be mistaken for CSX
+    // merely because CommunityShaders.dll is also present in the process.
     for(size_t i=0;i<engineHooks.size();++i)if(engineHooks[i].chained) {
         auto* module=GetModuleHandleW(L"CommunityShaders.dll");
         if(i!=0 || !module || !csxAdapter.Prepare(reinterpret_cast<uintptr_t>(module),
                engineHooks[i].chained,reinterpret_cast<uintptr_t>(&CsxAccepted))) {
-            SKSE::log::error("DAPA BODY MASK v4: existing draw owner not supported at RVA 0x{:X}; CSX acceptance signature failed, Win32={}; no patches applied",engineHooks[i].spec->rva,csxAdapter.error);
             const auto ownerAddress=reinterpret_cast<uintptr_t>(engineHooks[i].chained);
             const auto moduleBase=reinterpret_cast<uintptr_t>(module);
-            SKSE::log::error("DAPA BODY MASK compatibility: CommunityShaders present={}, owner=0x{:X}, relativeToCsx=0x{:X}, validatedContracts={}. Player/body/held-item correction INACTIVE; world correction unchanged. Report the exact CommunityShaders.dll and this startup log; the 3.19 version label is not sufficient.",
-                module!=nullptr,ownerAddress,module && ownerAddress>=moduleBase?ownerAddress-moduleBase:0,DapaCsxDraw::builds.size());
+            HMODULE actualModule=nullptr;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(ownerAddress),&actualModule);
+            const bool isCsx=module && actualModule==module;
+            startupFailure=isCsx ? "Community Shaders/Open Shaders draw-call integration could not be validated or installed for this build." :
+                "Another renderer/mod owns a draw call that DAPA cannot safely observe. This is not automatically a Community Shaders failure.";
+            SKSE::log::error("DAPA BODY MASK compatibility: meshRva=0x{:X}, ownerModule={}, owner=0x{:X}, CommunityShadersOwnsCall={}, relativeToCsx=0x{:X}, validatedContracts={}, adapterError={}. Player/body/held-item correction INACTIVE; world correction unchanged. Report this log and the DLL identified as owner; no unknown owner was bypassed.",
+                engineHooks[i].spec->rva,ModuleAt(engineHooks[i].chained),ownerAddress,isCsx,isCsx?ownerAddress-moduleBase:0,DapaCsxDraw::builds.size(),csxAdapter.error);
             return;
         }
         csxPrepared=true;
-        SKSE::log::info("DAPA BODY MASK v4: validated {} accepted-draw adapter",csxAdapter.build->name);
+        SKSE::log::info("DAPA BODY MASK v4: validated {} accepted-draw adapter; codeRebased={}, actualOwnerRva=0x{:X}",csxAdapter.build->name,csxAdapter.relocated,csxAdapter.build->ownerRva);
     }
     SKSE::AllocTrampoline(2048);
     for(size_t i=0;i<engineHooks.size();++i) {
@@ -243,4 +344,6 @@ void InstallSetupGeometryHook() {
     }
     ready.store(true,std::memory_order_release);
     SKSE::log::info("DAPA BODY MASK v4: 17 mesh sites + 4 geometry hooks + {} CSX accepted-draw observers installed; mask=depth-tested scene-sampled; no D3D11 vtable writes; awaiting coverage verification",csxPrepared?2:0);
+    SKSE::log::info("DAPA VR ARROW MASK v1: live ArrowNode/ArrowHoldNode/ArrowSnapNode ancestry enabled; fired/world projectiles retain world correction");
+    SKSE::log::info("DAPA VR EQUIPMENT MASK v1: native left/right weapon, crossbow, melee, staff, shield and bow rotation roots enabled");
 }

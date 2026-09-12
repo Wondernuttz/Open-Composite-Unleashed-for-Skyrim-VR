@@ -6,9 +6,13 @@
 #include "../Reimpl/BaseInput.h"
 #include "dx11compositor.h"
 #include "VRSGaze.h"
+#include "VRSSceneScope.h"
+#include "VRSShaderGuard.h"
+#include "VRSAlphaCoverageScope.h"
 
 
 #include "../Misc/Config.h"
+#include "../Misc/EffectFoveationState.h"
 #include "../Misc/MipBiasHook.h"
 #include "../Misc/xr_ext.h"
 #include "generated/static_bases.gen.h"
@@ -260,7 +264,7 @@ struct OCRenderTargetBridge {
 	// FP draw replay — pointer to heap-allocated FPReplayData (same process, read by OC).
 	uint64_t fpReplayDataPtr;          // FPReplayData* (cast to uint64_t)
 
-	// Menu state — ASW skips MV corrections when a menu is open.
+	// Menu state — DAPA suspends synthetic frames while a gameplay menu is open.
 	uint8_t  isMenuOpen;               // 1 = a gameplay menu is open, 0 = gameplay
 	uint8_t  isConsoleOpen;            // 1 = the game console menu is open (VR keyboard overlay sync)
 	uint8_t  _padMenu[6];              // alignment
@@ -299,6 +303,13 @@ static int OCBridge_MenuState()
 	if (!s_pBridge)
 		return -1;
 	return s_pBridge->isMenuOpen ? 1 : 0;
+}
+
+bool OCBridge_DapaMenuPaused()
+{
+	OpenRenderTargetBridge();
+	return s_pBridge && (s_pBridge->isMenuOpen != 0 ||
+	    s_pBridge->isLoadingScreen != 0 || s_pBridge->isMainMenu != 0);
 }
 static void OpenRenderTargetBridge()
 {
@@ -557,82 +568,77 @@ static bool s_renderTargetHooksInstalled = false;
 static bool s_renderTargetHooksUsable = false;
 using OMSetRT_fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
 static OMSetRT_fn s_origOMSetRT = nullptr;
-using ClearDSV_fn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
-static ClearDSV_fn s_origClearDSV = nullptr;
-static bool s_depthClearHookUsable = false;
-
 // VRS is armed at WaitGetPoses, but only bound while Skyrim's actual stereo
 // scene target is current. This prevents an atlas-sized resource from leaking
 // into shadow, reflection, UI, and other differently sized render passes.
 static VRSManager* s_vrsHookManager = nullptr;
-static DensityMaskManager* s_densityMaskHookManager = nullptr;
+static RDMRenderScope* s_densityMaskHookManager = nullptr;
 static ID3D11Texture2D* s_vrsSceneTarget = nullptr; // observed game resource; not owned
-static ID3D11RenderTargetView* s_vrsSceneRTV = nullptr; // cached identity; not owned
+static ID3D11DeviceContext* s_sceneHookContext = nullptr;
+static ocu_vrs_scope::SceneScope s_vrsSceneScope;
+static VRSAlphaCoverageScope s_vrsAlphaCoverageScope;
+static std::uint32_t s_vrsSceneBindings = 0;
+static bool s_vrsSceneEligible = false;
+static std::uint32_t s_vrsProtectedBindings = 0;
+static std::uint32_t s_vrsCoarseBindings = 0;
+static std::uint32_t s_vrsUnclassifiedBindings = 0;
+static std::uint32_t s_vrsTerrainDepthBindings = 0;
+static void ResetVRSInputGeometry();
 static bool s_vrsFrameArmed = false;
 static bool s_vrsHookApplied = false;
-static bool s_densityMaskDrawing = false;
-static ID3D11DepthStencilView* s_pendingDensityDSV = nullptr;
-static float s_pendingDensityClearDepth = 1.0f;
-
-static void ClearPendingDensityMask()
+static void SyncVRSForShaderState(ID3D11DeviceContext* ctx)
 {
-	if (s_pendingDensityDSV) {
-		s_pendingDensityDSV->Release();
-		s_pendingDensityDSV = nullptr;
+	if (!s_vrsHookManager || ctx != s_sceneHookContext) return;
+	const auto reasons = ocu_vrs_guard::CurrentReasons(ctx);
+	const auto coarseHazards = ocu_vrs_guard::CurrentCoarseHazards(ctx);
+	const bool alphaCoverage = s_vrsAlphaCoverageScope.ProtectsCurrentDraw(ctx);
+	const bool scene = s_vrsFrameArmed && s_vrsSceneEligible;
+	const auto* viewports = ocu_vrs_guard::CurrentViewports(ctx);
+	const bool viewportReady = scene && viewports &&
+	    s_vrsHookManager->UpdateActiveViewports(viewports->count, viewports->values);
+	const bool shouldApply = scene && viewportReady && reasons == ocu_vrs_guard::Compatible &&
+	    coarseHazards == ocu_vrs_guard::CoarseCompatible && !alphaCoverage;
+	if (scene && (reasons || coarseHazards || alphaCoverage)) {
+		++s_vrsProtectedBindings;
+		if ((reasons & ocu_vrs_guard::Unclassified) || (coarseHazards & ocu_vrs_guard::CoarseUnclassified))
+			++s_vrsUnclassifiedBindings;
+		if (coarseHazards & ocu_vrs_guard::RasterDepthTextureLoad) ++s_vrsTerrainDepthBindings;
 	}
-}
-
-static bool IsVRSSceneTarget(UINT numViews, ID3D11RenderTargetView* const* ppRTVs)
-{
-	if (!s_vrsFrameArmed || !s_vrsSceneTarget || !ppRTVs)
-		return false;
-	if (s_vrsSceneRTV) {
-		for (UINT i = 0; i < numViews; ++i) {
-			if (ppRTVs[i] == s_vrsSceneRTV)
-				return true;
-		}
-		return false;
-	}
-	for (UINT i = 0; i < numViews; ++i) {
-		if (!ppRTVs[i])
-			continue;
-		ID3D11Resource* resource = nullptr;
-		ppRTVs[i]->GetResource(&resource);
-		const bool matches = resource == s_vrsSceneTarget;
-		if (resource)
-			resource->Release();
-		if (matches) {
-			s_vrsSceneRTV = ppRTVs[i];
-			return true;
-		}
-	}
-	return false;
-}
-
-static void SyncVRSForRenderTargets(UINT numViews, ID3D11RenderTargetView* const* ppRTVs)
-{
-	if (!s_vrsHookManager)
-		return;
-	const bool shouldApply = IsVRSSceneTarget(numViews, ppRTVs);
 	if (shouldApply && !s_vrsHookApplied)
 		s_vrsHookApplied = s_vrsHookManager->ApplyStereo();
 	else if (!shouldApply && s_vrsHookApplied) {
 		s_vrsHookManager->Disable();
 		s_vrsHookApplied = false;
 	}
+	if (shouldApply && s_vrsHookApplied) ++s_vrsCoarseBindings;
 }
 
-static void TryApplyPendingDensityMask(UINT numViews,
+static void SyncVRSForRenderTargets(ID3D11DeviceContext* ctx, UINT numViews,
     ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* dsv)
 {
-	if (s_densityMaskDrawing || !s_densityMaskHookManager ||
-	    !s_densityMaskHookManager->IsArmed() || !s_pendingDensityDSV ||
-	    dsv != s_pendingDensityDSV || !IsVRSSceneTarget(numViews, ppRTVs))
+	if (!s_vrsHookManager || ctx != s_sceneHookContext) return;
+	s_vrsSceneEligible = s_vrsFrameArmed && s_vrsSceneScope.Matches(ctx, numViews, ppRTVs, dsv);
+	if (s_vrsSceneEligible) ++s_vrsSceneBindings;
+	SyncVRSForShaderState(ctx);
+}
+
+static void VRSShaderStateChanged(ID3D11DeviceContext* ctx, bool targetsChanged)
+{
+	if (!s_vrsHookManager || ctx != s_sceneHookContext) return;
+	s_vrsAlphaCoverageScope.ShaderStateChanged(ctx, targetsChanged);
+	if (!targetsChanged) {
+		SyncVRSForShaderState(ctx);
 		return;
-	s_densityMaskDrawing = true;
-	s_densityMaskHookManager->ApplyDepthMask(dsv, s_pendingDensityClearDepth);
-	s_densityMaskDrawing = false;
-	ClearPendingDensityMask();
+	}
+	// ClearState, command-list playback and context-state swaps can bypass the
+	// individual target/shader setters and can change driver extension state.
+	if (s_vrsHookApplied) s_vrsHookManager->Disable();
+	s_vrsHookApplied = false;
+	ID3D11RenderTargetView* views[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+	Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth;
+	ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, views, &depth);
+	SyncVRSForRenderTargets(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, views, depth.Get());
+	for (auto* view : views) if (view) view->Release();
 }
 
 static void DisarmSceneVRS()
@@ -640,56 +646,23 @@ static void DisarmSceneVRS()
 	if (s_vrsHookManager && s_vrsHookApplied)
 		s_vrsHookManager->Disable();
 	s_vrsFrameArmed = false;
+	s_vrsAlphaCoverageScope.EndFrame();
 	s_vrsHookApplied = false;
+	s_vrsSceneScope.Reset();
+	s_vrsSceneEligible = false;
+	ocu_vrs_guard::UnwatchContext(s_sceneHookContext);
 	if (s_densityMaskHookManager)
-		s_densityMaskHookManager->EndFrameMasking();
+		s_densityMaskHookManager->EndFrame();
 	s_densityMaskHookManager = nullptr;
-	ClearPendingDensityMask();
-}
-
-static void STDMETHODCALLTYPE Hook_ClearDepthStencilView(ID3D11DeviceContext* ctx,
-    ID3D11DepthStencilView* dsv, UINT clearFlags, FLOAT depth, UINT8 stencil)
-{
-	s_origClearDSV(ctx, dsv, clearFlags, depth, stencil);
-	if (s_densityMaskDrawing || !s_densityMaskHookManager || !dsv ||
-	    (clearFlags & D3D11_CLEAR_DEPTH) == 0 ||
-	    !s_densityMaskHookManager->IsArmed() || OCBridge_MenuState() == 1)
-		return;
-
-	ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-	ID3D11DepthStencilView* boundDSV = nullptr;
-	ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &boundDSV);
-	const bool sceneBound = boundDSV == dsv &&
-	    IsVRSSceneTarget(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs);
-	if (boundDSV)
-		boundDSV->Release();
-	for (auto* rtv : rtvs) {
-		if (rtv)
-			rtv->Release();
-	}
-
-	if (sceneBound) {
-		s_densityMaskDrawing = true;
-		s_densityMaskHookManager->ApplyDepthMask(dsv, depth);
-		s_densityMaskDrawing = false;
-		ClearPendingDensityMask();
-		return;
-	}
-
-	// Some engines clear the main depth texture immediately before binding it.
-	// Retain that exact DSV until the known stereo scene target is bound.
-	ClearPendingDensityMask();
-	s_pendingDensityDSV = dsv;
-	s_pendingDensityDSV->AddRef();
-	s_pendingDensityClearDepth = depth;
 }
 
 static void STDMETHODCALLTYPE Hook_OMSetRenderTargets(
     ID3D11DeviceContext* ctx, UINT numViews, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV)
 {
 	s_origOMSetRT(ctx, numViews, ppRTVs, pDSV);
-	SyncVRSForRenderTargets(numViews, ppRTVs);
-	TryApplyPendingDensityMask(numViews, ppRTVs, pDSV);
+	if (ctx != s_sceneHookContext) return;
+	SyncVRSForRenderTargets(ctx, numViews, ppRTVs, pDSV);
+	RDMRenderScope::NotifyTargets(ctx);
 }
 
 static bool InstallSceneTargetHooks(ID3D11Device* device)
@@ -731,8 +704,12 @@ static bool InstallSceneTargetHooks(ID3D11Device* device)
 		    UINT uavStart, UINT numUAVs, ID3D11UnorderedAccessView* const* ppUAVs, const UINT* pInitial)
 		{
 			s_origOMSetRTUAV(ctx, numRTVs, ppRTVs, pDSV, uavStart, numUAVs, ppUAVs, pInitial);
-			SyncVRSForRenderTargets(numRTVs, ppRTVs);
-			TryApplyPendingDensityMask(numRTVs, ppRTVs, pDSV);
+			if (ctx != s_sceneHookContext) return;
+			ocu_vrs_scope::WithRenderTargets(ctx, numRTVs, ppRTVs, pDSV,
+			    [ctx](UINT count, ID3D11RenderTargetView* const* views, ID3D11DepthStencilView* depth) {
+				    SyncVRSForRenderTargets(ctx, count, views, depth);
+				    RDMRenderScope::NotifyTargets(ctx);
+			    });
 		}
 	};
 	st = MH_CreateHook(vtable[34], (void*)&RTUAVHook::Hook, (void**)&s_origOMSetRTUAV);
@@ -744,18 +721,10 @@ static bool InstallSceneTargetHooks(ID3D11Device* device)
 		OOVR_LOGF("FPDepth: OMSetRTAndUAV hooked at %p", vtable[34]);
 	}
 
-	// Radial Density Mask needs to seed the exact scene depth buffer after each
-	// clear. The hook is installed once but remains a no-op unless RDM is armed.
-	st = MH_CreateHook(vtable[53], (void*)&Hook_ClearDepthStencilView, (void**)&s_origClearDSV);
-	if (st == MH_OK) st = MH_EnableHook(vtable[53]);
-	s_depthClearHookUsable = st == MH_OK;
-	if (st != MH_OK)
-		OOVR_LOGF("DensityMask: ClearDepthStencilView hook failed (%d)", (int)st);
-	else
-		OOVR_LOGF("DensityMask: ClearDepthStencilView hooked at %p", vtable[53]);
-
 	s_renderTargetHooksInstalled = true;
 	s_renderTargetHooksUsable = omRTHookOk && omRTUAVHookOk;
+    if (s_renderTargetHooksUsable)
+        RDMRenderScope::RegisterTargetObserver(vtable[33], vtable[34]);
 	ctx->Release();
 	return s_renderTargetHooksUsable;
 }
@@ -2656,6 +2625,8 @@ DX11Compositor::DX11Compositor(ID3D11Texture2D* initial)
 {
 	initial->GetDevice(&device);
 	device->GetImmediateContext(&context);
+	OOVR_LOGF("Foveation shader guard v1: game-device shader capture %s",
+	    ocu_vrs_guard::InstallShaderCapture(device) ? "installed" : "unavailable");
 	UpdateMipBiasForUpscaler(context);
 
 	// Shaders for inverting copy
@@ -2893,16 +2864,16 @@ DX11Compositor::~DX11Compositor()
 			DisarmSceneVRS();
 			s_vrsHookManager = nullptr;
 			s_vrsSceneTarget = nullptr;
-			s_vrsSceneRTV = nullptr;
 		}
 		if (s_densityMaskHookManager == &densityMaskManager) {
 			DisarmSceneVRS();
 			s_densityMaskHookManager = nullptr;
 			s_vrsSceneTarget = nullptr;
-			s_vrsSceneRTV = nullptr;
 		}
 		vrsManager.Shutdown();
 		densityMaskManager.Shutdown();
+		s_sceneHookContext = nullptr;
+		ResetVRSInputGeometry();
 	}
 
 #ifdef OC_HAS_FSR3
@@ -3297,9 +3268,10 @@ static float s_vrsTanU[2] = {};
 static float s_vrsTanD[2] = {};
 static ocu_vrs_gaze::Center s_vrsSmoothedGaze[2];
 static bool s_vrsHasSmoothedGaze = false;
+static std::int64_t s_vrsLastGazeQpc = 0;
 static int s_vrsRenderWidth[2] = {};
 static int s_vrsRenderHeight[2] = {};
-static void* s_vrsRenderTexture[2] = {};
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_vrsRenderTexture[2];
 static VRSManager::EyeRegion s_vrsEyeRegion[2];
 static std::uint8_t s_vrsGeometryMask = 0;
 static bool s_vrsInitialFrameDone = false;
@@ -3307,42 +3279,79 @@ static bool s_vrsPatternReady = false;
 static std::uint32_t s_vrsGazeDiagnosticCounter = 0;
 static int s_currentEyeIdx = 0;
 
+static void ResetVRSInputGeometry()
+{
+	s_vrsRenderTexture[0].Reset();
+	s_vrsRenderTexture[1].Reset();
+	s_vrsGeometryMask = 0;
+}
+
 void DX11Compositor::BeginVRSGameFrame()
 {
+	// Reuse the existing menu/bridge lookup before expiring coverage: this call
+	// can establish the first bridge connection during this very frame boundary.
+	const bool menuOpen = OCBridge_MenuState() == 1;
+	// WaitGetPoses begins every real frame, including native/backoff/menu frames
+	// that never enter DAPA's cache path. Expire the producer mask here so its
+	// first owned draw clears old pixels, and a frame with no owned draws cannot
+	// reuse old coverage. This is a CPU flag only; cached synthetic eyes own copies.
+	if (s_pBridge)
+		s_pBridge->preFPDepthCaptured = 0;
+	// Publish a fresh disabled frame before any early return. Effect consumers
+	// use the same gaze policy without depending on a GPU backend or upscaler.
+	ocu_effect_foveation::BeginFrame();
+	// Only the two submissions since the previous frame boundary may form a pair.
+	const auto submittedEyeMask = s_vrsGeometryMask;
+	s_vrsGeometryMask = 0;
+	s_vrsSceneBindings = 0;
+	s_vrsProtectedBindings = s_vrsUnclassifiedBindings = s_vrsCoarseBindings = 0;
+	s_vrsTerrainDepthBindings = 0;
+	s_sceneHookContext = context;
 	// Always expire previous-frame reconstruction, even when gaze disappears,
 	// menus open, geometry is unavailable, or the selected backend changes.
 	DisarmSceneVRS();
-	densityMaskManager.BeginFrame();
-	const bool menuOpen = OCBridge_MenuState() == 1;
+	densityMaskManager.EndFrame();
 	if (!oovr_global_configuration.VrsAnyEnabled() || menuOpen) {
 		DisarmSceneVRS();
 		s_vrsSceneTarget = nullptr;
-		s_vrsSceneRTV = nullptr;
 		vrsManager.Disable();
 		s_vrsPatternReady = false;
 		s_vrsHasSmoothedGaze = false;
 		return;
 	}
 
-	const bool hasStereoGeometry = s_vrsGeometryMask == 0x3 &&
+	const bool hasStereoGeometry = submittedEyeMask == 0x3 &&
 	    s_vrsRenderTexture[0] != nullptr &&
-	    s_vrsRenderTexture[0] == s_vrsRenderTexture[1] &&
+	    s_vrsRenderTexture[0].Get() == s_vrsRenderTexture[1].Get() &&
 	    s_vrsRenderWidth[0] == s_vrsRenderWidth[1] &&
 	    s_vrsRenderHeight[0] == s_vrsRenderHeight[1] &&
 	    s_vrsRenderWidth[0] > 0 && s_vrsRenderHeight[0] > 0;
-	if (!hasStereoGeometry) {
+	// Eye output layout is independent of gaze availability. Fixed foveation
+	// and gaze-loss fallback must also reach the validated scene-depth path
+	// when an upscaler submits a separate texture for each eye.
+	const bool hasSubmittedEyeGeometry =
+	    submittedEyeMask == 0x3 && s_vrsRenderTexture[0] && s_vrsRenderTexture[1] &&
+	    s_vrsRenderWidth[0] > 0 && s_vrsRenderHeight[0] > 0 &&
+	    s_vrsRenderWidth[1] > 0 && s_vrsRenderHeight[1] > 0;
+	static int lastGeometryStatus = -1;
+	auto reportGeometry = [&](int status, const char* description) {
+		if (lastGeometryStatus == status) return;
+		lastGeometryStatus = status;
+		OOVR_LOGF("Foveation geometry v3: %s; submittedMask=0x%X left=%dx%d right=%dx%d",
+		    description, unsigned(submittedEyeMask), s_vrsRenderWidth[0], s_vrsRenderHeight[0],
+		    s_vrsRenderWidth[1], s_vrsRenderHeight[1]);
+	};
+	if (!hasSubmittedEyeGeometry) {
 		DisarmSceneVRS();
 		vrsManager.Disable();
 		s_vrsPatternReady = false;
-		static bool loggedMissingGeometry = false;
-		if (!loggedMissingGeometry) {
-			loggedMissingGeometry = true;
-			OOVR_LOG("Foveation: waiting for a shared stereo render target and both submitted eye regions; no unsafe mask was bound");
-		}
+		s_vrsHasSmoothedGaze = false;
+		reportGeometry(0, "waiting for both submitted eyes; scene foveation withheld");
 		return;
 	}
 
 	bool gazeUsed = false;
+	XrTime effectGazeSampleTime = 0;
 	float nextCenterX[2] = { s_vrsOpticalX[0], s_vrsOpticalX[1] };
 	float nextCenterY[2] = { s_vrsOpticalY[0], s_vrsOpticalY[1] };
 	if (oovr_global_configuration.VrsEyeTracked()) {
@@ -3370,9 +3379,13 @@ void DX11Compositor::BeginVRSGameFrame()
 				        s_vrsTanL[1], s_vrsTanR[1], s_vrsTanU[1], s_vrsTanD[1],
 				        target[1], &eyeLocal[1]);
 				if (gazeUsed) {
-					const XrDuration period = xr_gbl->nextPredictedFramePeriod.load(std::memory_order_acquire);
-					const float dt = period > 0 ?
-					    (float)((double)period / 1000000000.0) : (1.0f / 90.0f);
+					effectGazeSampleTime = gazeSampleTime;
+					const auto now = ocu_effect_foveation::ClockTicks();
+					LARGE_INTEGER frequency{};
+					QueryPerformanceFrequency(&frequency);
+					const float dt = frequency.QuadPart > 0 && now > s_vrsLastGazeQpc ?
+					    static_cast<float>(double(now - s_vrsLastGazeQpc) / double(frequency.QuadPart)) : 0.0f;
+					s_vrsLastGazeQpc = now;
 					for (int gazeEye = 0; gazeEye < 2; ++gazeEye) {
 						s_vrsSmoothedGaze[gazeEye] = ocu_vrs_gaze::Smooth(
 						    s_vrsSmoothedGaze[gazeEye], target[gazeEye], dt, s_vrsHasSmoothedGaze);
@@ -3414,11 +3427,11 @@ void DX11Compositor::BeginVRSGameFrame()
 		                                              "off (gaze unavailable; Fixed disabled)");
 		OOVR_LOGF("Foveation mode: %s; profile inner=%.2f mid=%.2f", modeName,
 		    profileRadii.inner, profileRadii.mid);
-		if (customEyeRates)
-			OOVR_LOGF("Eye-tracked custom rates (effective): %s/%s/%s; compatibility cap=%s",
+		if (vrsMode == ocu_vrs_gaze::Mode::EyeTracked)
+			OOVR_LOGF("Eye-tracked rates (effective): %s/%s/%s; compatibility cap=%s",
 			    ocu_foveation::RateName(profileRates.inner), ocu_foveation::RateName(profileRates.mid),
 			    ocu_foveation::RateName(profileRates.outer),
-			    oovr_global_configuration.VrsCompatibilityMode() ? "on" : "off");
+			    oovr_global_configuration.VrsEyeCompatibilityMode() ? "on" : "off");
 		s_lastVrsMode = modeValue;
 	}
 
@@ -3434,16 +3447,72 @@ void DX11Compositor::BeginVRSGameFrame()
 		s_vrsProjY[eye] = nextCenterY[eye];
 	}
 
+	ocu_effect_foveation::Snapshot effectProfile{};
+	effectProfile.mode = vrsMode == ocu_vrs_gaze::Mode::EyeTracked ?
+	    ocu_effect_foveation::Mode::EyeTracked : ocu_effect_foveation::Mode::Fixed;
+	effectProfile.shape = ocu_effect_foveation::Shape::UVRadialHalfExtent;
+	effectProfile.publicationQpc = ocu_effect_foveation::ClockTicks();
+	effectProfile.predictedDisplayTime = xr_gbl->nextPredictedFrameTime;
+	effectProfile.gazeSampleTime = effectGazeSampleTime;
+	effectProfile.innerRadius = profileRadii.inner;
+	effectProfile.midRadius = profileRadii.mid;
+	for (int eye = 0; eye < 2; ++eye) {
+		effectProfile.centerUV[eye][0] = nextCenterX[eye];
+		effectProfile.centerUV[eye][1] = nextCenterY[eye];
+		effectProfile.fovTangents[eye][0] = s_vrsTanL[eye];
+		effectProfile.fovTangents[eye][1] = s_vrsTanR[eye];
+		effectProfile.fovTangents[eye][2] = s_vrsTanU[eye];
+		effectProfile.fovTangents[eye][3] = s_vrsTanD[eye];
+	}
+	ocu_effect_foveation::GetState().Publish(effectProfile);
+
 	std::string requestedBackend = oovr_global_configuration.FoveatedBackend();
 	std::transform(requestedBackend.begin(), requestedBackend.end(), requestedBackend.begin(),
 	    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-	if (requestedBackend != "auto" && requestedBackend != "vrs" && requestedBackend != "rdm") {
+	if (requestedBackend != "auto" && requestedBackend != "vrs" && requestedBackend != "rdm" && requestedBackend != "effects") {
 		static bool loggedBadBackend = false;
 		if (!loggedBadBackend) {
 			loggedBadBackend = true;
 			OOVR_LOGF("Foveation: unknown backend '%s'; using Auto", requestedBackend.c_str());
 		}
 		requestedBackend = "auto";
+	}
+
+	if (requestedBackend == "effects") {
+		DisarmSceneVRS();
+		vrsManager.Disable();
+		s_vrsPatternReady = false;
+		static bool loggedEffectOnly = false;
+		if (!loggedEffectOnly) {
+			loggedEffectOnly = true;
+			OOVR_LOG("Foveation: effects-only profile published; scene remains full rate. Requires an enabled compatible renderer effect consumer");
+		}
+		return;
+	}
+
+	// Separate upscaled eye outputs do not describe Skyrim's render atlas.
+	// The bridge identifies the original stereo depth allocation; live viewports
+	// supply its active render extent when a temporal upscaler changes scale.
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> separateEyeSceneDepth;
+	D3D11_TEXTURE2D_DESC separateEyeSceneDesc{};
+	if (!hasStereoGeometry) {
+		OCBridgeResourceSnapshot geometryResources;
+		if (AcquireBridgeResourceSnapshot(geometryResources) && geometryResources.Ready() &&
+		    geometryResources.d3dDevice == device && geometryResources.d3dContext == context &&
+		    geometryResources.depthTexture) {
+			geometryResources.depthTexture->GetDesc(&separateEyeSceneDesc);
+			if (separateEyeSceneDesc.ArraySize == 1 && separateEyeSceneDesc.SampleDesc.Count == 1 &&
+			    separateEyeSceneDesc.Width >= 2 && (separateEyeSceneDesc.Width % 2) == 0 &&
+			    separateEyeSceneDesc.Height > 0 && (separateEyeSceneDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL))
+				separateEyeSceneDepth = geometryResources.depthTexture;
+		}
+		if (!separateEyeSceneDepth) {
+			reportGeometry(2, "separate eye outputs without valid scene depth; scene foveation withheld, profile available to shader effects");
+			return;
+		}
+		reportGeometry(3, "separate eye outputs using validated stereo scene depth");
+	} else {
+		reportGeometry(1, "shared stereo eye output");
 	}
 
 	const bool mayUseVrs = requestedBackend != "rdm";
@@ -3470,31 +3539,77 @@ void DX11Compositor::BeginVRSGameFrame()
 		return;
 	}
 
-	auto* nextSceneTarget = static_cast<ID3D11Texture2D*>(s_vrsRenderTexture[0]);
-	if (nextSceneTarget != s_vrsSceneTarget) {
-		s_vrsSceneTarget = nextSceneTarget;
-		s_vrsSceneRTV = nullptr;
-	}
+	s_vrsSceneTarget = hasStereoGeometry ? s_vrsRenderTexture[0].Get() : nullptr;
 	s_vrsFrameArmed = true;
 	s_vrsHookApplied = false;
-	ClearPendingDensityMask();
 
 	static int s_lastBackend = -1;
 	if (useHardwareVrs) {
+		if (!ocu_vrs_guard::WatchContext(context, &VRSShaderStateChanged)) {
+			DisarmSceneVRS();
+			s_vrsPatternReady = false;
+			OOVR_LOG_LIMITEDF(5000, "VRS coverage guard v1: context hooks unavailable; hardware VRS not armed");
+			return;
+		}
 		s_densityMaskHookManager = nullptr;
-		densityMaskManager.EndFrameMasking();
+		densityMaskManager.EndFrame();
+		int renderWidth = s_vrsRenderWidth[0];
+		int renderHeight = s_vrsRenderHeight[0];
+		VRSManager::EyeRegion eyeRegions[2] = { s_vrsEyeRegion[0], s_vrsEyeRegion[1] };
+		ID3D11Texture2D* sceneDepth = nullptr;
+		if (separateEyeSceneDepth) {
+			sceneDepth = separateEyeSceneDepth.Get();
+			renderWidth = static_cast<int>(separateEyeSceneDesc.Width);
+			renderHeight = static_cast<int>(separateEyeSceneDesc.Height);
+			eyeRegions[0] = {0, 0, renderWidth / 2, renderHeight};
+			eyeRegions[1] = {renderWidth / 2, 0, renderWidth / 2, renderHeight};
+		}
+		OCBridgeResourceSnapshot sceneResources;
+		if (!separateEyeSceneDepth && AcquireBridgeResourceSnapshot(sceneResources) && sceneResources.Ready() &&
+		    sceneResources.d3dDevice == device && sceneResources.d3dContext == context &&
+		    sceneResources.depthTexture) {
+			D3D11_TEXTURE2D_DESC depthDesc{};
+			sceneResources.depthTexture->GetDesc(&depthDesc);
+			if (depthDesc.ArraySize == 1 && depthDesc.SampleDesc.Count == 1 &&
+			    depthDesc.Width && depthDesc.Height && (depthDesc.BindFlags & D3D11_BIND_DEPTH_STENCIL)) {
+				sceneDepth = sceneResources.depthTexture;
+				renderWidth = int(depthDesc.Width);
+				renderHeight = int(depthDesc.Height);
+				for (int e = 0; e < 2; ++e)
+					eyeRegions[e] = ocu_vrs_scope::ScaleRegion(s_vrsEyeRegion[e],
+					    s_vrsRenderWidth[0], s_vrsRenderHeight[0], renderWidth, renderHeight);
+			}
+		}
+		s_vrsSceneScope.Arm(context, sceneDepth, s_vrsSceneTarget, renderWidth, renderHeight);
+		if (sceneDepth && !s_vrsAlphaCoverageScope.Arm(context, sceneDepth, &SyncVRSForShaderState)) {
+			DisarmSceneVRS();
+			s_vrsPatternReady = false;
+			OOVR_LOG_LIMITEDF(5000, "VRS cutout-material-guard-v1: draw observer unavailable; hardware VRS not armed");
+			return;
+		}
+		static ID3D11Texture2D* lastLoggedDepth = nullptr;
+		static int lastLoggedWidth = 0, lastLoggedHeight = 0;
+		if (lastLoggedDepth != sceneDepth || lastLoggedWidth != renderWidth || lastLoggedHeight != renderHeight) {
+			OOVR_LOGF("Foveation scene scope v2: source=%s render=%dx%d submitted=%dx%d bridgeGeneration=%llu",
+			    sceneDepth ? "main-depth" : "submitted-color fallback", renderWidth, renderHeight,
+			    s_vrsRenderWidth[0], s_vrsRenderHeight[0], (unsigned long long)sceneResources.generation);
+			lastLoggedDepth = sceneDepth;
+			lastLoggedWidth = renderWidth;
+			lastLoggedHeight = renderHeight;
+		}
 		vrsManager.SetProjectionCenters(s_vrsProjX[0], s_vrsProjY[0],
 		    s_vrsProjX[1], s_vrsProjY[1]);
-		if (!vrsManager.UpdateStereoPattern(s_vrsRenderWidth[0], s_vrsRenderHeight[0],
-		        s_vrsEyeRegion[0], s_vrsEyeRegion[1], profileRadii.inner, profileRadii.mid, profileRates)) {
+		if (!vrsManager.UpdateStereoPattern(renderWidth, renderHeight,
+		        eyeRegions[0], eyeRegions[1], profileRadii.inner, profileRadii.mid, profileRates)) {
 			DisarmSceneVRS();
 			s_vrsPatternReady = false;
 			return;
 		}
 		s_vrsHookManager = &vrsManager;
 		ID3D11RenderTargetView* currentRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-		context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, currentRTVs, nullptr);
-		SyncVRSForRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, currentRTVs);
+		Microsoft::WRL::ComPtr<ID3D11DepthStencilView> currentDepth;
+		context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, currentRTVs, &currentDepth);
+		SyncVRSForRenderTargets(context, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, currentRTVs, currentDepth.Get());
 		for (auto* rtv : currentRTVs) {
 			if (rtv)
 				rtv->Release();
@@ -3504,41 +3619,41 @@ void DX11Compositor::BeginVRSGameFrame()
 			s_lastBackend = 0;
 		}
 	} else if (useDensityMask) {
-		static bool loggedCsDepthBoundary = false;
-		if (!loggedCsDepthBoundary && GetModuleHandleW(L"CommunityShaders.dll")) {
-			loggedCsDepthBoundary = true;
-			OOVR_LOG("DensityMask: Community Shaders detected. Color reconstruction occurs at OpenVR Submit; earlier CS depth consumers have no reconstruction handoff. CS/RDM integration remains unvalidated.");
-		}
-		s_vrsHookManager = nullptr;
-		vrsManager.Disable();
-		if (!s_depthClearHookUsable ||
-		    (!densityMaskManager.IsAvailable() && !densityMaskManager.Initialize(device))) {
-			DisarmSceneVRS();
-			s_vrsPatternReady = false;
-			OOVR_LOG("Foveation: Density Mask requires the D3D11 depth-clear hook; backend unavailable");
-			return;
-		}
-		densityMaskManager.SetProjectionCenters(s_vrsProjX[0], s_vrsProjY[0],
-		    s_vrsProjX[1], s_vrsProjY[1]);
-		const DensityMaskManager::EyeRegion left = {
-			s_vrsEyeRegion[0].left, s_vrsEyeRegion[0].top,
-			s_vrsEyeRegion[0].width, s_vrsEyeRegion[0].height
-		};
-		const DensityMaskManager::EyeRegion right = {
-			s_vrsEyeRegion[1].left, s_vrsEyeRegion[1].top,
-			s_vrsEyeRegion[1].width, s_vrsEyeRegion[1].height
-		};
-		densityMaskManager.SetPatternSettings({
-		    profileRadii.inner,
-		    profileRadii.mid,
-		    oovr_global_configuration.VrsCompatibilityMode(), customEyeRates, profileRates });
-		if (!densityMaskManager.PrepareStereoTarget(nextSceneTarget,
-		        s_vrsRenderWidth[0], s_vrsRenderHeight[0], left, right)) {
-			DisarmSceneVRS();
-			s_vrsPatternReady = false;
-			return;
-		}
-		s_densityMaskHookManager = &densityMaskManager;
+        s_vrsHookManager = nullptr;
+        vrsManager.Disable();
+        OCBridgeResourceSnapshot sceneResources;
+        ID3D11Texture2D* sceneDepth = nullptr;
+        int width = s_vrsRenderWidth[0], height = s_vrsRenderHeight[0];
+        DensityMaskManager::EyeRegion regions[2] = {
+            {s_vrsEyeRegion[0].left, s_vrsEyeRegion[0].top, s_vrsEyeRegion[0].width, s_vrsEyeRegion[0].height},
+            {s_vrsEyeRegion[1].left, s_vrsEyeRegion[1].top, s_vrsEyeRegion[1].width, s_vrsEyeRegion[1].height}
+        };
+        if (separateEyeSceneDepth) {
+            sceneDepth = separateEyeSceneDepth.Get();
+            width = static_cast<int>(separateEyeSceneDesc.Width);
+            height = static_cast<int>(separateEyeSceneDesc.Height);
+            regions[0] = {0, 0, width / 2, height};
+            regions[1] = {width / 2, 0, width / 2, height};
+        }
+        if (!separateEyeSceneDepth && AcquireBridgeResourceSnapshot(sceneResources) && sceneResources.Ready() &&
+            sceneResources.d3dDevice == device && sceneResources.d3dContext == context && sceneResources.depthTexture) {
+            D3D11_TEXTURE2D_DESC d{}; sceneResources.depthTexture->GetDesc(&d);
+            if (d.ArraySize == 1 && d.SampleDesc.Count == 1 && d.Width && d.Height) {
+                sceneDepth = sceneResources.depthTexture; width = int(d.Width); height = int(d.Height);
+                for (auto& region : regions) region = ocu_vrs_scope::ScaleRegion(region,
+                    s_vrsRenderWidth[0], s_vrsRenderHeight[0], width, height);
+            }
+        }
+        const float centers[4] = {s_vrsProjX[0], s_vrsProjY[0], s_vrsProjX[1], s_vrsProjY[1]};
+        if (!densityMaskManager.Arm(context, sceneDepth, s_vrsSceneTarget, width, height, regions[0], regions[1],
+                {profileRadii.inner, profileRadii.mid,
+                    vrsMode == ocu_vrs_gaze::Mode::EyeTracked ? oovr_global_configuration.VrsEyeCompatibilityMode() : oovr_global_configuration.VrsCompatibilityMode(),
+                    customEyeRates, profileRates}, centers)) {
+            DisarmSceneVRS(); s_vrsPatternReady = false;
+            OOVR_LOG_LIMITEDF(5000, "RDM handoff v2: context/geometry/ownership guide unavailable for this frame");
+            return;
+        }
+        s_densityMaskHookManager = &densityMaskManager;
 		if (s_lastBackend != 1) {
 			OOVR_LOG("Foveation backend: cross-vendor Radial Density Mask");
 			s_lastBackend = 1;
@@ -5623,8 +5738,10 @@ void DX11Compositor::InvokeCubemap(const vr::Texture_t* textures)
 void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::VRTextureBounds_t* ptrBounds,
     vr::EVRSubmitFlags submitFlags, XrCompositionLayerProjectionView& layer)
 {
+	// All game-side effects must already be complete before the first Submit.
+	// Prevent later compositor/overlay work from consuming an old active profile.
+	ocu_effect_foveation::Clear();
 	const vr::Texture_t* gameTexture = texture;
-	vr::Texture_t reconstructedTexture = *texture;
 #if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 	// Reset upscaler viewport crop — set by FSR3/DLSS dispatch if it runs this frame
 	s_fsr3ViewportW = 0;
@@ -5634,6 +5751,18 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	// VRS was bound at WaitGetPoses, before Skyrim rendered this frame. Clear it
 	// before OCU's compositor/upscaler passes so coarse shading never touches UI,
 	// motion/depth processing, or the OpenXR submission copy.
+	if (s_vrsFrameArmed && s_vrsHookManager) {
+		const auto shaders = ocu_vrs_guard::Counts();
+		OOVR_LOG_LIMITEDF(5000, "VRS coverage guard v1 terrain-depth-guard-v1 frame: source=%s sceneBindings=%u coarseStateChanges=%u fullRateStateChanges=%u unclassifiedStateChanges=%u terrainDepthStateChanges=%u capturedShaders=(compatible=%llu protected=%llu unknown=%llu terrainDepth=%llu)",
+		    s_vrsSceneScope.UsesDepth() ? "main-depth" : "submitted-color fallback", s_vrsSceneBindings,
+		    s_vrsCoarseBindings, s_vrsProtectedBindings, s_vrsUnclassifiedBindings, s_vrsTerrainDepthBindings,
+		    (unsigned long long)shaders.compatible, (unsigned long long)shaders.protectedShaders,
+		    (unsigned long long)shaders.unclassified, (unsigned long long)shaders.rasterDepthTextureLoad);
+		const auto alpha = s_vrsAlphaCoverageScope.Stats();
+		OOVR_LOG_LIMITEDF(5000, "VRS cutout-material-guard-v1 frame: depthDraws=%u materials=%u protectedDraws=%u stateQueries=%u resets=%u unknownCommandLists=%u untrackedDepthDraws=%u ambiguousDraws=%u",
+		    alpha.depthDraws, alpha.materials, alpha.protectedDraws, alpha.stateQueries, alpha.resets,
+		    alpha.unknownCommandLists, alpha.untrackedDepthDraws, alpha.ambiguousDraws);
+	}
 	DisarmSceneVRS();
 	if (vrsManager.IsAvailable())
 		vrsManager.Disable();
@@ -5644,14 +5773,13 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 	// Set current eye index for FSR radius matching (inner Invoke reads this)
 	s_currentEyeIdx = (eye == XruEyeLeft) ? 0 : 1;
-	if (!isOverlay && densityMaskManager.WasMaskAppliedThisFrame()) {
-		auto* reconstructed = densityMaskManager.ReconstructStereo(
-		    static_cast<ID3D11Texture2D*>(gameTexture->handle), s_currentEyeIdx);
-		if (reconstructed) {
-			reconstructedTexture.handle = reconstructed;
-			texture = &reconstructedTexture;
-		}
-	}
+    const auto rdmStats = densityMaskManager.Stats();
+    if (rdmStats.draws) {
+        OOVR_LOG_LIMITEDF(5000, "RDM handoff v2: draws=%u masked=%u protected=%u batches=%u MRTresolves=%u consumerBoundaries=%u stateQueries=%u guideDraws=%u guideInvalidationDraws=%u guideResets=%u noGuideStates=%u resolve=packed-original-targets depth=original-unmodified",
+            rdmStats.draws, rdmStats.maskedDraws, rdmStats.protectedDraws, rdmStats.batches,
+            rdmStats.resolves, rdmStats.consumerBoundaries, rdmStats.stateQueries,
+            rdmStats.guideDraws, rdmStats.guideInvalidationDraws, rdmStats.guideResets, rdmStats.noGuideStates);
+    }
 
 	// The render-target bridge is only consumed by the temporal upscalers and
 	// space-warp paths.  The ordinary compositor must not pin seven bridge COM
@@ -5823,22 +5951,20 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	// Copy the texture across
 	Invoke(texture, ptrBounds);
 
-	// OCU ASW: pause warping during loading screens and the main menu
-	// (prevents warping stale pre-loading/logo content into a double projection).
-	if (g_aswProvider && s_pBridge) {
-		g_aswProvider->SetPaused(s_pBridge->isLoadingScreen != 0 || s_pBridge->isMainMenu != 0);
-	}
+	// UI color is not a world-depth surface. Suspend DAPA for every gameplay
+	// menu as well as loading/main, including menus that do not pause simulation.
+	if (g_aswProvider)
+		g_aswProvider->SetPaused(OCBridge_DapaMenuPaused());
 
 	// Reset optional per-view extension data before the current frame is assembled.
 	layer.next = nullptr;
 
 	// OCU ASW: cache frame data (color + MV + depth + pose) for warping
-	// Skip caching during main menu / loading screen — MV and depth data are invalid,
-	// and warping menu content causes visual glitches on save load.
+	// A menu pause invalidates the previous pair and forbids caching menu color.
 	if (g_aswProvider && g_aswProvider->IsReady()
 	    && g_aswProvider->IsInjectionWanted() // auto-native: no injection → skip cache copies
 	    && bridgeResourcesReady && bridgeResources.mvTexture
-	    && !s_pBridge->isMainMenu && !s_pBridge->isLoadingScreen
+	    && !g_aswProvider->IsPaused()
 	    && ValidateBridgeTexture(bridgeResources.mvTexture, "ASW-MV")) {
 
 		auto* mvTex = bridgeResources.mvTexture;

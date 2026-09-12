@@ -68,19 +68,38 @@
 ; Radial Density Mask backend (AMD/Intel/NVIDIA). Default: auto
 ;foveatedBackend=auto
 
-; Skyrim shader compatibility. Caps peripheral VRS at half-rate (2x1/1x2)
-; instead of 2x2 to avoid terrain and alpha-tested foliage corruption.
-; Disable only when deliberately selecting a more aggressive performance preset.
+; Fixed-mode compatibility cap. Caps coarse shading at half-rate (2x1/1x2).
+; Existing eye profiles without their own explicit cap inherit this setting.
 ; Default: true
 ;vrsCompatibilityMode=true
 
-; Radius of the full-rate 1x1 area. Outside this radius, Compatibility mode
-; uses half-rate shading. Default: 0.60
-;vrsInnerRadius=0.60
+; Moving-eye Performance profile (fresh-install and full-reset default):
+; Center 0.20 / Middle 0.40, rates 1x1 / 2x2 / 4x2, eye half-rate cap off.
+; Older saved profiles keep their explicit values; missing rate keys in an
+; existing profile retain the former 1x1 / 2x1 / 2x2 fallbacks. To select the
+; complete current Performance in an existing INI, set all seven options below.
+;vrsEyeInnerRadius=0.20
+;vrsEyeMidRadius=0.40
+;vrsEyeCustomRates=true
+;vrsEyeCompatibilityMode=false
+;vrsEyeInnerRate=1x1
+;vrsEyeMidRate=2x2
+;vrsEyeOuterRate=4x2
+; Other eye presets (all use custom rates and eye half-rate cap off):
+; Quality:    0.30 / 0.65, rates 1x1 / 1x2 / 2x2
+; Balanced:   0.22 / 0.45, rates 1x1 / 2x2 / 4x2
+; Aggressive: 0.20 / 0.40, rates 1x1 / 2x2 / 4x4
 
-; In performance mode, radius of the half-rate ring; 2x2 begins outside it.
-; Ignored while vrsCompatibilityMode=true. Default: 0.80
-;vrsMidRadius=0.80
+; Fixed-mode radii are independent of the moving-eye profile.
+; Defaults: 0.70 / 0.85. The compatibility cap above still applies.
+;vrsFixedInnerRadius=0.70
+;vrsFixedMidRadius=0.85
+
+; Legacy vrsInnerRadius / vrsMidRadius values, if explicitly present, supply
+; missing radii for both modes. Use the separate fixed/eye keys for new tuning.
+
+; Overlay gaze/foveation ring diagnostics in game. Default: false
+;foveationDebugRings=false
 
 ; Choose whether half-rate tiles use 2x1 (true) or 1x2 (false).
 ; Default: true
@@ -333,10 +352,15 @@
 ; Default: false
 ;disableTrackPad=false
 
-; Enable VRIK-compatible Knuckles trackpad gesture routing.
-; Only relevant if you use the VRIK mod with Index controllers.
+; Use Index trackpad pressure for VRIK gestures (A-touch), instead of button bindings.
+; VRIK installation alone does not require this. Off allows upper/lower assignments.
 ; Default: false
 ;enableVRIKKnucklesTrackPadSupport=false
+
+; Managed by Configurator custom controller presets: independent Index pad halves.
+; Bits 1/2 = left upper/lower; 4/8 = right upper/lower. Leave at 0 for legacy Menu/A.
+; Do not change manually without the matching controlmapvr.txt assignments.
+;indexTrackpadCustomRegions=0
 
 ; Default text pre-filled in the VR keyboard when it opens.
 ; Default: Adventurer
@@ -345,6 +369,31 @@
 ; Allow unknown OpenVR properties without aborting.
 ; Default: false
 ;admitUnknownProps=false
+
+
+; ----------------------------------------------------------------------------
+;  DAPA — DEFAULT TUNING
+; ----------------------------------------------------------------------------
+; Enabling DAPA uses this baseline without further tuning. These are defaults,
+; not overrides for existing saved values. Runtime motion smoothing/SSW should
+; be off when testing DAPA. Frame timing and short pressure recovery are automatic.
+; DAPA remains opt-in; set true to enable.
+;aswEnabled=false
+;aswWarpStrength=1.00
+;aswRotationScale=1.00
+;aswTranslationScale=0.00
+;aswLocoScale=1.00
+;aswDepthScale=1.00
+;aswNearFadeDepth=0.00
+;aswEdgeFadeWidth=3.00
+; Manual mode: no optional FPS engagement threshold before DAPA can run.
+;aswAutoNative=false
+; Only used when aswAutoNative=true; adjusted for the runtime cadence.
+;aswAutoEngageFps=50
+; Pressure threshold scaled to runtime cadence; 12 ms is the 90 Hz reference.
+;aswEndSpikeMs=12.00
+; No synthetic-frame tint or developer visualizations by default.
+;aswDebugMode=0
 
 
 ; ----------------------------------------------------------------------------

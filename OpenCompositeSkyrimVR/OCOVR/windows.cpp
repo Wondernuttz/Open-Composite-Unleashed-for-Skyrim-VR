@@ -93,6 +93,7 @@ alternativeCoreFactory_t PlatformGetAlternativeCoreFactory()
 		OOVR_ABORT(msg.c_str());
 	}
 
+	OOVR_LOGF("OpenVR client-core routing: loading configured alternative runtime %s", dll.c_str());
 	chainedImplementation = LoadLibraryA(dll.c_str());
 	if (!chainedImplementation) {
 		string msg = "Failed to load SteamVR DLL '" + dll + "' with error:\n" + GetLastErrorAsString();

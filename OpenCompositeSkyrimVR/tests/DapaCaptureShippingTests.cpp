@@ -12,6 +12,12 @@ int main() {
     capture.ToggleSession();
     DapaCaptureControl::toggleRequested.store(true);
     for (int i = 0; i < 10; ++i) capture.Poll();
+	// Production render entry must not dereference D3D inputs or allocate anything.
+	if (capture.BeginEye(0, nullptr, nullptr, nullptr, nullptr, 0, 0, false,
+	    nullptr, nullptr, nullptr) != nullptr) {
+		std::puts("FAIL: production warp activated the diagnostic shader");
+		return 1;
+	}
     if (capture.Recording() || capture.Busy() || capture.ShaderReady()
         || !capture.OutputRoot().empty() || capture.NeedsPump() || capture.NeedsNext()
         || DapaCaptureControl::recording.load() || DapaCaptureControl::telemetryWanted.load()

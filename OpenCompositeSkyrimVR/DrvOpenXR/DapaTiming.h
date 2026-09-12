@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <openxr/openxr.h>
 
 namespace DapaTiming {
@@ -10,6 +11,31 @@ inline double PeriodMs(double reported)
 {
 	return std::isfinite(reported) && reported > 0.0 ? reported : 1000.0 / 90.0;
 }
+// Fastest runtime cadence observed in this session, NOT a panel-refresh query.
+// Missed-frame multiples must not raise the pressure thresholds. New sessions
+// relearn the baseline; faster samples can improve it without resetting recovery.
+struct PeriodBaseline {
+	double fastestMs = 0.0;
+	void Observe(double reported) {
+		if (std::isfinite(reported) && reported > 0.0 && (fastestMs == 0.0 || reported < fastestMs))
+			fastestMs = reported;
+	}
+	double Get() const { return PeriodMs(fastestMs); }
+};
+
+using Clock = std::chrono::steady_clock;
+struct Cooldown {
+	double backoffMs = 0.0;
+	Clock::time_point deadline{};
+	void AdvanceTo(Clock::time_point now) {
+		backoffMs = std::max(0.0, std::chrono::duration<double, std::milli>(deadline - now).count());
+	}
+	void Start(double delayMs, Clock::time_point now) {
+		backoffMs = delayMs;
+		deadline = now + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(delayMs));
+	}
+	void Clear() { backoffMs = 0.0; deadline = {}; }
+};
 inline double StallLimitMs(double period) { return 2.7 * PeriodMs(period); }
 inline double AutoEngageFps(double requested, double period)
 {
@@ -30,13 +56,20 @@ inline double EndPressureLimitMs(double configuredAt90Hz, double period)
 	if (!std::isfinite(configuredAt90Hz) || configuredAt90Hz <= 0.0) return 0.0;
 	return std::max(1.25 * PeriodMs(period), configuredAt90Hz * PeriodMs(period) / (1000.0 / 90.0));
 }
-struct PacingGuard {
-	double backoffMs = 0.0;
-	double cleanMs = 0.0;
+struct PacingGuard : Cooldown {
 	int consecutiveSlow = 0;
-	int level = 0;
-	void Advance(double elapsedMs) { backoffMs = std::max(0.0, backoffMs - std::max(0.0, elapsedMs)); }
-	bool Observe(double waitMs, double endMs, double configuredAt90Hz, double period)
+	bool yieldedRealFrame = false;
+	// Called once per real frame. Even at high FPS, accepted-frame pressure can
+	// skip at most one injection, then retries without a clean-zone re-entry gate.
+	bool HoldRealFrame(Clock::time_point now) {
+		if (yieldedRealFrame) Clear();
+		AdvanceTo(now);
+		if (backoffMs <= 0.0) return false;
+		yieldedRealFrame = true;
+		return true;
+	}
+	bool Observe(double waitMs, double endMs, double configuredAt90Hz, double period,
+	    Clock::time_point now = Clock::now())
 	{
 		period = PeriodMs(period);
 		const double limit = EndPressureLimitMs(configuredAt90Hz, period);
@@ -44,17 +77,11 @@ struct PacingGuard {
 		const bool slow = limit > 0 && endMs > limit;
 		consecutiveSlow = slow ? consecutiveSlow + 1 : 0;
 		if (severe || consecutiveSlow >= 3) {
-			backoffMs = std::min(250.0, period * (2u << level));
-			level = std::min(3, level + 1);
+			Start(std::min(25.0, 2.0 * period), now);
+			yieldedRealFrame = false;
 			consecutiveSlow = 0;
-			cleanMs = 0.0;
 			return true;
 		}
-		if (!slow) {
-			// Credit actual successful attempts, not time spent in a cooldown.
-			cleanMs += 2.0 * period;
-			if (cleanMs >= 500.0) { level = 0; cleanMs = 500.0; }
-		} else cleanMs = 0.0;
 		return false;
 	}
 };
@@ -63,8 +90,7 @@ struct PacingGuard {
 inline bool Accepted(XrResult result) { return result == XR_SUCCESS; }
 
 // Recovery uses wall time, so a falling frame rate cannot lengthen a cooldown.
-struct Recovery {
-	double backoffMs = 0.0;
+struct Recovery : Cooldown {
 	double cleanMs = 0.0;
 	double engagedCleanMs = 0.0;
 	double engageHoldMs = 3000.0;
@@ -72,16 +98,16 @@ struct Recovery {
 	double dwellMs = 0.0;
 	int level = 0;
 	bool forceRelease = false;
-	void Advance(double elapsedMs)
+	void Advance(double elapsedMs, Clock::time_point now = Clock::now())
 	{
-		backoffMs = std::max(0.0, backoffMs - elapsedMs);
+		AdvanceTo(now);
 		dwellMs = std::min(600000.0, dwellMs + elapsedMs);
 	}
-	void Trouble()
+	void Trouble(Clock::time_point now = Clock::now())
 	{
 		constexpr double delays[] = { 180.0, 710.0, 2840.0, 11380.0 };
 		cleanMs = engagedCleanMs = 0.0;
-		backoffMs = delays[level];
+		Start(delays[level], now);
 		level = std::min(3, level + 1);
 		if (level >= 2) forceRelease = true;
 	}

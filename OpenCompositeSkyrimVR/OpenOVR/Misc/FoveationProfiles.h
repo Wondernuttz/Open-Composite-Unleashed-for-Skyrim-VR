@@ -6,13 +6,13 @@
 namespace ocu_foveation {
 struct Radii { float inner; float mid; };
 
-// Conservative starting profiles, not universal perceptual thresholds. Values
+// Starting profiles, not universal perceptual thresholds. Values
 // are normalized eye-texture radii, not degrees. Preserve explicit legacy
 // sizes until a user saves independent profiles in the configurator.
 inline Radii Resolve(bool eyeTracked, float legacyInner, float legacyMid,
     float fixedInner, float fixedMid, float eyeInner, float eyeMid)
 {
-    const Radii defaults = eyeTracked ? Radii{0.50f, 0.70f} : Radii{0.70f, 0.85f};
+    const Radii defaults = eyeTracked ? Radii{0.20f, 0.40f} : Radii{0.70f, 0.85f};
     auto choose = [](float explicitValue, float legacyValue, float fallback, float maximum) {
         const float value = std::isfinite(explicitValue) && explicitValue >= 0.0f ? explicitValue
             : (std::isfinite(legacyValue) && legacyValue >= 0.0f ? legacyValue : fallback);

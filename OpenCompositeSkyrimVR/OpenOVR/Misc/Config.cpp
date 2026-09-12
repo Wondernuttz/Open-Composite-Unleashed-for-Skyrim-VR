@@ -211,6 +211,12 @@ int Config::ini_handler(void* user, const char* pSection,
 	    || section == "mip_bias"
 	    || section == "vrs"
 	    || section == "debug") {
+		if (name == "vrsInnerRadius" || name == "vrsMidRadius" ||
+		    name == "vrsEyeInnerRadius" || name == "vrsEyeMidRadius" ||
+		    name == "vrsCompatibilityMode" || name == "vrsEyeCompatibilityMode" ||
+		    name == "vrsFavorHorizontal" || name == "vrsEyeInnerRate" ||
+		    name == "vrsEyeMidRate" || name == "vrsEyeOuterRate" || name == "vrsEyeCustomRates")
+			cfg->vrsEyeLegacyProfile = true;
 		CFGOPT(bool, renderCustomHands);
 		CFGOPT(bool, useLegacyGreyHands);
 		CFGOPT(HmdColor_t, handColour);
@@ -290,6 +296,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, triggerMax);
 		CFGOPT(float, hapticStrength);
 		CFGOPT(bool, disableTrackPad);
+		CFGOPT(int, indexTrackpadCustomRegions);
 		CFGOPT(bool, enableControllerSmoothing);
 		CFGOPT(bool, enableVRIKKnucklesTrackPadSupport);
 		CFGOPT(bool, swapThumbsticks);
@@ -376,6 +383,7 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, fsr3MipBiasOffset);
 		CFGOPT(bool, vrsEnabled);
 		CFGOPT(bool, vrsEyeTracked);
+		CFGOPT(bool, foveationDebugRings);
 		CFGOPT(string, foveatedBackend);
 		CFGOPT(float, vrsInnerRadius);
 		CFGOPT(float, vrsMidRadius);
@@ -383,11 +391,24 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, vrsFixedMidRadius);
 		CFGOPT(float, vrsEyeInnerRadius);
 		CFGOPT(float, vrsEyeMidRadius);
-		CFGOPT(bool, vrsEyeCustomRates);
+		if (name == "vrsEyeCustomRates") {
+			cfg->vrsEyeCustomRates = parse_bool(value, name, lineno);
+			cfg->vrsEyeCustomRatesExplicit = true;
+			return true;
+		}
 		CFGOPT(string, vrsEyeInnerRate);
 		CFGOPT(string, vrsEyeMidRate);
 		CFGOPT(string, vrsEyeOuterRate);
-		CFGOPT(bool, vrsCompatibilityMode);
+		if (name == "vrsCompatibilityMode") {
+			cfg->vrsCompatibilityMode = parse_bool(value, name, lineno);
+			cfg->vrsCompatibilityExplicit = true;
+			return true;
+		}
+		if (name == "vrsEyeCompatibilityMode") {
+			cfg->vrsEyeCompatibilityMode = parse_bool(value, name, lineno);
+			cfg->vrsEyeCompatibilityExplicit = true;
+			return true;
+		}
 		// Legacy no-op accepted so older INIs do not emit an unknown-key warning.
 		// The configurator removes it the next time settings are saved.
 		CFGOPT(float, vrsOuterRadius);

@@ -1,4 +1,5 @@
 #include "ASWProvider.h"
+#include "DapaCaptureControl.h"
 
 #include "../OpenOVR/Misc/xr_ext.h"
 #include "../OpenOVR/Misc/Config.h"
@@ -15,6 +16,25 @@
 
 // Global instance — accessed from XrBackend for frame injection
 ASWProvider* g_aswProvider = nullptr;
+
+DapaGpuTiming::Scope ASWProvider::MeasureGpu(ID3D11DeviceContext* ctx, DapaGpuTiming::Stage stage)
+{
+	const bool enabled = oovr_global_configuration.DebugLogging();
+	if (enabled) {
+		m_gpuTiming.Poll(ctx, [this](const DapaGpuTiming::Result& result) {
+			if (result.valid)
+				OOVR_LOGF("DAPA GPU SAMPLE v1: stage=%s gpuElapsed=%.3fms resultObservedAfter=%llums eye=%ux%u depth=%ux%u (sparse GPU timestamps; observation delay includes polling, not compositor/GPU queue latency)",
+				    DapaGpuTiming::Name(result.stage), result.gpuMs, (unsigned long long)result.readyObservedAfterMs,
+				    m_eyeWidth, m_eyeHeight, m_depthWidth, m_depthHeight);
+			else
+				OOVR_LOGF("DAPA GPU SAMPLE v1: stage=%s unavailable/disjoint status=0x%08X; no GPU duration inferred",
+				    DapaGpuTiming::Name(result.stage), (unsigned int)result.status);
+		});
+		if (m_gpuTiming.Unavailable())
+			OOVR_LOG_LIMITEDF(60000, "DAPA GPU SAMPLE v1: timestamp queries unsupported; CPU call times remain separate");
+	}
+	return m_gpuTiming.Measure(ctx, stage, enabled);
+}
 
 // ============================================================================
 // Embedded HLSL compute shader for frame warping
@@ -432,9 +452,15 @@ XrRect2Di ASWProvider::GetOutputRect(int eye) const
 
 bool ASWProvider::CreateDepthSwapchain(uint32_t width, uint32_t height)
 {
+	m_depthTransfer.Reset();
+	uint32_t formatCount = 0;
+	XrResult res = xrEnumerateSwapchainFormats(xr_session.get(), 0, &formatCount, nullptr);
+	if (res != XR_SUCCESS || !formatCount) return false;
+	std::vector<int64_t> formats(formatCount);
+	res = xrEnumerateSwapchainFormats(xr_session.get(), formatCount, &formatCount, formats.data());
+	if (res != XR_SUCCESS) return false;
+	formats.resize(formatCount);
 	XrSwapchainCreateInfo ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
-	ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-	ci.format = DXGI_FORMAT_R32_FLOAT;
 	ci.sampleCount = 1;
 	ci.width = width;
 	ci.height = height;
@@ -442,30 +468,45 @@ bool ASWProvider::CreateDepthSwapchain(uint32_t width, uint32_t height)
 	ci.arraySize = 1;
 	ci.mipCount = 1;
 
-	XrResult res = xrCreateSwapchain(xr_session.get(), &ci, &m_depthSwapchain);
-	if (XR_FAILED(res)) {
-		OOVR_LOGF("ASW: xrCreateSwapchain (depth) failed (%ux%u) result=%d", width, height, (int)res);
+	// Standard depth first; retain R32_FLOAT compatibility where advertised.
+	for (auto format : { DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT }) {
+		if (std::find(formats.begin(), formats.end(), int64_t(format)) == formats.end()) continue;
+		ci.format = format;
+		ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+		if (format == DXGI_FORMAT_D32_FLOAT) ci.usageFlags |= XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+		res = xrCreateSwapchain(xr_session.get(), &ci, &m_depthSwapchain);
+		if (res == XR_SUCCESS) break;
+		m_depthSwapchain = XR_NULL_HANDLE;
+		OOVR_LOGF("ASW: depth format=%d rejected result=%d; trying next advertised format", int(format), int(res));
+	}
+	if (m_depthSwapchain == XR_NULL_HANDLE) {
+		OOVR_LOG("ASW: no supported D32_FLOAT/R32_FLOAT depth swapchain; continuing with PC-side depth");
 		return false;
 	}
+	auto discard = [&]() {
+		xrDestroySwapchain(m_depthSwapchain);
+		m_depthSwapchain = XR_NULL_HANDLE;
+		m_depthSwapchainImages.clear();
+		return false;
+	};
 
 	uint32_t imageCount = 0;
-	OOVR_FAILED_XR_SOFT_ABORT(xrEnumerateSwapchainImages(m_depthSwapchain, 0, &imageCount, nullptr));
-	if (imageCount == 0) {
+	res = xrEnumerateSwapchainImages(m_depthSwapchain, 0, &imageCount, nullptr);
+	if (res != XR_SUCCESS || imageCount == 0) {
 		OOVR_LOG("ASW: Depth swapchain has 0 images");
-		xrDestroySwapchain(m_depthSwapchain);
-		m_depthSwapchain = {};
-		return false;
+		return discard();
 	}
 
 	std::vector<XrSwapchainImageD3D11KHR> images(imageCount, { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR });
-	OOVR_FAILED_XR_SOFT_ABORT(xrEnumerateSwapchainImages(m_depthSwapchain,
-	    imageCount, &imageCount, (XrSwapchainImageBaseHeader*)images.data()));
+	res = xrEnumerateSwapchainImages(m_depthSwapchain,
+	    imageCount, &imageCount, (XrSwapchainImageBaseHeader*)images.data());
+	if (res != XR_SUCCESS || !imageCount || imageCount > images.size()) return discard();
 
 	m_depthSwapchainImages.resize(imageCount);
 	for (uint32_t i = 0; i < imageCount; i++)
 		m_depthSwapchainImages[i] = images[i].texture;
 
-	OOVR_LOGF("ASW: Depth swapchain created %ux%u (%u images)", width, height, imageCount);
+	OOVR_LOGF("ASW: Depth transfer v2: swapchain %ux%u format=%lld (%u images), whole-atlas copy", width, height, (long long)ci.format, imageCount);
 	return true;
 }
 
@@ -501,7 +542,7 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		return false;
 	};
 
-	if (!m_ready || eye < 0 || eye > 1)
+	if (!m_ready || m_paused || eye < 0 || eye > 1)
 		return failGeneration();
 
 	// A left-eye submit begins a new generation. The provider has a single
@@ -562,6 +603,7 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	m_depthLayerValid = (m_depthWidth == m_eyeWidth && m_depthHeight == m_eyeHeight);
 
 	// Copy color (game eye texture → cached)
+	auto gpuSample = MeasureGpu(ctx, eye == 0 ? DapaGpuTiming::Stage::CacheLeft : DapaGpuTiming::Stage::CacheRight);
 	if (colorTex && colorRegion) {
 		if (!SafeBridgeCopy(ctx, m_cachedColor[eye], 0, 0, 0, 0,
 		    colorTex, 0, colorRegion)) {
@@ -630,6 +672,7 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 void ASWProvider::SampleLocomotion(XrTime time, DapaMotion::Vec3 position)
 {
 	m_motion.Sample(time, position);
+	if constexpr (!DapaCaptureControl::Enabled) return;
 	// Independent raw actor displacement: no predictor filtering/confidence/clamp.
 	m_captureMovement.SamplePosition(time,DapaCaptureTelemetry::NowNs(),position);
 	m_captureMovement.latest.predictorVelocity=m_motion.velocity;
@@ -654,6 +697,7 @@ void ASWProvider::SampleLocomotion(XrTime time, DapaMotion::Vec3 position)
 
 void ASWProvider::CaptureTick()
 {
+	if constexpr (!DapaCaptureControl::Enabled) return;
 	m_capture.Poll();
 	if (m_device && m_capture.NeedsPump()) {
 		ID3D11DeviceContext* ctx = nullptr;
@@ -674,7 +718,7 @@ void ASWProvider::SetMotionGeometry(int eye, const float* view, const float* vp)
 bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
     const XrPosef& newPose)
 {
-	if (!m_ready || !m_hasCachedFrame || eye < 0 || eye > 1) return false;
+	if (!m_ready || m_paused || !m_hasCachedFrame || eye < 0 || eye > 1) return false;
 
 	// Build pose delta matrix
 	WarpConstants cb = {};
@@ -790,7 +834,10 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 
 	uint32_t groupsX = (m_eyeWidth + 7) / 8;
 	uint32_t groupsY = (m_eyeHeight + 7) / 8;
-	ctx->Dispatch(groupsX, groupsY, 1);
+	{
+		auto gpuSample = MeasureGpu(ctx, eye == 0 ? DapaGpuTiming::Stage::WarpLeft : DapaGpuTiming::Stage::WarpRight);
+		ctx->Dispatch(groupsX, groupsY, 1);
+	}
 
 	// Unbind to avoid hazards
 	ID3D11ShaderResourceView* nullSRVs[3] = {};
@@ -806,7 +853,7 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx, double displayPeriodMs)
 {
 	m_depthSubmittedThisFrame = false;
-	if (!m_ready || !m_hasCachedFrame) return false;
+	if (!m_ready || m_paused || !m_hasCachedFrame) return false;
 
 	const auto deadline = std::chrono::steady_clock::now() +
 	    std::chrono::nanoseconds(DapaTiming::ImageWaitBudget(displayPeriodMs));
@@ -835,10 +882,13 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx, double displayPer
 	}
 	ID3D11Texture2D* target = m_outputSwapchainImages[idx];
 	// Copy warped output (translation-corrected) into stereo-combined swapchain
-	ctx->CopySubresourceRegion(target, 0,
-	    0, 0, 0, m_warpedOutput[0], 0, nullptr); // left eye at x=0
-	ctx->CopySubresourceRegion(target, 0,
-	    m_eyeWidth, 0, 0, m_warpedOutput[1], 0, nullptr); // right eye at x=eyeWidth
+	{
+		auto gpuSample = MeasureGpu(ctx, DapaGpuTiming::Stage::Output);
+		ctx->CopySubresourceRegion(target, 0,
+		    0, 0, 0, m_warpedOutput[0], 0, nullptr); // left eye at x=0
+		ctx->CopySubresourceRegion(target, 0,
+		    m_eyeWidth, 0, 0, m_warpedOutput[1], 0, nullptr); // right eye at x=eyeWidth
+	}
 
 	// Release only after a successful wait and queued copies; no forced GPU drain.
 	if (m_outputLease.Release(m_outputSwapchain, xrReleaseSwapchainImage) != XR_SUCCESS) {
@@ -856,20 +906,16 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx, double displayPer
 		    xrAcquireSwapchainImage, xrWaitSwapchainImage);
 		if (depthRes == XR_SUCCESS) {
 			const uint32_t depthIdx = m_depthLease.index;
+			bool copied = false;
 			if (depthIdx < m_depthSwapchainImages.size()) {
 				ID3D11Texture2D* depthTarget = m_depthSwapchainImages[depthIdx];
-				D3D11_BOX depthBox = {};
-				depthBox.right = m_eyeWidth;
-				depthBox.bottom = m_eyeHeight;
-				depthBox.front = 0;
-				depthBox.back = 1;
-				ctx->CopySubresourceRegion(depthTarget, 0,
-				    0, 0, 0, m_cachedDepth[0], 0, &depthBox);
-				ctx->CopySubresourceRegion(depthTarget, 0,
-				    m_eyeWidth, 0, 0, m_cachedDepth[1], 0, &depthBox);
+				auto gpuSample = MeasureGpu(ctx, DapaGpuTiming::Stage::DepthOutput);
+				copied = m_depthTransfer.Copy(ctx, depthTarget, m_cachedDepth[0], m_cachedDepth[1]);
 			}
 			depthRes = m_depthLease.Release(m_depthSwapchain, xrReleaseSwapchainImage);
-			m_depthSubmittedThisFrame = depthRes == XR_SUCCESS && depthIdx < m_depthSwapchainImages.size();
+			m_depthSubmittedThisFrame = depthRes == XR_SUCCESS && copied;
+			if (!copied)
+				OOVR_LOG_LIMITEDF(5000, "ASW: depth atlas transfer unavailable; submitting colour without runtime depth");
 		}
 		if (depthRes != XR_SUCCESS && depthRes != XR_TIMEOUT_EXPIRED) {
 			m_depthLease.failure = depthRes;
@@ -890,6 +936,8 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx, double displayPer
 
 void ASWProvider::Shutdown()
 {
+	m_gpuTiming.Reset();
+	m_depthTransfer.Reset();
 	m_outputLease = {};
 	m_depthLease = {};
 	m_depthSubmittedThisFrame = false;

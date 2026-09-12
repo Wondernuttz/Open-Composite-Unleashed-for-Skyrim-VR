@@ -88,6 +88,7 @@ public:
 	inline float TriggerMax() const { return triggerMax; }
 	float HapticStrength() { return hapticStrength; }
 	inline bool DisableTrackPad() { return disableTrackPad; }
+	inline unsigned IndexTrackpadCustomRegions() const { return indexTrackpadCustomRegions >= 0 && indexTrackpadCustomRegions <= 15 ? static_cast<unsigned>(indexTrackpadCustomRegions) : 0u; }
 	inline bool EnableControllerSmoothing() { return enableControllerSmoothing; }
 	inline bool EnableVRIKKnucklesTrackPadSupport() { return enableVRIKKnucklesTrackPadSupport; }
 	std::string KeyboardText() { return keyboardText; }
@@ -235,6 +236,7 @@ public:
 	inline bool VrsEnabled() const { return vrsEnabled; }
 	inline bool VrsFixedEnabled() const { return vrsEnabled; }
 	inline bool VrsEyeTracked() const { return vrsEyeTracked; }
+	inline bool FoveationDebugRings() const { return foveationDebugRings; }
 	inline bool VrsAnyEnabled() const { return vrsEnabled || vrsEyeTracked; }
 	inline const std::string& FoveatedBackend() const { return foveatedBackend; }
 	inline ocu_foveation::Radii FoveationRadii(bool eyeTracked) const {
@@ -242,19 +244,30 @@ public:
 		    vrsFixedInnerRadius, vrsFixedMidRadius, vrsEyeInnerRadius, vrsEyeMidRadius);
 	}
 	inline bool VrsCompatibilityMode() const { return vrsCompatibilityMode; }
-	inline bool VrsEyeCustomRates() const { return vrsEyeCustomRates; }
+	inline bool VrsEyeCompatibilityMode() const {
+		return vrsEyeCompatibilityExplicit ? vrsEyeCompatibilityMode :
+		    (vrsCompatibilityExplicit || vrsEyeLegacyProfile ? vrsCompatibilityMode : vrsEyeCompatibilityMode);
+	}
+	inline bool VrsEyeCustomRates() const {
+		return vrsEyeCustomRatesExplicit || !vrsEyeLegacyProfile ? vrsEyeCustomRates : false;
+	}
 	inline ocu_foveation::RingRates FoveationRates(bool eyeTracked) const {
-		return ocu_foveation::ResolveRates(eyeTracked, vrsEyeCustomRates, vrsCompatibilityMode, vrsFavorHorizontal,
-		    {ocu_foveation::ParseRate(vrsEyeInnerRate), ocu_foveation::ParseRate(vrsEyeMidRate),
-		        ocu_foveation::ParseRate(vrsEyeOuterRate)});
+		// New profiles use the Performance preset. A partial older profile must
+		// keep the former values for any ring rates it did not specify.
+		const auto requested = vrsEyeLegacyProfile ?
+		    ocu_foveation::RingRates{ocu_foveation::ParseRate(vrsEyeInnerRate),
+		        ocu_foveation::ParseRate(vrsEyeMidRate), ocu_foveation::ParseRate(vrsEyeOuterRate)} :
+		    ocu_foveation::RingRates{ocu_foveation::Rate::X1x1, ocu_foveation::Rate::X2x2, ocu_foveation::Rate::X4x2};
+		return ocu_foveation::ResolveRates(eyeTracked, VrsEyeCustomRates(), eyeTracked ? VrsEyeCompatibilityMode() : vrsCompatibilityMode, vrsFavorHorizontal,
+		    requested);
 	}
 	inline bool VrsFavorHorizontal() const { return vrsFavorHorizontal; }
 
 	// ASW tuning variables — public for hot-reload from ini file watcher
 	float aswWarpStrength = 1.0f;  // 0.0 = no warp (static copy), 1.0 = full correction
-	float aswRotationScale = 0.0f; // 0.0 = no rotation correction, 1.0 = full
-	float aswTranslationScale = 1.0f; // 0.0 = no translation correction, 1.0 = full
-	float aswLocoScale = 1.0f;     // locomotion correction scale (0=off, 1=full). Multiplied by timingRatio (~0.5).
+	float aswRotationScale = 1.0f; // stick-turn correction: 0.0 = off, 1.0 = full
+	float aswTranslationScale = 0.0f; // optional HMD translation; default baseline uses actor locomotion only
+	float aswLocoScale = 1.0f;     // actor locomotion prediction to the synthetic display time (0=off, 1=full)
 	float aswDepthScale = 1.0f;    // multiplier on linearized depth (parallax intensity)
 	float aswEdgeFadeWidth = 3.0f;   // depth-edge fade threshold (depth ratio units)
 	float aswNearFadeDepth = 0.0f;   // parallax fades to 0 below this depth (meters); 0 = disabled
@@ -370,6 +383,7 @@ private:
 	float triggerMax = 1.0f;        // raw trigger value at which output = 1.0 (for worn controllers)
 	float hapticStrength = 0.1f;
 	bool disableTrackPad = false;
+	int indexTrackpadCustomRegions = 0;
 	bool enableControllerSmoothing = false;
 	bool enableVRIKKnucklesTrackPadSupport = false;
 	bool swapThumbsticks = false; // Swap stick values and Axis0 touch; keep press/click physical
@@ -450,18 +464,25 @@ private:
 	// Cross-vendor foveated rendering
 	bool vrsEnabled = false;   // explicit fixed-center mode (legacy key name)
 	bool vrsEyeTracked = true; // Auto gaze only; no implicit fixed fallback
-	std::string foveatedBackend = "auto"; // auto, vrs (NVIDIA), or rdm (cross-vendor)
+	bool foveationDebugRings = false;
+	std::string foveatedBackend = "auto"; // auto, vrs (NVIDIA), rdm, or effects (renderer integration only)
 	float vrsInnerRadius = -1.0f; // legacy explicit values migrate to both profiles
 	float vrsMidRadius = -1.0f;
 	float vrsFixedInnerRadius = -1.0f;
 	float vrsFixedMidRadius = -1.0f;
 	float vrsEyeInnerRadius = -1.0f;
 	float vrsEyeMidRadius = -1.0f;
-	bool vrsEyeCustomRates = false;
+	bool vrsEyeCustomRates = true;
+	bool vrsEyeCustomRatesExplicit = false;
+	bool vrsEyeLegacyProfile = false; // tuned older profiles retain their original RDM sampling arrangement
+	bool vrsEyeCompatibilityMode = false;
+	bool vrsEyeCompatibilityExplicit = false;
+	// Legacy missing-key fallbacks; untouched profiles resolve Performance above.
 	std::string vrsEyeInnerRate = "1x1";
 	std::string vrsEyeMidRate = "2x1";
 	std::string vrsEyeOuterRate = "2x2";
 	bool vrsCompatibilityMode = true; // cap coarse shading at 2x1/1x2 for Skyrim shader safety
+	bool vrsCompatibilityExplicit = false; // explicit legacy cap still applies to an unspecified eye cap
 	float vrsOuterRadius = 1.00f; // legacy no-op; retained only to parse older INIs quietly
 	bool vrsFavorHorizontal = true;
 

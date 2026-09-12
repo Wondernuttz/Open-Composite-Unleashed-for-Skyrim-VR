@@ -1,0 +1,179 @@
+#include <windows.h>
+#include <openxr/openxr.h>
+#include "generated/interfaces/vrtypes.h"
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace DapaTiming { using Clock=std::chrono::steady_clock; }
+
+#define OOVR_FAILED_XR_ABORT(expr) do { if ((expr) != XR_SUCCESS) throw std::runtime_error(#expr); } while (0)
+#define OOVR_FAILED_XR_SOFT_ABORT(expr) OOVR_FAILED_XR_ABORT(expr)
+#define OOVR_FALSE_ABORT(expr) do { if (!(expr)) throw std::runtime_error(#expr); } while (0)
+#define OOVR_LOGF(...) do {} while (0)
+
+enum XruEye { Left=0, Right=1 };
+constexpr int XruEyeCount=2;
+const XrSession temporarySession=reinterpret_cast<XrSession>(1);
+const XrSession applicationSession=reinterpret_cast<XrSession>(2);
+struct Session {
+    XrSession value=temporarySession;
+    XrSession get() const { return value; }
+    struct Lock {};
+    Lock lock_shared() { return {}; }
+} xr_session;
+struct Globals {
+    XrTime nextPredictedFrameTime=0;
+    std::atomic<XrDuration> nextPredictedFramePeriod{0};
+    bool viewsLatched=false, viewSpaceViewsLatched=false;
+} globalState;
+Globals* xr_gbl=&globalState;
+struct Calls { unsigned waits=0, begins=0, ends=0, projections=0; } temporaryCalls, applicationCalls;
+std::vector<std::string> order;
+std::array<void*,2> storedTextures{};
+std::array<XrSession,2> storedSessions{};
+bool runtimeShouldRender=false;
+unsigned checks=0;
+void Check(bool ok, const char* reason) {
+    ++checks;
+    if (!ok) throw std::runtime_error(reason);
+}
+Calls& SessionCalls(XrSession session) {
+    Check(session==temporarySession || session==applicationSession,"runtime called with a valid session");
+    return session==temporarySession ? temporaryCalls : applicationCalls;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrWaitFrame(XrSession session, const XrFrameWaitInfo*, XrFrameState* state) {
+    auto& calls=SessionCalls(session);
+    Check(calls.waits==calls.begins,"no second wait before the first begin");
+    ++calls.waits;
+    order.push_back(session==temporarySession ? "temp-wait" : "app-wait");
+    state->predictedDisplayTime=1000+calls.waits*11111111;
+    state->predictedDisplayPeriod=11111111;
+    state->shouldRender=runtimeShouldRender ? XR_TRUE : XR_FALSE;
+    return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrBeginFrame(XrSession session, const XrFrameBeginInfo*) {
+    auto& calls=SessionCalls(session);
+    Check(calls.waits==calls.begins+1,"exactly one wait precedes each begin");
+    Check(calls.begins==calls.ends,"no double begin on one application frame");
+    ++calls.begins;
+    order.push_back(session==temporarySession ? "temp-begin" : "app-begin");
+    return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrEndFrame(XrSession session, const XrFrameEndInfo* info) {
+    auto& calls=SessionCalls(session);
+    Check(calls.begins==calls.ends+1,"end matches one begun frame");
+    ++calls.ends;
+    order.push_back("app-end");
+    Check(info->layerCount==1,"first application frame contains its stereo projection");
+    const auto* projection=reinterpret_cast<const XrCompositionLayerProjection*>(info->layers[0]);
+    Check(projection->type==XR_TYPE_COMPOSITION_LAYER_PROJECTION && projection->viewCount==2,"production submits two projection views");
+    for (int eye=0;eye<2;++eye) {
+        Check(projection->views[eye].subImage.swapchain!=XR_NULL_HANDLE,"both eye swapchains reach first end frame");
+        Check(storedSessions[eye]==session,"both images belong to the replacement session");
+    }
+    ++calls.projections;
+    return XR_SUCCESS;
+}
+struct BaseSystem {
+    XrReferenceSpaceType currentSpace=XR_REFERENCE_SPACE_TYPE_STAGE;
+    void _OnPostFrame() {}
+} systemState;
+BaseSystem* GetUnsafeBaseSystem() { return &systemState; }
+XrSpace xr_space_from_ref_space_type(XrReferenceSpaceType) { return reinterpret_cast<XrSpace>(1); }
+struct BaseOverlay {
+    XrCompositionLayerBaseHeader* scene=nullptr;
+    int _BuildLayers(XrCompositionLayerBaseHeader* value, XrCompositionLayerBaseHeader const* const*& headers) {
+        scene=value; headers=&scene; return value ? 1 : 0;
+    }
+} overlay;
+BaseOverlay* GetUnsafeBaseOverlay() { return &overlay; }
+std::shared_ptr<BaseOverlay> GetCreateBaseOverlay() { return {}; }
+struct AswProvider { void CaptureTick() {} };
+AswProvider* g_aswProvider=nullptr;
+struct Compositor {
+    void Invoke(XruEye eye, const vr::Texture_t* texture, const vr::VRTextureBounds_t*, vr::EVRSubmitFlags, XrCompositionLayerProjectionView& view) {
+        Check(xr_session.get()==applicationSession,"copy uses application session");
+        Check(applicationCalls.begins==applicationCalls.ends+1,"copy occurs after application begin and before end");
+        Check(xr_gbl->viewsLatched,"application views are latched before copy");
+        order.push_back(eye==Left ? "copy-left" : "copy-right");
+        storedTextures[eye]=texture->handle;
+        storedSessions[eye]=xr_session.get();
+        view.subImage.swapchain=reinterpret_cast<XrSwapchain>(static_cast<uintptr_t>(100+eye));
+    }
+};
+class XrBackend {
+public:
+    bool sessionActive=true, usingApplicationGraphicsAPI=false, renderingFrame=false;
+    bool deferredRenderingStart=false, submittedEyeTextures=false, postPresentStatus=false;
+    bool realFrameShouldRender=false, qpcInitialized=false;
+    std::unique_ptr<Compositor> compositors[2];
+    XrCompositionLayerProjectionView projectionViews[2]{};
+    LARGE_INTEGER qpcFrequency{},waitFrameStart{},waitFrameEnd{},beginFrameQpc{},cpuFrameStart{},cpuFrameEnd{},endFrameStart{},endFrameEnd{},lastFrameSubmitQpc{};
+    float measuredWaitFrameMs=0, measuredCpuFrameMs=0, measuredEndFrameMs=0, measuredFrameIntervalMs=0, predictedDisplayPeriodMs=0, compositorOverheadMs=0;
+    struct Baseline { void Observe(float) {} } dapaPeriodBaseline;
+    double frameSubmitTimeUs=0;
+    uint32_t nFrameIndex=0;
+    void PumpEvents() {}
+    void LatchViewsForDisplayTime(XrTime) { xr_gbl->viewsLatched=true; order.push_back("latch"); }
+    void CheckOrInitCompositors(const vr::Texture_t*) {
+        if (!usingApplicationGraphicsAPI) {
+            usingApplicationGraphicsAPI=true;
+            xr_session.value=applicationSession;
+            renderingFrame=false; // OnSessionCreated resets the old frame's state.
+            realFrameShouldRender=false;
+            xr_gbl->viewsLatched=false;
+            order.push_back("replace");
+        }
+        for (auto& compositor:compositors) if (!compositor) compositor=std::make_unique<Compositor>();
+    }
+    void WaitForTrackingData();
+    void StoreEyeTexture(vr::EVREye,const vr::Texture_t*,const vr::VRTextureBounds_t*,vr::EVRSubmitFlags,bool);
+    void SubmitFrames(bool,bool);
+};
+/*WAIT*/
+/*STORE*/
+/*SUBMIT*/
+
+int main() try {
+    for (bool rightFirst:{false,true}) for (bool shouldRender:{false,true}) {
+        xr_session.value=temporarySession;
+        temporaryCalls={}; applicationCalls={}; order.clear(); storedTextures={}; storedSessions={};
+        xr_gbl->viewsLatched=false;
+        runtimeShouldRender=shouldRender;
+        XrBackend backend;
+        vr::Texture_t textures[2]{};
+        textures[0].handle=reinterpret_cast<void*>(11);
+        textures[1].handle=reinterpret_cast<void*>(22);
+        const int first=rightFirst ? 1 : 0, second=1-first;
+        backend.WaitForTrackingData();
+        Check(temporaryCalls.waits==1 && temporaryCalls.begins==1,"temporary wait/begin establishes the deferred frame");
+        backend.StoreEyeTexture(static_cast<vr::EVREye>(first),&textures[first],nullptr,vr::Submit_Default,true);
+        Check(storedTextures[first]==textures[first].handle,"first submitted eye survives the session replacement");
+        Check(applicationCalls.waits==1 && applicationCalls.begins==1,"replacement begins exactly once before first copy");
+        Check(backend.realFrameShouldRender==shouldRender,"render permission remains the real runtime result");
+        backend.StoreEyeTexture(static_cast<vr::EVREye>(second),&textures[second],nullptr,vr::Submit_Default,false);
+        Check(storedTextures[second]==textures[second].handle,"second submitted eye is copied");
+        Check(applicationCalls.waits==1 && applicationCalls.begins==1,"second eye does not repeat wait/begin");
+        backend.SubmitFrames(false,false);
+        Check(applicationCalls.projections==1,"first frame ends with one complete projection");
+        Check(!backend.deferredRenderingStart,"replacement consumes the deferred frame once");
+        backend.WaitForTrackingData();
+        backend.StoreEyeTexture(static_cast<vr::EVREye>(first),&textures[first],nullptr,vr::Submit_Default,true);
+        backend.StoreEyeTexture(static_cast<vr::EVREye>(second),&textures[second],nullptr,vr::Submit_Default,false);
+        backend.SubmitFrames(false,false);
+        Check(applicationCalls.waits==2 && applicationCalls.begins==2 && applicationCalls.ends==2,"ordinary following frame keeps one wait/begin/end");
+    }
+    std::cout<<"PASS: "<<checks<<" checks; production startup wait/store/submit preserves both first-frame eyes, both eye orders, runtime render permission and one begin per frame\n";
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr<<"FAIL: "<<error.what()<<"\n";
+    return 1;
+}

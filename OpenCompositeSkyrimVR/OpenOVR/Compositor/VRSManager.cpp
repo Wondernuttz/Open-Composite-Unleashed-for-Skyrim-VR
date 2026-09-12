@@ -54,13 +54,15 @@ bool VRSManager::Initialize(ID3D11Device* dev)
 
 	OOVR_LOG("VRSManager: Initializing NVAPI...");
 
-	if (!nvapiLoaded) {
-		NvAPI_Status result = NvAPI_Initialize();
+	{
+		// NVAPI wraps game-owned D3D objects which outlive individual compositors.
+		// Keep one process-lifetime initialization; unloading it mid-device can
+		// leave those objects calling into an unloaded driver wrapper at Release.
+		static const NvAPI_Status result = NvAPI_Initialize();
 		if (result != NVAPI_OK) {
 			OOVR_LOG("VRSManager: NvAPI_Initialize failed — not an NVIDIA GPU or driver issue");
 			return false;
 		}
-		nvapiLoaded = true;
 	}
 
 	// Check if this GPU supports Variable Pixel Rate Shading
@@ -85,8 +87,8 @@ void VRSManager::SetProjectionCenters(float leftPX, float leftPY, float rightPX,
 	const float nextX[2] = { leftPX, rightPX };
 	const float nextY[2] = { leftPY, rightPY };
 	for (int eye = 0; eye < 2; ++eye) {
-		if (std::fabs(projX[eye] - nextX[eye]) > 0.0001f ||
-		    std::fabs(projY[eye] - nextY[eye]) > 0.0001f)
+		if (std::fabs(uploadedProjX[eye] - nextX[eye]) > 0.0001f ||
+		    std::fabs(uploadedProjY[eye] - nextY[eye]) > 0.0001f)
 			patternDirty = true;
 		projX[eye] = nextX[eye];
 		projY[eye] = nextY[eye];
@@ -156,8 +158,13 @@ bool VRSManager::UpdateStereoPattern(int nextRenderWidth, int nextRenderHeight,
 	renderHeight = nextRenderHeight;
 	eyeRegions[0] = leftEye;
 	eyeRegions[1] = rightEye;
-	if (geometryChanged)
+	if (geometryChanged) {
 		patternDirty = true;
+		activeViewportValid = true;
+		for (int eye = 0; eye < 2; ++eye)
+			activeEyeRegions[eye] = {float(eyeRegions[eye].left), float(eyeRegions[eye].top),
+			    float(eyeRegions[eye].width), float(eyeRegions[eye].height)};
+	}
 
 	if (sizeChanged || !vrsTex || !vrsView)
 		SetupStereoPattern();
@@ -165,6 +172,31 @@ bool VRSManager::UpdateStereoPattern(int nextRenderWidth, int nextRenderHeight,
 		UploadStereoPattern();
 
 	return available && vrsTex != nullptr && vrsView != nullptr && !patternDirty;
+}
+
+bool VRSManager::UpdateActiveViewports(UINT count, const D3D11_VIEWPORT* viewports)
+{
+	if (!available || !vrsTex || !vrsView) return false;
+	ocu_vrs_scope::ViewportEyeRegion next[2];
+	activeViewportValid = ocu_vrs_scope::MapStereoViewports(renderWidth, renderHeight,
+	    eyeRegions, count, viewports, next);
+	if (!activeViewportValid) {
+		const D3D11_VIEWPORT first = count && viewports ? viewports[0] : D3D11_VIEWPORT{};
+		OOVR_LOG_LIMITEDF(5000,
+		    "VRS active viewport mapping: full rate for unrecognized/ambiguous layout; atlas=%dx%d count=%u first=(%.2f,%.2f %.2fx%.2f)",
+		    renderWidth, renderHeight, count, first.TopLeftX, first.TopLeftY, first.Width, first.Height);
+		Disable();
+		return false;
+	}
+	for (int eye = 0; eye < 2; ++eye) {
+		const auto& old = activeEyeRegions[eye];
+		if (old.left != next[eye].left || old.top != next[eye].top ||
+		    old.width != next[eye].width || old.height != next[eye].height)
+			patternDirty = true;
+		activeEyeRegions[eye] = next[eye];
+	}
+	if (patternDirty) UploadStereoPattern();
+	return !patternDirty;
 }
 
 std::vector<uint8_t> VRSManager::CreateStereoPattern() const
@@ -185,12 +217,18 @@ std::vector<uint8_t> VRSManager::CreateStereoPattern() const
 			    NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT * 0.5f;
 
 			for (int eye = 0; eye < 2; ++eye) {
-				const EyeRegion& region = eyeRegions[eye];
+				const auto& region = activeEyeRegions[eye];
 				float fx = 0.0f;
 				float fy = 0.0f;
-				if (!ocu_vrs_pattern::NormalizeInEyeRegion(pixelX, pixelY,
-				        region.left, region.top, region.width, region.height, fx, fy))
+				// One hardware tile cannot serve different eyes or an eye and
+				// atlas padding. Boundary tiles stay full rate, including offsets.
+				if (pixelX - NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH * 0.5f < region.left ||
+				    pixelY - NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT * 0.5f < region.top ||
+				    pixelX + NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH * 0.5f > region.left + region.width ||
+				    pixelY + NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT * 0.5f > region.top + region.height)
 					continue;
+				fx = (pixelX - region.left) / region.width;
+				fy = (pixelY - region.top) / region.height;
 
 				// Distance from that eye's projection/gaze center, scaled so a
 				// radius of 1.0 reaches the edge from a centered gaze.
@@ -242,12 +280,7 @@ void VRSManager::SetupStereoPattern()
 	td.MiscFlags = 0;
 	td.MipLevels = 1;
 
-	D3D11_SUBRESOURCE_DATA srd = {};
-	srd.pSysMem = data.data();
-	srd.SysMemPitch = patternWidth;
-	srd.SysMemSlicePitch = 0;
-
-	HRESULT hr = device->CreateTexture2D(&td, &srd, &vrsTex);
+	HRESULT hr = device->CreateTexture2D(&td, nullptr, &vrsTex);
 	if (FAILED(hr)) {
 		OOVR_LOGF("VRSManager: Failed to create stereo-atlas VRS texture: 0x%08X", hr);
 		available = false;
@@ -270,6 +303,16 @@ void VRSManager::SetupStereoPattern()
 		available = false;
 		return;
 	}
+	// NVAPI establishes its shading-rate resource tracking when the view is
+	// created. Publish the first pattern afterwards, just like later gaze updates;
+	// CreateTexture2D initial data alone can leave fixed foveation at full rate.
+	context->UpdateSubresource(vrsTex, 0, nullptr, data.data(), patternWidth, 0);
+	++patternUpdates.resourceCreations;
+	++patternUpdates.uploads;
+	for (int eye = 0; eye < 2; ++eye) {
+		uploadedProjX[eye] = projX[eye];
+		uploadedProjY[eye] = projY[eye];
+	}
 	patternDirty = false;
 }
 
@@ -280,6 +323,11 @@ void VRSManager::UploadStereoPattern()
 
 	auto data = CreateStereoPattern();
 	context->UpdateSubresource(vrsTex, 0, nullptr, data.data(), patternWidth, 0);
+	++patternUpdates.uploads;
+	for (int eye = 0; eye < 2; ++eye) {
+		uploadedProjX[eye] = projX[eye];
+		uploadedProjY[eye] = projY[eye];
+	}
 	patternDirty = false;
 }
 
@@ -330,6 +378,7 @@ bool VRSManager::EnableShadingRates()
 
 bool VRSManager::ApplyStereo()
 {
+	if (!activeViewportValid || patternDirty) return false;
 	if (!available) {
 		OOVR_LOG_LIMITEDF(5000, "VRSManager::ApplyStereo: skipped (available=%d)", (int)available);
 		return false;
@@ -404,6 +453,7 @@ void VRSManager::Shutdown()
 		NvAPI_D3D11_RSSetViewportsPixelShadingRates(context, &srd);
 	}
 	shadingRatesSet = false;
+	activeViewportValid = true;
 
 	ReleasePatternResources();
 
@@ -412,11 +462,6 @@ void VRSManager::Shutdown()
 		context = nullptr;
 	}
 	device = nullptr;
-
-	if (nvapiLoaded) {
-		NvAPI_Unload();
-		nvapiLoaded = false;
-	}
 
 	available = false;
 }

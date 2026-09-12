@@ -22,15 +22,115 @@ static bool Near(float a, float b, float tolerance = 0.0001f)
 	return std::fabs(a - b) <= tolerance;
 }
 
+static void CheckGeometryCoverage()
+{
+	using namespace ocu_vrs_gaze;
+	constexpr float radians = 3.14159265358979323846f / 180.0f;
+	unsigned samples = 0;
+	// Synthetic geometry coverage, not measurements of individual headsets.
+	// Parallel projection and driver-adjustable cant must use runtime geometry;
+	// asymmetric/wide FOV must not assume that straight ahead is texture center.
+	const float fovs[][4] = {{-1.1f, 1.1f, 1.0f, -1.0f},
+	    {-2.4f, 1.1f, 1.3f, -0.9f}, {-1.1f, 2.4f, 1.3f, -0.9f}};
+	for (float cant : {0.0f, 2.0f, 10.0f, 15.0f}) {
+		for (float side : {-1.0f, 1.0f}) {
+			const float eyeYaw = side * cant * radians;
+			for (float yawDegrees : {-40.0f, -20.0f, 0.0f, 20.0f, 40.0f}) {
+				for (float pitchDegrees : {-25.0f, 0.0f, 25.0f}) {
+					const float yaw = yawDegrees * radians, pitch = pitchDegrees * radians;
+					const float x = std::sin(yaw) * std::cos(pitch);
+					const float y = std::sin(pitch);
+					const float z = -std::cos(yaw) * std::cos(pitch);
+					for (const auto& fov : fovs) {
+						Center projected{};
+						Check(ProjectViewSpace(x, y, z, 0.0f, -std::sin(eyeYaw / 2.0f),
+						    0.0f, std::cos(eyeYaw / 2.0f), fov[0], fov[1], fov[2], fov[3], projected),
+						    "parallel/canted/asymmetric geometry accepts valid gaze");
+						// Independent angular reference rather than repeating quaternion math.
+						const float expectedX = std::clamp((std::tan(yaw - eyeYaw) - fov[0]) /
+						    (fov[1] - fov[0]), 0.02f, 0.98f);
+						const float expectedY = std::clamp((fov[2] - std::tan(pitch) /
+						    std::cos(yaw - eyeYaw)) / (fov[2] - fov[3]), 0.02f, 0.98f);
+						Check(Near(projected.x, expectedX) && Near(projected.y, expectedY),
+						    "both-eye projection matches angular reference throughout gaze range");
+						++samples;
+					}
+				}
+			}
+		}
+	}
+	for (float hz : {60.0f, 72.0f, 90.0f, 120.0f, 144.0f}) {
+		bool hasPrevious = false;
+		Center smoothed{};
+		for (bool valid : {false, false, true, true, false, true}) {
+			const auto mode = SelectMode(true, false, valid, false);
+			if (mode != Mode::EyeTracked) {
+				hasPrevious = false;
+				continue;
+			}
+			const Center target{0.8f, 0.25f};
+			smoothed = Smooth(smoothed, target, 1.0f / hz, hasPrevious);
+			if (!hasPrevious)
+				Check(Near(smoothed.x, target.x) && Near(smoothed.y, target.y),
+				    "gaze resumes immediately after startup/tracking loss at every refresh rate");
+			hasPrevious = true;
+		}
+	}
+	std::printf("Geometry matrix: %u projections; startup/loss recovery at 60/72/90/120/144 Hz checked\n", samples);
+}
+
+static void CheckRateCapProfiles()
+{
+	using namespace ocu_foveation;
+	auto area = [](Rate rate) { const auto d = Dimensions(rate); return d.x * d.y; };
+	unsigned profiles = 0;
+	for (bool horizontal : {false, true}) {
+		const Rate half = horizontal ? Rate::X2x1 : Rate::X1x2;
+		for (bool tracked : {false, true}) {
+			Check(ResolveRates(tracked, false, true, horizontal, {}) ==
+			    RingRates{Rate::X1x1, half, half}, "default cap makes middle and outer equally half-rate");
+		}
+		for (unsigned inner = 0; inner < 7; ++inner)
+		for (unsigned mid = 0; mid < 7; ++mid)
+		for (unsigned outer = 0; outer < 7; ++outer) {
+			const RingRates requested{static_cast<Rate>(inner), static_cast<Rate>(mid), static_cast<Rate>(outer)};
+			const auto capped = ResolveRates(true, true, true, horizontal, requested);
+			Check(area(capped.inner) <= 2 && area(capped.mid) <= 2 && area(capped.outer) <= 2,
+			    "effective custom cap covers center, middle and outer for every combination");
+			Check(area(capped.inner) <= area(requested.inner) && area(capped.mid) <= area(requested.mid) &&
+			    area(capped.outer) <= area(requested.outer), "cap never reduces any ring's requested density");
+			if (area(requested.inner) <= area(requested.mid) && area(requested.mid) <= area(requested.outer))
+				Check(area(capped.inner) <= area(capped.mid) && area(capped.mid) <= area(capped.outer),
+				    "cap cannot reverse a progressively coarser requested profile");
+			Check(ResolveRates(true, true, true, horizontal, capped) == capped, "applying cap twice does not alter axes or density");
+			Check(ResolveRates(true, true, false, horizontal, requested) == requested,
+			    "uncapped custom combinations preserve intentional ring choices");
+			++profiles;
+		}
+		const auto intentionallyFinerOuter = ResolveRates(true, true, true, horizontal,
+		    {Rate::X1x1, Rate::X2x2, Rate::X1x1});
+		Check(intentionallyFinerOuter == RingRates{Rate::X1x1, half, Rate::X1x1},
+		    "cap preserves an explicitly full-rate outer ring rather than silently coarsening it");
+		const auto axisChange = ResolveRates(true, true, true, horizontal,
+		    {Rate::X1x1, Rate::X2x4, Rate::X4x2});
+		Check(axisChange == RingRates{Rate::X1x1, Rate::X1x2, Rate::X2x1},
+		    "different custom axes may remain different despite equal capped density");
+	}
+	std::printf("Rate cap matrix: %u custom profiles; every ring capped; ordered densities never reversed\n", profiles);
+}
+
 int main()
 {
 	using namespace ocu_vrs_gaze;
 	Center center{};
+	CheckGeometryCoverage();
+	CheckRateCapProfiles();
 
 	const auto eyeDefault = ocu_foveation::Resolve(true, -1, -1, -1, -1, -1, -1);
 	const auto fixedDefault = ocu_foveation::Resolve(false, -1, -1, -1, -1, -1, -1);
-	Check(Near(eyeDefault.inner, 0.5f) && Near(fixedDefault.inner, 0.7f),
-	    "new installations have separate eye-tracked and fixed defaults");
+	Check(Near(eyeDefault.inner, 0.2f) && Near(eyeDefault.mid, 0.4f) &&
+	    Near(fixedDefault.inner, 0.7f) && Near(fixedDefault.mid, 0.85f),
+	    "new installations use Normal gaze radii and preserve fixed defaults");
 	for (bool tracked : {false, true}) {
 	    const auto legacy = ocu_foveation::Resolve(tracked, 0.63f, 0.83f, -1, -1, -1, -1);
 	    Check(Near(legacy.inner, 0.63f) && Near(legacy.mid, 0.83f),
@@ -165,8 +265,18 @@ int main()
 	Check(Near(first.x, target.x) && Near(first.y, target.y),
 	    "first sample is not delayed");
 	Center next = Smooth({ 0.5f, 0.5f }, target, 1.0f / 90.0f, true);
-	Check(next.x > 0.5f && next.x < target.x && next.y < 0.5f && next.y > target.y,
-	    "steady sample receives bounded smoothing");
+	Check(Near(next.x, target.x) && Near(next.y, target.y), "saccade reaches the new fixation in one frame");
+	for (float hz : {15.0f, 30.0f, 45.0f, 60.0f, 90.0f, 120.0f, 144.0f}) {
+		Center prior{0.5f, 0.5f};
+		for (int i = 1; i <= 100; ++i) {
+			const Center pursuit{0.5f + 0.2f * std::sin(i * .03f), 0.5f + 0.1f * std::cos(i * .03f)};
+			prior = Smooth(prior, pursuit, 1.0f / hz, true);
+			Check(std::hypot(prior.x - pursuit.x, prior.y - pursuit.y) <= .00201f,
+			    "pursuit stays within the lag budget at variable real-frame rates");
+		}
+	}
+	const Center noisy = Smooth({.5f, .5f}, {.501f, .5f}, 1.0f / 90, true);
+	Check(noisy.x > .5f && noisy.x < .501f, "small tracker noise is still filtered");
 
 	{
 		using namespace ocu_foveation;

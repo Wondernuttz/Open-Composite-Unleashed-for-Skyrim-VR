@@ -5,6 +5,7 @@
 
 #include <d3d11.h>
 #include <vector>
+#include "VRSSceneScope.h"
 
 class VRSManager {
 public:
@@ -22,7 +23,7 @@ public:
 	bool Initialize(ID3D11Device* device);
 
 	// Set projection centers for each eye (normalized 0-1 coordinates).
-	// Call this once when eye projection data is available.
+	// Call for each new projection or eye-gaze sample.
 	void SetProjectionCenters(float leftProjX, float leftProjY, float rightProjX, float rightProjY);
 
 	// Create/update one shading-rate resource for the full bound stereo render
@@ -34,6 +35,12 @@ public:
 
 	// Apply the full stereo-atlas pattern before the game starts drawing a frame.
 	bool ApplyStereo();
+
+	// Match a recognized active stereo viewport while keeping the full-target
+	// rate resource. Unknown subrect semantics withhold VRS until they recover.
+	bool UpdateActiveViewports(UINT count, const D3D11_VIEWPORT* viewports);
+	struct PatternUpdates { unsigned resourceCreations = 0, uploads = 0; };
+	PatternUpdates GetPatternUpdates() const { return patternUpdates; }
 
 	// Disable VRS. Call before our own post-processing (FSR passes).
 	void Disable();
@@ -50,7 +57,6 @@ public:
 
 private:
 	bool available = false;
-	bool nvapiLoaded = false;
 	bool initializationAttempted = false;
 
 	ID3D11Device* device = nullptr;
@@ -64,10 +70,17 @@ private:
 	int renderWidth = 0;
 	int renderHeight = 0;
 	EyeRegion eyeRegions[2];
+	ocu_vrs_scope::ViewportEyeRegion activeEyeRegions[2];
+	bool activeViewportValid = true;
+	PatternUpdates patternUpdates;
 
 	// Projection centers per eye
 	float projX[2] = { 0.5f, 0.5f };
 	float projY[2] = { 0.5f, 0.5f };
+	// Dirty detection must accumulate movement since the last actual upload,
+	// not since the previous sample (which can drift forever in tiny steps).
+	float uploadedProjX[2] = { 0.5f, 0.5f };
+	float uploadedProjY[2] = { 0.5f, 0.5f };
 	bool patternDirty = true;
 
 	// Cached config values used to detect changes
@@ -107,6 +120,7 @@ public:
 	bool UpdateStereoPattern(int, int, const EyeRegion&, const EyeRegion&, float, float,
 	    const ocu_foveation::RingRates&) { return false; }
 	bool ApplyStereo() { return false; }
+	bool UpdateActiveViewports(UINT, const D3D11_VIEWPORT*) { return false; }
 	void Disable() {}
 	void Shutdown() {}
 	bool IsAvailable() const { return false; }

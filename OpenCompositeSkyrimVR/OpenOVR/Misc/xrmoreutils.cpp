@@ -5,6 +5,7 @@
 #include "stdafx.h"
 
 #include "Misc/Config.h"
+#include "../InputTrace.h"
 #include "OneEuroFilterPosition.cpp"
 #include "OneEuroFilterRotation.cpp"
 #include "xrmoreutils.h"
@@ -123,6 +124,19 @@ void xr_utils::PoseFromSpace(vr::TrackedDevicePose_t* pose, XrSpace space,
 	XrSpaceLocation info{ XR_TYPE_SPACE_LOCATION, &velocity, 0, {} };
 	const ControllerPoseFilterKey filterKey{ device, static_cast<int>(origin) };
 	XrResult locateResult = xrLocateSpace(space, baseSpace, xr_gbl->GetBestTime(), &info);
+	// Observe the existing locate result, without doing another tracking query.
+	if (extraTransform && device >= 0 && device < 2
+	    && (oovr_debug_logging_enabled() || XR_FAILED(locateResult))) {
+		thread_local OcuInputTrace::ChangeGate poseTrace[2];
+		if (poseTrace[device].Allow(true, { OcuInputTrace::Handle(xr_session.get()), OcuInputTrace::Code(locateResult),
+		        info.locationFlags, (uint64_t)origin, OcuInputTrace::Handle(space) }, OcuLogging::NowMs())) {
+			OOVR_LOGF("[INPUT-TRACE] Pose session=%p hand=%s space=%p origin=%d result=%s(%d) flags=0x%llx positionValid=%d orientationValid=%d positionTracked=%d orientationTracked=%d",
+			    (void*)xr_session.get(), device == 0 ? "left" : "right", (void*)space, (int)origin,
+			    OcuInputTrace::Result(locateResult), (int)locateResult, (unsigned long long)info.locationFlags,
+			    !!(info.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT), !!(info.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT),
+			    !!(info.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT), !!(info.locationFlags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT));
+		}
+	}
 	if (XR_FAILED(locateResult)) {
 		OOVR_FAILED_XR_SOFT_ABORT(locateResult);
 		if (extraTransform) {
