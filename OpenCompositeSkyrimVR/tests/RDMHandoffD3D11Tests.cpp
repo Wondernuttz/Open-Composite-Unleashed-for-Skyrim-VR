@@ -22,6 +22,15 @@ void oovr_log_raw_format(const char*, long, const char*, const char* fmt, ...) {
     va_list args; va_start(args,fmt); std::vprintf(fmt,args); va_end(args); std::puts("");
 }
 static void Require(bool ok,const char* message) { if(!ok) throw std::runtime_error(message); }
+// Manual scene-only timing fixtures bypass the draw detour while busy. Supply
+// the same current-geometry coverage proof the production detour requires.
+static bool PrepareCoveredDraw(RDMRenderScope& scope, ID3D11DeviceContext* context) {
+    if (scope.BeginColorCoverage({}, false)) {
+        context->Draw(3, 0);
+        scope.EndColorCoverage();
+    }
+    return scope.BeforeDraw();
+}
 static void HRAt(HRESULT hr,unsigned line,const char* expression) {
     if(FAILED(hr)) {
         std::printf("HRESULT=%08X at RDMHandoffD3D11Tests.cpp:%u: %s\n",unsigned(hr),line,expression);
@@ -748,7 +757,7 @@ static void Run(IDXGIAdapter* adapter,D3D_DRIVER_TYPE driver,UINT width,UINT hei
         const auto partialBefore=rdm.Stats();
         // Install the mask before measuring so shader invocation counts cover
         // only the real scene draw, excluding setup and reconstruction work.
-        Require(rdm.BeforeDraw(),"partial-write color pass was rejected");
+        Require(PrepareCoveredDraw(rdm,ctx.Get()),"partial-write color pass was rejected");
         D3D11_QUERY_DESC queryDesc{D3D11_QUERY_PIPELINE_STATISTICS,0};
         ComPtr<ID3D11Query> sceneQuery;HR(dev->CreateQuery(&queryDesc,&sceneQuery));
         ctx->Begin(sceneQuery.Get());ctx->Draw(3,0);ctx->End(sceneQuery.Get());rdm.AfterDraw(true);
@@ -954,7 +963,7 @@ static void Run(IDXGIAdapter* adapter,D3D_DRIVER_TYPE driver,UINT width,UINT hei
     // scene draws preserve the prepared depth mask across those separate batches.
     Prepare(true);const auto reuseDepth=Read(dev.Get(),ctx.Get(),depth.Get());
     Bind();ctx->Draw(3,0);CheckColor();
-    Bind();ctx->Draw(3,0);CheckColor();
+    ctx->Draw(3,0);CheckColor();
     Require(rdm.Stats().batches==2 && rdm.Stats().maskPreparations==1 && rdm.Stats().maskReuses==1,
         "unchanged depth/guide rebuilt the mask at a color consumer boundary");
     Require(Read(dev.Get(),ctx.Get(),depth.Get())==reuseDepth,"mask reuse modified scene depth");
@@ -981,7 +990,10 @@ static void Run(IDXGIAdapter* adapter,D3D_DRIVER_TYPE driver,UINT width,UINT hei
         Prepare();TimedArm(true);
         Bind(false);ctx->PSSetShader(nullptr,nullptr,0);ctx->Draw(3,0);
         Bind();ctx->Draw(3,0);CheckColor();
-        Bind();ctx->Draw(3,0);CheckColor();
+        ctx->Draw(3,0);CheckColor();
+        std::printf("Timed coverage: draws=%u captures=%u coverageReuses=%u preparations=%u maskReuses=%u\n",
+            timedScope.Stats().draws,timedScope.Stats().colorCoverageDraws,timedScope.Stats().colorCoverageReuses,
+            timedScope.Stats().maskPreparations,timedScope.Stats().maskReuses);
         Require(timedScope.Stats().maskPreparations==1 && timedScope.Stats().maskReuses==1,
             "timed RDM changed mask reuse");
         timedScope.EndFrame();
@@ -1214,7 +1226,7 @@ static void Run(IDXGIAdapter* adapter,D3D_DRIVER_TYPE driver,UINT width,UINT hei
     Prepare(true);auto expectedDepth=Read(dev.Get(),ctx.Get(),depth.Get());
     Bind();
     // Measure the scene draw alone, excluding mask setup and reconstruction.
-    Require(rdm.BeforeDraw(),"eligible color pass rejected");
+    Require(PrepareCoveredDraw(rdm,ctx.Get()),"eligible color pass rejected");
     D3D11_QUERY_DESC qd{D3D11_QUERY_PIPELINE_STATISTICS,0};ComPtr<ID3D11Query> query;HR(dev->CreateQuery(&qd,&query));
     ctx->Begin(query.Get());ctx->Draw(3,0);ctx->End(query.Get());
     const auto sparse=Read(dev.Get(),ctx.Get(),color.Get());
@@ -1358,6 +1370,40 @@ static void Run(IDXGIAdapter* adapter,D3D_DRIVER_TYPE driver,UINT width,UINT hei
     ComPtr<ID3D11VertexShader> meshVS;ComPtr<ID3D11PixelShader> meshPS;
     HR(dev->CreateVertexShader(meshVSCode->GetBufferPointer(),meshVSCode->GetBufferSize(),nullptr,&meshVS));
     HR(dev->CreatePixelShader(meshPSCode->GetBufferPointer(),meshPSCode->GetBufferSize(),nullptr,&meshPS));
+    // A full depth prepass is not evidence that a later color draw covers the
+    // same pixels. Preserve a varying background outside each color rectangle,
+    // including partial clusters and geometry thinner than a sampling cluster.
+    for (const auto bounds : {std::array<UINT,2>{0,width/4},
+             std::array<UINT,2>{0,width/4-3},
+             std::array<UINT,2>{width/2-3,width/2+3},
+             std::array<UINT,2>{width/4,width/4+1}}) {
+        auto PartialColor=[&](bool enabled) {
+            Prepare(enabled);
+            std::vector<unsigned char> background(width*height*4);
+            for(UINT y=0;y<height;++y) for(UINT x=0;x<width;++x) {
+                const UINT p=(y*width+x)*4;
+                background[p]=static_cast<unsigned char>(x*13+y*7);
+                background[p+1]=static_cast<unsigned char>(x*3+y*19);
+                background[p+2]=static_cast<unsigned char>(x*23+y*11);
+                background[p+3]=255;
+            }
+            ctx->UpdateSubresource(color.Get(),0,nullptr,background.data(),width*4,0);
+            ctx->VSSetShader(meshVS.Get(),nullptr,0);
+            ctx->PSSetShader(meshPS.Get(),nullptr,0);
+            params[2]=float(bounds[0]);params[3]=float(bounds[1]);
+            ctx->UpdateSubresource(cb.Get(),0,nullptr,params,0,0);
+            ctx->Draw(6,0);rdm.EndFrame();
+            return std::array{Read(dev.Get(),ctx.Get(),color.Get()),
+                Read(dev.Get(),ctx.Get(),motion.Get()),Read(dev.Get(),ctx.Get(),depth.Get())};
+        };
+        const auto native=PartialColor(false);
+        const auto reconstructed=PartialColor(true);
+        Require(rdm.Stats().colorCoverageDraws==1 && rdm.Stats().maskedDraws==1,
+            "partial color fixture did not exercise current-draw coverage");
+        Require(reconstructed==native,"reconstruction overwrote outside actual color geometry");
+    }
+    params[2]=params[3]=0;ctx->UpdateSubresource(cb.Get(),0,nullptr,params,0,0);
+    std::puts("RDM partial color coverage PASS: varying background, aligned/partial clusters and thin geometry");
     auto Meshes=[&](bool colors) {
         Bind(!colors?false:true);ctx->VSSetShader(meshVS.Get(),nullptr,0);
         ctx->PSSetShader(colors?meshPS.Get():nullptr,nullptr,0);
@@ -1386,10 +1432,14 @@ static void Run(IDXGIAdapter* adapter,D3D_DRIVER_TYPE driver,UINT width,UINT hei
     Require(rdm.Stats().guideInvalidationDraws==1,"alpha depth producer did not invalidate its geometry");
     const FLOAT clearedColor[4]{};
     ctx->ClearRenderTargetView(colorRT.Get(),clearedColor);ctx->ClearRenderTargetView(motionRT.Get(),clearedColor);
-    Bind();Require(rdm.BeforeDraw(),"guide invalidation unexpectedly disabled the whole renderer");
+    Bind();Require(PrepareCoveredDraw(rdm,ctx.Get()),"guide invalidation unexpectedly disabled the whole renderer");
     Require(rdm.Stats().maskPreparations==2,"protected depth writer reused a stale prepared mask");
-    ctx->Draw(3,0);auto invalidated=Read(dev.Get(),ctx.Get(),color.Get());rdm.AfterDraw(true);rdm.EndFrame();
-    for(size_t i=3;i<invalidated.size();i+=4)Require(invalidated[i]==255,"unsupported depth producer retained sparse coverage");
+    ctx->Draw(3,0);rdm.AfterDraw(true);rdm.EndFrame();
+    // The old prepass guide is invalid here, but the current color draw now
+    // supplies its own coverage proof against final depth. It may be sparse;
+    // the resolved image must still equal native rendering.
+    Require(rdm.Stats().colorCoverageDraws > 0,"color draw reused invalid prepass ownership");
+    CheckColor();
     for(unsigned mutation=0;mutation<(d24?3u:4u);++mutation) {
         Prepare(true);ctx->Draw(3,0);CheckColor();
         Require(rdm.Stats().maskPreparations==1,"depth-write mutation fixture did not create a cached mask");

@@ -143,6 +143,27 @@ struct DrawHandler {
             ++observerDrawDepth;
             if (observer->beforeDraw) observer->beforeDraw(observer->owner, ctx);
         }
+        if (owner) {
+            std::array<std::uint64_t, 8> key{};
+            // Direct D3D11 draw methods have distinct argument counts (2, 3,
+            // 4, 5). Use the operation, not its trampoline address: native
+            // query/lazy-dispatch transitions can change that address without
+            // changing geometry. Indirect/DrawAuto never reuse this key.
+            key[0] = sizeof...(A);
+            unsigned index = 1;
+            auto append = [&](auto value) {
+                if constexpr (std::is_pointer_v<decltype(value)>)
+                    key[index++] = reinterpret_cast<std::uintptr_t>(value);
+                else key[index++] = static_cast<std::uint64_t>(value);
+            };
+            (append(args), ...);
+            // Indirect arguments and DrawAuto can change without a setter.
+            constexpr bool reusable = sizeof...(A) > 0 && (std::is_integral_v<A> && ...);
+            if (owner->BeginColorCoverage(key, reusable)) {
+                original(ctx, args...);
+                owner->EndColorCoverage();
+            }
+        }
         const bool masked = owner && owner->BeforeDraw();
         const bool guide = owner && !masked && owner->BeginDepthGuide(false);
         if (owner && !guide) owner->BeginSceneDraw(masked);
@@ -163,7 +184,7 @@ struct DrawHandler {
     }
 };
 template<unsigned GuideFlags> struct StateHandler {
-    template<class F, class... A> static void Call(F original, ID3D11DeviceContext* ctx, A... args)
+    template<class F, class Context, class... A> static void Call(F original, Context* ctx, A... args)
     {
         if constexpr (GuideFlags & RDMRenderScope::GuideTargets)
             RDMRenderScope::NotifyBeforeDepthStateBoundary(ctx);
@@ -186,12 +207,20 @@ struct DepthBindingQueryHandler {
         if (auto* owner = RDMRenderScope::Active(ctx)) owner->ExposeOriginalDepthBinding(depth);
     }
 };
+struct GeometryStateHandler {
+    template<class F, class Context, class... A> static void Call(F original, Context* ctx, A... args)
+    {
+        original(ctx, args...);
+        RDMRenderScope::NotifyGeometryState(ctx);
+    }
+};
 struct ReadHandler {
     template<class F> static void Call(F original, ID3D11DeviceContext* ctx, UINT slot,
         UINT count, ID3D11ShaderResourceView* const* views)
     {
         if (auto* owner = RDMRenderScope::Active(ctx)) owner->BeforeReads(count, views);
         original(ctx, slot, count, views);
+        RDMRenderScope::NotifyGeometryState(ctx);
         if (const auto* observer = Observer(ctx); observer && observer->stateChanged)
             observer->stateChanged(observer->owner, ctx);
     }
@@ -454,6 +483,21 @@ bool Install(ID3D11DeviceContext* ctx)
         INSTALL(45, StateHandler<RDMRenderScope::GuideNone>, UINT, const D3D11_RECT*);
         INSTALL(30, StateHandler<RDMRenderScope::GuidePredicate>, ID3D11Predicate*, BOOL);
         INSTALL(37, StateHandler<RDMRenderScope::GuideStreamOutput>, UINT, ID3D11Buffer* const*, const UINT*);
+        // Geometry coverage may only be reused with identical geometry inputs.
+        INSTALL(11, GeometryStateHandler, ID3D11VertexShader*, ID3D11ClassInstance* const*, UINT);
+        INSTALL(23, GeometryStateHandler, ID3D11GeometryShader*, ID3D11ClassInstance* const*, UINT);
+        INSTALL(60, GeometryStateHandler, ID3D11HullShader*, ID3D11ClassInstance* const*, UINT);
+        INSTALL(64, GeometryStateHandler, ID3D11DomainShader*, ID3D11ClassInstance* const*, UINT);
+        INSTALL(17, GeometryStateHandler, ID3D11InputLayout*);
+        INSTALL(18, GeometryStateHandler, UINT, UINT, ID3D11Buffer* const*, const UINT*, const UINT*);
+        INSTALL(19, GeometryStateHandler, ID3D11Buffer*, DXGI_FORMAT, UINT);
+        INSTALL(24, GeometryStateHandler, D3D11_PRIMITIVE_TOPOLOGY);
+        for (UINT slot : {7u, 22u, 62u, 66u}) {
+            INSTALL(slot, GeometryStateHandler, UINT, UINT, ID3D11Buffer* const*);
+        }
+        for (UINT slot : {26u, 32u, 61u, 65u}) {
+            INSTALL(slot, GeometryStateHandler, UINT, UINT, ID3D11SamplerState* const*);
+        }
         INSTALL(41, ComputeHandler, UINT, UINT, UINT);
         INSTALL(42, ComputeHandler, ID3D11Buffer*, UINT);
         // Distinct handler types are needed for equal signatures at different slots.
@@ -486,6 +530,10 @@ bool Install(ID3D11DeviceContext* ctx)
             INSTALL1(132, ID3D11View*, const FLOAT*, const D3D11_RECT*, UINT);
             INSTALL1(133, ID3D11View*, const D3D11_RECT*, UINT);
 #undef INSTALL1
+            for (UINT slot : {119u, 120u, 121u, 122u})
+                ok = Hook<void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, UINT, UINT,
+                    ID3D11Buffer* const*, const UINT*, const UINT*),
+                    GeometryStateHandler>::Install(v1[slot], slot) && ok;
         }
         ok = Hook<HRESULT(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP,
             UINT, D3D11_MAPPED_SUBRESOURCE*), MapHandler>::Install(v[14], 14) && ok;
@@ -534,6 +582,15 @@ struct RDMRenderScope::Impl {
     bool armed = false, busy = false, dirty = true, eligible = false, pending = false;
     bool privateDepthBound = false;
     bool preparedMask = false;
+    bool colorCoverageReady = false, colorCoverageReusable = false;
+    std::array<std::uint64_t, 8> colorDrawKey{};
+    struct RasterGeometry {
+        D3D11_RASTERIZER_DESC raster{};
+        std::array<D3D11_VIEWPORT, 16> viewports{};
+        std::array<D3D11_RECT, 16> scissors{};
+        UINT viewportCount = 0, scissorCount = 0;
+    } currentRasterGeometry{}, capturedRasterGeometry{};
+    ComPtr<ID3D11Texture2D> capturedCoverageDepth;
     bool invalidatingGuide = false;
     Statistics stats;
     DiagnosticSnapshot diagnostics;
@@ -901,6 +958,17 @@ struct RDMRenderScope::Impl {
             }
         }
         if (!current.eyes) return Reject(QueryReject::Viewport);
+        currentRasterGeometry = {};
+        currentRasterGeometry.raster = rd;
+        currentRasterGeometry.viewportCount = count;
+        std::copy_n(vp, count, currentRasterGeometry.viewports.begin());
+        if (rd.ScissorEnable) {
+            currentRasterGeometry.scissorCount = sc;
+            std::copy_n(scissors, sc, currentRasterGeometry.scissors.begin());
+        }
+        if (colorCoverageReady && (capturedCoverageDepth != current.depth ||
+            std::memcmp(&capturedRasterGeometry, &currentRasterGeometry, sizeof(RasterGeometry))))
+            colorCoverageReady = false;
         lastQueryReject = QueryReject::Count;
         ++stats.queryAccepted;
         return true;
@@ -1121,6 +1189,7 @@ bool RDMRenderScope::Arm(ID3D11DeviceContext* ctx, ID3D11Texture2D* depth,
     EndFrame();
     impl->stats = {}; impl->diagnostics = {};
     impl->preparedMask = false;
+    impl->colorCoverageReady = false;
     impl->scopeProbeOrdinal = impl->noPixelShaderProbeOrdinal = 0;
     impl->queryProbeKeys = {}; impl->queryProbeKeyCount = 0;
     impl->lastQueryReject = QueryReject::Count;
@@ -1200,6 +1269,7 @@ void RDMRenderScope::StateChanged(ID3D11DeviceContext* ctx, unsigned guideChange
 {
     if (ctx == impl->context.Get() && !impl->busy) {
         impl->dirty = true;
+        if (guideChanges == GuideAll) impl->colorCoverageReady = false;
         if (guideChanges) { impl->guideState.dirty = true; impl->guideState.changed |= guideChanges; }
     }
 }
@@ -1230,6 +1300,13 @@ void RDMRenderScope::NotifyState(ID3D11DeviceContext* ctx, unsigned guideChanges
     if (const auto* observer = Observer(ctx); observer && observer->stateChanged)
         observer->stateChanged(observer->owner, ctx);
 }
+void RDMRenderScope::NotifyGeometryState(ID3D11DeviceContext* ctx)
+{
+    if (auto* owner = Active(ctx)) {
+        owner->impl->colorCoverageReady = false;
+        owner->StateChanged(ctx, GuideNone);
+    }
+}
 void RDMRenderScope::NotifyTargets(ID3D11DeviceContext* ctx)
 {
     NotifyState(ctx, GuideTargets | GuideUavs);
@@ -1250,12 +1327,52 @@ void RDMRenderScope::RemoveDrawObserver(ID3D11DeviceContext* ctx)
     drawObserverContext.store(nullptr, std::memory_order_release);
     drawObserver = nullptr;
 }
+bool RDMRenderScope::BeginColorCoverage(const std::array<std::uint64_t, 8>& key, bool reusable)
+{
+    auto& p = *impl;
+    Impl::CpuTimer timer(p.diagnostics.enabled, p.stats.admissionCpuMs);
+    if (p.dirty) p.eligible = p.Query();
+    if (!p.eligible) { p.colorCoverageReady = false; return false; }
+    if (reusable && p.colorCoverageReusable && p.colorCoverageReady && p.colorDrawKey == key) {
+        ++p.stats.colorCoverageReuses;
+        return false;
+    }
+    // Complete the previous color batch before replacing its ownership guide.
+    p.Finish();
+    p.busy = true;
+    p.preparedMask = false;
+    p.colorCoverageReady = false;
+    p.colorDrawKey = key;
+    p.colorCoverageReusable = reusable;
+    p.capturedRasterGeometry = p.currentRasterGeometry;
+    p.capturedCoverageDepth = p.current.depth;
+    // Query has already excluded shader discard/depth/coverage side effects,
+    // stencil, blending, predication, stream output, and UAV writes. Keep the
+    // original EQUAL test and geometry stages; only replace color outputs.
+    p.gpuTiming.BeginWork(ocu_rdm::GpuTiming::WorkStage::GuideCapture);
+    p.resolver.ClearDepthGuide();
+    if (!p.resolver.BeginDepthGuide(p.current.dsv.Get(), false)) {
+        p.gpuTiming.EndWork(ocu_rdm::GpuTiming::WorkStage::GuideCapture);
+        p.busy = false;
+        return false;
+    }
+    return true;
+}
+void RDMRenderScope::EndColorCoverage()
+{
+    auto& p = *impl;
+    p.resolver.EndDepthGuide();
+    p.gpuTiming.EndWork(ocu_rdm::GpuTiming::WorkStage::GuideCapture);
+    p.busy = false;
+    p.colorCoverageReady = true;
+    ++p.stats.colorCoverageDraws;
+}
 bool RDMRenderScope::BeforeDraw()
 {
     auto& p = *impl; ++p.stats.draws;
     Impl::CpuTimer timer(p.diagnostics.enabled, p.stats.admissionCpuMs);
     if (p.dirty) p.eligible = p.Query();
-    if (!p.eligible) {
+    if (!p.eligible || !p.colorCoverageReady) {
         p.Finish(); ++p.stats.protectedDraws;
         if (p.lastQueryReject != QueryReject::Count)
             ++p.stats.rejectedDrawCounts[static_cast<unsigned>(p.lastQueryReject)];
@@ -1298,10 +1415,29 @@ void RDMRenderScope::InvalidateDepthGuide()
 {
     auto& p=*impl;
     p.preparedMask=false;
+    p.colorCoverageReady=false;
     Impl::Busy guard(p);p.resolver.ClearDepthGuide();p.dirty=true;++p.stats.guideResets;
 }
 void RDMRenderScope::BeforeWrite(ID3D11Resource* resource)
 {
+    // Readback destinations cannot supply geometry or depth. Do not discard
+    // valid coverage just because a consumer copies color into staging memory.
+    bool staging = false;
+    if (resource) {
+        D3D11_RESOURCE_DIMENSION type{}; resource->GetType(&type);
+        if (type == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            ComPtr<ID3D11Buffer> buffer;
+            if (SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&buffer)))) {
+                D3D11_BUFFER_DESC d{}; buffer->GetDesc(&d); staging = d.Usage == D3D11_USAGE_STAGING;
+            }
+        } else if (type == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+            ComPtr<ID3D11Texture2D> texture;
+            if (SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&texture)))) {
+                D3D11_TEXTURE2D_DESC d{}; texture->GetDesc(&d); staging = d.Usage == D3D11_USAGE_STAGING;
+            }
+        }
+    }
+    if (!staging) impl->colorCoverageReady = false;
     BeforeRead(resource);
     if(resource && resource==impl->expectedDepth.Get())InvalidateDepthGuide();
 }
@@ -1335,6 +1471,7 @@ void RDMRenderScope::EndDepthGuide()
         ocu_rdm::GpuTiming::WorkStage::GuideCapture);
     p.busy=false;
     p.preparedMask=false;
+    p.colorCoverageReady=false;
     // Guide bindings are fully restored. Only guide availability can change
     // color admission without a game pipeline-state setter notifying us.
     if(p.lastQueryReject==QueryReject::NoDepthGuide)p.dirty=true;
@@ -1358,6 +1495,7 @@ void RDMRenderScope::BeforeReads(UINT count, ID3D11ShaderResourceView* const* vi
 }
 void RDMRenderScope::BeforeCompute()
 {
+    impl->colorCoverageReady = false;
     if (impl->pending) { ++impl->stats.consumerBoundaries; impl->Finish(); }
     // UAV bindings and command execution can change implicit resource hazards.
     impl->dirty = true; impl->guideState.dirty = true; impl->guideState.changed = GuideAll;

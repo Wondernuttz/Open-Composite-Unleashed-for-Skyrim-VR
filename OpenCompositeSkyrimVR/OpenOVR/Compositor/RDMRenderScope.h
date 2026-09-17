@@ -37,6 +37,7 @@ public:
     // draw batch. The native getter's returned reference is replaced in place.
     void ExposeOriginalDepthBinding(ID3D11DepthStencilView** depth);
     static void NotifyState(ID3D11DeviceContext* context, unsigned guideChanges);
+    static void NotifyGeometryState(ID3D11DeviceContext* context);
     static void NotifyTargets(ID3D11DeviceContext* context);
     static void RegisterTargetObserver(void* renderTargets, void* renderTargetsAndUavs);
 
@@ -80,6 +81,7 @@ public:
         unsigned partialMaskDraws = 0, inactiveTargetDraws = 0;
         unsigned protectedDraws = 0, consumerBoundaries = 0, stateQueries = 0;
         unsigned guideDraws = 0, guideInvalidationDraws = 0, guideResets = 0;
+        unsigned colorCoverageDraws = 0, colorCoverageReuses = 0;
         unsigned guideStateQueries = 0, emptyGuideSkips = 0;
         unsigned guideDepthReads = 0, guideTargetReads = 0, guideHazardReads = 0;
         double admissionCpuMs = 0, guideQueryCpuMs = 0;
@@ -156,6 +158,10 @@ public:
     // Entry points shared by the D3D11 detours and the compositor's existing
     // render-target observer. All internal rendering is reentrancy guarded.
     static RDMRenderScope* Active(ID3D11DeviceContext* context);
+    // Rasterize current color geometry against original depth before deriving
+    // skip eligibility. Prepass ownership alone does not own a color write.
+    bool BeginColorCoverage(const std::array<std::uint64_t, 8>& drawKey, bool reusable);
+    void EndColorCoverage();
     bool BeforeDraw();
     void AfterDraw(bool masked);
     void BeforeRead(ID3D11Resource* resource);

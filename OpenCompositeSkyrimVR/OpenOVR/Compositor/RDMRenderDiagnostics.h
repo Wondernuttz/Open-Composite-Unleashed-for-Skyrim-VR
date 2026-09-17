@@ -87,6 +87,8 @@ inline void LogRDMFrame(RDMRenderScope& scope, bool reportScheduled)
         stats.maskPreparations, stats.maskReuses, stats.guideStateQueries, stats.emptyGuideSkips);
     OOVR_LOGF("rdm-depth-binding-v1 sampled-frame: maskedDraws=%u privateBinds=%u originalRestores=%u (operation counts, not GPU timings)",
         stats.maskedDraws, stats.privateDepthBinds, stats.originalDepthRestores);
+    OOVR_LOGF("rdm-color-coverage-v1 sampled-frame: captures=%u reuses=%u source=current-color-geometry",
+        stats.colorCoverageDraws, stats.colorCoverageReuses);
     OOVR_LOGF("rdm-guide-cache-v1 sampled-frame: depthReads=%u targetReads=%u hazardReads=%u admissionCpuWallMs=%.4f guideQueryCpuWallMs=%.4f cpuWallIncludesDriverWork=1",
         stats.guideDepthReads, stats.guideTargetReads, stats.guideHazardReads,
         stats.admissionCpuMs, stats.guideQueryCpuMs);
