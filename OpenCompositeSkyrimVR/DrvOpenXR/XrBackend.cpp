@@ -35,6 +35,8 @@
 #include "generated/static_bases.gen.h"
 
 #include "../OpenOVR/Misc/NetworkTrackers.h"
+#include "../OpenOVR/Misc/Input/OscLocomotion.h"
+#include "../OpenOVR/Misc/Input/LocomotionHeading.h"
 #include "../OpenOVR/Misc/OVRPerfHook.h"
 #include "../OpenOVR/Misc/WalkInPlace.h"
 #include "generated/interfaces/IVRCompositor_018.h"
@@ -129,6 +131,8 @@ XrBackend::XrBackend(bool useVulkanTmpGfx, bool useD3D11TmpGfx)
 
 XrBackend::~XrBackend()
 {
+	OcuLocomotionHeading::Instance().Reset();
+	OscLocomotion::Instance().Stop();
 	// Stop the OSC listener before anything it could touch goes away
 	NetworkTrackerReceiver::Instance().Stop();
 
@@ -170,13 +174,9 @@ ITrackedDevice* XrBackend::GetDevice(
 	default: {
 		if (index < 3)
 			return nullptr;
-		vr::TrackedDeviceIndex_t i = index - 3;
-		if (i < (vr::TrackedDeviceIndex_t)bodyTrackers.size())
-			return bodyTrackers[i].get();
-		i -= (vr::TrackedDeviceIndex_t)bodyTrackers.size();
-		if (i < (vr::TrackedDeviceIndex_t)networkTrackers.size())
-			return networkTrackers[i].get();
-		return nullptr;
+		// Late tracker discovery may append native roles after existing NET
+		// devices. Resolve assigned indices instead of renumbering those devices.
+		return OcuFindPublishedTracker<ITrackedDevice>(index, bodyTrackers, networkTrackers);
 	}
 	}
 }
@@ -719,7 +719,9 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
 	std::vector<const XrCompositionLayerBaseHeader*> debugLayers;
 	const XrCompositionLayerBaseHeader* debugHeaders[FoveationDebugOverlay::LayerCount]{};
-	if (oovr_global_configuration.FoveationDebugRings() && app_layer) {
+	const bool sceneBlackout = ocu_effect_foveation::GetState().ReadBlackout().Active();
+	if ((oovr_global_configuration.FoveationDebugRings() ||
+	        (!sceneBlackout && oovr_global_configuration.VrsEyeTracked() && oovr_global_configuration.VrsEyeAnyBlackout())) && app_layer) {
 		const auto& limits = xr_gbl->systemProperties.graphicsProperties;
 		const auto* binding = static_cast<const XrBaseInStructure*>(GetCurrentGraphicsBinding());
 		if (binding && binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR &&
@@ -728,13 +730,25 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 		    limits.maxSwapchainImageWidth >= 1024 && limits.maxSwapchainImageHeight >= 512) {
 			if (!foveationDebugOverlay) foveationDebugOverlay = std::make_unique<FoveationDebugOverlay>();
 			const auto profile = ocu_effect_foveation::GetState().ReadForPresentation(ocu_effect_foveation::ClockTicks());
+			const bool tracked = profile.mode == ocu_effect_foveation::Mode::EyeTracked;
+			std::string shapeBackend = oovr_global_configuration.FoveatedBackend();
+			std::transform(shapeBackend.begin(), shapeBackend.end(), shapeBackend.begin(),
+			    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			const float horizontalScale = tracked && shapeBackend != "effects" ?
+			    oovr_global_configuration.VrsEyeHorizontalScale() : 1.f;
 			const auto* d3d = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(binding);
-			if (foveationDebugOverlay->Update(xr_session.get(), d3d->device, profile) &&
+			if (foveationDebugOverlay->Update(xr_session.get(), d3d->device, profile, horizontalScale,
+			        oovr_global_configuration.FoveationDebugRings(),
+			        tracked && !sceneBlackout && oovr_global_configuration.VrsEyePeripheralMask(),
+			        oovr_global_configuration.VrsEyePeripheralMaskRadius(profile.midRadius),
+			        tracked && !sceneBlackout && oovr_global_configuration.VrsEyeMiddleBlackout(),
+			        tracked && !sceneBlackout && oovr_global_configuration.VrsEyeOuterBlackout()) &&
 			    foveationDebugOverlay->PositionOverScene(mainLayer)) {
 				for (uint32_t eye = 0; eye < FoveationDebugOverlay::LayerCount; ++eye)
 					debugHeaders[eye] = foveationDebugOverlay->Layer(eye);
 			}
-			OOVR_LOG_LIMITEDF(5000, "Eye-tracking rings: %s (diagnostic profile boundaries, not a shading-coverage proof)", foveationDebugOverlay->Status());
+			OOVR_LOG_LIMITEDF(5000, "Eye-tracking overlay: %s; scene blackout culling=%s",
+			    foveationDebugOverlay->Status(), sceneBlackout ? "armed" : "off (visual masks only)");
 			if (debugHeaders[0] && debugHeaders[1]) {
 				debugLayers.assign(headers, headers + layer_count);
 				for (auto* header : debugHeaders) debugLayers.push_back(header);
@@ -742,7 +756,7 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 				layer_count = static_cast<int>(debugLayers.size());
 			}
 		} else {
-			OOVR_LOG_LIMITEDF(5000, "Eye-tracking rings unavailable: D3D11 graphics and two spare OpenXR composition layers required");
+			OOVR_LOG_LIMITEDF(5000, "Eye-tracking overlay unavailable: D3D11 graphics and two spare OpenXR composition layers required");
 		}
 	}
 #endif
@@ -1069,6 +1083,10 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 				break;
 			if (recovery.backoffMs > 0.0)
 				break; // trouble on a previous injection this frame — stop claiming slots
+			if (!OCBridge_DapaMaskCacheValid()) {
+				g_aswProvider->InvalidateCachedFrame();
+				break; // Incomplete player coverage: retry on the next real frame, no cooldown.
+			}
 
 			// 1. Claim next display slot (measure time — xrWaitFrame can block the game)
 			auto t0 = DapaTiming::Clock::now();
@@ -1589,27 +1607,41 @@ bool XrBackend::IsInputAvailable()
 
 void XrBackend::PumpEvents()
 {
+	if (oovr_global_configuration.TreadmillEnabled()) {
+		if (!treadmillAttempted) {
+			treadmillAttempted = true;
+			OscLocomotion::Instance().Start(oovr_global_configuration.TreadmillPort(),
+			    oovr_global_configuration.TreadmillFullSpeed());
+		}
+	}
 	BaseInput* input = GetUnsafeBaseInput();
 
 	// Build raw HTCX role readers after actions are attached. These never become
 	// public devices themselves: the publication pass below gives each physical
 	// pose exactly one stable identity and keeps OCU-NET1/2/3 compatible with
 	// existing SkyrimVR-FBT serial pins in both physical and camera modes.
-	if (input && sessionState == XR_SESSION_STATE_FOCUSED && !bodyTrackersAttempted
-	    && input->AreActionsLoaded()) {
-		bodyTrackersAttempted = true;
+	const bool trackerInputsReady = input && IsInputAvailable() && input->AreActionsLoaded()
+	    && input->AreActionsAttachedToSession(xr_session.get());
+	if (trackerInputsReady && bodyTrackerDiscovery.Claim(input->GetTrackerSpaceGeneration())) {
 		if (xr_htcxViveTrackers && oovr_global_configuration.BodyTrackersEnabled()) {
+			const auto previousSources = htcxTrackerSources.size();
 			for (int i = 0; i < OCU_TRACKER_ROLE_COUNT; i++) {
 				XrSpace space = XR_NULL_HANDLE;
 				input->GetTrackerSpace(i, space);
 				if (space == XR_NULL_HANDLE)
 					continue;
+				const bool known = std::any_of(htcxTrackerSources.begin(), htcxTrackerSources.end(),
+				    [i](const auto& source) { return source->GetRoleIndex() == i; });
+				if (known)
+					continue;
 
 				htcxTrackerSources.push_back(std::make_unique<XrGenericTracker>(i));
 			}
-			if (!htcxTrackerSources.empty())
+			if (htcxTrackerSources.size() != previousSources) {
+				networkTrackersAttempted = false;
 				OOVR_LOGF("Body trackers: discovered %d private HTCX role sources",
 				    (int)htcxTrackerSources.size());
+			}
 		}
 	}
 
@@ -1618,8 +1650,7 @@ void XrBackend::PumpEvents()
 	// existing FBT calibration pins. With OSC active, the remaining camera slots
 	// also mux matching HTCX chest/knee/elbow roles. Physical roles without a
 	// network slot retain their native OCU-* identity. No pose is exposed twice.
-	if (input && sessionState == XR_SESSION_STATE_FOCUSED && !networkTrackersAttempted
-	    && input->AreActionsLoaded()) {
+	if (trackerInputsReady && !networkTrackersAttempted) {
 		networkTrackersAttempted = true;
 		const bool wantOsc = oovr_global_configuration.NetworkTrackersEnabled();
 		bool oscReady = false;
@@ -1641,8 +1672,8 @@ void XrBackend::PumpEvents()
 		};
 
 		const bool hasCanonicalHtcx = findHtcxRole(0) || findHtcxRole(1) || findHtcxRole(2);
-		const int trackerCount = oscReady ? NetworkTrackerReceiver::MAX_TRACKERS
-		                                  : (hasCanonicalHtcx ? 3 : 0);
+		const int trackerCount = std::max(static_cast<int>(networkTrackers.size()),
+		    oscReady ? NetworkTrackerReceiver::MAX_TRACKERS : (hasCanonicalHtcx ? 3 : 0));
 		auto roleUsesNetworkIdentity = [&](int role) {
 			for (int slot = 0; slot < trackerCount; slot++) {
 				if (htcxRoleForNetworkSlot[slot] == role)
@@ -1651,12 +1682,17 @@ void XrBackend::PumpEvents()
 			return false;
 		};
 
-		// GetDevice enumerates native extras before OCU-NET, so assign those
-		// indices first. Canonical waist/feet are always withheld for NET1..3.
-		vr::TrackedDeviceIndex_t nextIndex = 3;
+		// Allocate only missing identities. Existing devices keep their assigned
+		// indices when a new action set recovers previously rejected HTCX roles.
+		vr::TrackedDeviceIndex_t nextIndex = 3 + static_cast<vr::TrackedDeviceIndex_t>(
+		    bodyTrackers.size() + networkTrackers.size());
+		auto hasPublicNativeRole = [&](int role) {
+			return std::any_of(bodyTrackers.begin(), bodyTrackers.end(),
+			    [role](const auto& tracker) { return tracker->GetRoleIndex() == role; });
+		};
 		for (auto& source : htcxTrackerSources) {
 			const int role = source->GetRoleIndex();
-			if (roleUsesNetworkIdentity(role))
+			if (roleUsesNetworkIdentity(role) || hasPublicNativeRole(role))
 				continue;
 			bodyTrackers.push_back(std::make_unique<XrGenericTracker>(role, nextIndex));
 			input->RegisterBodyTrackerDevice(nextIndex, role);
@@ -1666,20 +1702,24 @@ void XrBackend::PumpEvents()
 		}
 
 		if (trackerCount > 0) {
-			const vr::TrackedDeviceIndex_t networkFirstIndex = nextIndex;
-			for (int i = 0; i < trackerCount; i++, nextIndex++) {
+			for (int i = 0; i < trackerCount; i++) {
 				const int htcxRole = htcxRoleForNetworkSlot[i];
-				ITrackedDevice* htcxRoleSource = findHtcxRole(htcxRole);
-				networkTrackers.push_back(std::make_unique<XrNetworkTracker>(i, nextIndex, htcxRoleSource));
+				ITrackedDevice* htcxRoleSource = hasPublicNativeRole(htcxRole) ? nullptr : findHtcxRole(htcxRole);
+				if (i < static_cast<int>(networkTrackers.size()))
+					networkTrackers[i]->SetHtcxRoleSource(htcxRoleSource);
+				else
+					networkTrackers.push_back(std::make_unique<XrNetworkTracker>(i, nextIndex++, htcxRoleSource));
 				if (htcxRoleSource)
-					input->RegisterBodyTrackerDevice(nextIndex, htcxRole);
+					input->RegisterBodyTrackerDevice(networkTrackers[i]->DeviceIndex(), htcxRole);
 			}
+			const auto networkFirstIndex = networkTrackers.front()->DeviceIndex();
+			const auto networkLastIndex = networkTrackers.back()->DeviceIndex();
 			if (oscReady) {
 				OOVR_LOGF("Network trackers: listening on UDP %d, exposing %d fused trackers (devices %u-%u)",
-				    port, trackerCount, (unsigned)networkFirstIndex, (unsigned)(nextIndex - 1));
+				    port, trackerCount, (unsigned)networkFirstIndex, (unsigned)networkLastIndex);
 			} else {
 				OOVR_LOGF("Body trackers: OSC disabled/unavailable; exposing canonical HTCX-backed OCU-NET1-3 (devices %u-%u)",
-				    (unsigned)networkFirstIndex, (unsigned)(nextIndex - 1));
+				    (unsigned)networkFirstIndex, (unsigned)networkLastIndex);
 			}
 		} else if (wantOsc && !oscReady) {
 			OOVR_LOGF("Network trackers: could not open UDP port %d and no HTCX roles are available", port);
@@ -1921,6 +1961,8 @@ void XrBackend::PumpEvents()
 			    && (changed->state == XR_SESSION_STATE_READY || changed->state == XR_SESSION_STATE_FOCUSED))
 				interactionProfileRetry.Request();
 			sessionState = changed->state;
+			if (oovr_global_configuration.TreadmillEnabled())
+				OcuLocomotionHeading::Instance().SetFocused(IsInputAvailable());
 
 			// Monado bug: it returns 0 for this value (at least for the first two states)
 			// Make sure this is actually greater than 0, otherwise this will mess up xr_gbl->GetBestTime()
@@ -1971,6 +2013,21 @@ void XrBackend::PumpEvents()
 				// suppress clion warning about missing branches
 				break;
 			}
+		} else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+			const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&ev);
+			if (oovr_global_configuration.TreadmillEnabled() && OcuInputSession::Matches(xr_session.get(), changed->session)) {
+				if (changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE) {
+					const auto q = changed->poseValid ? changed->poseInPreviousSpace.orientation : XrQuaternionf{};
+					const bool preserve = OcuLocomotionHeading::Instance().QueueStageChange(changed->changeTime,
+					    changed->poseValid != XR_FALSE, q.x, q.y, q.z, q.w);
+					OscLocomotion::Instance().SuspendHeading();
+					OOVR_LOG_LIMITEDF(1000, "Locomotion: STAGE recenter queued time=%lld poseValid=%d preserveHeading=%d",
+					    (long long)changed->changeTime, (int)changed->poseValid, preserve);
+				} else {
+					OOVR_LOG_LIMITEDF(1000, "Locomotion: reference change type=%d leaves STAGE heading unchanged",
+					    (int)changed->referenceSpaceType);
+				}
+			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
 			const auto* changed = reinterpret_cast<const XrEventDataInteractionProfileChanged*>(&ev);
 			if (OcuInputSession::Matches(xr_session.get(), changed->session))
@@ -1982,6 +2039,12 @@ void XrBackend::PumpEvents()
 		}
 
 	} // while loop
+	// Observe suppression even when Skyrim temporarily stops querying movement
+	// actions, so a menu or focus transition cannot replay a cached command.
+	if (input && oovr_global_configuration.TreadmillEnabled()) {
+		OcuLocomotionHeading::Instance().SetFocused(IsInputAvailable());
+		input->ReadExternalMovement(0, 0);
+	}
 
 	// xrGetCurrentInteractionProfile requires attached actions, NOT input focus.
 	// Resolve hands independently even if no change event arrives during startup
@@ -2009,6 +2072,7 @@ void XrBackend::PumpEvents()
 
 void XrBackend::OnSessionCreated()
 {
+	OcuLocomotionHeading::Instance().Reset();
 	dapaPeriodBaseline = {};
 	dapaResetPending = true;
 	realFrameShouldRender = false;
@@ -2074,6 +2138,8 @@ void XrBackend::OnSessionCreated()
 
 void XrBackend::PrepareForSessionShutdown()
 {
+	OcuLocomotionHeading::Instance().Reset();
+	OscLocomotion::Instance().Invalidate();
 #if defined(SUPPORT_DX11)
 	foveationDebugOverlay.reset();
 #endif

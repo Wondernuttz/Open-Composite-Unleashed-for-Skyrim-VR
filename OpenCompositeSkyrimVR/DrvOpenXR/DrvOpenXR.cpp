@@ -20,6 +20,12 @@
 static XrBackend* currentBackend;
 static bool initialised = false;
 static std::shared_ptr<BaseInput> sessionInputKeepalive;
+static uint32_t viveTrackerInteractionVersion = 0;
+
+uint32_t DrvOpenXR::GetViveTrackerInteractionVersion()
+{
+	return viveTrackerInteractionVersion;
+}
 
 #ifdef _WIN32
 static std::string DiagnosticUtf8(const wchar_t* value)
@@ -191,7 +197,7 @@ static void CreateSystemID()
 
 IBackend* DrvOpenXR::CreateOpenXRBackend()
 {
-	OOVR_LOG("OCU runtime build: 4.3.7-foveation-debug-hotfix1 / fixed-ring-no-timeout-v1 / foveation-geometry-v3-fixed-separate + rdm-depth-scope-v3 / eye-presets-v3-performance-1x1-2x2-4x2 + gaze-upload-v3 / DAPA menu-pause-v1 / DAPA mask-frame-v1 + exact-mask-v1 / terrain-depth-guard-v1 / cutout-material-guard-v1 / ring-debug-v2-quads / runtime-route-v2 / first-stereo-frame-v1 / controller-index-v1 / moving-gaze-v2 + effect-foveation-v1 / Index-grip-touch-v1 / input-recovery-v5 / DAPA render-permission-v4 + GPU timing v1");
+	OOVR_LOG("OCU runtime build: 4.3.11-rdm-perf4 / dapa-mask-lease-v1 / stage-recenter-v1 + controller-calibration-v1 / external-locomotion-v1 + cached-head-v1 + bridge-publish-v1 + startup-checkpoints-v1 / body-tracker-validation-v2 + live-pose-status-v1 / eye-shape-offset-v1 + ring-visual-masks-v2 + scene-blackout-cull-v1 + dapa-blackout-guard-v1 / rdm-thread-hooks2-perf4 + rdm-depth-binding-batch-v1 + rdm-mask-reuse-v1 + guide-state-cache-v2 + rdm-work-sampling-v1 / rdm-reject-diag-v2 / rdm-sampled-diagnostics-v1 + immutable-guide-zero-v1 / compute-state-restore-v1 + depth-read-hazard-v1 / fixed-ring-no-timeout-v1 / foveation-geometry-v3-fixed-separate + rdm-depth-scope-v3 / eye-presets-v3-performance-1x1-2x2-4x2 + gaze-upload-v3 / DAPA menu-pause-v1 / DAPA mask-frame-v1 + exact-mask-v1 / terrain-depth-guard-v1 / cutout-material-guard-v1 / ring-debug-v2-quads / runtime-route-v2 / first-stereo-frame-v1 / controller-index-v1 / moving-gaze-v2 + effect-foveation-v1 / Index-grip-touch-v1 / input-recovery-v5 / DAPA render-permission-v4 + GPU timing v1");
 	LogRuntimeProcessIdentity();
 	// TODO handle something like Unity which stops and restarts the instance
 	if (initialised) {
@@ -218,8 +224,12 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	OOVR_FAILED_XR_ABORT(xrEnumerateInstanceExtensionProperties(nullptr,
 	    extensionProperties.size(), &availableExtensionsCount, extensionProperties.data()));
 	std::set<std::string> availableExtensions;
+	viveTrackerInteractionVersion = 0;
+	xr_htcxViveTrackers = false;
 	for (const XrExtensionProperties& ext : extensionProperties) {
 		availableExtensions.insert(ext.extensionName);
+		if (strcmp(ext.extensionName, "XR_HTCX_vive_tracker_interaction") == 0)
+			viveTrackerInteractionVersion = ext.extensionVersion;
 		OOVR_LOGF("Extension: %s", ext.extensionName);
 	}
 
@@ -325,6 +335,7 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	if (availableExtensions.count("XR_HTCX_vive_tracker_interaction")) {
 		extensions.push_back("XR_HTCX_vive_tracker_interaction");
 		xr_htcxViveTrackers = true;
+		OOVR_LOGF("XR_HTCX_vive_tracker_interaction enabled, revision %u", viveTrackerInteractionVersion);
 	}
 
 	const char* const layers[] = {
@@ -415,11 +426,21 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	return currentBackend;
 }
 
+static void LogLocomotionSessionCheckpoint(const char* stage)
+{
+	if (!oovr_global_configuration.TreadmillEnabled()) return;
+	OOVR_LOGF("Locomotion startup: %s", stage);
+	// Preserve the last completed startup phase if the process exits before
+	// the normal buffered logger's next flush. No per-frame disk writes.
+	oovr_log_flush();
+}
+
 void DrvOpenXR::SetupSession()
 {
 	// SetupSession is used to restart the session, and as such, we want to prevent other threads from attempting to use the session
 	// while we're rebuilding it (otherwise we get gross nondescript crashes), so we will put a lock on it here.
 	auto lock = xr_session.lock();
+	LogLocomotionSessionCheckpoint("session setup entered");
 	if (xr_gbl) {
 		ShutdownSession();
 	}
@@ -435,6 +456,7 @@ void DrvOpenXR::SetupSession()
 
 	// Setup the OpenXR globals, which uses the current session so we have to do this last
 	xr_gbl = new XrSessionGlobals();
+	LogLocomotionSessionCheckpoint("session and reference spaces created");
 
 	// Print the current version for diagnostic purposes
 	OOVR_LOGF("Started OpenXR session on system '%s', hand tracking supported: %d, eye gaze supported: %d",
@@ -465,7 +487,9 @@ void DrvOpenXR::SetupSession()
 		}
 	}
 
+	LogLocomotionSessionCheckpoint("input setup completed; processing session events");
 	currentBackend->OnSessionCreated();
+	LogLocomotionSessionCheckpoint("session event processing completed");
 }
 
 void DrvOpenXR::ShutdownSession()
@@ -529,6 +553,8 @@ void DrvOpenXR::FullShutdown()
 	}
 
 	initialised = false;
+	viveTrackerInteractionVersion = 0;
+	xr_htcxViveTrackers = false;
 	currentBackend = nullptr;
 	sessionInputKeepalive.reset();
 }

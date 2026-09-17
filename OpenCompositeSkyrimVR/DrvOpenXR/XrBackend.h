@@ -7,6 +7,7 @@
 #include "XrDriverPrivate.h"
 #include "InputSessionRecovery.h"
 #include "DapaTiming.h"
+#include "../OpenOVR/Misc/BodyTrackerDevices.h"
 
 #include "XrController.h"
 #include "XrGenericTracker.h"
@@ -37,6 +38,7 @@ public:
 	 * we call xrEndSession.
 	 */
 	bool sessionActive = false;
+	bool treadmillAttempted = false;
 
 	/**
 	 * To be called after xrCreateSession. Should only be used by DrvOpenXR.
@@ -67,8 +69,8 @@ private:
 	// identity and canonical waist/foot serials remain OCU-NET1/2/3.
 	std::vector<std::unique_ptr<XrGenericTracker>> htcxTrackerSources;
 	std::vector<std::unique_ptr<XrGenericTracker>> bodyTrackers; // public native roles not represented by an OCU-NET slot
-	std::vector<std::unique_ptr<XrNetworkTracker>> networkTrackers; // canonical HTCX/OSC mux devices after bodyTrackers
-	bool bodyTrackersAttempted = false;
+	std::vector<std::unique_ptr<XrNetworkTracker>> networkTrackers; // canonical HTCX/OSC mux devices with stable assigned indices
+	OcuBodyTrackerDiscovery bodyTrackerDiscovery;
 	bool networkTrackersAttempted = false; // one-shot device publication and optional UDP bind
 
 	void CheckOrInitCompositors(const vr::Texture_t* tex);

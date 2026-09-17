@@ -1,10 +1,11 @@
 // Included inside the plugin namespace after the bridge definitions.
-// Bridge v6 reserved bytes negotiate this new mask without accepting old R8 masks.
+// Mask format 2 adds a nonblocking lifetime/content lease in reserved bridge words.
 namespace PlayerMask {
     using GeometryFn=void(__fastcall*)(void*,RE::BSRenderPass*,uint32_t);
     using InstancedFn=void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,UINT,UINT,UINT,INT,UINT);
     GeometryFn originalSetup[2]{},originalRestore[2]{};
     DapaPlayerMaskGpu gpu;
+    using MaskAccess = DapaMaskBridge::Access<OCRenderTargetBridge>;
     DapaVtableSlot hooks[4];
     std::array<DapaEngineDraw::Hook,DapaEngineDraw::sites.size()> engineHooks{};
     DapaCsxDraw::Adapter csxAdapter;
@@ -112,7 +113,7 @@ namespace PlayerMask {
     template<int Type> void __fastcall Restore(void* shader,RE::BSRenderPass* pass,uint32_t flags) {
         owned=false;originalRestore[Type](shader,pass,flags);
     }
-    bool Prepare(ID3D11DeviceContext* ctx,bool playerDraw,ID3D11Texture2D* apiSceneDepth=nullptr) {
+    bool Prepare(ID3D11DeviceContext* ctx,bool playerDraw,MaskAccess& access,ID3D11Texture2D* apiSceneDepth=nullptr) {
         if(!playerDraw)return false;
         ++ownedCallbacks;
         if(ctx!=immediate) {++rejected[0];return false;}
@@ -130,34 +131,39 @@ namespace PlayerMask {
         if(actual.Get()!=resources.depthTexture) {++rejected[4];return false;} // no shadow/reflection passes
         D3D11_TEXTURE2D_DESC desc{};resources.depthTexture->GetDesc(&desc);
         if(desc.SampleDesc.Count!=1 || desc.ArraySize!=1) {++rejected[5];return false;}
+        // Reject non-scene/deferred draws before touching the mask gate: their
+        // concurrent callbacks must not poison actual scene player coverage.
+        if(!access.TryAcquire(g_pBridge,DapaMaskBridge::AccessMode::Write) || !access.Clean()) {++rejected[6];return false;}
         const auto* previous=gpu.Texture();
-        // Invalidate publication before resource replacement. Producer and consumer
-        // both run on the same immediate-context render thread.
-        g_pBridge->_padPreFP[0]=0;
-        if(!gpu.Size(resources.d3dDevice,desc.Width,desc.Height)) {++rejected[6];return false;}
-        if(previous!=gpu.Texture() || needsClear || !g_pBridge->preFPDepthCaptured) {
+        const bool hadCapture=access.Valid();
+        // The lease remains held through replay/publication. Neither a different
+        // draw thread nor the compositor can replace, clear or copy this mask.
+        if(!gpu.Size(resources.d3dDevice,desc.Width,desc.Height)) {access.Poison();++rejected[6];return false;}
+        if(previous!=gpu.Texture() || needsClear || !hadCapture) {
             gpu.Clear(ctx);needsClear=false;
         }
-        g_pBridge->preFPDepthTexture=reinterpret_cast<uint64_t>(gpu.Texture());
         return true;
     }
-    void Publish() {
+    bool Publish(MaskAccess& access) {
+        if(!access.Publish(reinterpret_cast<uint64_t>(gpu.Texture())))return false;
         ++draws;
-        g_pBridge->preFPDepthCaptured=1;
-        g_pBridge->_padPreFP[0]=1; // R32 raw device-depth mask v1; clear sentinel -1
-        if(!g_diagnosticLogging.load(std::memory_order_relaxed))return;
+        if(!g_diagnosticLogging.load(std::memory_order_relaxed))return true;
         const auto now=std::chrono::steady_clock::now();
         if(now-lastLog>std::chrono::seconds(5)) {
             SKSE::log::debug("DAPA BODY MASK v4: ownedPasses={} maskDraws={} HIGGS-ownedPasses={} SpellWheel-ownedPasses={} VR-arrow-ownedPasses={} crossbow-reload-ownedPasses={} VR-equipment-ownedPasses={} (live ownership, no IB guessing)",classified,draws,higgsClassified,spellWheelClassified,vrArrowClassified,crossbowClassified,vrEquipmentClassified);
             lastLog=now;
         }
+        return true;
     }
     template<size_t Site> void STDMETHODCALLTYPE Draw(ID3D11DeviceContext* ctx,UINT n,UINT start,INT base) {
         ++callbacks;const bool playerDraw=owned;
         // Fetch CURRENT dispatch, never retain/overwrite D3D11's mutable slots.
         ctx->DrawIndexed(n,start,base);
-        if(Prepare(ctx,playerDraw)) {
-            if(!gpu.Replay(ctx,[&]{ctx->DrawIndexed(n,start,base);})) {++rejected[6];return;}Publish();
+        if(!playerDraw)return;
+        MaskAccess access;
+        if(Prepare(ctx,playerDraw,access)) {
+            if(!gpu.Replay(ctx,[&]{ctx->DrawIndexed(n,start,base);})) {access.Poison();++rejected[6];return;}
+            if(!Publish(access))return;
             if(++siteDraws[Site]==1)SKSE::log::info("DAPA BODY MASK v4: first mask at mesh draw RVA 0x{:X}",DapaEngineDraw::sites[Site].rva);
         }
     }
@@ -170,8 +176,11 @@ namespace PlayerMask {
         // The CSX adapter observes accepted draws while their geometry state is
         // still bound. No acceptance means suppression/redirection: no mask.
         if(previous && playerDraw && !scope.consumed)++rejected[7];
-        if(!previous && Prepare(ctx,playerDraw)) {
-            if(!gpu.Replay(ctx,[&]{ctx->DrawIndexedInstanced(n,instances,start,base,first);})) {++rejected[6];return;}Publish();
+        if(previous || !playerDraw)return;
+        MaskAccess access;
+        if(Prepare(ctx,playerDraw,access)) {
+            if(!gpu.Replay(ctx,[&]{ctx->DrawIndexedInstanced(n,instances,start,base,first);})) {access.Poison();++rejected[6];return;}
+            if(!Publish(access))return;
             if(++siteDraws[Site]==1)SKSE::log::info("DAPA BODY MASK v4: first mask at mesh draw RVA 0x{:X}",DapaEngineDraw::sites[Site].rva);
         }
     }
@@ -182,8 +191,10 @@ namespace PlayerMask {
             [&]{ctx->DrawIndexedInstanced(n,instances,start,base,first);},
             [&]{
                 ++csxPlayerAccepted;
-                if(Prepare(ctx,true)) {
-                    if(!gpu.Replay(ctx,[&]{ctx->DrawIndexedInstanced(n,instances,start,base,first);})) {++rejected[6];return;}Publish();
+                MaskAccess access;
+                if(Prepare(ctx,true,access)) {
+                    if(!gpu.Replay(ctx,[&]{ctx->DrawIndexedInstanced(n,instances,start,base,first);})) {access.Poison();++rejected[6];return;}
+                    if(!Publish(access))return;
                     if(++siteDraws[0]==1)
                         SKSE::log::info("DAPA BODY MASK v4: first CSX-accepted player draw MASKED (primary mesh site, live geometry state)");
                 }
@@ -200,13 +211,14 @@ namespace PlayerMask {
         ++csxAccepted;
         if(!IsPlayerGeometry(static_cast<const RE::BSGeometry*>(event->geometry)))return;
         ++classified;
-        if(!Prepare(event->context,true,event->sceneDepth))return;
+        MaskAccess access;
+        if(!Prepare(event->context,true,access,event->sceneDepth))return;
         uint32_t replayResult=CSXAcceptedDrawAPI::Failed;
         const bool restored=gpu.Replay(event->context,[&] {
             replayResult=event->replay(event->replayToken);
         });
-        if(!restored || replayResult!=CSXAcceptedDrawAPI::Success) {++rejected[6];return;}
-        Publish();
+        if(!restored || replayResult!=CSXAcceptedDrawAPI::Success) {access.Poison();++rejected[6];return;}
+        if(!Publish(access))return;
         if(++csxPlayerAccepted==1)
             SKSE::log::info("DAPA BODY MASK API v1: first player-owned accepted scene draw MASKED");
     }

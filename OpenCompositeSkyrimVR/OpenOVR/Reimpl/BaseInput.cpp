@@ -1,6 +1,8 @@
 #include "generated/interfaces/vrtypes.h"
 #include "Misc/BodyTrackerRoles.h"
 #include "Misc/WalkInPlace.h"
+#include "Misc/Input/OscLocomotion.h"
+#include "Misc/Input/LocomotionHeading.h"
 #include "logging.h"
 #include "openxr/openxr.h"
 #include "stdafx.h"
@@ -40,6 +42,7 @@
 using namespace vr;
 
 #include "../DrvOpenXR/XrBackend.h"
+#include "../../DrvOpenXR/pub/DrvOpenXR.h"
 #include "../InputTrace.h"
 #include "../Misc/Input/IndexTrackpadRouting.h"
 #include "../DrvOpenXR/DapaCaptureTelemetry.h"
@@ -59,6 +62,32 @@ void BaseInput::RememberPhysicalMove(float y)
 {
 	physicalMoveY.store(y);
 	physicalMoveSampleMs.store(InputNowMs());
+}
+
+BaseInput::ExternalMovement BaseInput::ReadExternalMovement(float physicalX, float physicalY) const
+{
+	ExternalMovement value{};
+	if (!oovr_global_configuration.TreadmillEnabled()) return value;
+	bool paused = true;
+#if defined(_WIN32) && defined(SUPPORT_DX11)
+	extern int OCBridge_LocomotionState();
+	extern std::atomic<bool> g_ocuKeyboardActive;
+	paused = OCBridge_LocomotionState() != 0 || g_ocuKeyboardActive.load(std::memory_order_acquire) ||
+	    CameraLegCalibration::CapturesInput();
+#endif
+	// SetupSession may still be constructing/replacing the backend here. Only
+	// consume an observed head-space sample; input never performs a pose query.
+	const auto heading = OcuLocomotionHeading::Instance().Read(InputNowMs(), paused);
+	const bool focused = heading.focused;
+	const auto yaw = heading.yaw;
+	const auto output = OscLocomotion::Instance().Read({physicalX, physicalY}, yaw, focused, paused,
+	    heading.referenceEpoch, heading.token, heading.calibrationAllowed);
+	value.x = static_cast<float>(output.stick.x);
+	value.y = static_cast<float>(output.stick.y);
+	value.ownsAxis = output.source != locomotion::Source::None;
+	value.treadmillSelected = output.source == locomotion::Source::Locomotion;
+	value.allowSynthetic = focused && !paused && yaw.has_value();
+	return value;
 }
 
 bool BaseInput::HasWalkInPlaceActivationButton() const
@@ -863,6 +892,7 @@ void BaseInput::ResetBodyTrackerActionHandles()
 {
 	std::fill(std::begin(bodyTrackerActions), std::end(bodyTrackerActions), XR_NULL_HANDLE);
 	std::fill(std::begin(bodyTrackerHaptics), std::end(bodyTrackerHaptics), XR_NULL_HANDLE);
+	bodyTrackerBindings.Reset();
 }
 
 void BaseInput::DestroyEyeGazeSpace()
@@ -1686,6 +1716,7 @@ EVRInputError BaseInput::UpdateActionState(VR_ARRAY_COUNT(unSetCount) VRActiveAc
 	TraceActionSync(syncedSession, syncResult, false);
 	OOVR_FAILED_XR_ABORT(syncResult);
 	UpdateDapaCaptureGesture(syncResult == XR_SUCCESS);
+	UpdateTreadmillCalibrationGesture(syncResult == XR_SUCCESS);
 	syncSerial++;
 
 	return VRInputError_None;
@@ -1706,6 +1737,7 @@ void BaseInput::InternalUpdate()
 	TraceActionSync(syncedSession, syncResult, true);
 	OOVR_FAILED_XR_SOFT_ABORT(syncResult);
 	UpdateDapaCaptureGesture(syncResult == XR_SUCCESS);
+	UpdateTreadmillCalibrationGesture(syncResult == XR_SUCCESS);
 	syncSerial++;
 }
 
@@ -1752,6 +1784,55 @@ void BaseInput::TraceActionSync(XrSession syncedSession, XrResult result, bool l
 			    (void*)session, hand == 0 ? "left" : "right", grip.isActive, aim.isActive,
 			    (void*)ctrl.gripPoseSpace, (void*)ctrl.aimPoseSpace, (int)gripResult, (int)aimResult);
 		}
+	}
+}
+
+void BaseInput::UpdateTreadmillCalibrationGesture(bool focused)
+{
+	const auto now = InputNowMs();
+	const auto session = xr_session.get();
+	bool available = oovr_global_configuration.TreadmillEnabled() &&
+	    oovr_global_configuration.TreadmillControllerCalibration() && focused && HasFocusedActionSync(session);
+	if (available) {
+		const auto movement = ReadExternalMovement(0, 0);
+		available = movement.allowSynthetic && OscLocomotion::Instance().ControllerCalibrationReady();
+	}
+	bool held[2]{};
+	bool centered = true;
+	if (available) for (int hand = 0; hand < 2; ++hand) {
+		const auto& ctrl = legacyControllers[hand];
+		XrActionStateGetInfo get{ XR_TYPE_ACTION_STATE_GET_INFO };
+		get.action = ctrl.stickBtn;
+		XrActionStateBoolean click{ XR_TYPE_ACTION_STATE_BOOLEAN };
+		if (!get.action || XR_FAILED(xrGetActionStateBoolean(session, &get, &click)) || !click.isActive) {
+			available = false; break;
+		}
+		held[hand] = click.currentState != XR_FALSE;
+		double axes[2]{};
+		for (int axis = 0; axis < 2; ++axis) {
+			get.action = axis == 0 ? ctrl.stickX : ctrl.stickY;
+			XrActionStateFloat value{ XR_TYPE_ACTION_STATE_FLOAT };
+			if (!get.action || XR_FAILED(xrGetActionStateFloat(session, &get, &value)) ||
+			    !value.isActive || !std::isfinite(value.currentState)) { available = false; break; }
+			axes[axis] = value.currentState;
+		}
+		centered = centered && std::hypot(axes[0], axes[1]) <= .15;
+	}
+	if (!treadmillCalibrationGesture.Update(now, available, held[0], held[1], centered)) return;
+	if (!OscLocomotion::Instance().CalibrateFromControllers()) {
+		OOVR_LOGF("Locomotion: controller calibration canceled; fresh headset and sensor data required");
+		return;
+	}
+	OOVR_LOGF("Locomotion: controller heading calibration accepted");
+	// Existing action-session haptic route; no input remapping or extra poses.
+	if (!oovr_global_configuration.Haptics()) return;
+	for (const auto& ctrl : legacyControllers) {
+		if (!ctrl.haptic) continue;
+		XrHapticActionInfo info{ XR_TYPE_HAPTIC_ACTION_INFO }; info.action = ctrl.haptic;
+		XrHapticVibration pulse{ XR_TYPE_HAPTIC_VIBRATION };
+		pulse.frequency = XR_FREQUENCY_UNSPECIFIED; pulse.duration = 80000000;
+		pulse.amplitude = std::clamp(oovr_global_configuration.HapticStrength() * .5f, 0.0f, 1.0f);
+		if (pulse.amplitude > 0) xrApplyHapticFeedback(session, &info, reinterpret_cast<const XrHapticBaseHeader*>(&pulse));
 	}
 }
 
@@ -1952,11 +2033,49 @@ EVRInputError BaseInput::GetDigitalActionData(VRActionHandle_t action, InputDigi
 
 	// Skyrim consumes the action API, not only GetControllerState. Keep the
 	// movement/turn stick touch action asserted while synthetic gait locomotion is live.
-	if (oovr_global_configuration.WalkInPlaceEnabled() &&
+	if (!oovr_global_configuration.TreadmillEnabled() && oovr_global_configuration.WalkInPlaceEnabled() &&
 	    ((isSkyrimLeftStickTouch && std::abs(GetWalkInPlaceStickY()) > 0.0f) ||
 	        (isSkyrimRightStickTouch && std::abs(GetWalkInPlaceTurnX()) > 0.0f))) {
 		pActionData->bState = true;
 		pActionData->bActive = true;
+	}
+	if (oovr_global_configuration.TreadmillEnabled() && isSkyrimLeftStickTouch &&
+	    checkRestrictToDevice(ulRestrictToDevice, allSubactionPaths[0])) {
+		const int physicalHand = oovr_global_configuration.SwapThumbsticks() ? 1 : 0;
+		Action* moveAction = actions.LookupItem(physicalHand ?
+		    "/actions/legacy/in/right_axis0_value" : "/actions/legacy/in/left_axis0_value");
+		XrActionStateVector2f move{XR_TYPE_ACTION_STATE_VECTOR2F};
+		if (moveAction && moveAction->xr != XR_NULL_HANDLE) {
+			XrActionStateGetInfo moveInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+			moveInfo.action = moveAction->xr;
+			moveInfo.subactionPath = allSubactionPaths[physicalHand];
+			if (xrGetActionStateVector2f(xr_session.get(), &moveInfo, &move) != XR_SUCCESS || !move.isActive)
+				move.currentState = {};
+		}
+		const auto& cfg = oovr_global_configuration;
+		const float dead = std::abs(physicalHand ? cfg.RightDeadZoneSize() : cfg.LeftDeadZoneSize());
+		const float deadX = std::abs(physicalHand ? cfg.RightDeadZoneXSize() : cfg.LeftDeadZoneXSize());
+		const float deadY = std::abs(physicalHand ? cfg.RightDeadZoneYSize() : cfg.LeftDeadZoneYSize());
+		if (std::abs(move.currentState.x) <= std::max(dead, deadX)) move.currentState.x = 0;
+		if (std::abs(move.currentState.y) <= std::max(dead, deadY)) move.currentState.y = 0;
+		const auto external = ReadExternalMovement(move.currentState.x, move.currentState.y);
+		const bool syntheticTouch = external.allowSynthetic &&
+		    (external.ownsAxis ? std::hypot(external.x, external.y) > 0 :
+		        (cfg.WalkInPlaceEnabled() && std::abs(GetWalkInPlaceStickY()) > 0));
+		if (syntheticTouch) {
+			pActionData->bState = true;
+			pActionData->bActive = true;
+			pActionData->activeOrigin = activeOriginFromSubaction(digitalSourceAction, allSubactionPathNames[physicalHand].c_str());
+		}
+	}
+	if (oovr_global_configuration.TreadmillEnabled() && isSkyrimRightStickTouch &&
+	    checkRestrictToDevice(ulRestrictToDevice, allSubactionPaths[1])) {
+		const auto external = ReadExternalMovement(0, 0);
+		if (external.allowSynthetic && !external.ownsAxis &&
+		    oovr_global_configuration.WalkInPlaceEnabled() && std::abs(GetWalkInPlaceTurnX()) > 0) {
+			pActionData->bState = true;
+			pActionData->bActive = true;
+		}
 	}
 
 	// Note it's possible we didn't set any output if this action isn't bound to anything, just leave the
@@ -1966,6 +2085,16 @@ EVRInputError BaseInput::GetDigitalActionData(VRActionHandle_t action, InputDigi
 		pActionData->bChanged = false;
 		pActionData->bActive = false;
 		pActionData->activeOrigin = 0;
+	}
+	if (oovr_global_configuration.TreadmillEnabled() && isSkyrimLeftStickTouch &&
+	    checkRestrictToDevice(ulRestrictToDevice, allSubactionPaths[0])) {
+		if (treadmillTouchSync != syncSerial) {
+			treadmillTouchSync = syncSerial;
+			treadmillTouchChanged = false;
+		}
+		treadmillTouchChanged |= pActionData->bState != treadmillTouchPrevious;
+		treadmillTouchPrevious = pActionData->bState;
+		pActionData->bChanged |= treadmillTouchChanged;
 	}
 
 	return VRInputError_None;
@@ -2070,7 +2199,26 @@ EVRInputError BaseInput::GetAnalogActionData(VRActionHandle_t action, InputAnalo
 			bool turnInjected = false;
 			float wip = 0.0f;
 			float wipTurn = 0.0f;
-			if (i == physicalStickHand && isSkyrimLeftMoveAction && oovr_global_configuration.WalkInPlaceEnabled()) {
+			ExternalMovement external{};
+			bool useExternal = oovr_global_configuration.TreadmillEnabled() && i == physicalStickHand &&
+			    (isSkyrimLeftMoveAction || isSkyrimRightTurnAction);
+			if (useExternal) {
+				if (!state.isActive) state.currentState = {};
+				const auto& cfg = oovr_global_configuration;
+				const float dead = std::abs(i ? cfg.RightDeadZoneSize() : cfg.LeftDeadZoneSize());
+				const float deadX = std::abs(i ? cfg.RightDeadZoneXSize() : cfg.LeftDeadZoneXSize());
+				const float deadY = std::abs(i ? cfg.RightDeadZoneYSize() : cfg.LeftDeadZoneYSize());
+				if (std::abs(state.currentState.x) <= std::max(dead, deadX)) state.currentState.x = 0;
+				if (std::abs(state.currentState.y) <= std::max(dead, deadY)) state.currentState.y = 0;
+				external = isSkyrimLeftMoveAction ? ReadExternalMovement(state.currentState.x, state.currentState.y) :
+				    ReadExternalMovement(0, 0);
+				if (isSkyrimLeftMoveAction && external.ownsAxis) {
+					state.currentState = {external.x, external.y};
+					state.isActive = XR_TRUE;
+				}
+			}
+			const bool allowGait = !useExternal || (external.allowSynthetic && !external.ownsAxis);
+			if (allowGait && i == physicalStickHand && isSkyrimLeftMoveAction && oovr_global_configuration.WalkInPlaceEnabled()) {
 				wip = GetWalkInPlaceStickY();
 				if (std::abs(wip) > std::abs(state.currentState.y)) {
 					state.currentState.y = wip;
@@ -2078,7 +2226,7 @@ EVRInputError BaseInput::GetAnalogActionData(VRActionHandle_t action, InputAnalo
 					wipInjected = true;
 				}
 			}
-			if (i == physicalStickHand && isSkyrimRightTurnAction && oovr_global_configuration.WalkInPlaceEnabled()) {
+			if (allowGait && i == physicalStickHand && isSkyrimRightTurnAction && oovr_global_configuration.WalkInPlaceEnabled()) {
 				wipTurn = GetWalkInPlaceTurnX();
 				float sourceDeadzone = physicalStickHand == 0
 				    ? std::abs(oovr_global_configuration.LeftDeadZoneSize())
@@ -2102,10 +2250,10 @@ EVRInputError BaseInput::GetAnalogActionData(VRActionHandle_t action, InputAnalo
 				deadZoneSize = std::abs(oovr_global_configuration.RightDeadZoneSize());
 			}
 
-			if (std::abs(state.currentState.x) <= deadZoneSize) {
+			if (!external.treadmillSelected && std::abs(state.currentState.x) <= deadZoneSize) {
 				state.currentState.x = 0.0f;
 			}
-			if (std::abs(state.currentState.y) <= deadZoneSize) {
+			if (!external.treadmillSelected && std::abs(state.currentState.y) <= deadZoneSize) {
 				state.currentState.y = 0.0f;
 			}
 
@@ -3285,12 +3433,23 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 	}
 	if (hand == 0)
 		RememberPhysicalMove(CameraLegCalibration::CapturesInput() ? 0.0f : thumbstick.y);
+	ExternalMovement external{};
+	const bool useExternal = oovr_global_configuration.TreadmillEnabled();
+	if (useExternal) {
+		external = hand == 0 ? ReadExternalMovement(thumbstick.x, thumbstick.y) : ReadExternalMovement(0, 0);
+		if (hand == 0 && external.ownsAxis) {
+			thumbstick = {external.x, external.y};
+			if (std::hypot(external.x, external.y) > 0)
+				state->ulButtonTouched |= ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
+		}
+	}
+	const bool allowGait = !useExternal || (external.allowSynthetic && !external.ownsAxis);
 
 	// Walk-in-place locomotion: stepping (body trackers) synthesizes forward/
 	// backward on the LEFT stick. A real stick push always overrides. The
 	// touch flag comes with it — input paths can ignore axis values that
 	// arrive without Axis0 registering as touched.
-	if (hand == 0 && oovr_global_configuration.WalkInPlaceEnabled()
+	if (allowGait && hand == 0 && oovr_global_configuration.WalkInPlaceEnabled()
 	    && !CameraLegCalibration::CapturesInput()) {
 		float wip = GetWalkInPlaceStickY();
 		if (std::abs(wip) > std::abs(thumbstick.y)) {
@@ -3298,7 +3457,7 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 			state->ulButtonTouched |= ButtonMaskFromId(vr::k_EButton_SteamVR_Touchpad);
 		}
 	}
-	if (hand == 1 && oovr_global_configuration.WalkInPlaceEnabled()
+	if (allowGait && hand == 1 && oovr_global_configuration.WalkInPlaceEnabled()
 	    && !CameraLegCalibration::CapturesInput()) {
 		float wipTurn = GetWalkInPlaceTurnX();
 		if (std::abs(thumbstick.x) < 0.05f && std::abs(wipTurn) > 0.0f) {
@@ -3427,30 +3586,33 @@ void BaseInput::CreateBodyTrackerActions()
 	// bind defensive instead of retaining a space from the wrong session.
 	DestroyBodyTrackerSpaces();
 
-	if (!xr_htcxViveTrackers || !oovr_global_configuration.BodyTrackersEnabled())
+	if (!xr_htcxViveTrackers || !oovr_global_configuration.BodyTrackersEnabled()) {
+		bodyTrackerBindings.Prepare(false, [](bool) { return XR_ERROR_PATH_UNSUPPORTED; });
+		return;
+	}
+
+	// The owning action set is immutable after its first attachment, even if
+	// its session is later destroyed. Retain success/failure until that set is
+	// rebuilt, instead of creating or re-suggesting actions on session restart.
+	if (!bodyTrackerBindings.NeedsSuggestion())
 		return;
 
-	// Parse the enabled role list: "waist,left_foot,right_foot" (default) or "all"
 	const std::string& roleList = oovr_global_configuration.BodyTrackerRoles();
-	const bool all = (roleList == "all");
-	auto roleEnabled = [&](int role) {
-		if (all)
-			return true;
-		const std::string needle = OCU_TRACKER_ROLES[role].iniName;
-		const std::string padded = "," + roleList + ",";
-		return padded.find("," + needle + ",") != std::string::npos;
-	};
+	const uint32_t extensionVersion = DrvOpenXR::GetViveTrackerInteractionVersion();
 
 	std::vector<XrActionSuggestedBinding> bindings;
 	std::vector<XrActionSuggestedBinding> hapticBindings;
-	bool needsBindingSuggestion = false;
 	for (int i = 0; i < OCU_TRACKER_ROLE_COUNT; i++) {
-		if (!roleEnabled(i))
+		if (!OcuTrackerRoleRequested(roleList, i))
 			continue;
+		if (!OcuTrackerRoleEnabled(roleList, i, extensionVersion)) {
+			OOVR_LOGF("Body trackers: skipping %s; requires HTCX revision %u, runtime advertises %u",
+			    OCU_TRACKER_ROLES[i].iniName, OCU_TRACKER_ROLES[i].minimumExtensionVersion, extensionVersion);
+			continue;
+		}
 
 		const bool createdPoseAction = bodyTrackerActions[i] == XR_NULL_HANDLE;
 		if (createdPoseAction) {
-			needsBindingSuggestion = true;
 			XrActionCreateInfo info = { XR_TYPE_ACTION_CREATE_INFO };
 			info.actionType = XR_ACTION_TYPE_POSE_INPUT;
 			strcpy_arr(info.actionName, OCU_TRACKER_ROLES[i].actionName);
@@ -3487,10 +3649,13 @@ void BaseInput::CreateBodyTrackerActions()
 		}
 	}
 
-	if (bindings.empty())
+	if (bindings.empty()) {
+		// Remember this immutable set has no prepared roles as well. A later
+		// session must not add actions to it after attachment.
+		bodyTrackerBindings.Prepare(false, [](bool) { return XR_ERROR_PATH_UNSUPPORTED; });
 		return;
+	}
 
-	if (needsBindingSuggestion) {
 	XrPath profilePath;
 	OOVR_FAILED_XR_ABORT(xrStringToPath(xr_instance, "/interaction_profiles/htc/vive_tracker_htcx", &profilePath));
 
@@ -3501,30 +3666,31 @@ void BaseInput::CreateBodyTrackerActions()
 	std::vector<XrActionSuggestedBinding> combined = bindings;
 	combined.insert(combined.end(), hapticBindings.begin(), hapticBindings.end());
 
-	XrInteractionProfileSuggestedBinding suggested = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
-	suggested.interactionProfile = profilePath;
-	suggested.suggestedBindings = combined.data();
-	suggested.countSuggestedBindings = (uint32_t)combined.size();
-	XrResult res = xrSuggestInteractionProfileBindings(xr_instance, &suggested);
+	const XrResult res = bodyTrackerBindings.Prepare(!hapticBindings.empty(), [&](bool withHaptics) {
+		const auto& selected = withHaptics ? combined : bindings;
+		XrInteractionProfileSuggestedBinding suggested = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+		suggested.interactionProfile = profilePath;
+		suggested.suggestedBindings = selected.data();
+		suggested.countSuggestedBindings = static_cast<uint32_t>(selected.size());
+		const XrResult result = xrSuggestInteractionProfileBindings(xr_instance, &suggested);
+		if (XR_FAILED(result))
+			OOVR_LOGF("Body trackers: %s binding suggestion failed (%d)",
+			    withHaptics ? "pose/haptic" : "pose-only", result);
+		return result;
+	});
 
-	if (XR_FAILED(res) && !hapticBindings.empty()) {
-		OOVR_LOGF("Body trackers: suggestion with haptics failed (%d), retrying pose-only", res);
+	if (!bodyTrackerBindings.HasHapticBindings()) {
 		for (int i = 0; i < OCU_TRACKER_ROLE_COUNT; i++) {
 			if (bodyTrackerHaptics[i] != XR_NULL_HANDLE) {
-				xrDestroyAction(bodyTrackerHaptics[i]);
+				OOVR_FAILED_XR_SOFT_ABORT(xrDestroyAction(bodyTrackerHaptics[i]));
 				bodyTrackerHaptics[i] = XR_NULL_HANDLE;
 			}
 		}
-		suggested.suggestedBindings = bindings.data();
-		suggested.countSuggestedBindings = (uint32_t)bindings.size();
-		res = xrSuggestInteractionProfileBindings(xr_instance, &suggested);
 	}
 
 	if (XR_FAILED(res)) {
-		// Non-fatal: runtime advertised HTCX but rejected the profile — trackers stay dead
-		OOVR_LOGF("Body trackers: xrSuggestInteractionProfileBindings failed (%d), trackers disabled", res);
+		OOVR_LOGF("Body trackers: bindings rejected (%d); no tracker spaces will be created for this action set", res);
 		return;
-	}
 	}
 
 	// XrActions are instance/action-set owned and may already exist from the
@@ -3535,23 +3701,18 @@ void BaseInput::CreateBodyTrackerActions()
 void BaseInput::CreateBodyTrackerSpaces()
 {
 	DestroyBodyTrackerSpaces();
-	if (!xr_htcxViveTrackers || !oovr_global_configuration.BodyTrackersEnabled())
+	++bodyTrackerSpaceGeneration;
+	if (!xr_htcxViveTrackers || !oovr_global_configuration.BodyTrackersEnabled()
+	    || !bodyTrackerBindings.HasPoseBindings())
 		return;
 
 	const std::string& roleList = oovr_global_configuration.BodyTrackerRoles();
-	const bool all = (roleList == "all");
-	auto roleEnabled = [&](int role) {
-		if (all)
-			return true;
-		const std::string needle = OCU_TRACKER_ROLES[role].iniName;
-		const std::string padded = "," + roleList + ",";
-		return padded.find("," + needle + ",") != std::string::npos;
-	};
+	const uint32_t extensionVersion = DrvOpenXR::GetViveTrackerInteractionVersion();
 
 	int createdSpaces = 0;
 	bool hapticsLive = false;
 	for (int i = 0; i < OCU_TRACKER_ROLE_COUNT; i++) {
-		if (!roleEnabled(i) || bodyTrackerActions[i] == XR_NULL_HANDLE)
+		if (!OcuTrackerRoleEnabled(roleList, i, extensionVersion) || bodyTrackerActions[i] == XR_NULL_HANDLE)
 			continue;
 		XrActionSpaceCreateInfo spaceInfo = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
 		spaceInfo.action = bodyTrackerActions[i];

@@ -46,8 +46,39 @@ cbuffer MaskCB : register(b0) {
     float compatibilityMode;
     float protectDepthEdges;
     uint4 ringRates;
+    float inverseHorizontalScale;
+    uint blackoutFlags;
+    float blackoutCutoff;
+    float blackoutGuardPixels;
 };
 )HLSL" OCU_RDM_RATE_HELPERS R"HLSL(
+// Coverage 0 is untouched, 1 is a reconstructable hole, and 64/255 is an
+// intentional omission. No surviving donor exists in an omitted cluster.
+static const float BLACKOUT_COVERAGE = 64.0 / 255.0;
+bool WholeBlackoutCluster(float2 local) {
+    if (blackoutFlags == 0u) return false;
+    float2 eyeSize = round(8.0 / invClusterResolution);
+    float2 tile = floor(local * 0.125) * 8.0;
+    float2 lo = ((tile - blackoutGuardPixels) / eyeSize - projectionCenter) * 2.0;
+    float2 hi = ((tile + 8.0 + blackoutGuardPixels) / eyeSize - projectionCenter) * 2.0;
+    lo.x *= inverseHorizontalScale; hi.x *= inverseHorizontalScale;
+    float2 nearest = clamp(float2(0, 0), lo, hi);
+    float2 farthest = max(abs(lo), abs(hi));
+    float minimum = dot(nearest, nearest);
+    float maximum = dot(farthest, farthest);
+    bool middle = (blackoutFlags & 1u) != 0u;
+    bool outer = (blackoutFlags & 2u) != 0u;
+    bool cutoff = (blackoutFlags & 4u) != 0u;
+    // Keep a small numerical margin inside the hidden area at every boundary.
+    bool beyondInner = minimum > radius.x * radius.x + 0.00001;
+    float cutoffRadius = max(radius.y, blackoutCutoff);
+    if (middle && (outer || (cutoff && cutoffRadius <= radius.y)))
+        return beyondInner;
+    if (middle && beyondInner && maximum < radius.y * radius.y - 0.00001)
+        return true;
+    float outerBoundary = outer ? radius.y : cutoffRadius;
+    return (outer || cutoff) && minimum > outerBoundary * outerBoundary + 0.00001;
+}
 float4 VS(uint vertexId : SV_VertexID) : SV_POSITION {
     float2 p;
     p.x = (vertexId == 2) ? 3.0 : -1.0;
@@ -65,8 +96,11 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET {
         int2 cluster = int2(local) / 8 + int2(int(protectDepthEdges)-1, 0);
         if (SceneDepth.Load(int3(cluster, 0)) < 0.5) discard;
     }
+    if (WholeBlackoutCluster(local)) return BLACKOUT_COVERAGE;
     float2 block = floor(local * 0.125) * invClusterResolution;
-    float distanceToCenter = length(block - projectionCenter) * 2.0;
+    float2 offset = block - projectionCenter;
+    offset.x *= inverseHorizontalScale;
+    float distanceToCenter = length(offset) * 2.0;
     uint2 halfCoord = uint2(max(local, 0.0) * 0.5);
 
     if (ringRates.w != 0u) {
@@ -107,6 +141,9 @@ cbuffer ReconstructCB : register(b0) {
     float3 radius;
     float compatibilityMode;
     uint4 ringRates;
+    float inverseHorizontalScale;
+    float2 invClusterResolution;
+    float aspectPadding;
 };
 )HLSL" OCU_RDM_RATE_HELPERS R"HLSL(
 float4 VS(uint vertexId : SV_VertexID) : SV_POSITION {
@@ -130,8 +167,10 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET {
     if (any((floor(float2(local) * 0.125) + 1.0) * 8.0 > eyeSize))
         return Source.Load(int3(ClampToEye(pixel), 0));
     uint2 halfCoord = uint2(max(local, int2(0, 0))) >> 1u;
-    float2 block = floor(float2(local) * 0.125) * (8.0 / eyeSize);
-    float distanceToCenter = length(block - projectionCenter) * 2.0;
+    float2 block = floor(float2(local) * 0.125) * invClusterResolution;
+    float2 offset = block - projectionCenter;
+    offset.x *= inverseHorizontalScale;
+    float distanceToCenter = length(offset) * 2.0;
     int2 samplePixel = pixel;
 
     if (ringRates.w != 0u) {
@@ -321,8 +360,13 @@ struct PipelineState {
 		// RTV and pixel-UAV slots overlap; restoring eight RTVs erases shader UAVs.
 		UINT counts[D3D11_1_UAV_SLOT_COUNT];
 		std::fill_n(counts, D3D11_1_UAV_SLOT_COUNT, 0xffffffffu);
-		ctx->OMSetRenderTargetsAndUnorderedAccessViews(rtvCount, rtvs, dsv,
-		    rtvCount, uavSlotCount - rtvCount, uavs + rtvCount, counts);
+		if (rtvCount < uavSlotCount)
+			ctx->OMSetRenderTargetsAndUnorderedAccessViews(rtvCount, rtvs, dsv,
+			    rtvCount, uavSlotCount - rtvCount, uavs + rtvCount, counts);
+		else
+			// Feature level 11.0 has eight shared slots. StartSlot 8 is invalid
+			// even with zero UAVs; eight RTVs already occupy the complete range.
+			ctx->OMSetRenderTargets(rtvCount, rtvs, dsv);
 		ctx->RSSetState(rasterizer);
 		ctx->OMSetDepthStencilState(depthState, stencilRef);
 		ctx->OMSetBlendState(blendState, blendFactor, sampleMask);
@@ -396,6 +440,8 @@ bool DensityMaskManager::Initialize(ID3D11Device* dev)
 	device = dev;
 	device->AddRef();
 	device->GetImmediateContext(&context);
+	if (context)
+		context->QueryInterface(IID_PPV_ARGS(&context1));
 	available = context && CreateShadersAndStates();
 	if (!available) {
 		OOVR_LOG("DensityMask: initialization failed; backend disabled for this device session");
@@ -575,6 +621,18 @@ bool DensityMaskManager::CreateColorResources(const D3D11_TEXTURE2D_DESC& source
 	return true;
 }
 
+void DensityMaskManager::SetPatternSettings(const PatternSettings& settings)
+{
+	patternSettings = settings;
+	patternSettings.horizontalScale = std::isfinite(settings.horizontalScale) ?
+	    std::clamp(settings.horizontalScale, 0.5f, 2.0f) : 1.0f;
+	if (!std::isfinite(settings.innerRadius) || !std::isfinite(settings.midRadius) ||
+	    settings.innerRadius < 0.f || settings.midRadius < settings.innerRadius ||
+	    !std::isfinite(settings.blackout.cutoffRadius) || settings.blackout.cutoffRadius < 0.f ||
+	    !std::isfinite(settings.blackout.guardPixels) || settings.blackout.guardPixels < 0.f)
+		patternSettings.blackout = {};
+}
+
 void DensityMaskManager::SetProjectionCenters(float leftX, float leftY, float rightX, float rightY)
 {
 	projX[0] = std::clamp(leftX, -0.25f, 1.25f);
@@ -635,6 +693,17 @@ bool DensityMaskManager::DrawMaskForEye(ID3D11DepthStencilView* dsv, int eye, fl
     ID3D11RenderTargetView* coverage, ID3D11ShaderResourceView* sceneDepth)
 {
 	MaskConstants constants = {};
+	constants.inverseHorizontalScale = 1.0f / patternSettings.horizontalScale;
+	// Intentional omissions require the same ownership/depth eligibility proof
+	// and coverage record as the private scene pass that will resolve this mask.
+	if (coverage && sceneDepth && ocu_foveation::ValidBlackoutGeometry(projX[eye], projY[eye],
+	        patternSettings.innerRadius, patternSettings.midRadius, patternSettings.horizontalScale)) {
+		const auto& blackout = patternSettings.blackout;
+		constants.blackoutFlags = (blackout.middle ? 1u : 0u) |
+		    (blackout.outer ? 2u : 0u) | (blackout.cutoff ? 4u : 0u);
+		constants.blackoutCutoff = float(ocu_foveation::BlackoutCutoff(blackout, patternSettings.midRadius));
+		constants.blackoutGuardPixels = blackout.guardPixels;
+	}
 	constants.ringRates[0] = static_cast<unsigned>(patternSettings.rates.inner);
 	constants.ringRates[1] = static_cast<unsigned>(patternSettings.rates.mid);
 	constants.ringRates[2] = static_cast<unsigned>(patternSettings.rates.outer);
@@ -717,6 +786,9 @@ ID3D11Texture2D* DensityMaskManager::ReconstructStereo(ID3D11Texture2D* source, 
 bool DensityMaskManager::DrawReconstructionForEye(int eye, ID3D11ShaderResourceView* coverage)
 {
 	ReconstructConstants constants = {};
+	constants.inverseHorizontalScale = 1.0f / patternSettings.horizontalScale;
+	constants.invClusterResolution[0] = 8.0f / static_cast<float>(eyeRegions[eye].width);
+	constants.invClusterResolution[1] = 8.0f / static_cast<float>(eyeRegions[eye].height);
 	constants.ringRates[0] = static_cast<unsigned>(patternSettings.rates.inner);
 	constants.ringRates[1] = static_cast<unsigned>(patternSettings.rates.mid);
 	constants.ringRates[2] = static_cast<unsigned>(patternSettings.rates.outer);
@@ -803,7 +875,7 @@ void DensityMaskManager::Shutdown()
 {
 	EndDepthGuide();
 	ReleasePtr(guideTexture); ReleasePtr(guideRTV); ReleasePtr(guideSRV);
-	ReleasePtr(guidePS); ReleasePtr(guideCB); ReleasePtr(guideInvalidateDepth);
+	ReleasePtr(guidePS); ReleasePtr(guideCB); ReleasePtr(guideInvalidationCB); ReleasePtr(guideInvalidateDepth);
 	guideWidth = guideHeight = guideDraws = 0;
 	armed = false;
 	maskAppliedThisFrame = false;
@@ -813,6 +885,8 @@ void DensityMaskManager::Shutdown()
 	ReleasePackedResources();
 	for (auto*& shader : gatherShaders) ReleasePtr(shader);
 	for (auto*& shader : scatterShaders) ReleasePtr(shader);
+	for (auto& entry : scatterBlendStates) ReleasePtr(entry.second);
+	scatterBlendStates.clear(); scatterBlendState = nullptr;
 	ReleasePtr(maskVS);
 	ReleasePtr(reconstructVS);
 	ReleasePtr(maskPS);
@@ -823,6 +897,7 @@ void DensityMaskManager::Shutdown()
 	ReleasePtr(noDepthState);
 	ReleasePtr(rasterizerState);
 	ReleasePtr(samplerState);
+	ReleasePtr(context1);
 	ReleasePtr(context);
 	ReleasePtr(device);
 	available = false;

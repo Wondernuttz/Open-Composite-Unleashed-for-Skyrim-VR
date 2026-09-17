@@ -9,6 +9,10 @@ https://github.com/Wondernuttz/Open-Composite-Unleashed-for-Skyrim-VR
 Components redistributed with this package
 ------------------------------------------
 
+Third-party components retain their respective copyright notices and licenses.
+Their inclusion does not transfer ownership to OCU. The applicable license
+texts and attributions are identified below.
+
 HIGGS C++ interface declaration prefix (adapted in the SKSE plugin)
   Author/source: adamhynek / https://github.com/adamhynek/higgs
   License: GPLv3 (OpenComposite-OCU-GPLv3.txt)
@@ -26,10 +30,10 @@ NVIDIA DLSS (nvngx_dlss.dll)
   This software contains source code provided by NVIDIA Corporation.
 
 NVIDIA NVAPI (statically linked)
-  License: NVIDIA NVAPI license (NVIDIA-NVAPI-LICENSE.txt)
+  License: MIT (NVIDIA-NVAPI-LICENSE.txt)
   Source:  https://developer.nvidia.com/nvapi
 
-AMD FidelityFX / FSR3 (amd_fidelityfx_*.dll)
+AMD FidelityFX / FSR upscaling (amd_fidelityfx_*.dll)
   License: MIT (AMD-FidelityFX-MIT.txt)
   Source:  https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
 
@@ -38,19 +42,11 @@ VRPerfKit_RSF Radial Density Mask algorithm (modified source)
   Source:  https://github.com/RavenSystem/VRPerfKit_RSF
   Provenance commit: b2150204fc9886ee0b6fb8be81bb9f795118d1bc
 
-Google MediaPipe Pose Landmarker v0.10.35 (libmediapipe.dll,
-pose_landmarker_full.task, pose_landmarker_lite.task)
-  License: Apache License 2.0 (MediaPipe-Apache2.txt)
-  Source:  https://github.com/google-ai-edge/mediapipe
-  All pose inference runs locally; no camera data leaves the machine.
-
-OpenCV (opencv_world3410.dll, opencv_videoio_ffmpeg dlls)
-  License: see OpenCV-LICENSE.txt
-  Source:  https://opencv.org
-
-OpenCvSharp + OpenCvSharpExtern.dll (camera capture in the Configurator)
-  License: Apache License 2.0
+OpenCvSharp (managed assembly in the Configurator)
+  License: Apache License 2.0 (OpenCvSharp-Apache2.txt)
   Source:  https://github.com/shimat/opencvsharp
+  The standard mod does not include the experimental camera feature's
+  MediaPipe models, MediaPipe runtime, or native OpenCV camera libraries.
 
 Valve OpenVR API headers
   License: BSD 3-Clause (Valve-OpenVR-BSD3.txt)
@@ -89,3 +85,8 @@ Microsoft .NET runtime (bundled in the self-contained Configurator exe)
 Fonts (keyboard skins): MedievalSharp (SIL Open Font License),
 Ubuntu font (Ubuntu Font Licence), and the additional fonts documented in
 Keyboard-Fonts-OFL-1.1.txt.
+
+KATReader (when included)
+  Independent optional locomotion data reader. Copyright 2026 Wondernutts.
+  License: MIT (Tools/KATReader/LICENSE.txt).
+  KAT SDK binaries and Gateway are separately installed vendor software.

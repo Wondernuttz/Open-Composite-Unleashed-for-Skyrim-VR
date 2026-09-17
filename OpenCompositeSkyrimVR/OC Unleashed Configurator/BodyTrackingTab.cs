@@ -843,6 +843,7 @@ namespace OpenCompositeConfigurator
 
         private void SaveBodyUi()
         {
+            if (!ShowDevTools) return;
             try
             {
                 var st = new BodyUiState
@@ -2389,11 +2390,32 @@ namespace OpenCompositeConfigurator
     // matching keypoint tracks. KAT treadmill = puck under the feet.
     internal class BodySilhouettePanel : Panel
     {
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        internal bool ReferenceOnly { get; set; }
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        internal bool RuntimeMonitor { get; set; }
+        private uint _runtimeValid, _runtimeTracked;
         private float[,] _kp = new float[133, 3];
         private bool _valid;
         private bool _kat;
 
         public BodySilhouettePanel() { DoubleBuffered = true; }
+
+        internal void SetRuntimeTrackerState(uint valid, uint tracked)
+        {
+            if (_runtimeValid == valid && _runtimeTracked == tracked) return;
+            _runtimeValid = valid;
+            _runtimeTracked = tracked & valid;
+            Invalidate();
+        }
+
+        internal void SetTreadmillConnected(bool connected)
+        {
+            if (_kat == connected) return;
+            _kat = connected;
+            AccessibleDescription = connected ? "Treadmill connected with fresh reader data" : "No live treadmill connection data";
+            Invalidate();
+        }
 
         public void UpdateState(float[,] kp, bool valid, bool kat)
         {
@@ -2412,11 +2434,11 @@ namespace OpenCompositeConfigurator
             float w = ClientSize.Width, h = ClientSize.Height;
             float cx = w / 2f;
             // Body proportions inside the panel
-            float top = h * 0.06f, bottom = h * 0.86f;
+            float top = h * (ReferenceOnly ? 0.12f : 0.06f), bottom = h * 0.86f;
             float bodyH = bottom - top;
             float headR = bodyH * 0.07f;
 
-            using var outlinePen = new Pen(Color.FromArgb(90, 90, 100), 2.5f);
+            using var outlinePen = new Pen(ModernUiTheme.TextMuted, 2.5f);
 
             float headCy = top + headR;
             float neckY = headCy + headR;
@@ -2445,13 +2467,14 @@ namespace OpenCompositeConfigurator
             g.DrawLine(outlinePen, cx + hipHalf, kneeY, cx + hipHalf, ankY);
 
             // KAT treadmill puck under the feet
-            if (_kat)
+            if (_kat || ReferenceOnly)
             {
-                using var puckBrush = new SolidBrush(Color.FromArgb(200, 180, 140, 40));
-                using var puckPen = new Pen(Color.FromArgb(240, 210, 160, 60), 2f);
+                using var puckBrush = new SolidBrush(_kat ? ModernUiTheme.AccentSoft : ModernUiTheme.Surface);
+                using var puckPen = new Pen(_kat ? ModernUiTheme.KeyGlow : ModernUiTheme.TextMuted, 2f);
                 g.FillEllipse(puckBrush, cx - w * 0.30f, ankY + 4, w * 0.60f, h * 0.055f);
                 g.DrawEllipse(puckPen, cx - w * 0.30f, ankY + 4, w * 0.60f, h * 0.055f);
-                DrawCenteredText(g, "KAT treadmill", cx, ankY + h * 0.055f + 8, Color.FromArgb(210, 170, 70));
+                DrawCenteredText(g, _kat ? "KAT connected" : "KAT — no live data", cx, ankY + h * 0.055f + 8,
+                    _kat ? ModernUiTheme.AccentText : ModernUiTheme.TextMuted);
             }
             else
             {
@@ -2460,10 +2483,19 @@ namespace OpenCompositeConfigurator
 
             // Tracker dots: (label position, keypoint index or -1 for derived)
             const float minConf = 0.3f;
-            bool KpOk(int i) => _valid && _kp[i, 2] > minConf;
-            void Dot(float x, float y, bool on)
+            bool KpOk(int i) => !ReferenceOnly && _valid && _kp[i, 2] > minConf;
+            void Dot(float x, float y, bool on, int role = -1, int alternativeRole = -1)
             {
-                using var b = new SolidBrush(on ? Color.FromArgb(90, 230, 90) : Color.FromArgb(70, 70, 78));
+                uint mask = role >= 0 ? 1u << role : 0;
+                if (alternativeRole >= 0) mask |= 1u << alternativeRole;
+                bool inferred = false;
+                if (RuntimeMonitor)
+                {
+                    on = (_runtimeTracked & mask) != 0;
+                    inferred = !on && (_runtimeValid & mask) != 0;
+                }
+                using var b = new SolidBrush(on ? ModernUiTheme.KeyGlowBright
+                    : inferred ? Color.FromArgb(230, 178, 70) : ModernUiTheme.TextMuted);
                 g.FillEllipse(b, x - 5, y - 5, 10, 10);
                 if (on)
                 {
@@ -2473,20 +2505,21 @@ namespace OpenCompositeConfigurator
             }
 
             Dot(cx, headCy, KpOk(0));                                          // head
-            Dot(cx, (shoY + hipY) / 2f, KpOk(5) && KpOk(6));                   // chest
-            Dot(cx, hipY, KpOk(11) && KpOk(12));                               // waist
-            Dot(cx - armX, elbY, KpOk(7));                                     // elbows
-            Dot(cx + armX, elbY, KpOk(8));
-            Dot(cx - armX, wriY, KpOk(9));                                     // wrists
-            Dot(cx + armX, wriY, KpOk(10));
-            Dot(cx - hipHalf, kneeY, KpOk(13));                                // knees
-            Dot(cx + hipHalf, kneeY, KpOk(14));
+            Dot(cx, (shoY + hipY) / 2f, KpOk(5) && KpOk(6), 3);                // chest
+            Dot(cx, hipY, KpOk(11) && KpOk(12), 0);                            // waist
+            Dot(cx - armX, elbY, KpOk(7), 6);                                 // elbows
+            Dot(cx + armX, elbY, KpOk(8), 7);
+            Dot(cx - armX, wriY, KpOk(9), 10);                                // wrists
+            Dot(cx + armX, wriY, KpOk(10), 11);
+            Dot(cx - hipHalf, kneeY, KpOk(13), 4);                            // knees
+            Dot(cx + hipHalf, kneeY, KpOk(14), 5);
             bool leftFoot = KpOk(15) && (KpOk(19) || KpOk(17) || KpOk(18));
             bool rightFoot = KpOk(16) && (KpOk(22) || KpOk(20) || KpOk(21));
-            Dot(cx - hipHalf, ankY, leftFoot);                                 // feet
-            Dot(cx + hipHalf, ankY, rightFoot);
+            Dot(cx - hipHalf, ankY, leftFoot, 1, 12);                         // feet / ankles
+            Dot(cx + hipHalf, ankY, rightFoot, 2, 13);
 
-            DrawCenteredText(g, _valid ? "TRACKING" : "no pose", cx, top - 2, _valid ? Color.FromArgb(90, 230, 90) : Color.FromArgb(110, 110, 120));
+            DrawCenteredText(g, RuntimeMonitor ? "BODY POSES" : ReferenceOnly ? "BODY LAYOUT" : (_valid ? "TRACKING" : "no pose"),
+                cx, ReferenceOnly ? 12 : top - 2, !ReferenceOnly && _valid ? ModernUiTheme.KeyGlowBright : ModernUiTheme.TextMuted);
         }
 
         private static void DrawCenteredText(Graphics g, string text, float cx, float y, Color color)

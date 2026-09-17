@@ -3,6 +3,7 @@
 #include "XrTrackedDevice.h"
 
 #include <cstdint>
+#include <atomic>
 
 /**
  * A canonical body tracker exposed as TrackedDeviceClass_GenericTracker.
@@ -30,12 +31,15 @@ public:
 	    char* value, uint32_t bufferSize, vr::ETrackedPropertyError* pErrorL) override;
 
 	vr::ETrackedDeviceClass GetTrackedDeviceClass() override;
+	// A later action-set rebuild can make a previously unavailable role usable.
+	// Update its source without replacing this device or its calibration identity.
+	void SetHtcxRoleSource(ITrackedDevice* source) { htcxRoleSource.store(source); }
 
 private:
 	void GetPoseImpl(vr::ETrackingUniverseOrigin origin, vr::TrackedDevicePose_t* pose,
 	    ETrackingStateType trackingState, bool allowLocomotionRelease);
 	int trackerIdx;
-	ITrackedDevice* htcxRoleSource;
+	std::atomic<ITrackedDevice*> htcxRoleSource;
 	bool loggedHtcxSource = false;
 	uint64_t kickPassthroughUntilMs = 0;
 	uint64_t kickRecoveryDeadlineMs = 0;

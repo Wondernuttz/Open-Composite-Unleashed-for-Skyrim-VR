@@ -11,14 +11,31 @@
 #include <cmath>
 #include <stdexcept>
 #include "DrvOpenXR/DapaPlayerMaskGpu.h"
+#include "DrvOpenXR/DapaMaskBridge.h"
+#include "OpenOVR/Compositor/RDMDiagnosticSchedule.h"
 using Microsoft::WRL::ComPtr;
 namespace SKSE::log { template<class... Args> void debug(const char*, Args...) {} }
-static void Check(bool pass,const char* reason) { if(!pass) throw std::runtime_error(reason); }
+static unsigned checks=0;
+static void Check(bool pass,const char* reason) { ++checks;if(!pass) throw std::runtime_error(reason); }
 static void HR(HRESULT hr) { Check(SUCCEEDED(hr),"D3D11 call failed"); }
-struct Bridge { unsigned char _padPreFP[7]{}; unsigned char preFPDepthCaptured=0; uint64_t preFPDepthTexture=0; };
+struct Bridge {
+    unsigned char _padPreFP[3]{DapaMaskBridge::Format};
+    unsigned char preFPDepthCaptured=0;
+    uint64_t preFPDepthTexture=0;
+    std::uint32_t maskAccessGate=0,maskFrameGeneration=0,maskConflictSerial=0,maskFrameConflictBaseline=0;
+};
+using MaskAccess=DapaMaskBridge::Access<Bridge>;
+struct BridgePointer {
+    Bridge* value=nullptr;
+    Bridge* Get() const { return value; }
+    Bridge* operator->() const { return value; }
+    operator Bridge*() const { return value; }
+    BridgePointer& operator=(Bridge* pointer) { value=pointer;return *this; }
+};
 static Bridge bridge;
 static Bridge* g_pBridge=&bridge;
-static Bridge* s_pBridge=&bridge;
+static BridgePointer s_pBridge{&bridge};
+static RDMDiagnosticSchedule rdmDiagnosticSchedule;
 static Bridge* pendingBridge=nullptr;
 static unsigned bridgeLookups=0;
 static int OCBridge_MenuState() {
@@ -59,8 +76,10 @@ int main() try {
     Check(gpu.Initialize(device.Get()),"production GPU mask initialized");
     auto ownedDraw=[&](bool right){
         D3D11_VIEWPORT viewport{right?8.f:0.f,0,8,8,0,1};context->RSSetViewports(1,&viewport);
-        Check(Prepare(context.Get(),true),"production player draw preparation");
-        Check(gpu.Replay(context.Get(),[&]{context->Draw(3,0);}),"production player mask replay");Publish();
+        MaskAccess access;
+        Check(Prepare(context.Get(),true,access),"production player draw preparation");
+        Check(gpu.Replay(context.Get(),[&]{context->Draw(3,0);}),"production player mask replay");
+        Check(Publish(access),"production mask publication under write lease");
     };
     auto stalePixels=[&](){
         D3D11_TEXTURE2D_DESC d{};gpu.Texture()->GetDesc(&d);d.BindFlags=0;d.Usage=D3D11_USAGE_STAGING;d.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
@@ -77,14 +96,50 @@ int main() try {
     for(int frame=0;frame<20;++frame){BeginRealFrame();ownedDraw(frame%2!=0);}
     Check(stalePixels()==0,"repeated uncached frames accumulate no stale mask");
     BeginRealFrame();Check(!bridge.preFPDepthCaptured,"frame with no player draws cannot reuse prior mask");
-    // The frame boundary still invalidates after a failed/partial publication,
-    // which leaves the format byte zero while the old captured byte may be one.
-    bridge._padPreFP[0]=0;bridge.preFPDepthCaptured=1;BeginRealFrame();
-    Check(!bridge.preFPDepthCaptured,"incomplete publication expires at next real frame");
+    // Unsupported peers cannot expose their raw pointer through the new lease.
+    bridge._padPreFP[0]=1;bridge.preFPDepthCaptured=1;BeginRealFrame();
+    {MaskAccess unsupported(&bridge,DapaMaskBridge::AccessMode::Read);
+        Check(!unsupported && !unsupported.Valid() && !unsupported.Texture(),"legacy format is rejected without reading its texture");}
+    bridge._padPreFP[0]=DapaMaskBridge::Format;BeginRealFrame();
+    Check(!bridge.preFPDepthCaptured,"restored protocol expires previous publication");
+
+    BeginRealFrame();ownedDraw(false);
+    {
+        MaskAccess read(&bridge,DapaMaskBridge::AccessMode::Read);
+        Check(read.Valid(),"current mask acquired by compositor read lease");
+        auto* before=gpu.Texture();
+        const auto oldConflict=bridge.maskConflictSerial;
+        MaskAccess nonplayer;
+        Check(!Prepare(context.Get(),false,nonplayer) && read.Clean(),"non-player rejection does not poison active mask reader");
+        MaskAccess wrongContext;
+        Check(!Prepare(nullptr,true,wrongContext) && read.Clean(),"wrong-context draw is rejected before mask lease");
+        MaskAccess denied;
+        Check(!Prepare(context.Get(),true,denied),"producer cannot resize or clear during a compositor mask read");
+        Check(gpu.Texture()==before,"denied producer leaves texture lifetime unchanged");
+        Check(bridge.maskConflictSerial==oldConflict+1 && !read.Valid(),"missed owned draw poisons partial coverage for this frame");
+    }
+    {MaskAccess read(&bridge,DapaMaskBridge::AccessMode::Read);Check(!read.Valid(),"poisoned frame cannot become readable after gate release");}
+    BeginRealFrame();ownedDraw(true);Check(stalePixels()==0,"clean next frame recovers after rejected overlapping producer");
+    {
+        MaskAccess write;
+        Check(Prepare(context.Get(),true,write),"writer holds lease across replay and publication");
+        BeginRealFrame();
+        Check(!write.Clean() && !Publish(write),"frame boundary collision prevents old-generation publication");
+    }
+    {MaskAccess read(&bridge,DapaMaskBridge::AccessMode::Read);Check(!read.Valid(),"boundary collision cannot expose stale coverage");}
+    BeginRealFrame();ownedDraw(true);Check(stalePixels()==0,"next real frame recovers after boundary collision");
+    {
+        MaskAccess write;
+        Check(Prepare(context.Get(),true,write),"prepare replay-failure scenario");
+        write.Poison();
+        Check(!Publish(write),"failed replay cannot publish a valid mask");
+    }
+    {MaskAccess read(&bridge,DapaMaskBridge::AccessMode::Read);Check(!read.Valid(),"replay-failure frame is rejected by consumer");}
+    BeginRealFrame();ownedDraw(true);Check(stalePixels()==0,"new frame clears pixels after failed replay");
     s_pBridge=nullptr;BeginRealFrame();Check(!s_pBridge,"absent bridge stays absent");
     bridge.preFPDepthCaptured=1;pendingBridge=&bridge;
     const auto beforeLookups=bridgeLookups;BeginRealFrame();
     Check(s_pBridge==&bridge&&!bridge.preFPDepthCaptured,"bridge connecting at this boundary expires earlier mask immediately");
     Check(bridgeLookups==beforeLookups+1,"frame reset reuses one existing bridge lookup");
-    std::puts("PASS: production mask lifecycle clears uncached frames, missing draws, incomplete publication, absent and newly connected bridge");return 0;
+    std::printf("PASS: %u production/GPU lifecycle checks; uncached-frame pixels, lease conflicts, failed replay, legacy rejection and bridge recovery\n",checks);return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}

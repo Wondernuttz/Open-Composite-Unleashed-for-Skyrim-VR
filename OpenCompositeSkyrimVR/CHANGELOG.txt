@@ -1,3 +1,8 @@
+4.3.7 Hotfix 6 (2026-09-12)
+- Fixed slow resource-identity recovery after CSX/upscaler render-target recreation. Coalesced game-thread maintenance replaces the approximately one-second poll; unchanged resources return before COM/descriptor work. Exact scene ownership and safe resource retirement remain.
+- Reconcile menu activity after events so a later pause-count release can restore foveation/DAPA without another menu event. Tracked menus and real pauses remain protected.
+- Includes the fixed-profile diagnostic timeout correction below. DAPA tuning, ring settings and Configurator are unchanged. See doc/4.3.7-Hotfix-6.md for tests and remaining headset confirmation.
+
 4.3.7 fixed-ring diagnostic follow-up (2026-09-12)
 - Fixed and gaze-loss fallback debug rings no longer turn into an amber X solely because a rendered frame took over 500 milliseconds. The next frame still clears the profile before menu, missing-geometry or other disabled decisions; invalid profiles and clocks remain rejected.
 - Eye-tracked diagnostic gaze still expires after 500 milliseconds. Rendering eligibility, CSX compatibility, DAPA timing, settings and GPU work are unchanged. This removes a misleading indicator, not a demonstrated cause of every reported gameplay dropout.

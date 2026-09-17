@@ -1,9 +1,11 @@
 // Actual production cutout-material policy and NVIDIA GPU regression tests.
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include <dxgi.h>
 #include <wrl/client.h>
 #include <array>
+#include <algorithm>
 #include <vector>
 #include <cstdio>
 #include <cstdarg>
@@ -59,8 +61,63 @@ void Changed(ID3D11DeviceContext* context,bool targetsChanged) {
 
 void CoverageChanged(ID3D11DeviceContext* context) { Changed(context,false); }
 
-int main() try {
+// Independent post-draw observer, outside the production native hook broker.
+// It models a renderer consuming the game bindings immediately after Draw.
+// No RDM instance is armed in this fixture mode; VRS may still use the broker.
+struct UnarmedDrawObserver {
+    using DrawFn=void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,UINT,UINT);
+    static inline DrawFn draw=nullptr;
+    static inline ID3D11Multithread* multithread=nullptr;
+    static inline BOOL expectedProtection=FALSE;
+    static inline UINT64 callbacks=0;
+    ID3D11DeviceContext* context=nullptr;
+    void** original=nullptr;
+    std::array<void*,149> table{};
+    template<class Interface> static bool AliasesContext(ID3D11DeviceContext* c) {
+        ComPtr<Interface> queried;
+        return SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&queried)))&&
+            static_cast<ID3D11DeviceContext*>(queried.Get())==c;
+    }
+    static void STDMETHODCALLTYPE Draw(ID3D11DeviceContext* c,UINT count,UINT first) {
+        Check(!RDMRenderScope::Active(c),"RDM unexpectedly active in VRS/disabled fixture");
+        ComPtr<ID3D11RenderTargetView> beforeColor,afterColor;
+        ComPtr<ID3D11DepthStencilView> beforeDepth,afterDepth;
+        ComPtr<ID3D11PixelShader> beforePS,afterPS;
+        c->OMGetRenderTargets(1,&beforeColor,&beforeDepth);c->PSGetShader(&beforePS,nullptr,nullptr);
+        draw(c,count,first);
+        c->OMGetRenderTargets(1,&afterColor,&afterDepth);c->PSGetShader(&afterPS,nullptr,nullptr);
+        Check(beforeColor.Get()==afterColor.Get()&&beforeDepth.Get()==afterDepth.Get()&&beforePS.Get()==afterPS.Get(),
+            "inactive RDM bootstrap altered bindings seen by post-draw observer");
+        Check(!RDMRenderScope::Active(c)&&multithread->GetMultithreadProtected()==expectedProtection,
+            "inactive RDM bootstrap armed a scope or changed game protection");
+        ++callbacks;
+    }
+    UnarmedDrawObserver(ID3D11DeviceContext* c,ID3D11Multithread* mt,bool enabled) {
+        if(!enabled)return;
+        context=c;multithread=mt;expectedProtection=mt->GetMultithreadProtected();callbacks=0;
+        original=*reinterpret_cast<void***>(context);
+        // Counts verified against SDK10.0.26100.0 C-interface declarations.
+        // Preserve extension methods only when QueryInterface aliases this
+        // exact pointer; non-aliasing COM interfaces keep their own tables.
+        size_t slots=115;
+        if(AliasesContext<ID3D11DeviceContext1>(context))slots=134;
+        if(AliasesContext<ID3D11DeviceContext2>(context))slots=144;
+        if(AliasesContext<ID3D11DeviceContext3>(context))slots=147;
+        if(AliasesContext<ID3D11DeviceContext4>(context))slots=149;
+        std::copy_n(original,slots,table.begin());draw=reinterpret_cast<DrawFn>(table[13]);
+        table[13]=reinterpret_cast<void*>(&Draw);*reinterpret_cast<void***>(context)=table.data();
+    }
+    ~UnarmedDrawObserver(){if(context)*reinterpret_cast<void***>(context)=original;}
+};
+
+int main(int argc,char** argv) try {
     std::setvbuf(stdout,nullptr,_IONBF,0);
+    bool unarmedBootstrap=false,protectedContext=false;
+    for(int i=1;i<argc;++i){
+        if(std::strcmp(argv[i],"--unarmed-bootstrap")==0)unarmedBootstrap=true;
+        else if(std::strcmp(argv[i],"--protected")==0)protectedContext=true;
+        else Check(false,"unknown fixture argument");
+    }
     ComPtr<IDXGIFactory1> factory; HR(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
     ComPtr<IDXGIAdapter1> adapter;
     for(UINT i=0;;++i) {
@@ -71,6 +128,15 @@ int main() try {
     Check(adapter!=nullptr,"NVIDIA GPU required");
     ComPtr<ID3D11Device> device; ComPtr<ID3D11DeviceContext> context;
     HR(D3D11CreateDevice(adapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context));
+    ComPtr<ID3D11Multithread> multithread;HR(context.As(&multithread));
+    multithread->SetMultithreadProtected(protectedContext);
+    Check(multithread->GetMultithreadProtected()==BOOL(protectedContext),"fixture protection mode applied");
+    if(unarmedBootstrap){
+        Check(RDMRenderScope::PrepareDrawHooks(device.Get()),"early RDM draw bootstrap installed for VRS/disabled test");
+        Check(!RDMRenderScope::Active(context.Get()),"early draw bootstrap armed RDM");
+        Check(multithread->GetMultithreadProtected()==BOOL(protectedContext),"bootstrap changed game protection");
+    }
+    UnarmedDrawObserver observer(context.Get(),multithread.Get(),unarmedBootstrap);
     Check(ocu_vrs_guard::InstallShaderCapture(device.Get()),"production shader capture installed");
     constexpr UINT width=256,height=128,texWidth=128;
     auto diffuse=Color(device.Get(),width,height,DXGI_FORMAT_R32G32B32A32_FLOAT);
@@ -113,7 +179,10 @@ float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{return float4(ba
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);context->VSSetShader(vs.Get(),nullptr,0);context->OMSetBlendState(nullptr,nullptr,~0u);
     auto draw=[&]() {
         D3D11_QUERY_DESC qd{D3D11_QUERY_PIPELINE_STATISTICS,0};ComPtr<ID3D11Query> query;HR(device->CreateQuery(&qd,&query));context->Begin(query.Get());
+        const auto callbacksBefore=UnarmedDrawObserver::callbacks;
         for(int eye=0;eye<2;++eye){D3D11_VIEWPORT vp{float(eye*width/2),0,float(width/2),float(height),0,1};context->RSSetViewports(1,&vp);context->Draw(3,0);}
+        if(unarmedBootstrap)Check(UnarmedDrawObserver::callbacks==callbacksBefore+2,
+            "early RDM hooks lost or duplicated stereo post-draw callbacks");
         context->End(query.Get());D3D11_QUERY_DATA_PIPELINE_STATISTICS s{};HRESULT hr=S_FALSE;
         for(int i=0;i<1000&&hr==S_FALSE;++i){hr=context->GetData(query.Get(),&s,sizeof(s),0);if(hr==S_FALSE)Sleep(1);}Check(hr==S_OK,"GPU statistics completed");return s.PSInvocations;
     };
@@ -124,6 +193,29 @@ float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{return float4(ba
         for(UINT y=0;y<height;++y)std::memcpy(result.data()+y*width,static_cast<const unsigned char*>(mapped.pData)+y*mapped.RowPitch,width*16);
         context->Unmap(staging.Get(),0);return result;
     };
+    if(unarmedBootstrap){
+        // Foveation completely disabled: pixel coordinates expose any accidental
+        // coarse shading/reconstruction, and the PS count catches lost/replayed
+        // work. This runs before VRS is initialized or its draw observer armed.
+        auto* target=diffuse.rtv.Get();context->OMSetRenderTargets(1,&target,dsv.Get());
+        context->OMSetDepthStencilState(writeDepth.Get(),0);context->PSSetShader(opaquePS.Get(),nullptr,0);
+        context->ClearDepthStencilView(dsv.Get(),D3D11_CLEAR_DEPTH,1,0);
+        const auto fullInvocations=draw();const auto pixels=read();
+        Check(fullInvocations==UINT64(width)*height,"inactive RDM changed full-rate pixel invocation count");
+        for(UINT y=0;y<height;++y)for(UINT x=0;x<width;++x){const auto& p=pixels[y*width+x];
+            Check(p[0]==float(x)+0.5f&&p[1]==float(y)+0.5f&&p[2]==0.25f&&p[3]==1,
+                "inactive RDM changed exact full-rate stereo pixels");}
+        D3D11_TEXTURE2D_DESC stagedDesc=dd;stagedDesc.BindFlags=0;stagedDesc.Usage=D3D11_USAGE_STAGING;
+        stagedDesc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;ComPtr<ID3D11Texture2D> depthRead;
+        HR(device->CreateTexture2D(&stagedDesc,nullptr,&depthRead));context->CopyResource(depthRead.Get(),depth.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped{};HR(context->Map(depthRead.Get(),0,D3D11_MAP_READ,0,&mapped));
+        for(UINT y=0;y<height;++y){const auto* row=reinterpret_cast<const float*>(
+            static_cast<const unsigned char*>(mapped.pData)+y*mapped.RowPitch);
+            for(UINT x=0;x<width;++x)Check(row[x]==0.5f,"inactive RDM changed original game depth");}
+        context->Unmap(depthRead.Get(),0);
+        std::printf("UNARMED DISABLED PASS multithread=%d PS=%llu callbacks=%llu exactStereoPixels=yes originalDepth=yes\n",
+            int(protectedContext),fullInvocations,UnarmedDrawObserver::callbacks);
+    }
     VRSAlphaCoverageScope alphaCoverage;
     VRSManager vrs;Check(vrs.Initialize(device.Get()),"production NVAPI backend initialized");manager=&vrs;
     ocu_vrs_scope::SceneScope scope;scope.Arm(context.Get(),depth.Get(),diffuse.texture.Get(),width,height);sceneScope=&scope;
@@ -252,6 +344,7 @@ void main(float4 p:SV_Position,float2 uv:TEXCOORD0){if(base.Sample(s,uv).a*norma
         context->ClearDepthStencilView(dsv.Get(),D3D11_CLEAR_DEPTH,1,0);context->Draw(3,0);Check(!alphaCoverage.ProtectsCurrentDraw(context.Get()),"canonical clear ends command-list ambiguity");}
     // Alternating owners uses the same native hook broker; no duplicate-hook
     // failures or stale VRS observer calls may appear after switching back.
+    if(!unarmedBootstrap){
     auto rdmColor=Color(device.Get(),width,height,DXGI_FORMAT_R8G8B8A8_UNORM);
     auto rdmDepthDesc=dd;rdmDepthDesc.Format=DXGI_FORMAT_R32_TYPELESS;rdmDepthDesc.MipLevels=1;rdmDepthDesc.BindFlags|=D3D11_BIND_SHADER_RESOURCE;
     ComPtr<ID3D11Texture2D> rdmDepth;HR(device->CreateTexture2D(&rdmDepthDesc,nullptr,&rdmDepth));
@@ -259,7 +352,14 @@ void main(float4 p:SV_Position,float2 uv:TEXCOORD0){if(base.Sample(s,uv).a*norma
         RDMRenderScope rdm;float centers[4]={.5f,.5f,.5f,.5f};
         Check(rdm.Arm(context.Get(),rdmDepth.Get(),rdmColor.texture.Get(),width,height,{0,0,int(width/2),int(height)},{int(width/2),0,int(width/2),int(height)},{.3f,.6f,true,false,{}},centers),"VRS to RDM uses shared hooks");
         rdm.EndFrame();beginFrame();depthDraw(dsv.Get());colorDraw(aliasSRV.Get(),colorPS.Get());Check(alphaCoverage.ProtectsCurrentDraw(context.Get()),"RDM to VRS retains draw observation");}
-    std::puts("LIFECYCLE PASS: aliases, PBR, shader masks, cache, clear views, zero draws, shadow/read-only depth, predicates, deferred execution, backend switching");
+    }
+    std::printf("LIFECYCLE PASS: aliases, PBR, shader masks, cache, clear views, zero draws, shadow/read-only depth, predicates, deferred execution, %s\n",
+        unarmedBootstrap?"RDM never armed":"backend switching");
     alphaCoverage.EndFrame();coverage=nullptr;
-    ocu_vrs_guard::UnwatchContext(context.Get());vrs.Disable();std::puts("PASS: actual production cutout material policy fixes two-pass foliage while retaining opaque VRS");return 0;
+    ocu_vrs_guard::UnwatchContext(context.Get());vrs.Disable();
+    Check(multithread->GetMultithreadProtected()==BOOL(protectedContext),"VRS lifecycle changed game protection");
+    if(unarmedBootstrap){Check(!RDMRenderScope::Active(context.Get()),"RDM became active during VRS-only run");
+        std::printf("UNARMED VRS PASS multithread=%d callbacks=%llu RDM-never-armed=yes opaqueVRS-reduction=yes cutoutPolicy=yes\n",
+            int(protectedContext),UnarmedDrawObserver::callbacks);}
+    std::puts("PASS: actual production cutout material policy fixes two-pass foliage while retaining opaque VRS");return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}

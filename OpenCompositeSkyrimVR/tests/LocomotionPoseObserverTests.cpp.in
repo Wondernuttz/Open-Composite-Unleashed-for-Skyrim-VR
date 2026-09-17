@@ -1,0 +1,110 @@
+#include <openxr/openxr.h>
+#include "generated/interfaces/vrtypes.h"
+#include "OpenOVR/Misc/Input/LocomotionHeading.h"
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+
+#define OOVR_LOGF(...) ((void)0)
+enum class ETrackingStateType { TrackingStateType_Now };
+enum { XruEyeLeft, XruEyeRight };
+struct Globals {
+    bool viewsLatched = true;
+    XrViewStateFlags latchedViewStateFlags = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
+    XrView latchedViews[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    XrSpace viewSpace = reinterpret_cast<XrSpace>(1);
+    XrTime nextPredictedFrameTime = 12345;
+} globals;
+Globals* xr_gbl = &globals;
+std::mutex xr_session_call_mutex;
+struct { bool enabled = true; bool TreadmillEnabled() const { return enabled; } } oovr_global_configuration;
+namespace glm { struct mat4 { XrPosef pose; }; }
+glm::mat4 X2G_om34_pose(XrPosef pose) { return {pose}; }
+vr::HmdMatrix34_t G2S_m34(glm::mat4 matrix) {
+    vr::HmdMatrix34_t result{};
+    const auto& q = matrix.pose.orientation;
+    result.m[0][2] = 2 * (q.x*q.z + q.w*q.y);
+    result.m[2][2] = 1 - 2 * (q.y*q.y + q.x*q.x);
+    result.m[0][3] = matrix.pose.position.x;
+    return result;
+}
+vr::HmdVector3_t X2S_v3f(XrVector3f value) { return {{value.x, value.y, value.z}}; }
+XrSpace xr_space_from_tracking_origin(vr::ETrackingUniverseOrigin origin) {
+    return reinterpret_cast<XrSpace>(origin == vr::TrackingUniverseStanding ? 2 : 3);
+}
+unsigned locates = 0, fallbacks = 0;
+XrResult locateResult = XR_SUCCESS;
+bool interruptSession = false;
+XrSpaceLocationFlags headFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+XrQuaternionf headOrientation{0, float(std::sin(.3/2)), 0, float(std::cos(.3/2))};
+XRAPI_ATTR XrResult XRAPI_CALL xrLocateSpace(XrSpace, XrSpace, XrTime, XrSpaceLocation* location) {
+    ++locates;
+    location->locationFlags = headFlags;
+    location->pose.orientation = headOrientation;
+    auto* velocity = static_cast<XrSpaceVelocity*>(location->next);
+    velocity->linearVelocity = {1, 2, 3};
+    velocity->angularVelocity = {4, 5, 6};
+    if (interruptSession) OcuLocomotionHeading::Instance().Reset();
+    return locateResult;
+}
+namespace xr_utils {
+void PoseFromSpace(vr::TrackedDevicePose_t* pose, XrSpace, vr::ETrackingUniverseOrigin) {
+    ++fallbacks; *pose = {}; pose->bDeviceIsConnected = true;
+}
+}
+class XrHMD {
+public:
+    void GetPose(vr::ETrackingUniverseOrigin, vr::TrackedDevicePose_t*, ETrackingStateType);
+};
+/*PRODUCTION_GET_POSE*/
+
+unsigned checks = 0;
+void Check(bool ok, const char* reason) { ++checks; if (!ok) throw std::runtime_error(reason); }
+bool Near(double a, double b) { return std::abs(a-b) < .00001; }
+int main() {
+    try {
+        auto& heading = OcuLocomotionHeading::Instance();
+        const auto ready = [&] {
+            heading.Reset(); heading.SetFocused(true); heading.Read(OcuLocomotionHeading::NowMs(), false);
+        };
+        const auto yaw = [&] { return heading.Read(OcuLocomotionHeading::NowMs(), false).yaw; };
+        globals.latchedViews[0].pose.orientation = {0, float(std::sin(.8/2)), 0, float(std::cos(.8/2))};
+        globals.latchedViews[1].pose.orientation = {0, float(std::sin(-.2/2)), 0, float(std::cos(-.2/2))};
+        XrHMD hmd;
+        vr::TrackedDevicePose_t pose{};
+        ready();
+        hmd.GetPose(vr::TrackingUniverseStanding, &pose, ETrackingStateType::TrackingStateType_Now);
+        Check(locates == 1, "observer adds no locate calls");
+        Check(yaw() && Near(*yaw(), .3), "observer consumes actual head orientation, not canted eye orientation");
+        Check(pose.bPoseIsValid && Near(std::atan2(pose.mDeviceToAbsoluteTracking.m[0][2], pose.mDeviceToAbsoluteTracking.m[2][2]), .8),
+            "existing render pose remains unchanged by observation");
+        Check(Near(pose.vVelocity.v[0], 1) && Near(pose.vAngularVelocity.v[2], 6), "existing velocity output unchanged");
+        ready();
+        hmd.GetPose(vr::TrackingUniverseSeated, &pose, ETrackingStateType::TrackingStateType_Now);
+        Check(locates == 2 && !yaw(), "seated timing query cannot replace standing movement heading");
+        ready(); headFlags = 0;
+        hmd.GetPose(vr::TrackingUniverseStanding, &pose, ETrackingStateType::TrackingStateType_Now);
+        Check(!yaw() && pose.bPoseIsValid, "invalid head orientation remains neutral without altering latched render pose");
+        headFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        hmd.GetPose(vr::TrackingUniverseStanding, &pose, ETrackingStateType::TrackingStateType_Now);
+        Check(yaw().has_value(), "next valid existing head sample recovers");
+        locateResult = XR_ERROR_RUNTIME_FAILURE;
+        hmd.GetPose(vr::TrackingUniverseStanding, &pose, ETrackingStateType::TrackingStateType_Now);
+        Check(!yaw() && Near(pose.vVelocity.v[0], 0), "failed locate invalidates heading and preserves velocity fallback");
+        locateResult = XR_SUCCESS; ready(); interruptSession = true;
+        hmd.GetPose(vr::TrackingUniverseStanding, &pose, ETrackingStateType::TrackingStateType_Now);
+        Check(!yaw(), "sample started before session invalidation cannot be published afterward");
+        interruptSession = false; ready(); oovr_global_configuration.enabled = false;
+        hmd.GetPose(vr::TrackingUniverseStanding, &pose, ETrackingStateType::TrackingStateType_Now);
+        Check(!yaw(), "disabled treadmill cannot publish a heading");
+        oovr_global_configuration.enabled = true; ready(); globals.viewsLatched = false;
+        const auto before = locates;
+        hmd.GetPose(vr::TrackingUniverseStanding, &pose, ETrackingStateType::TrackingStateType_Now);
+        Check(locates == before && fallbacks == 1 && !yaw(), "pre-first-frame path unchanged and no fabricated heading");
+        std::cout << checks << " production pose-observer checks passed\n";
+        return 0;
+    } catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; return 1; }
+}

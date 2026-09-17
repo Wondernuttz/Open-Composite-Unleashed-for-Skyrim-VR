@@ -21,6 +21,7 @@ static partial class Program
             if (args.Length > 0 && args[0] == "--layout") return AuditLayout();
             if (args.Length > 0 && args[0] == "--foveation") return AuditFoveation();
             if (args.Length > 0 && args[0] == "--trackpads") return AuditTrackpads();
+            if (args.Length > 0 && args[0] == "--controller-save") return AuditControllerSave();
             // Fixtures stay beside this test executable; never show the form or install a runtime.
             var root = AppContext.BaseDirectory;
             Directory.CreateDirectory(Path.Combine(root, "root"));
@@ -52,6 +53,9 @@ static partial class Program
             Check(dots.Keys.Count(key => key.Contains("trackpad")) == 4, "Index needs upper/lower dots for each hand");
             var contexts = Field<Dictionary<string, List<string[]>>>(form, "_contextBindings");
             contexts.Clear();
+            // This fixture replaces the loaded map, including its routing metadata.
+            Set(form, "_indexTrackpadCustomRegions", 0);
+            Set(form, "_savedIndexTrackpadCustomRegions", 0);
             string[] Row(string name, string left) => new[] { name, "0x11", "0xff", "0xffff", "0x07", left, "0x07", left, "0x07", left, "1", "1", "1", "1", "1", "1", "1", "1", "1" };
             var face = Row("Activate", "0x01");
             var menu = Row("Tween Menu", "0x02");

@@ -9,6 +9,14 @@
 #include "VRSSceneScope.h"
 #include "VRSShaderGuard.h"
 #include "VRSAlphaCoverageScope.h"
+#include "DepthExtract.h"
+#include "RDMRenderDiagnostics.h"
+#include "FoveationBlackoutRenderer.h"
+#include "PublishedBridge.h"
+
+// Shared by the eye compositors; prepared before either eye can omit scene work.
+static FoveationBlackoutRenderer s_blackoutRenderer;
+static bool s_blackoutPresentationFailed = false;
 
 
 #include "../Misc/Config.h"
@@ -114,6 +122,7 @@ static bool CompileOrLoadCached(
 #endif
 
 #include "../../DrvOpenXR/ASWProvider.h"
+#include "../../DrvOpenXR/DapaMaskBridge.h"
 
 #include <MinHook.h>
 
@@ -249,17 +258,19 @@ struct OCRenderTargetBridge {
 	uint32_t fpStencilDrawCount;       // Number of FP draw calls this frame (diagnostic)
 	uint32_t fpStencilDrawCountTotal;  // Cumulative FP draws (diagnostic)
 
-	// Pre-FP depth snapshot — depth buffer state before first-person geometry renders.
-	// OC compares this against post-FP depth: where depth got closer → FP pixel.
-	uint64_t preFPDepthTexture;        // ID3D11Texture2D* (R24G8_TYPELESS, same size as main DS)
+	// Player-mask texture and its independent producer/consumer lease.
+	uint64_t preFPDepthTexture;        // ID3D11Texture2D* (R32_FLOAT, same size as scene depth)
 	uint8_t  preFPDepthCaptured;       // 1 = valid capture for current frame
-	uint8_t  _padPreFP[7];
+	uint8_t  _padPreFP[3];             // [0] = mask protocol; immutable after bridge publication
+	uint32_t maskAccessGate;
 
 	// FP geometry pointers — BSGeometry* addresses for positively-identified FP draws.
 	// OC reads their worldBound LIVE at WarpFrame time (no stale data).
 	uint64_t fpGeomPointers[16];       // Up to 16 BSGeometry* pointers
 	uint32_t fpGeomCount;              // Number of valid pointers
-	uint32_t _padGeom[3];              // Alignment to 16 bytes
+	uint32_t maskFrameGeneration;
+	uint32_t maskConflictSerial;
+	uint32_t maskFrameConflictBaseline;
 
 	// FP draw replay — pointer to heap-allocated FPReplayData (same process, read by OC).
 	uint64_t fpReplayDataPtr;          // FPReplayData* (cast to uint64_t)
@@ -273,10 +284,24 @@ struct OCRenderTargetBridge {
 static_assert(sizeof(OCRenderTargetBridge) == 704);
 static_assert(offsetof(OCRenderTargetBridge, publishSequence) % alignof(uint32_t) == 0);
 static_assert(offsetof(OCRenderTargetBridge, resourceReaders) % alignof(uint32_t) == 0);
+static_assert(offsetof(OCRenderTargetBridge, maskAccessGate) == 540);
+static_assert(offsetof(OCRenderTargetBridge, maskFrameGeneration) == 676);
+static_assert(offsetof(OCRenderTargetBridge, maskConflictSerial) == 680);
+static_assert(offsetof(OCRenderTargetBridge, maskFrameConflictBaseline) == 684);
 
-static HANDLE s_hBridgeMap = nullptr;
-static OCRenderTargetBridge* s_pBridge = nullptr;
-static bool s_bridgeTried = false;
+static PublishedBridge<OCRenderTargetBridge> s_pBridge;
+static uint32_t s_dapaMaskCacheFrame = 0;
+static uint32_t s_dapaMaskCacheConflicts = 0;
+
+bool OCBridge_DapaMaskCacheValid()
+{
+	// Revalidate immediately before claiming a synthetic slot. A producer may
+	// have reported a missed draw after the right-eye copy finished.
+	DapaMaskBridge::Access<OCRenderTargetBridge> mask(
+	    s_pBridge.Get(), DapaMaskBridge::AccessMode::Read);
+	return mask.Clean() && mask.Frame() == s_dapaMaskCacheFrame &&
+	    mask.ConflictSerial() == s_dapaMaskCacheConflicts;
+}
 
 static void OpenRenderTargetBridge();
 
@@ -311,43 +336,48 @@ bool OCBridge_DapaMenuPaused()
 	return s_pBridge && (s_pBridge->isMenuOpen != 0 ||
 	    s_pBridge->isLoadingScreen != 0 || s_pBridge->isMainMenu != 0);
 }
+
+// Input eligibility is independent of render-resource readiness. Unknown menu
+// state must not be treated as permission to synthesize locomotion.
+int OCBridge_LocomotionState()
+{
+	OpenRenderTargetBridge();
+	if (!s_pBridge) return -1;
+	return s_pBridge->isMenuOpen || s_pBridge->isMainMenu ||
+	    s_pBridge->isLoadingScreen || s_pBridge->isConsoleOpen ? 1 : 0;
+}
 static void OpenRenderTargetBridge()
 {
-	if (s_pBridge)
-		return;
+	s_pBridge.Connect([]() -> OCRenderTargetBridge* {
+		const HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
+		    L"Local\\OpenCompositeRenderTargets");
+		if (!mapping) return nullptr;
 
-	// Retry every ~2 seconds (assuming ~90fps, every 180 frames)
-	static int retryCounter = 0;
-	if (s_bridgeTried && (++retryCounter % 180) != 0)
-		return;
-	s_bridgeTried = true;
+		auto* view = static_cast<OCRenderTargetBridge*>(
+		    MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(OCRenderTargetBridge)));
+		if (!view) {
+			CloseHandle(mapping);
+			return nullptr;
+		}
 
-	s_hBridgeMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE,
-	    L"Local\\OpenCompositeRenderTargets");
-	if (!s_hBridgeMap)
-		return;
+		// The writer can still be initializing its header when the named mapping
+		// first appears. Keep this view private until validation is complete.
+		// Resource fields retain the existing v2 publish protocol below.
+		if (view->magic != OCRenderTargetBridge::MAGIC ||
+		    view->version != OCRenderTargetBridge::VERSION ||
+		    view->byteSize < sizeof(OCRenderTargetBridge)) {
+			OOVR_LOG("RT Bridge: Invalid magic/version/size — shared memory not ready or incompatible SKSE plugin");
+			UnmapViewOfFile(view);
+			CloseHandle(mapping);
+			return nullptr;
+		}
 
-	s_pBridge = static_cast<OCRenderTargetBridge*>(
-	    MapViewOfFile(s_hBridgeMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(OCRenderTargetBridge)));
-	if (!s_pBridge) {
-		CloseHandle(s_hBridgeMap);
-		s_hBridgeMap = nullptr;
-		return;
-	}
-
-	// The header is immutable after creation; resource fields use the v2 publish protocol below.
-	if (s_pBridge->magic != OCRenderTargetBridge::MAGIC ||
-	    s_pBridge->version != OCRenderTargetBridge::VERSION ||
-	    s_pBridge->byteSize < sizeof(OCRenderTargetBridge)) {
-		OOVR_LOG("RT Bridge: Invalid magic/version/size — wrong SKSE plugin version?");
-		UnmapViewOfFile(s_pBridge);
-		s_pBridge = nullptr;
-		CloseHandle(s_hBridgeMap);
-		s_hBridgeMap = nullptr;
-		return;
-	}
-
-	OOVR_LOG("RT Bridge: Connected to SKSE shared memory");
+		// The mapped view retains the mapping object after its handle closes.
+		// Keep the successful view alive for every input/render reader.
+		CloseHandle(mapping);
+		OOVR_LOG("RT Bridge: Connected to SKSE shared memory");
+		return view;
+	});
 }
 
 struct OCBridgeResourceSnapshot {
@@ -659,6 +689,7 @@ static void DisarmSceneVRS()
 static void STDMETHODCALLTYPE Hook_OMSetRenderTargets(
     ID3D11DeviceContext* ctx, UINT numViews, ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV)
 {
+	RDMRenderScope::NotifyBeforeDepthStateBoundary(ctx);
 	s_origOMSetRT(ctx, numViews, ppRTVs, pDSV);
 	if (ctx != s_sceneHookContext) return;
 	SyncVRSForRenderTargets(ctx, numViews, ppRTVs, pDSV);
@@ -703,6 +734,7 @@ static bool InstallSceneTargetHooks(ID3D11Device* device)
 		    ID3D11RenderTargetView* const* ppRTVs, ID3D11DepthStencilView* pDSV,
 		    UINT uavStart, UINT numUAVs, ID3D11UnorderedAccessView* const* ppUAVs, const UINT* pInitial)
 		{
+			RDMRenderScope::NotifyBeforeDepthStateBoundary(ctx);
 			s_origOMSetRTUAV(ctx, numRTVs, ppRTVs, pDSV, uavStart, numUAVs, ppUAVs, pInitial);
 			if (ctx != s_sceneHookContext) return;
 			ocu_vrs_scope::WithRenderTargets(ctx, numRTVs, ppRTVs, pDSV,
@@ -728,20 +760,6 @@ static bool InstallSceneTargetHooks(ID3D11Device* device)
 	ctx->Release();
 	return s_renderTargetHooksUsable;
 }
-
-static constexpr char s_depthExtractHLSL[] = R"HLSL(
-Texture2D<float>   DepthIn  : register(t0);  // R24_UNORM_X8_TYPELESS view of depth-stencil
-RWTexture2D<float> DepthOut : register(u0);  // R32_FLOAT output
-
-[numthreads(8, 8, 1)]
-void CS_DepthExtract(uint3 id : SV_DispatchThreadID)
-{
-    uint w, h;
-    DepthOut.GetDimensions(w, h);
-    if (id.x >= w || id.y >= h) return;
-    DepthOut[id.xy] = DepthIn.Load(int3(id.xy, 0));
-}
-)HLSL";
 
 #if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
 // ── Reactive mask compute shader ──
@@ -1043,7 +1061,7 @@ static bool EnsureDepthExtractResources(ID3D11Device* device, uint32_t depthW, u
 	// Compile CS once
 	if (!s_depthExtractCS) {
 		ID3DBlob* blob = nullptr;
-		if (!CompileOrLoadCached(s_depthExtractHLSL, sizeof(s_depthExtractHLSL) - 1,
+		if (!CompileOrLoadCached(ocu_depth_extract::Shader, sizeof(ocu_depth_extract::Shader) - 1,
 		        "CS_DepthExtract", "cs_5_0", 0, &blob))
 			return false;
 		HRESULT hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &s_depthExtractCS);
@@ -1161,36 +1179,8 @@ static ID3D11ShaderResourceView* GetOrCreateDepthSRV(ID3D11Device* device, ID3D1
 static bool ExtractDepthToR32F(ID3D11DeviceContext* context, ID3D11ShaderResourceView* depthSRV,
     uint32_t width, uint32_t height)
 {
-	// Save current CS state
-	ID3D11ComputeShader* oldCS = nullptr;
-	ID3D11ShaderResourceView* oldSRV = nullptr;
-	ID3D11UnorderedAccessView* oldUAV = nullptr;
-	context->CSGetShader(&oldCS, nullptr, nullptr);
-	context->CSGetShaderResources(0, 1, &oldSRV);
-	context->CSGetUnorderedAccessViews(0, 1, &oldUAV);
-
-	// Set shader + resources
-	context->CSSetShader(s_depthExtractCS, nullptr, 0);
-	context->CSSetShaderResources(0, 1, &depthSRV);
-	context->CSSetUnorderedAccessViews(0, 1, &s_depthR32FUAV, nullptr);
-
-	// Dispatch
-	uint32_t groupsX = (width + 7) / 8;
-	uint32_t groupsY = (height + 7) / 8;
-	context->Dispatch(groupsX, groupsY, 1);
-
-	// Restore CS state
-	context->CSSetShader(oldCS, nullptr, 0);
-	context->CSSetShaderResources(0, 1, &oldSRV);
-	context->CSSetUnorderedAccessViews(0, 1, &oldUAV, nullptr);
-	if (oldCS)
-		oldCS->Release();
-	if (oldSRV)
-		oldSRV->Release();
-	if (oldUAV)
-		oldUAV->Release();
-
-	return true;
+	return ocu_depth_extract::Dispatch(context, s_depthExtractCS, depthSRV,
+	    s_depthR32FUAV, width, height);
 }
 
 // ── Stencil extraction ──
@@ -3288,15 +3278,16 @@ static void ResetVRSInputGeometry()
 
 void DX11Compositor::BeginVRSGameFrame()
 {
+	rdmDiagnosticSchedule.BeginFrame();
 	// Reuse the existing menu/bridge lookup before expiring coverage: this call
 	// can establish the first bridge connection during this very frame boundary.
 	const bool menuOpen = OCBridge_MenuState() == 1;
 	// WaitGetPoses begins every real frame, including native/backoff/menu frames
 	// that never enter DAPA's cache path. Expire the producer mask here so its
 	// first owned draw clears old pixels, and a frame with no owned draws cannot
-	// reuse old coverage. This is a CPU flag only; cached synthetic eyes own copies.
-	if (s_pBridge)
-		s_pBridge->preFPDepthCaptured = 0;
+	// reuse old coverage. A conflicting producer/reader invalidates only this
+	// real frame's mask; the next boundary retries without waiting.
+	DapaMaskBridge::BeginFrame(s_pBridge.Get());
 	// Publish a fresh disabled frame before any early return. Effect consumers
 	// use the same gaze policy without depending on a GPU backend or upscaler.
 	ocu_effect_foveation::BeginFrame();
@@ -3442,7 +3433,15 @@ void DX11Compositor::BeginVRSGameFrame()
 		return;
 	}
 
+	std::string shapeBackend = oovr_global_configuration.FoveatedBackend();
+	std::transform(shapeBackend.begin(), shapeBackend.end(), shapeBackend.begin(),
+	    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	const float horizontalScale = vrsMode == ocu_vrs_gaze::Mode::EyeTracked && shapeBackend != "effects" ?
+	    oovr_global_configuration.VrsEyeHorizontalScale() : 1.f;
 	for (int eye = 0; eye < 2; ++eye) {
+		if (vrsMode == ocu_vrs_gaze::Mode::EyeTracked)
+			ocu_foveation::OffsetCenter(nextCenterX[eye], nextCenterY[eye], eye,
+			    oovr_global_configuration.VrsEyeHorizontalOffset(), oovr_global_configuration.VrsEyeVerticalOffset());
 		s_vrsProjX[eye] = nextCenterX[eye];
 		s_vrsProjY[eye] = nextCenterY[eye];
 	}
@@ -3464,7 +3463,7 @@ void DX11Compositor::BeginVRSGameFrame()
 		effectProfile.fovTangents[eye][2] = s_vrsTanU[eye];
 		effectProfile.fovTangents[eye][3] = s_vrsTanD[eye];
 	}
-	ocu_effect_foveation::GetState().Publish(effectProfile);
+	ocu_effect_foveation::GetState().Publish(effectProfile, horizontalScale);
 
 	std::string requestedBackend = oovr_global_configuration.FoveatedBackend();
 	std::transform(requestedBackend.begin(), requestedBackend.end(), requestedBackend.begin(),
@@ -3544,6 +3543,38 @@ void DX11Compositor::BeginVRSGameFrame()
 	s_vrsHookApplied = false;
 
 	static int s_lastBackend = -1;
+	ocu_foveation::BlackoutFrame blackout;
+	const auto prepareBlackout = [&](int leftWidth, int leftHeight, int rightWidth, int rightHeight) {
+		if (!oovr_global_configuration.VrsEyeBlackoutCull() ||
+		    !oovr_global_configuration.VrsEyeAnyBlackout() ||
+		    vrsMode != ocu_vrs_gaze::Mode::EyeTracked || s_blackoutPresentationFailed ||
+		    !s_blackoutRenderer.Initialize(device)) return;
+		blackout.mask.middle = oovr_global_configuration.VrsEyeMiddleBlackout();
+		blackout.mask.outer = oovr_global_configuration.VrsEyeOuterBlackout();
+		blackout.mask.cutoff = oovr_global_configuration.VrsEyePeripheralMask();
+		blackout.mask.cutoffRadius = oovr_global_configuration.VrsEyePeripheralMaskRadius(profileRadii.mid);
+		blackout.inner = profileRadii.inner;
+		blackout.middle = profileRadii.mid;
+		blackout.horizontalScale = horizontalScale;
+		blackout.frameId = ocu_effect_foveation::GetState().ReadForPresentation(
+		    ocu_effect_foveation::ClockTicks()).frameId;
+		const int sizes[2][2] = {{leftWidth, leftHeight}, {rightWidth, rightHeight}};
+		for (int eye = 0; eye < 2; ++eye) {
+			blackout.centers[eye][0] = s_vrsProjX[eye];
+			blackout.centers[eye][1] = s_vrsProjY[eye];
+			for (int axis = 0; axis < 2; ++axis) {
+				blackout.sceneEyeSize[eye][axis] = float(sizes[eye][axis]);
+				if (oovr_global_configuration.ASWEnabled()) {
+					// Render a border covering DAPA's bounded source search. CacheFrame
+					// independently checks this against the actual source dimensions.
+					const int submitted = axis == 0 ? s_vrsEyeRegion[eye].width : s_vrsEyeRegion[eye].height;
+					const float guard = (std::max)(.125f * sizes[eye][axis],
+					    65.f * sizes[eye][axis] / (std::max)(1, submitted)) + 2.f;
+					blackout.mask.guardPixels = (std::max)(blackout.mask.guardPixels, guard);
+				}
+			}
+		}
+	};
 	if (useHardwareVrs) {
 		if (!ocu_vrs_guard::WatchContext(context, &VRSShaderStateChanged)) {
 			DisarmSceneVRS();
@@ -3599,6 +3630,10 @@ void DX11Compositor::BeginVRSGameFrame()
 		}
 		vrsManager.SetProjectionCenters(s_vrsProjX[0], s_vrsProjY[0],
 		    s_vrsProjX[1], s_vrsProjY[1]);
+		vrsManager.SetHorizontalScale(horizontalScale);
+		prepareBlackout(eyeRegions[0].width, eyeRegions[0].height,
+		    eyeRegions[1].width, eyeRegions[1].height);
+		vrsManager.SetBlackout(blackout.mask);
 		if (!vrsManager.UpdateStereoPattern(renderWidth, renderHeight,
 		        eyeRegions[0], eyeRegions[1], profileRadii.inner, profileRadii.mid, profileRates)) {
 			DisarmSceneVRS();
@@ -3645,10 +3680,13 @@ void DX11Compositor::BeginVRSGameFrame()
             }
         }
         const float centers[4] = {s_vrsProjX[0], s_vrsProjY[0], s_vrsProjX[1], s_vrsProjY[1]};
+        prepareBlackout(regions[0].width, regions[0].height, regions[1].width, regions[1].height);
+        const bool captureDiagnostics = rdmDiagnosticSchedule.Schedule(
+            OcuLogging::NowMs(), oovr_global_configuration.DebugLogging());
         if (!densityMaskManager.Arm(context, sceneDepth, s_vrsSceneTarget, width, height, regions[0], regions[1],
                 {profileRadii.inner, profileRadii.mid,
                     vrsMode == ocu_vrs_gaze::Mode::EyeTracked ? oovr_global_configuration.VrsEyeCompatibilityMode() : oovr_global_configuration.VrsCompatibilityMode(),
-                    customEyeRates, profileRates}, centers)) {
+                    customEyeRates, profileRates, horizontalScale, blackout.mask}, centers, captureDiagnostics)) {
             DisarmSceneVRS(); s_vrsPatternReady = false;
             OOVR_LOG_LIMITEDF(5000, "RDM handoff v2: context/geometry/ownership guide unavailable for this frame");
             return;
@@ -3659,7 +3697,17 @@ void DX11Compositor::BeginVRSGameFrame()
 			s_lastBackend = 1;
 		}
 	}
+	if (blackout.Active() && !ocu_effect_foveation::GetState().LatchBlackout(blackout)) {
+		DisarmSceneVRS();
+		densityMaskManager.EndFrame();
+		vrsManager.Disable();
+		s_vrsPatternReady = false;
+		return;
+	}
 	s_vrsPatternReady = true;
+	if (blackout.Active())
+		OOVR_LOG_LIMITEDF(5000, "Foveation blackout culling armed: backend=%s guard=%.1fpx; final mask latched to rendered frame",
+		    useHardwareVrs ? "VRS" : "RDM", blackout.mask.guardPixels);
 
 	if (!s_vrsInitialFrameDone) {
 		OOVR_LOGF("Foveation: first pre-render stereo atlas armed — target %dx%d, eye regions %dx%d + %dx%d",
@@ -3922,22 +3970,9 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 
 	// Copy the source to the destination image
 	// Use SOURCE texture dimensions for region (not swapchain — they differ when FSR upscales)
-	D3D11_BOX sourceRegion;
-	if (bounds) {
-		uint32_t srcEyeW = (uint32_t)(srcDesc.Width * std::fabs(bounds->uMax - bounds->uMin));
-		uint32_t srcEyeH = srcDesc.Height;
-		sourceRegion.left = (uint32_t)(bounds->uMin * srcDesc.Width);
-		sourceRegion.right = sourceRegion.left + srcEyeW;
-		sourceRegion.top = 0;
-		sourceRegion.bottom = srcEyeH;
-	} else {
-		sourceRegion.left = 0;
-		sourceRegion.right = srcDesc.Width;
-		sourceRegion.top = 0;
-		sourceRegion.bottom = srcDesc.Height;
-	}
-	sourceRegion.front = 0;
-	sourceRegion.back = 1;
+	D3D11_BOX sourceRegion{};
+	if (!ResolveSubmittedTextureRegion(srcDesc, bounds, sourceRegion))
+		OOVR_ABORTF("Invalid submitted eye texture region");
 
 #ifdef OC_HAS_FSR3
 	// FSR3 debug modes are only visible when the temporal FSR3 submit path is
@@ -3973,6 +4008,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	}
 #endif
 
+	bool copiedWithVerticalFlip = false;
 	// Bounds describe an inverted image so copy texture using pixel shader inverting on copy
 	if (bounds && bounds->vMin > bounds->vMax && oovr_global_configuration.InvertUsingShaders() && !swapchain_rtvs.empty()) {
 		auto* src = (ID3D11Texture2D*)texture->handle;
@@ -4020,6 +4056,7 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 		context->IAGetPrimitiveTopology(&currTopology);
 		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 		context->Draw(4, 0);
+		copiedWithVerticalFlip = true;
 		context->IASetPrimitiveTopology(currTopology);
 
 		if (numViewPorts)
@@ -5686,6 +5723,32 @@ void CS(uint3 id : SV_DispatchThreadID) {
 		}
 	}
 
+	// Fill deliberately omitted pixels after every filter, in the acquired eye
+	// itself. A newer gaze sample or unavailable overlay must not expose them.
+	const auto blackout = ocu_effect_foveation::GetState().ReadBlackout();
+	if (!isOverlay && blackout.Active()) {
+		D3D11_VIEWPORT viewport{};
+		viewport.Width = float(bounds && s_fsr3ViewportW > 0 ? s_fsr3ViewportW : createInfo.width);
+		viewport.Height = float(bounds && s_fsr3ViewportH > 0 ? s_fsr3ViewportH : createInfo.height);
+		viewport.MaxDepth = 1.f;
+		// Match the physical row inversion above. Swapping OpenXR FOV angles
+		// without flipping the copied texture leaves scene UV coordinates intact.
+		if (!s_blackoutRenderer.Apply(context, swapchain_rtvs[currentIndex], blackout,
+		        s_currentEyeIdx, viewport, copiedWithVerticalFlip)) {
+			// This image already contains omissions. Hide it and render complete
+			// frames thereafter if presentation resources fail unexpectedly.
+			const float black[4] = {0.f, 0.f, 0.f, 1.f};
+			Microsoft::WRL::ComPtr<ID3D11Predicate> predicate;
+			BOOL predicateValue = FALSE;
+			context->GetPredication(&predicate, &predicateValue);
+			context->SetPredication(nullptr, FALSE);
+			context->ClearRenderTargetView(swapchain_rtvs[currentIndex], black);
+			context->SetPredication(predicate.Get(), predicateValue);
+			s_blackoutPresentationFailed = true;
+			OOVR_LOG("Foveation blackout presentation failed; image hidden and subsequent scene culling disabled");
+		}
+	}
+
 	// Release the swapchain - OpenXR will use the last-released image in a swapchain
 	// No manual Flush() needed — xrReleaseSwapchainImage handles GPU synchronization internally.
 	XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -5773,13 +5836,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 
 	// Set current eye index for FSR radius matching (inner Invoke reads this)
 	s_currentEyeIdx = (eye == XruEyeLeft) ? 0 : 1;
-    const auto rdmStats = densityMaskManager.Stats();
-    if (rdmStats.draws) {
-        OOVR_LOG_LIMITEDF(5000, "RDM handoff v2: draws=%u masked=%u protected=%u batches=%u MRTresolves=%u consumerBoundaries=%u stateQueries=%u guideDraws=%u guideInvalidationDraws=%u guideResets=%u noGuideStates=%u resolve=packed-original-targets depth=original-unmodified",
-            rdmStats.draws, rdmStats.maskedDraws, rdmStats.protectedDraws, rdmStats.batches,
-            rdmStats.resolves, rdmStats.consumerBoundaries, rdmStats.stateQueries,
-            rdmStats.guideDraws, rdmStats.guideInvalidationDraws, rdmStats.guideResets, rdmStats.noGuideStates);
-    }
+    LogRDMFrame(densityMaskManager, rdmDiagnosticSchedule.ConsumeReport());
 
 	// The render-target bridge is only consumed by the temporal upscalers and
 	// space-warp paths.  The ordinary compositor must not pin seven bridge COM
@@ -6058,19 +6115,44 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				if (s_aswBadColorRegionLog++ < 5)
 					OOVR_LOGF("ASW: skipping cache for eye %d because submitted texture bounds are invalid", eyeIdx);
 			} else {
-				aswEyeCached = g_aswProvider->CacheFrame(eyeIdx, context,
-				    colorSrc, &colorRegion,
-				    colorFlipV,
-				    mvTex, &mvRegion,
-				    aswDepthSrc, &depthRegion,
-				    layer.pose, layer.fov,
-				    g_fsr3CameraNear, g_fsr3CameraFar,
-				    s_pBridge->_padPreFP[0]==1 && s_pBridge->preFPDepthCaptured ?
-				        reinterpret_cast<ID3D11Texture2D*>(s_pBridge->preFPDepthTexture) : nullptr);
+				// Hold ownership before the first COM method and through the queued
+				// copy. AddRef after reading an unprotected pointer is already too late.
+				DapaMaskBridge::Access<OCRenderTargetBridge> mask(
+				    s_pBridge.Get(), DapaMaskBridge::AccessMode::Read);
+				const bool samePair = eyeIdx == 0 ||
+				    (s_dapaMaskCacheFrame == mask.Frame() &&
+				        s_dapaMaskCacheConflicts == mask.ConflictSerial());
+				if (mask.Clean() && samePair) {
+					aswEyeCached = g_aswProvider->CacheFrame(eyeIdx, context,
+					    colorSrc, &colorRegion,
+					    colorFlipV,
+					    mvTex, &mvRegion,
+					    aswDepthSrc, &depthRegion,
+					    layer.pose, layer.fov,
+					    g_fsr3CameraNear, g_fsr3CameraFar,
+					    reinterpret_cast<ID3D11Texture2D*>(mask.Texture()),
+					    ocu_effect_foveation::GetState().ReadBlackout());
+					// A missed owned draw while we held the lease poisons this pair.
+					// Never turn a partially protected player into a synthetic frame.
+					aswEyeCached = aswEyeCached && mask.Clean();
+				}
+				if (eyeIdx == 0) {
+					s_dapaMaskCacheFrame = aswEyeCached ? mask.Frame() : 0;
+					s_dapaMaskCacheConflicts = mask.ConflictSerial();
+				}
+				if (!aswEyeCached) {
+					g_aswProvider->InvalidateCachedFrame();
+					if (!DapaMaskBridge::Supported(s_pBridge.Get())) {
+						OOVR_LOG_LIMITEDF(5000, "DAPA mask handoff unavailable: protocol=%u; matching runtime and SKSE plugin required",
+						    unsigned(s_pBridge->_padPreFP[0]));
+					} else {
+						OOVR_LOG_LIMITEDF(5000, "DAPA mask handoff: skipped incomplete eye=%d frame=%u; retrying next real frame",
+						    eyeIdx, mask.Frame());
+					}
+				}
 			}
 
-			// Both eye regions have been copied before recycling the producer mask.
-			if(eyeIdx==1 && s_pBridge->_padPreFP[0]==1)s_pBridge->preFPDepthCaptured=0;
+			// Only BeginVRSGameFrame recycles the producer mask under its lease.
 			// Geometry is per eye; actor position is sampled once per complete real pair.
 			// Do not mix NiCamera Z with actor XY: it includes tracked HMD movement.
 			if (aswEyeCached && s_pBridge->rssBasePtr) {

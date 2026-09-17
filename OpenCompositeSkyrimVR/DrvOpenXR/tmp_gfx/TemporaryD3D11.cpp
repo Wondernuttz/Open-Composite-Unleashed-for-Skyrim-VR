@@ -6,6 +6,7 @@
 
 #include "TemporaryD3D11.h"
 #include "../../OpenOVR/Compositor/VRSShaderGuard.h"
+#include "../../OpenOVR/Compositor/RDMRenderScope.h"
 
 static IDXGIAdapter1* d3d_get_adapter(const LUID& adapter_luid)
 {
@@ -57,6 +58,8 @@ TemporaryD3D11::TemporaryD3D11()
 	// submitted eye. Any shaders created earlier remain full-rate individually.
 	OOVR_LOGF("Foveation shader guard v1: early shader capture %s",
 	    ocu_vrs_guard::InstallShaderCapture(device) ? "installed" : "unavailable");
+	OOVR_LOGF("RDM draw hook bootstrap: cold and initialized entries in both multithread protection modes %s",
+	    RDMRenderScope::PrepareDrawHooks(device) ? "installed" : "unavailable");
 
 	d3dInfo = XrGraphicsBindingD3D11KHR{ XR_TYPE_GRAPHICS_BINDING_D3D11_KHR };
 	d3dInfo.device = device;

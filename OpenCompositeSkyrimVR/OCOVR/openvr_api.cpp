@@ -115,7 +115,8 @@ VR_INTERFACE void* VR_CALLTYPE VR_GetGenericInterface(const char* interfaceVersi
 
 	if (!running) {
 		OOVR_LOGF("[INFO] VR_GetGenericInterface called while OOVR not running, setting error=NotInitialized, for interfaceVersion=%s", interfaceVersion);
-		*error = VRInitError_Init_NotInitialized;
+		if (error)
+			*error = VRInitError_Init_NotInitialized;
 		return NULL;
 	}
 

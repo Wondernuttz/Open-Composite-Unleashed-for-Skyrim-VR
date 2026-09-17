@@ -1,0 +1,13 @@
+{
+  "name": "ocu-audio-recovery",
+  "version-semver": "0.1.0",
+  "description": "Skyrim VR audio endpoint recovery after headset reconnect",
+  "dependencies": [
+    "directxmath",
+    "directxtk",
+    "fmt",
+    "rapidcsv",
+    "spdlog",
+    "xbyak"
+  ]
+}

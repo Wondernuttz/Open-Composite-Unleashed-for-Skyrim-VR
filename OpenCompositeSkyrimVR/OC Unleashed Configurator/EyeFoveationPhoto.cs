@@ -27,9 +27,19 @@ internal sealed class EyeFoveationPhoto : IDisposable
         return new Rectangle((source.Width - side) / 2, (source.Height - side) / 2, side, side);
     }
 
-    internal static RectangleF RingBounds(RectangleF plot, PointF gaze, decimal boundary) => new(
-        gaze.X - plot.Width * (float)boundary / 2, gaze.Y - plot.Height * (float)boundary / 2,
-        plot.Width * (float)boundary, plot.Height * (float)boundary);
+    internal static RectangleF RingBounds(RectangleF plot, PointF gaze, decimal boundary, decimal horizontalScale = 1m) => new(
+        gaze.X - plot.Width * (float)(boundary * horizontalScale) / 2, gaze.Y - plot.Height * (float)boundary / 2,
+        plot.Width * (float)(boundary * horizontalScale), plot.Height * (float)boundary);
+
+    internal static PointF AdjustedGaze(RectangleF plot, PointF gaze, EyeFoveationSettings settings)
+    {
+        float x = gaze.X, y = gaze.Y;
+        if (settings.HorizontalOffset != 0)
+            x = Math.Clamp(x + plot.Width * (float)settings.HorizontalOffset, plot.Left, plot.Right);
+        if (settings.VerticalOffset != 0)
+            y = Math.Clamp(y + plot.Height * (float)settings.VerticalOffset, plot.Top, plot.Bottom);
+        return new PointF(x, y);
+    }
 
     internal static Size RateSize(string rate) => rate switch {
         "1x2" => new(1, 2), "2x1" => new(2, 1), "2x2" => new(2, 2),
@@ -76,6 +86,7 @@ internal sealed class EyeFoveationPhoto : IDisposable
 
     internal void Draw(Graphics g, RectangleF plot, PointF gaze, EyeFoveationSettings settings, bool showEffect)
     {
+        gaze = AdjustedGaze(plot, gaze, settings);
         int side = (int)Math.Ceiling(plot.Width);
         string[] rates = showEffect && settings.Enabled && settings.Backend != 3
             ? settings.EffectiveRates : new[] { "1x1", "1x1", "1x1" };
@@ -87,13 +98,33 @@ internal sealed class EyeFoveationPhoto : IDisposable
             g.DrawImage(ImageForRate(side, rates[2]), plot);
             void zone(decimal boundary, string rate) {
                 var state = g.Save();
-                using var clip = new GraphicsPath(); clip.AddEllipse(RingBounds(plot, gaze, boundary));
+                using var clip = new GraphicsPath(); clip.AddEllipse(RingBounds(plot, gaze, boundary, settings.EffectiveHorizontalScale));
                 g.SetClip(clip, CombineMode.Intersect);
                 g.DrawImage(ImageForRate(side, rate), plot);
                 g.Restore(state);
             }
             zone(settings.Radii.Mid, rates[1]);
             zone(settings.Radii.Inner, rates[0]);
+            if (settings.Enabled && (settings.MiddleBlackout || settings.OuterBlackout)) {
+                using var inner = new GraphicsPath();
+                inner.AddEllipse(RingBounds(plot, gaze, settings.Radii.Inner, settings.EffectiveHorizontalScale));
+                using var middle = new GraphicsPath();
+                middle.AddEllipse(RingBounds(plot, gaze, settings.Radii.Mid, settings.EffectiveHorizontalScale));
+                if (settings.MiddleBlackout) {
+                    using var band = new Region(middle); band.Exclude(inner);
+                    g.FillRegion(Brushes.Black, band);
+                }
+                if (settings.OuterBlackout) {
+                    using var outsideMiddle = new Region(plot); outsideMiddle.Exclude(middle);
+                    g.FillRegion(Brushes.Black, outsideMiddle);
+                }
+            }
+            if (settings.Enabled && settings.PeripheralMask) {
+                using var visible = new GraphicsPath();
+                visible.AddEllipse(RingBounds(plot, gaze, settings.EffectivePeripheralMaskRadius, settings.EffectiveHorizontalScale));
+                using var outside = new Region(plot); outside.Exclude(visible);
+                g.FillRegion(Brushes.Black, outside);
+            }
         } finally { g.Restore(saved); }
     }
 

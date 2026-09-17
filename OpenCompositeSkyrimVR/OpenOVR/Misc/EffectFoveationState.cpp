@@ -1,4 +1,5 @@
 #include "EffectFoveationState.h"
+#include "FoveationGeometrySettings.h"
 
 #include <cmath>
 #include <cstring>
@@ -51,9 +52,10 @@ void State::BeginFrame(std::int64_t ticks, std::int64_t frequency)
     snapshot = Disabled(snapshot.frameId + 1, ticks, frequency);
     presentation = snapshot;
     frameOpen = true;
+    blackout = {};
 }
 
-bool State::Publish(const Snapshot& value)
+bool State::Publish(const Snapshot& value, float horizontalScale)
 {
     const bool valid = ValidProfile(value);
     std::lock_guard<std::mutex> guard(mutex);
@@ -72,6 +74,16 @@ bool State::Publish(const Snapshot& value)
     snapshot.flags = value.gazeSampleTime != 0 ? SourceSampleTimeAvailable : 0;
     std::memset(snapshot.reserved, 0, sizeof(snapshot.reserved));
     presentation = snapshot;
+    // V1 renderer consumers understand circular profiles only. Enclose the
+    // scene ellipse so existing effect consumers never reduce quality inside
+    // its full-quality region. Presentation retains the actual scene radii.
+    if (value.mode == Mode::EyeTracked) {
+        const float envelope = (std::max)(1.f, ocu_foveation::HorizontalScale(horizontalScale));
+        snapshot.innerRadius *= envelope;
+        snapshot.midRadius *= envelope;
+        if (!ValidProfile(snapshot))
+            snapshot = Disabled(frame, value.publicationQpc, frequency);
+    }
     return true;
 }
 
@@ -87,6 +99,24 @@ Snapshot State::ReadForPresentation(std::int64_t now) const
             age > double(presentation.qpcFrequency) * 0.5))
         return Disabled(snapshot.frameId, now, snapshot.qpcFrequency);
     return presentation;
+}
+
+bool State::LatchBlackout(const ocu_foveation::BlackoutFrame& value)
+{
+    std::lock_guard<std::mutex> guard(mutex);
+    if (!frameOpen || blackout.Active() || !value.Active() || value.frameId != presentation.frameId ||
+        presentation.mode != Mode::EyeTracked) return false;
+    blackout = value;
+    return true;
+}
+
+ocu_foveation::BlackoutFrame State::ReadBlackout() const
+{
+    std::lock_guard<std::mutex> guard(mutex);
+    // Unlike a live gaze diagnostic, this describes pixels already omitted
+    // from the rendered frame. It must survive Clear(), both submissions and
+    // long frames. Only the next BeginFrame replaces this geometry.
+    return blackout;
 }
 
 void State::Clear(std::int64_t ticks)

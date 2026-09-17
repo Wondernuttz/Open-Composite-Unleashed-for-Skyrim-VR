@@ -51,7 +51,7 @@ namespace OpenCompositeConfigurator
         private static readonly HashSet<Control> DynamicContainers = new();
         private static readonly HashSet<Control> Rounded = new();
 
-        internal static void Apply(Form form)
+        internal static void Apply(Form form, bool windowBands = true)
         {
             form.SuspendLayout();
             form.BackColor = Window;
@@ -59,7 +59,7 @@ namespace OpenCompositeConfigurator
             form.Font = new Font("Segoe UI", 9.5f, FontStyle.Regular);
 
             StyleTree(form);
-            InstallWindowBands(form);
+            if (windowBands) InstallWindowBands(form);
             EnableDarkWindowChrome(form);
 
             form.ResumeLayout(performLayout: true);

@@ -95,6 +95,30 @@ void VRSManager::SetProjectionCenters(float leftPX, float leftPY, float rightPX,
 	}
 }
 
+void VRSManager::SetHorizontalScale(float scale)
+{
+	const float next = std::isfinite(scale) ? std::clamp(scale, .5f, 2.f) : 1.f;
+	if (next != horizontalScale) patternDirty = true;
+	horizontalScale = next;
+}
+
+void VRSManager::SetBlackout(const ocu_foveation::Blackout& mask)
+{
+	auto next = mask;
+	next.cutoffRadius = std::isfinite(next.cutoffRadius) ?
+	    std::clamp(next.cutoffRadius, .1f, 1.5f) : 1.f;
+	const bool changed = next.middle != blackout.middle || next.outer != blackout.outer ||
+	    next.cutoff != blackout.cutoff || next.cutoffRadius != blackout.cutoffRadius ||
+	    next.guardPixels != blackout.guardPixels;
+	if (changed && (next.Active() || blackout.Active())) {
+		// Do not leave an old cull mask bound between changing the profile and
+		// uploading its replacement, including immediate removal of blackout.
+		Disable();
+		patternDirty = true;
+	}
+	blackout = next;
+}
+
 static bool SameRegion(const VRSManager::EyeRegion& a, const VRSManager::EyeRegion& b)
 {
 	return a.left == b.left && a.top == b.top &&
@@ -232,11 +256,18 @@ std::vector<uint8_t> VRSManager::CreateStereoPattern() const
 
 				// Distance from that eye's projection/gaze center, scaled so a
 				// radius of 1.0 reaches the edge from a centered gaze.
-				const float dx = fx - projX[eye];
+				const float dx = (fx - projX[eye]) / horizontalScale;
 				const float dy = fy - projY[eye];
 				const float distance = 2.0f * std::sqrt(dx * dx + dy * dy);
 				data[y * patternWidth + x] = static_cast<uint8_t>(
 				    1 + static_cast<unsigned>(ocu_vrs_pattern::SelectLevel(distance, innerR, midR, false)));
+				if (blackout.Active() && ocu_foveation::WholeBlackoutTile(blackout,
+				        projX[eye], projY[eye], innerR, midR, horizontalScale,
+				        pixelX - NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH * .5f - region.left,
+				        pixelY - NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT * .5f - region.top,
+				        NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH, NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT,
+				        region.width, region.height))
+					data[y * patternWidth + x] = 4;
 				break;
 			}
 		}
@@ -357,6 +388,7 @@ bool VRSManager::EnableShadingRates()
 		vsrd[i].shadingRateTable[1] = nativeRate(cachedRates.inner);
 		vsrd[i].shadingRateTable[2] = nativeRate(cachedRates.mid);
 		vsrd[i].shadingRateTable[3] = nativeRate(cachedRates.outer);
+		vsrd[i].shadingRateTable[4] = NV_PIXEL_X0_CULL_RASTER_PIXELS;
 	}
 
 	NV_D3D11_VIEWPORTS_SHADING_RATE_DESC srd = {};

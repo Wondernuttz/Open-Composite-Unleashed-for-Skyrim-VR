@@ -1,5 +1,6 @@
 #pragma once
 #include "../Misc/FoveationRates.h"
+#include "../Misc/FoveationBlackout.h"
 
 #ifdef OC_HAS_NVAPI
 
@@ -25,6 +26,10 @@ public:
 	// Set projection centers for each eye (normalized 0-1 coordinates).
 	// Call for each new projection or eye-gaze sample.
 	void SetProjectionCenters(float leftProjX, float leftProjY, float rightProjX, float rightProjY);
+	void SetHorizontalScale(float scale);
+	// The caller supplies a frame-latched mask only after presentation and
+	// downstream consumers are ready. Configuration alone must not enable it.
+	void SetBlackout(const ocu_foveation::Blackout& mask);
 
 	// Create/update one shading-rate resource for the full bound stereo render
 	// target. NVIDIA requires this resource to match the complete render target
@@ -56,6 +61,7 @@ public:
 	bool WasInitializationAttempted() const { return initializationAttempted; }
 
 private:
+	friend struct VRSBlackoutTestAccess;
 	bool available = false;
 	bool initializationAttempted = false;
 
@@ -86,6 +92,8 @@ private:
 	// Cached config values used to detect changes
 	float cachedInnerRadius = 0.0f;
 	float cachedMidRadius = 0.0f;
+	float horizontalScale = 1.0f;
+	ocu_foveation::Blackout blackout;
 	ocu_foveation::RingRates cachedRates;
 	bool shadingRatesSet = false; // True after EnableShadingRates() — avoid redundant NVAPI calls
 
@@ -117,6 +125,8 @@ public:
 
 	bool Initialize(ID3D11Device*) { return false; }
 	void SetProjectionCenters(float, float, float, float) {}
+	void SetHorizontalScale(float) {}
+	void SetBlackout(const ocu_foveation::Blackout&) {}
 	bool UpdateStereoPattern(int, int, const EyeRegion&, const EyeRegion&, float, float,
 	    const ocu_foveation::RingRates&) { return false; }
 	bool ApplyStereo() { return false; }

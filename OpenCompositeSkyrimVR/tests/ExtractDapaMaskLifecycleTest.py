@@ -18,7 +18,7 @@ start = runtime.index("void DX11Compositor::BeginVRSGameFrame()")
 start = runtime.index("{", start) + 1
 end = runtime.index("// Publish a fresh disabled frame", start)
 boundary = "void BeginRealFrame() {" + runtime[start:end] + "}\n"
-result = boundary + function(producer, "bool Prepare(") + "\n" + function(producer, "void Publish()")
+result = boundary + function(producer, "bool Prepare(") + "\n" + function(producer, "bool Publish(MaskAccess&")
 output = Path(sys.argv[3])
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text(result, encoding="utf-8")

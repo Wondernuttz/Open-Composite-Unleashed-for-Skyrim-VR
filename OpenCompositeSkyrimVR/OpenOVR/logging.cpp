@@ -208,6 +208,14 @@ void oovr_log_raw(const char* file, long line, const char* func, const char* msg
 #endif
 }
 
+void oovr_log_flush()
+{
+#ifndef ANDROID
+	std::lock_guard<std::mutex> lock(log_mutex());
+	if (stream.is_open()) stream.flush();
+#endif
+}
+
 // Called from DLL_PROCESS_DETACH to flush and close the log stream
 void oovr_log_shutdown()
 {

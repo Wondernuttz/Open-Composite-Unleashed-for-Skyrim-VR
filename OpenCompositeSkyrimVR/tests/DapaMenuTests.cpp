@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include "DrvOpenXR/DapaTiming.h"
+#include "OpenOVR/Misc/FoveationBlackout.h"
 #define OOVR_LOGF(...) ((void)0)
 template<class T> T Handle(unsigned n) { return reinterpret_cast<T>(static_cast<uintptr_t>(n)); }
 static unsigned checks=0;
@@ -14,6 +15,12 @@ void Check(bool value,const char* reason) { ++checks; if(!value) throw std::runt
 struct Bridge { unsigned char isMenuOpen=0,isMainMenu=0,isLoadingScreen=0; } bridge;
 Bridge* s_pBridge=&bridge;
 static unsigned bridgeReads=0,openOnRead=0;
+static bool maskCacheValid=true;
+static unsigned maskReads=0,invalidateMaskOnRead=0;
+bool OCBridge_DapaMaskCacheValid() {
+    if(++maskReads==invalidateMaskOnRead)maskCacheValid=false;
+    return maskCacheValid;
+}
 void OpenRenderTargetBridge() { if(++bridgeReads==openOnRead) bridge.isMenuOpen=1; }
 #include "DapaMenuBridge.inc"
 enum class Phase { None, Wait, Begin, Locate, Warp, Copy, End };
@@ -27,6 +34,7 @@ public:
     bool m_ready=true,m_paused=false,m_hasCachedFrame=false,m_injectionWanted=true;
     uint8_t m_cacheBuildEyeMask=0;
     bool m_motionGeometryValid[2]{};
+    ocu_foveation::BlackoutFrame m_cachedBlackout[2]{};
     ResetState m_capture,m_motion,m_captureMovement,m_turn;
     unsigned warps=0,copies=0;
 #include "DapaMenuProvider.inc"
@@ -94,6 +102,7 @@ XrResult xrEndFrame(XrSession,const XrFrameEndInfo* frame){
 #include "DapaMenuScheduler.inc"
 void Reset() {
     provider=ASWProvider{};bridge={};s_pBridge=&bridge;bridgeReads=openOnRead=0;openAt=Phase::None;
+    maskCacheValid=true;maskReads=invalidateMaskOnRead=0;
     trouble=pacingObserved=waits=begins=ends=emptyEnds=renderedEnds=0;context={};dapaStats={};
     recovery={};pacing={};prepareInjection=true;
 }
@@ -136,6 +145,20 @@ int main() {
     }
     Reset();Pair();pacing.backoffMs=10;RunScheduler();
     Check(waits==0&&provider.HasCachedFrame()&&provider.IsInjectionWanted(),"existing pacing yield preserves cache history");
+    Reset();Pair();invalidateMaskOnRead=1;RunScheduler();
+    Check(maskReads==1 && waits==0 && begins==0 && ends==0 && dapaStats.attempts==0,
+        "late mask conflict is checked before claiming any synthetic XR slot");
+    Check(!provider.HasCachedFrame() && provider.m_cacheBuildEyeMask==0 && provider.warps==0 && provider.copies==0,
+        "late mask conflict invalidates complete stereo cache before warp or copy");
+    Check(context.releases==1 && trouble==0,"mask rejection releases context without creating runtime error/backoff");
+    maskCacheValid=true;invalidateMaskOnRead=0;RunScheduler();
+    Check(waits==0 && !provider.HasCachedFrame(),"clean mask state alone cannot restore invalidated stereo pair");
+    Check(!provider.CacheEye(1),"new right eye cannot reuse left from mask-conflicted pair");
+    Check(provider.CacheEye(0),"new left begins recovery after mask conflict");RunScheduler();
+    Check(waits==0,"partial recovery pair cannot claim a slot");
+    Check(provider.CacheEye(1),"new right completes recovery after mask conflict");RunScheduler();
+    Check(waits==1 && renderedEnds==1 && emptyEnds==0 && provider.warps==2,
+        "fresh pair and valid mask resume normal synthetic submission");
     std::printf("PASS: %u production menu/cache/scheduler checks; max one already-claimed slot, no menu-empty frame\n",checks);return 0;
  }catch(const std::exception& error){std::printf("FAIL: %s\n",error.what());return 1;}
 }

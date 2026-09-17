@@ -98,12 +98,12 @@ void XrNetworkTracker::GetPoseImpl(vr::ETrackingUniverseOrigin origin, vr::Track
 	pose->eTrackingResult = vr::TrackingResult_Running_OutOfRange;
 
 	// Canonical waist/foot roles automatically take a live HTCX pose first.
-	// A real Vive/Tundra tracker is true 6DoF and should beat monocular camera
-	// reconstruction; when it disappears, the same OCU-NET device falls back
+	// A complete runtime role pose takes priority over camera reconstruction;
+	// when it disappears, the same OCU-NET device falls back
 	// to OSC without making Skyrim-FBT recalibrate or change serial pins.
-	if (htcxRoleSource) {
+	if (ITrackedDevice* source = htcxRoleSource.load()) {
 		vr::TrackedDevicePose_t htcxPose{};
-		htcxRoleSource->GetPose(origin, &htcxPose, trackingState);
+		source->GetPose(origin, &htcxPose, trackingState);
 		if (htcxPose.bPoseIsValid) {
 			*pose = htcxPose;
 			if (!loggedHtcxSource) {

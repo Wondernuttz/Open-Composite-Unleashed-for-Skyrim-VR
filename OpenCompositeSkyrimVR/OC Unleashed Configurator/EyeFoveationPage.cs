@@ -5,6 +5,15 @@ namespace OpenCompositeConfigurator;
 
 public partial class MainForm
 {
+    private NumericUpDown _nudVrsEyeHorizontalScale = null!;
+    private NumericUpDown _nudVrsEyeHorizontalOffset = null!;
+    private NumericUpDown _nudVrsEyeVerticalOffset = null!;
+    private CheckBox _chkVrsEyePeripheralMask = null!;
+    private NumericUpDown _nudVrsEyePeripheralMaskRadius = null!;
+    private CheckBox _chkVrsEyeMiddleBlackout = null!;
+    private CheckBox _chkVrsEyeOuterBlackout = null!;
+    private CheckBox _chkVrsEyeBlackoutCull = null!;
+
     private void InitializeEyeFoveationState(Control parent)
     {
         // The popup owns the visible eye controls. Keep the existing state fields
@@ -28,6 +37,17 @@ public partial class MainForm
         _cboVrsEyePreset = choice(FoveationProfiles.EyePresetNames, FoveationProfiles.DefaultEyePreset);
         _nudVrsEyeInnerRadius = radius(1.00m);
         _nudVrsEyeMidRadius = radius(1.50m);
+        NumericUpDown adjustment(decimal minimum, decimal maximum, decimal value) => keep(new NumericUpDown {
+            DecimalPlaces = 4, Increment = .01m, Minimum = minimum, Maximum = maximum, Value = value
+        });
+        _nudVrsEyeHorizontalScale = adjustment(.5m, 2m, 1m);
+        _nudVrsEyeHorizontalOffset = adjustment(-.25m, .25m, 0m);
+        _nudVrsEyeVerticalOffset = adjustment(-.25m, .25m, 0m);
+        _chkVrsEyePeripheralMask = keep(new CheckBox());
+        _nudVrsEyePeripheralMaskRadius = adjustment(.1m, 1.5m, 1m);
+        _chkVrsEyeMiddleBlackout = keep(new CheckBox());
+        _chkVrsEyeOuterBlackout = keep(new CheckBox());
+        _chkVrsEyeBlackoutCull = keep(new CheckBox());
         _chkVrsEyeCustomRates = keep(new CheckBox());
         _chkVrsEyeCompatibilityMode = keep(new CheckBox());
         _chkVrsFavorHorizontal = keep(new CheckBox { Checked = true });
@@ -55,6 +75,13 @@ public partial class MainForm
         }
         _nudVrsEyeInnerRadius.ValueChanged += radiiChanged;
         _nudVrsEyeMidRadius.ValueChanged += radiiChanged;
+        foreach (var geometry in new[] { _nudVrsEyeHorizontalScale, _nudVrsEyeHorizontalOffset, _nudVrsEyeVerticalOffset })
+            geometry.ValueChanged += (_, _) => UpdateFoveationControls();
+        _chkVrsEyePeripheralMask.CheckedChanged += (_, _) => UpdateFoveationControls();
+        _nudVrsEyePeripheralMaskRadius.ValueChanged += (_, _) => UpdateFoveationControls();
+        _chkVrsEyeMiddleBlackout.CheckedChanged += (_, _) => UpdateFoveationControls();
+        _chkVrsEyeOuterBlackout.CheckedChanged += (_, _) => UpdateFoveationControls();
+        _chkVrsEyeBlackoutCull.CheckedChanged += (_, _) => UpdateFoveationControls();
         _cboFoveatedBackend.SelectedIndexChanged += (_, _) => UpdateFoveationControls();
         _chkVrsEyeCompatibilityMode.CheckedChanged += (_, _) => UpdateFoveationControls();
         _chkVrsFavorHorizontal.CheckedChanged += (_, _) => UpdateFoveationControls();
@@ -71,6 +98,14 @@ public partial class MainForm
         Radii = new(_nudVrsEyeInnerRadius.Value, _nudVrsEyeMidRadius.Value),
         CustomRates = _chkVrsEyeCustomRates.Checked, Compatibility = _chkVrsEyeCompatibilityMode.Checked,
         FavorHorizontal = _chkVrsFavorHorizontal.Checked,
+        HorizontalScale = _nudVrsEyeHorizontalScale.Value,
+        HorizontalOffset = _nudVrsEyeHorizontalOffset.Value,
+        VerticalOffset = _nudVrsEyeVerticalOffset.Value,
+        PeripheralMask = _chkVrsEyePeripheralMask.Checked,
+        PeripheralMaskRadius = _nudVrsEyePeripheralMaskRadius.Value,
+        MiddleBlackout = _chkVrsEyeMiddleBlackout.Checked,
+        OuterBlackout = _chkVrsEyeOuterBlackout.Checked,
+        BlackoutCull = _chkVrsEyeBlackoutCull.Checked,
         InnerRate = _cboVrsEyeInnerRate.SelectedItem?.ToString() ?? EyeFoveationSettings.DefaultInnerRate,
         MidRate = _cboVrsEyeMidRate.SelectedItem?.ToString() ?? EyeFoveationSettings.DefaultMidRate,
         OuterRate = _cboVrsEyeOuterRate.SelectedItem?.ToString() ?? EyeFoveationSettings.DefaultOuterRate
@@ -89,6 +124,14 @@ public partial class MainForm
             _chkVrsEyeCustomRates.Checked = settings.CustomRates;
             _chkVrsEyeCompatibilityMode.Checked = settings.Compatibility;
             _chkVrsFavorHorizontal.Checked = settings.FavorHorizontal;
+            _nudVrsEyeHorizontalScale.Value = System.Math.Clamp(settings.HorizontalScale, .5m, 2m);
+            _nudVrsEyeHorizontalOffset.Value = System.Math.Clamp(settings.HorizontalOffset, -.25m, .25m);
+            _nudVrsEyeVerticalOffset.Value = System.Math.Clamp(settings.VerticalOffset, -.25m, .25m);
+            _chkVrsEyePeripheralMask.Checked = settings.PeripheralMask;
+            _nudVrsEyePeripheralMaskRadius.Value = settings.EffectivePeripheralMaskRadius;
+            _chkVrsEyeMiddleBlackout.Checked = settings.MiddleBlackout;
+            _chkVrsEyeOuterBlackout.Checked = settings.OuterBlackout;
+            _chkVrsEyeBlackoutCull.Checked = settings.BlackoutCull;
             _cboVrsEyeInnerRate.SelectedItem = settings.InnerRate;
             _cboVrsEyeMidRate.SelectedItem = settings.MidRate;
             _cboVrsEyeOuterRate.SelectedItem = settings.OuterRate;

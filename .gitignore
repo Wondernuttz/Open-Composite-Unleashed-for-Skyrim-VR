@@ -57,3 +57,6 @@ BodyTracking/Captures/
 /.publish-links/
 __pycache__/
 *.pyc
+
+# Shelved audio recovery deployment backups
+/OCU Audio Recovery- Skyrim SKSE/shelved_deployed_copies/

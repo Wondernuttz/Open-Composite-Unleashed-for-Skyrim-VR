@@ -14,7 +14,9 @@ public:
     FoveationDebugOverlay(const FoveationDebugOverlay&) = delete;
     FoveationDebugOverlay& operator=(const FoveationDebugOverlay&) = delete;
     bool Update(XrSession session, ID3D11Device* device,
-        const ocu_effect_foveation::Snapshot& profile);
+        const ocu_effect_foveation::Snapshot& profile, float horizontalScale = 1.0f,
+        bool drawRings = true, bool peripheralMask = false, float maskRadius = 1.0f,
+        bool middleBlackout = false, bool outerBlackout = false);
     static constexpr uint32_t LayerCount = 2;
     bool PositionOverScene(const XrCompositionLayerProjection& scene);
     const XrCompositionLayerBaseHeader* Layer(uint32_t eye) const;

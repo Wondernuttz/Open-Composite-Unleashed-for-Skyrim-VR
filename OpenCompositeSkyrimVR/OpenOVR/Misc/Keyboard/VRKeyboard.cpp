@@ -21,6 +21,7 @@
 #include "Misc/lodepng.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <stdexcept>
 #include <utility>
@@ -29,6 +30,10 @@
 // MCI for MP3 sound playback
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
+
+// Input threads read this publication instead of inspecting the render-owned
+// keyboard pointer or guessing which desktop window owns its properties.
+std::atomic<bool> g_ocuKeyboardActive{false};
 
 // Persistent keyboard settings — survive keyboard close/reopen and game restarts
 // Note: These are written by file watcher thread and read by render thread.
@@ -1489,10 +1494,12 @@ VRKeyboard::VRKeyboard(ID3D11Device* dev, uint64_t userValue, uint32_t maxLength
 	// 	... (crosshair code disabled)
 	// }
 	OOVR_LOG("VR keyboard resources: 2 private swapchains (panel, console) plus shared laser atlas");
+	g_ocuKeyboardActive.store(true, std::memory_order_release);
 }
 
 VRKeyboard::~VRKeyboard()
 {
+	g_ocuKeyboardActive.store(false, std::memory_order_release);
 	ReleaseAllHeldPCKeys();
 	if (crosshairChain != XR_NULL_HANDLE) {
 		xrDestroySwapchain(crosshairChain);

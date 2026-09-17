@@ -96,6 +96,7 @@ namespace RE { class GASGlobalContext; } // Forward decl needed by GFxMovieRoot.
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include "../../../OpenCompositeSkyrimVR/DrvOpenXR/DapaPlayerMaskGpu.h"
+#include "../../../OpenCompositeSkyrimVR/DrvOpenXR/DapaMaskBridge.h"
 #include "DapaVtableSlot.h"
 #include "DapaEngineDraw.h"
 #include "DapaAcceptedDraw.h"
@@ -312,13 +313,16 @@ struct OCRenderTargetBridge {
 	// OC compares this against post-FP depth: where depth got closer → FP pixel.
 	uint64_t preFPDepthTexture;        // ID3D11Texture2D* (R24G8_TYPELESS, same size as main DS)
 	uint8_t  preFPDepthCaptured;       // 1 = valid capture for current frame
-	uint8_t  _padPreFP[7];
+	uint8_t  _padPreFP[3];             // [0] = negotiated mask format
+	uint32_t maskAccessGate;          // DAPA mask lifetime/content lease; never spun on
 
 	// FP geometry pointers — BSGeometry* addresses for positively-identified FP draws.
 	// OC reads their worldBound LIVE at WarpFrame time (no stale data).
 	uint64_t fpGeomPointers[16];       // Up to 16 BSGeometry* pointers
 	uint32_t fpGeomCount;              // Number of valid pointers
-	uint32_t _padGeom[3];              // Alignment to 16 bytes
+	uint32_t maskFrameGeneration;     // Nonzero real-frame sequence, protected by maskAccessGate
+	uint32_t maskConflictSerial;      // Atomic contention/failure count
+	uint32_t maskFrameConflictBaseline; // Count before this real frame began
 
 	// FP draw replay — pointer to heap-allocated FPReplayData (same process, read by OC).
 	// Double-buffered: SKSE writes captures, OC reads at warp time.
@@ -333,6 +337,12 @@ struct OCRenderTargetBridge {
 };
 #pragma pack(pop)
 static_assert(sizeof(OCRenderTargetBridge) == 704);
+static_assert(offsetof(OCRenderTargetBridge, maskAccessGate) == 540);
+static_assert(offsetof(OCRenderTargetBridge, maskFrameGeneration) == 676);
+static_assert(offsetof(OCRenderTargetBridge, maskConflictSerial) == 680);
+static_assert(offsetof(OCRenderTargetBridge, maskFrameConflictBaseline) == 684);
+static_assert(offsetof(OCRenderTargetBridge, maskAccessGate) % std::atomic_ref<uint32_t>::required_alignment == 0);
+static_assert(offsetof(OCRenderTargetBridge, maskConflictSerial) % std::atomic_ref<uint32_t>::required_alignment == 0);
 static_assert(offsetof(OCRenderTargetBridge, publishSequence) % alignof(uint32_t) == 0);
 static_assert(offsetof(OCRenderTargetBridge, resourceReaders) % alignof(uint32_t) == 0);
 
@@ -368,6 +378,7 @@ namespace
 	// =========================================================================
 	HANDLE                g_hBridgeMapFile = nullptr;
 	OCRenderTargetBridge* g_pBridge = nullptr;
+	bool g_bridgeMenuStateObserved = false;
 
 	template <class T>
 	T* RetainBridgeResource(T* a_resource)
@@ -561,18 +572,44 @@ namespace
 		return g_bridgeResources.RetainCopy();
 	}
 
-	bool CaptureBridgeResources(BridgeResourceRefs& o_resources)
+	enum class BridgeResourceCapture
+	{
+		Unavailable,
+		Unchanged,
+		Changed
+	};
+
+	BridgeResourceCapture CaptureBridgeResources(BridgeResourceRefs& o_resources)
 	{
 		auto* renderer = RE::BSGraphics::Renderer::GetSingleton();
 		if (!renderer)
-			return false;
+			return BridgeResourceCapture::Unavailable;
 
 		auto& runtimeData = renderer->GetRuntimeData();
 		auto& mvRT = runtimeData.renderTargets[RE::RENDER_TARGET::kMOTION_VECTOR];
 		auto* d3dDevice = reinterpret_cast<ID3D11Device*>(runtimeData.forwarder);
 		auto* d3dContext = reinterpret_cast<ID3D11DeviceContext*>(runtimeData.context);
 		if (!mvRT.texture || !d3dDevice || !d3dContext)
-			return false;
+			return BridgeResourceCapture::Unavailable;
+
+		auto& depthData = renderer->GetDepthStencilData();
+		auto& mainDepth = depthData.depthStencils[RE::RENDER_TARGET_DEPTHSTENCIL::kMAIN];
+		{
+			std::lock_guard<std::mutex> lock(g_bridgeResourceMutex);
+			// This runs on the renderer's game thread. Retained published references
+			// prevent address reuse, and a D3D11 resource's descriptor is immutable.
+			// Compare identities before any AddRef/GetDesc work so frequent probes
+			// are just pointer reads while CSX keeps the same render targets.
+			if (g_pBridge && g_pBridge->status == 1 &&
+			    g_bridgeResources.mvTexture == mvRT.texture &&
+			    g_bridgeResources.mvSRV == mvRT.SRV &&
+			    g_bridgeResources.mvUAV == mvRT.UAV &&
+			    g_bridgeResources.depthTexture == mainDepth.texture &&
+			    g_bridgeResources.depthSRV == (mainDepth.texture ? mainDepth.depthSRV : nullptr) &&
+			    g_bridgeResources.d3dDevice == d3dDevice &&
+			    g_bridgeResources.d3dContext == d3dContext)
+				return BridgeResourceCapture::Unchanged;
+		}
 
 		BridgeResourceRefs resources;
 		resources.mvTexture = RetainBridgeResource(mvRT.texture);
@@ -586,8 +623,6 @@ namespace
 		resources.mvWidth = mvDesc.Width;
 		resources.mvHeight = mvDesc.Height;
 
-		auto& depthData = renderer->GetDepthStencilData();
-		auto& mainDepth = depthData.depthStencils[RE::RENDER_TARGET_DEPTHSTENCIL::kMAIN];
 		if (mainDepth.texture) {
 			resources.depthTexture = RetainBridgeResource(mainDepth.texture);
 			resources.depthSRV = RetainBridgeResource(mainDepth.depthSRV);
@@ -599,7 +634,7 @@ namespace
 		}
 
 		o_resources = std::move(resources);
-		return true;
+		return BridgeResourceCapture::Changed;
 	}
 
 	void RefreshBridgeRenderTargets();
@@ -686,6 +721,13 @@ namespace
 		}
 
 		memset(g_pBridge, 0, sizeof(OCRenderTargetBridge));
+		g_bridgeMenuStateObserved = false;
+		// DataLoaded precedes menu observation. A valid render-resource bridge
+		// must not advertise gameplay until the game-thread menu reconciliation
+		// has observed it. Publish startup protection before the valid header.
+		g_pBridge->isMenuOpen = 1;
+		g_pBridge->_padPreFP[0] = DapaMaskBridge::Format;
+		MemoryBarrier();
 		g_pBridge->magic = OCRenderTargetBridge::MAGIC;
 		g_pBridge->version = OCRenderTargetBridge::VERSION;
 		g_pBridge->byteSize = sizeof(OCRenderTargetBridge);
@@ -696,18 +738,20 @@ namespace
 			sizeof(OCRenderTargetBridge));
 	}
 
-	// Re-capture the game's MV + depth render target pointers. Render-scale
-	// mods (e.g. Community Shaders VR) destroy and recreate the game's render
-	// targets mid-session ("relatch"); without this refresh the bridge keeps
-	// serving freed texture pointers to the compositor (garbage ASW warps,
-	// flashing, potential use-after-free). Called on the game thread ~1/sec.
+	// Probe the game's MV + depth identities on each scheduled game-thread
+	// refresh. Render-scale mods can replace textures without changing size.
+	// Recapture only a changed set so the bridge stops serving a retained but
+	// obsolete scene texture promptly, without COM churn on unchanged frames.
 	void RefreshBridgeRenderTargets()
 	{
 		if (!g_pBridge)
 			return;
 
 		BridgeResourceRefs resources;
-		if (!CaptureBridgeResources(resources)) {
+		const auto capture = CaptureBridgeResources(resources);
+		if (capture == BridgeResourceCapture::Unchanged)
+			return;
+		if (capture == BridgeResourceCapture::Unavailable) {
 			BridgeResourceRefs unavailable;
 			if (PublishBridgeResources(std::move(unavailable), 2)) {
 				SKSE::log::warn("RT Bridge v2: resources unavailable; publication paused and refresh will retry");
@@ -1177,6 +1221,61 @@ namespace
 		g_pTransform->updateCounter++;
 	}
 
+	// One-time startup snapshot, called only by game-thread maintenance, never
+	// from MenuOpenCloseEvent: IsMenuOpen takes the UI lock held during dispatch.
+	// Main/loading can already be open before our event sink is registered.
+	void ObserveInitialBridgeMenuState()
+	{
+		if (!g_pBridge || g_bridgeMenuStateObserved) return;
+		auto ui = RE::UI::GetSingleton();
+		if (!ui) return;
+		g_pBridge->isMainMenu = ui->IsMenuOpen("Main Menu") ? 1 : 0;
+		g_pBridge->isLoadingScreen = ui->IsMenuOpen("Loading Menu") ? 1 : 0;
+		g_pBridge->isConsoleOpen = ui->IsMenuOpen("Console") ? 1 : 0;
+		g_bridgeMenuStateObserved = true;
+	}
+
+	// Reconcile on the game thread both after menu events and from bridge
+	// maintenance. Bethesda may dispatch a close before its pause count drops;
+	// publishing only during that event can leave foveation/DAPA suspended for
+	// the rest of gameplay. Read only GameIsPaused(), never a menu/movie query
+	// that could take the UI lock held during MenuOpenCloseEvent dispatch.
+	void RefreshMenuActivityFromGameState()
+	{
+		// An unavailable UI singleton cannot prove that gameplay has resumed.
+		// Keep the last active state until a live observation, including startup.
+		static bool lastActive = true;
+		static HWND publishedWindow = nullptr;
+		static bool publishedWindowActive = true;
+
+		auto ui = RE::UI::GetSingleton();
+		const bool trackedMenuActive = !g_activeTrackedMenus.empty();
+		const bool startupMenuActive = g_pBridge && (g_pBridge->isMainMenu ||
+		    g_pBridge->isLoadingScreen || g_pBridge->isConsoleOpen);
+		const bool active = !g_bridgeMenuStateObserved || startupMenuActive ||
+		    trackedMenuActive || (ui ? ui->GameIsPaused() : lastActive);
+		if (active != lastActive)
+			SKSE::log::debug("Menu activity reconciled: active={} tracked={} liveUI={}",
+			    active, trackedMenuActive, ui != nullptr);
+		lastActive = active;
+
+		// A newly discovered/recreated window needs the current value even when
+		// no menu transition happened. Retry a failed property write next tick.
+		if (g_gameHwnd &&
+		    (g_gameHwnd != publishedWindow || active != publishedWindowActive)) {
+			if (SetPropW(g_gameHwnd, L"OC_MENU_ACTIVE", (HANDLE)(intptr_t)(active ? 1 : 0))) {
+				publishedWindow = g_gameHwnd;
+				publishedWindowActive = active;
+			}
+		}
+
+		// Comparing the shared value also initializes a late/recreated bridge.
+		// Preserve the existing tracked-menu OR pause policy for both foveation
+		// and DAPA; this repairs publication, not which menus are protected.
+		if (g_pBridge && g_pBridge->isMenuOpen != (active ? 1 : 0))
+			g_pBridge->isMenuOpen = active ? 1 : 0;
+	}
+
 	class MenuWatcher : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
 	{
 	public:
@@ -1184,7 +1283,7 @@ namespace
 		    const RE::MenuOpenCloseEvent* a_event,
 		    RE::BSTEventSource<RE::MenuOpenCloseEvent>* /*a_source*/) override
 		{
-			if (!g_gameHwnd || !a_event)
+			if (!a_event)
 				return RE::BSEventNotifyControl::kContinue;
 
 			std::string_view name = a_event->menuName.c_str();
@@ -1261,22 +1360,7 @@ namespace
 				}
 			}
 
-			// Set OC_MENU_ACTIVE for ALL menus (for WASD blocking in OpenComposite)
-			// IsShowingMenus() returns false in SkyrimVR — use tracked menus + GameIsPaused instead
-			auto ui = RE::UI::GetSingleton();
-			if (ui) {
-				bool anyMenuVisible = !g_activeTrackedMenus.empty() || ui->GameIsPaused();
-				SetPropW(g_gameHwnd, L"OC_MENU_ACTIVE",
-				    (HANDLE)(intptr_t)(anyMenuVisible ? 1 : 0));
-				SKSE::log::debug("Menu {} {} - active:{} gamePaused:{}",
-				    name, a_event->opening ? "opened" : "closed",
-				    !g_activeTrackedMenus.empty(), ui->GameIsPaused());
-
-				// Update ASW menu flag — when any menu is visible, ASW skips MV
-				// corrections to prevent UI duplication on warp frames.
-				if (g_pBridge)
-					g_pBridge->isMenuOpen = anyMenuVisible ? 1 : 0;
-			}
+			RefreshMenuActivityFromGameState();
 
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -6098,6 +6182,20 @@ namespace
 		}
 	}
 
+	// At most one maintenance task may be queued or executing. Read engine
+	// state only on the game thread, and sample the latest state when it runs.
+	void QueueBridgeMaintenance()
+	{
+		if (g_renderTargetRefreshTaskPending.exchange(true, std::memory_order_acq_rel))
+			return;
+		SKSE::GetTaskInterface()->AddTask([]() {
+			ObserveInitialBridgeMenuState();
+			RefreshMenuActivityFromGameState();
+			RefreshBridgeRenderTargets();
+			g_renderTargetRefreshTaskPending.store(false, std::memory_order_release);
+		});
+	}
+
 	// Scheduler: posts the pump onto the game thread while menus are active.
 	// Single AddTask per tick (never self-requeueing, so no same-frame loops).
 	void StartLaserPumpScheduler()
@@ -6105,7 +6203,6 @@ namespace
 		if (g_laserPumpRunning.exchange(true))
 			return;
 		std::thread([]() {
-			int rtRefreshTick = 0;
 			int consolePickTick = 0;
 			while (g_laserPumpRunning.load()) {
 				if (g_pTransform && g_pTransform->active &&
@@ -6134,17 +6231,10 @@ namespace
 						});
 					}
 				}
-				// ~1/sec: re-capture game render targets in case a render-scale
-				// mod (Community Shaders VR etc.) recreated them
-				if (++rtRefreshTick >= 125) {
-					rtRefreshTick = 0;
-					if (!g_renderTargetRefreshTaskPending.exchange(true, std::memory_order_acq_rel)) {
-						SKSE::GetTaskInterface()->AddTask([]() {
-							RefreshBridgeRenderTargets();
-							g_renderTargetRefreshTaskPending.store(false, std::memory_order_release);
-						});
-					}
-				}
+				// Reconcile pause state after event dispatch and promptly observe
+				// recreated render targets. Stable resources take the identity-only
+				// fast path; a stalled game thread cannot accumulate queued work.
+				QueueBridgeMaintenance();
 				std::this_thread::sleep_for(std::chrono::milliseconds(8));
 			}
 		}).detach();
@@ -7198,7 +7288,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	SetupLogging();
 
 	SKSE::log::info("OpenCompositeInput v3.2.0 loaded");
-	SKSE::log::info("OCU SKSE package: 4.3.7-custom-eye-test-hotfix4 / DAPA exact-mask-v1 / accepted-draw-api-v1 / held-geometry ownership");
+	SKSE::log::info("OCU SKSE package: 4.3.7-custom-eye-test-hotfix6 / prompt-bridge-refresh-v1 / menu-reconcile-v1 / DAPA exact-mask-v1 / accepted-draw-api-v1 / held-geometry ownership / startup-menu-state-v1 / dapa-mask-lease-v1");
 	SKSE::log::info("  VR keyboard bridge + Scaleform char injection + menu state tracking");
 		SKSE::log::info("  RaceMenu keyboard test: confirmed-naming-v4 / VR-button-slot-8");
 	SKSE::log::info("  + Render target bridge (MV + depth) for FSR 2/3 integration");

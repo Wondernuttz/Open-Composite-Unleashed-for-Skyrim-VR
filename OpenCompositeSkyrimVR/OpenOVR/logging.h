@@ -10,6 +10,7 @@
 
 void oovr_log_raw(const char* file, long line, const char* func, const char* msg);
 void oovr_log_raw_format(const char* file, long line, const char* func, const char* msg, ...);
+void oovr_log_flush(); // Explicit lifecycle checkpoints; never called per frame.
 bool oovr_debug_logging_enabled();
 #define OOVR_LOG(msg) oovr_log_raw(__FILE__, __LINE__, __FUNCTION__, msg)
 #define OOVR_LOGF(...) oovr_log_raw_format(__FILE__, __LINE__, __FUNCTION__, __VA_ARGS__)

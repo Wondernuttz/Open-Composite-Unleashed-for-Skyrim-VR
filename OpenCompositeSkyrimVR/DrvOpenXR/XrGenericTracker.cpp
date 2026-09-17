@@ -1,7 +1,9 @@
 #include "XrGenericTracker.h"
+#include "BodyTrackerPose.h"
 
 // Poses come from BaseInput's tracker action spaces, same pattern as XrController
-#include "../OpenOVR/Misc/xrmoreutils.h"
+#include "../OpenOVR/Misc/BodyTrackerStatus.h"
+#include "../OpenOVR/convert.h"
 #include "../OpenOVR/Reimpl/BaseInput.h"
 #include "generated/static_bases.gen.h"
 
@@ -25,6 +27,14 @@ void XrGenericTracker::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDe
 	pose->bDeviceIsConnected = true;
 	pose->bPoseIsValid = false;
 	pose->eTrackingResult = vr::TrackingResult_Running_OutOfRange;
+	// Publish once after every evaluation, including missing spaces and failed
+	// locations. Telemetry observes this read and never issues another XR query.
+	struct StatusPublisher {
+		int role;
+		const vr::TrackedDevicePose_t& pose;
+		bool tracked = false;
+		~StatusPublisher() { BodyTrackerStatus::Publish(role, pose.bPoseIsValid, tracked); }
+	} status{ roleIndex, *pose };
 
 	BaseInput* input = GetUnsafeBaseInput();
 	if (input == nullptr)
@@ -35,12 +45,26 @@ void XrGenericTracker::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDe
 	if (!space)
 		return;
 
-	// HTCX poses have already been fused, filtered, and predicted by the active
-	// runtime. Passing an extra transform here would enter PoseFromSpace's
-	// controller OneEuro filter with HAND_NONE as a shared key, causing every
-	// physical tracker to contaminate the same filter state. No transform also
-	// means no OCU controller smoothing: publish the runtime pose verbatim.
-	xr_utils::PoseFromSpace(pose, space, origin);
+	// Preserve the runtime's origin conversion and predicted sample time.
+	// Tracker poses never enter OCU's shared controller smoothing filters.
+	XrSpaceVelocity velocity{ XR_TYPE_SPACE_VELOCITY };
+	XrSpaceLocation location{ XR_TYPE_SPACE_LOCATION, &velocity };
+	const XrResult result = xrLocateSpace(space, xr_space_from_tracking_origin(origin),
+	    xr_gbl->GetBestTime(), &location);
+	if (XR_FAILED(result)) {
+		OOVR_FAILED_XR_SOFT_ABORT(result);
+		return;
+	}
+	const auto sample = OcuBodyTrackerPose::FromLocation(result, location, velocity);
+	if (!sample.valid)
+		return;
+
+	pose->mDeviceToAbsoluteTracking = G2S_m34(X2G_om34_pose(sample.pose));
+	pose->vVelocity = X2S_v3f(sample.linearVelocity);
+	pose->vAngularVelocity = X2S_v3f(sample.angularVelocity);
+	pose->bPoseIsValid = true;
+	pose->eTrackingResult = vr::TrackingResult_Running_OK;
+	status.tracked = sample.tracked;
 }
 
 uint32_t XrGenericTracker::GetStringTrackedDeviceProperty(vr::ETrackedDeviceProperty prop,

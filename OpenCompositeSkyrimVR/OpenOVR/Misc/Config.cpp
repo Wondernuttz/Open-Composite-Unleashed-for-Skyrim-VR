@@ -342,6 +342,10 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(string, bodyTrackerRoles);
 		CFGOPT(bool, networkTrackersEnabled);
 		CFGOPT(int, networkTrackerPort);
+		CFGOPT(bool, treadmillEnabled);
+		CFGOPT(bool, treadmillControllerCalibration);
+		CFGOPT(int, treadmillPort);
+		CFGOPT(float, treadmillFullSpeed);
 		CFGOPT(bool, cameraLegCalibrationEnabled);
 		CFGOPT(bool, menuLaserEnabled);
 		CFGOPT(bool, enableLaserSmoothing);
@@ -390,6 +394,14 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, vrsFixedInnerRadius);
 		CFGOPT(float, vrsFixedMidRadius);
 		CFGOPT(float, vrsEyeInnerRadius);
+		CFGOPT(float, vrsEyeHorizontalScale);
+		CFGOPT(float, vrsEyeHorizontalOffset);
+		CFGOPT(float, vrsEyeVerticalOffset);
+		CFGOPT(bool, vrsEyePeripheralMask);
+		CFGOPT(bool, vrsEyeMiddleBlackout);
+		CFGOPT(bool, vrsEyeOuterBlackout);
+		CFGOPT(bool, vrsEyeBlackoutCull);
+		CFGOPT(float, vrsEyePeripheralMaskRadius);
 		CFGOPT(float, vrsEyeMidRadius);
 		if (name == "vrsEyeCustomRates") {
 			cfg->vrsEyeCustomRates = parse_bool(value, name, lineno);

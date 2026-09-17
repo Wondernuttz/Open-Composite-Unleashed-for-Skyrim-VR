@@ -1,0 +1,86 @@
+#include <openxr/openxr.h>
+#include "OpenOVR/Misc/Input/LocomotionCalibrationGesture.h"
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#define OOVR_LOGF(...) ((void)0)
+struct { bool enabled=true, shortcut=true, haptics=true; float strength=1; bool TreadmillEnabled() const { return enabled; }
+    bool TreadmillControllerCalibration() const { return shortcut; } float HapticStrength() const { return strength; }
+    bool Haptics() const { return haptics; }
+} oovr_global_configuration;
+struct { XrSession get() const { return reinterpret_cast<XrSession>(1); } } xr_session;
+std::uint64_t now=100;
+bool sync=true, gameplay=true, held[2]{}, active=true, floatActive=true, actionError=false;
+float axes[4]{};
+unsigned boolQueries=0,floatQueries=0,haptics=0,checks=0;
+XrAction action(unsigned id) { return reinterpret_cast<XrAction>(std::uintptr_t(id)); }
+struct OscLocomotion {
+    bool ready=true, accept=true; unsigned requests=0;
+    static OscLocomotion& Instance() { static OscLocomotion value; return value; }
+    bool ControllerCalibrationReady() { return ready; }
+    bool CalibrateFromControllers() { ++requests; return accept; }
+};
+class BaseInput {
+public:
+    struct Controller { XrAction stickBtn,stickX,stickY,haptic; };
+    Controller legacyControllers[2]{{action(10),action(20),action(21),action(30)},
+        {action(11),action(22),action(23),action(31)}};
+    struct Movement { bool allowSynthetic; };
+    OcuLocomotionCalibrationGesture treadmillCalibrationGesture;
+    std::uint64_t InputNowMs() const { return now; }
+    bool HasFocusedActionSync(XrSession) const { return sync; }
+    Movement ReadExternalMovement(float,float) const { return {gameplay}; }
+    void UpdateTreadmillCalibrationGesture(bool);
+};
+XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateBoolean(XrSession,const XrActionStateGetInfo* get,XrActionStateBoolean* out) {
+    ++boolQueries; out->isActive=active; out->currentState=held[std::uintptr_t(get->action)-10];
+    return actionError ? XR_ERROR_RUNTIME_FAILURE : XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrGetActionStateFloat(XrSession,const XrActionStateGetInfo* get,XrActionStateFloat* out) {
+    ++floatQueries; out->isActive=floatActive; out->currentState=axes[std::uintptr_t(get->action)-20];
+    return XR_SUCCESS;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrApplyHapticFeedback(XrSession,const XrHapticActionInfo*,const XrHapticBaseHeader* out) {
+    if(reinterpret_cast<const XrHapticVibration*>(out)->amplitude>0) ++haptics;
+    return XR_SUCCESS;
+}
+/*PRODUCTION_GESTURE*/
+void Check(bool ok,const char* text) { ++checks; if(!ok) throw std::runtime_error(text); }
+int main() {
+    try {
+        BaseInput input; auto& osc=OscLocomotion::Instance();
+        const auto step=[&] { now+=100; input.UpdateTreadmillCalibrationGesture(true); };
+        const auto hold=[&] { held[0]=held[1]=false; step(); held[0]=held[1]=true; for(int i=0;i<21;++i) step(); };
+        oovr_global_configuration.enabled=false; hold();
+        Check(!boolQueries&&!floatQueries&&!osc.requests,"disabled KAT makes no action reads");
+        oovr_global_configuration.enabled=true; oovr_global_configuration.shortcut=false; hold();
+        Check(!boolQueries&&!osc.requests,"disabled shortcut makes no action reads");
+        oovr_global_configuration.shortcut=true; sync=false; hold();
+        Check(!boolQueries&&!osc.requests,"unfocused action synchronization gates shortcut");
+        sync=true; gameplay=false; hold();
+        Check(!boolQueries&&!osc.requests,"loading/menu gate prevents shortcut");
+        gameplay=true; osc.ready=false; hold();
+        Check(!boolQueries&&!osc.requests,"fresh headset/sensor pair required before reading shortcut");
+        osc.ready=true; hold();
+        Check(osc.requests==1&&haptics==2,"accepted two-second hold calibrates and confirms both controllers");
+        for(int i=0;i<30;++i) step();
+        Check(osc.requests==1,"continued hold does not issue duplicate request");
+        active=false; hold(); Check(osc.requests==1,"inactive click action cannot calibrate"); active=true;
+        floatActive=false; hold(); Check(osc.requests==1,"inactive stick axis cannot calibrate"); floatActive=true;
+        actionError=true; hold(); Check(osc.requests==1,"failed click state read cannot calibrate"); actionError=false;
+        axes[2]=.3f; hold(); Check(osc.requests==1,"physical stick deflection blocks shortcut"); axes[2]=0;
+        axes[0]=std::numeric_limits<float>::quiet_NaN(); hold();
+        Check(osc.requests==1,"nonfinite axis fails closed"); axes[0]=0;
+        osc.accept=false; hold();
+        Check(osc.requests==2&&haptics==2,"late sensor/pose loss does not emit false success haptic");
+        osc.accept=true; hold();
+        Check(osc.requests==3&&haptics==4,"release and fresh stable pair recover after interruption");
+        oovr_global_configuration.haptics=false; hold();
+        Check(osc.requests==4&&haptics==4,"haptics master switch silences confirmation without disabling calibration");
+        oovr_global_configuration.haptics=true; oovr_global_configuration.strength=0; hold();
+        Check(osc.requests==5&&haptics==4,"zero haptic strength also silences confirmation");
+        std::cout<<checks<<" production controller shortcut checks passed\n";
+    } catch(const std::exception& e) { std::cerr<<"FAIL: "<<e.what()<<'\n'; return 1; }
+}

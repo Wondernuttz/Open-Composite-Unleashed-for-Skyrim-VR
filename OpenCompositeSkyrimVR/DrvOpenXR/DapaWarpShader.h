@@ -10,6 +10,12 @@ RWTexture2D<float4> captureClean : register(u1);
 RWTexture2D<float4> captureDiagnostic : register(u2);
 #endif
 SamplerState linearClamp : register(s0);
+cbuffer BlackoutParams : register(b1) {
+    float2 blackoutCenter;
+    float blackoutInner, blackoutMiddle;
+    float blackoutScale, blackoutCutoff;
+    uint blackoutFlags, blackoutEnabled;
+};
 cbuffer WarpParams : register(b0) {
     row_major float4x4 poseDeltaMatrix;
     float2 resolution;
@@ -119,6 +125,22 @@ float2 SolveSource(float2 uv,out float confidence,out float2 displacement) {
 void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= (uint2)resolution)) return;
     float2 uv = (float2(tid.xy)+0.5)/resolution;
+    if(blackoutEnabled!=0) {
+        float2 delta=2*(uv-blackoutCenter);
+        delta.x/=max(blackoutScale,.5);
+        float radius=length(delta);
+        bool hidden=((blackoutFlags&1)!=0 && radius>blackoutInner && radius<=blackoutMiddle) ||
+            ((blackoutFlags&2)!=0 && radius>blackoutMiddle) ||
+            ((blackoutFlags&4)!=0 && radius>max(blackoutMiddle,blackoutCutoff));
+        if(hidden) {
+            output[tid.xy]=float4(0,0,0,1);
+#ifdef DAPA_CAPTURE
+            captureClean[tid.xy]=float4(0,0,0,1);
+            captureDiagnostic[tid.xy]=float4(0,.5,.5,1);
+#endif
+            return;
+        }
+    }
     float2 source = uv;
     float captureConfidence = 0;
     float2 captureDisplacement = 0;

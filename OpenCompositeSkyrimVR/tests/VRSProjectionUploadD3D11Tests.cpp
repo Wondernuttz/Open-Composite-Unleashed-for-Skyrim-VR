@@ -36,7 +36,7 @@ void VerifyAtlas(VRSManager& manager) {
         const unsigned eye=x<desc.Width/2?0:1;
         const float u=(float(x%(desc.Width/2))+.5f)/float(desc.Width/2);
         const float v=(float(y)+.5f)/float(desc.Height);
-        const float dx=u-manager.uploadedProjX[eye],dy=v-manager.uploadedProjY[eye];
+        const float dx=(u-manager.uploadedProjX[eye])/manager.horizontalScale,dy=v-manager.uploadedProjY[eye];
         const float distance=2.0f*std::sqrt(dx*dx+dy*dy);
         const unsigned expected=distance<manager.cachedInnerRadius?1:distance<manager.cachedMidRadius?2:3;
         const auto actual=static_cast<const unsigned char*>(map.pData)[y*map.RowPitch+x];
@@ -64,6 +64,15 @@ int main() {
         ocu_foveation::Rate::X2x2,ocu_foveation::Rate::X4x4};
     const auto update=[&]() { return manager.UpdateStereoPattern(8192,4096,left,right,.3f,.6f,rates); };
     manager.SetProjectionCenters(.5f,.5f,.5f,.5f); Check(update(),"initial pattern"); VerifyAtlas(manager);
+    for(float scale:{.5f,1.5f,2.f,1.f}) {
+        const auto shapeBefore=manager.GetPatternUpdates();
+        manager.SetHorizontalScale(scale);Check(update(),"shape update");VerifyAtlas(manager);
+        Check(manager.GetPatternUpdates().uploads==shapeBefore.uploads+1 &&
+            manager.GetPatternUpdates().resourceCreations==shapeBefore.resourceCreations,"shape change uploads without resource recreation");
+        const auto stable=manager.GetPatternUpdates();
+        manager.SetHorizontalScale(scale);Check(update(),"unchanged shape");
+        Check(manager.GetPatternUpdates().uploads==stable.uploads,"unchanged shape does not upload again");
+    }
     auto before=manager.GetPatternUpdates();
     for(unsigned frame=0;frame<1000;++frame) {
         manager.SetProjectionCenters(.5f,.5f,.5f,.5f); Check(update(),"stationary update");

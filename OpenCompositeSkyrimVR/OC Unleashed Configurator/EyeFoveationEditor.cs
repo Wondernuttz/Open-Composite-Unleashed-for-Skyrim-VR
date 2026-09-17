@@ -77,6 +77,8 @@ internal sealed class EyeFoveationPreview : Control
         AccessibleName = "Eye-tracked ring preview";
         AccessibleDescription = $"Configured center boundary {Settings.Radii.Inner:0.00}, middle boundary {Settings.Radii.Mid:0.00}. " +
             $"Effective rates: center {effective[0]}, middle {effective[1]}, outer {effective[2]}. " +
+            $"Width {Settings.EffectiveHorizontalScale * 100:0.#} percent, " +
+            $"horizontal offset {Settings.HorizontalOffset * 100:0.#} percent right in this preview and mirrored outward in the headset, vertical offset {Settings.VerticalOffset * 100:0.#} percent down. " +
             "Illustrative gaze motion, not live headset tracking.";
     }
     protected override void OnVisibleChanged(EventArgs e) { base.OnVisibleChanged(e); _timer.Enabled = Visible && Animate; }
@@ -90,10 +92,17 @@ internal sealed class EyeFoveationPreview : Control
         }
     }
     protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); _pointerInside = false; }
+    private bool WideLayout => Width > Height * 1.3f;
     internal RectangleF PlotBounds()
     {
         float s = Math.Max(DeviceDpi / 96f, Font.SizeInPoints / 10f);
         float pad = 22 * s;
+        if (WideLayout) {
+            // A high-DPI dialog can be limited by screen height. Place the
+            // legend beside the photo instead of shrinking the photo away.
+            float wideSide = Math.Max(80 * s, Math.Min(Width * .52f - pad * 1.5f, Height - 118 * s));
+            return new RectangleF(pad, pad + 72 * s, wideSide, wideSide);
+        }
         float side = Math.Max(80 * s, Math.Min(Width - pad * 2, Height - 265 * s));
         return new RectangleF((Width - side) / 2, pad + 72 * s, side, side);
     }
@@ -121,42 +130,53 @@ internal sealed class EyeFoveationPreview : Control
         using var small = new Font(Font.FontFamily, Font.SizeInPoints * .9f);
         using var primary = new SolidBrush(ModernUiTheme.TextPrimary);
         using var secondary = new SolidBrush(ModernUiTheme.TextSecondary);
-        g.DrawString("PugDragon · detail preview", heading, primary, pad, pad);
+        g.DrawString("PugDragon · gaze preview", heading, primary, pad, pad);
         g.DrawString("Move over the photo to aim the rings", small, secondary, pad, pad + 27 * s);
 
         var plot = PlotBounds();
         var saved = g.Save();
         g.SetClip(plot);
-        var gaze = new PointF(plot.Left + plot.Width * (.5f + DemoOffset.X), plot.Top + plot.Height * (.5f + DemoOffset.Y));
-        _photo.Draw(g, plot, gaze, Settings, ShowEffect);
-        RectangleF ring(decimal radius) => EyeFoveationPhoto.RingBounds(plot, gaze, radius);
+        var rawGaze = new PointF(plot.Left + plot.Width * (.5f + DemoOffset.X), plot.Top + plot.Height * (.5f + DemoOffset.Y));
+        var gaze = EyeFoveationPhoto.AdjustedGaze(plot, rawGaze, Settings);
+        _photo.Draw(g, plot, rawGaze, Settings, ShowEffect);
+        RectangleF ring(decimal radius) => EyeFoveationPhoto.RingBounds(plot, gaze, radius, Settings.EffectiveHorizontalScale);
         var mid = ring(Settings.Radii.Mid); var inner = ring(Settings.Radii.Inner);
         using var shadow = new Pen(Color.FromArgb(180, 0, 0, 0), 4 * s);
         g.DrawEllipse(shadow, mid); g.DrawEllipse(shadow, inner);
         using var midPen = new Pen(MiddleColor, 2 * s) { DashStyle = DashStyle.Dash };
         using var innerPen = new Pen(CenterColor, 2 * s);
         g.DrawEllipse(midPen, mid); g.DrawEllipse(innerPen, inner);
+        if (Settings.Enabled && Settings.PeripheralMask) {
+            using var maskPen = new Pen(OuterColor, 1.5f * s) { DashStyle = DashStyle.Dot };
+            g.DrawEllipse(maskPen, ring(Settings.EffectivePeripheralMaskRadius));
+        }
         using var dot = new SolidBrush(Color.White);
         g.FillEllipse(dot, gaze.X - 3 * s, gaze.Y - 3 * s, 6 * s, 6 * s);
         DrawEye(g, new RectangleF(gaze.X - 12 * s, gaze.Y + 10 * s, 24 * s, 11 * s), 0, Color.White);
         g.Restore(saved);
         using var border = new Pen(ModernUiTheme.Border, s); g.DrawRectangle(border, plot.X, plot.Y, plot.Width, plot.Height);
-        float y = plot.Bottom + 16 * s;
+        bool wide = WideLayout;
+        float legendX = wide ? plot.Right + 22 * s : pad;
+        float legendWidth = Width - pad - legendX;
+        float y = wide ? plot.Top + 8 * s : plot.Bottom + 16 * s;
         var requested = Settings.RequestedRates; var effective = Settings.EffectiveRates;
-        string[] labels = { $"Center  ·  {Settings.Radii.Inner:0.00}", $"Middle  ·  {Settings.Radii.Mid:0.00}", "Outer  ·  beyond middle" };
+        string[] labels = { $"Center  ·  {Settings.Radii.Inner:0.00}", $"Middle  ·  {Settings.Radii.Mid:0.00}",
+            Settings.PeripheralMask ? $"Outer  ·  cutoff {Settings.EffectivePeripheralMaskRadius:0.00}" : "Outer  ·  beyond middle" };
         Color[] colors = { CenterColor, MiddleColor, OuterColor };
         for (int i = 0; i < 3; i++) {
             using var color = new SolidBrush(colors[i]);
-            g.FillEllipse(color, pad, y + 5 * s, 8 * s, 8 * s);
-            g.DrawString(labels[i], Font, primary, pad + 18 * s, y);
-            string rate = Settings.Backend == 3 ? "Effects only" : requested[i] + "  →  " + effective[i];
+            g.FillEllipse(color, legendX, y + 5 * s, 8 * s, 8 * s);
+            g.DrawString(labels[i], Font, primary, legendX + 18 * s, y);
+            bool blacked = i == 1 ? Settings.MiddleBlackout : i == 2 && Settings.OuterBlackout;
+            string rate = blacked ? "Blackout" : Settings.Backend == 3 ? "Effects only" : requested[i] + "  →  " + effective[i];
             var size = g.MeasureString(rate, Font);
-            g.DrawString(rate, Font, color, Width - pad - size.Width, y);
-            y += 27 * s;
+            g.DrawString(rate, Font, color, wide ? legendX + 18 * s : Width - pad - size.Width, wide ? y + 23 * s : y);
+            y += (wide ? 50 : 27) * s;
         }
-        g.DrawString("Requested → effective rate · square eye-texture view", small, secondary, pad, y + 5 * s);
-        g.DrawString("Photo sampling illustration. In-game VRS / Density Mask results differ.", small, secondary,
-            new RectangleF(pad, y + 30 * s, Width - 2 * pad, 42 * s));
+        g.DrawString("Requested → effective rate · square eye-texture view", small, secondary,
+            new RectangleF(legendX, y + 5 * s, legendWidth, 46 * s));
+        g.DrawString(wide ? "Illustration only. In-game VRS / RDM results differ." : "Photo sampling illustration. In-game VRS / Density Mask results differ.", small, secondary,
+            new RectangleF(legendX, y + (wide ? 40 : 30) * s, legendWidth, 65 * s));
     }
     protected override void Dispose(bool disposing) { if (disposing) { _timer.Dispose(); _photo.Dispose(); } base.Dispose(disposing); }
 }
@@ -172,11 +192,22 @@ internal sealed class EyeFoveationEditor : Form
     internal readonly CheckBox DebugRings = Toggle("Show rings inside the headset (debug)", "Show eye-tracking debug rings");
     internal readonly NumericUpDown Inner = Number(1m, "Eye center boundary");
     internal readonly NumericUpDown Mid = Number(1.5m, "Eye middle boundary");
+    internal readonly NumericUpDown HorizontalScale = Percentage(50m, 200m, 100m, "Eye ring width percent");
+    internal readonly NumericUpDown HorizontalOffset = Percentage(-25m, 25m, 0m, "Mirrored horizontal eye offset percent");
+    internal readonly NumericUpDown VerticalOffset = Percentage(-25m, 25m, 0m, "Vertical eye offset percent");
+    internal readonly Button ClearAdjustments = new() { Text = "Clear adjustments", AccessibleName = "Clear eye ring shape and position adjustments",
+        AutoSize = true, Dock = DockStyle.Top, FlatStyle = FlatStyle.Flat, BackColor = ModernUiTheme.SurfaceRaised };
+    internal readonly CheckBox PeripheralMask = Toggle("Black out beyond outer boundary", "Enable blackout beyond the outer cutoff boundary");
+    internal readonly NumericUpDown PeripheralMaskRadius = Number(1.5m, "Outer optional cutoff boundary");
+    internal readonly CheckBox MiddleBlackout = Toggle("", "Black out middle ring");
+    internal readonly CheckBox OuterBlackout = Toggle("", "Black out outer ring");
+    internal readonly CheckBox BlackoutCull = Toggle("Skip rendering behind blackout (experimental)", "Skip rendering behind blackout (experimental)");
     internal readonly ComboBox InnerRate = Choice(FoveationProfiles.RateChoices, "Eye center requested rate");
     internal readonly ComboBox MidRate = Choice(FoveationProfiles.RateChoices, "Eye middle requested rate");
     internal readonly ComboBox OuterRate = Choice(FoveationProfiles.RateChoices, "Eye outer requested rate");
     internal readonly EyeFoveationPreview Preview = new() { Dock = DockStyle.Fill };
     internal readonly Label Status = TextLabel("");
+    private readonly Label _geometryHint = TextLabel("");
     internal EyeFoveationSettings? AcceptedSettings { get; private set; }
     private bool _loading;
     private readonly ToolTip _tips = new() { AutoPopDelay = 20000, InitialDelay = 300 };
@@ -215,14 +246,36 @@ internal sealed class EyeFoveationEditor : Form
         add(EyeEnabled);
         add(TextLabel("Backend · shared with fixed VRS / fallback")); add(Backend);
         add(TextLabel("Eye preset")); add(Preset);
-        var grid = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 3, RowCount = 4 };
+        var grid = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 4, RowCount = 4 };
         for (int row = 0; row < 4; ++row) grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33)); grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34)); grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
-        grid.Controls.Add(TextLabel("Ring"), 0, 0); grid.Controls.Add(TextLabel("Boundary"), 1, 0); grid.Controls.Add(TextLabel("Rate"), 2, 0);
-        grid.Controls.Add(TextLabel("Center", EyeFoveationPreview.CenterColor), 0, 1); grid.Controls.Add(Inner, 1, 1); grid.Controls.Add(InnerRate, 2, 1);
-        grid.Controls.Add(TextLabel("Middle", EyeFoveationPreview.MiddleColor), 0, 2); grid.Controls.Add(Mid, 1, 2); grid.Controls.Add(MidRate, 2, 2);
-        grid.Controls.Add(TextLabel("Outer", EyeFoveationPreview.OuterColor), 0, 3); grid.Controls.Add(TextLabel("Beyond middle"), 1, 3); grid.Controls.Add(OuterRate, 2, 3);
-        add(grid); add(CustomRates); add(Cap); add(Horizontal);
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 21)); grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30)); grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
+        grid.Controls.Add(TextLabel("Ring"), 0, 0); grid.Controls.Add(TextLabel("Blackout"), 1, 0);
+        grid.Controls.Add(TextLabel("Boundary"), 2, 0); grid.Controls.Add(TextLabel("Rate"), 3, 0);
+        grid.Controls.Add(TextLabel("Center", EyeFoveationPreview.CenterColor), 0, 1); grid.Controls.Add(TextLabel("—"), 1, 1);
+        grid.Controls.Add(Inner, 2, 1); grid.Controls.Add(InnerRate, 3, 1);
+        grid.Controls.Add(TextLabel("Middle", EyeFoveationPreview.MiddleColor), 0, 2); grid.Controls.Add(MiddleBlackout, 1, 2);
+        grid.Controls.Add(Mid, 2, 2); grid.Controls.Add(MidRate, 3, 2);
+        grid.Controls.Add(TextLabel("Outer", EyeFoveationPreview.OuterColor), 0, 3); grid.Controls.Add(OuterBlackout, 1, 3);
+        grid.Controls.Add(PeripheralMaskRadius, 2, 3); grid.Controls.Add(OuterRate, 3, 3);
+        add(grid);
+        add(PeripheralMask);
+        var cutoffHint = TextLabel("Outer boundary is an optional black cutoff. When off, the outer rate extends to the edge of the view.");
+        cutoffHint.Font = new Font(Font.FontFamily, 9); add(cutoffHint);
+        BlackoutCull.Font = new Font(Font.FontFamily, 9);
+        add(BlackoutCull);
+        var blackoutHint = TextLabel("Blackout hides the selected area. Optional skipping reduces rendering there; effects and upscalers may still need those pixels.");
+        blackoutHint.Font = new Font(Font.FontFamily, 9); add(blackoutHint);
+        var geometry = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 2, RowCount = 3 };
+        geometry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 64)); geometry.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 36));
+        for (int row = 0; row < 3; ++row) geometry.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        geometry.Controls.Add(TextLabel("Width (%)"), 0, 0); geometry.Controls.Add(HorizontalScale, 1, 0);
+        geometry.Controls.Add(TextLabel("Horizontal offset (%)"), 0, 1); geometry.Controls.Add(HorizontalOffset, 1, 1);
+        geometry.Controls.Add(TextLabel("Vertical offset (%)"), 0, 2); geometry.Controls.Add(VerticalOffset, 1, 2);
+        add(TextLabel("Eye ring shape and position")); add(geometry); add(ClearAdjustments);
+        _geometryHint.Font = new Font(Font.FontFamily, 9); add(_geometryHint);
+        ClearAdjustments.Click += (_, _) => SetDraft(ReadDraft().ClearAdjustments());
+        add(CustomRates); add(Cap); add(Horizontal);
         var axisHint = TextLabel("Direction also applies to fixed foveation. Fixed sizes and cap stay on the main page."); axisHint.Font = new Font(Font.FontFamily, 9); add(axisHint);
         add(DebugRings);
         var effect = Toggle("Show detail reduction in photo", "Show illustrative photo density reduction"); effect.Checked = true;
@@ -242,17 +295,31 @@ internal sealed class EyeFoveationEditor : Form
         _tips.SetToolTip(Inner, "Center boundary in normalized eye-texture units. This is not degrees or percent of image area.");
         _tips.SetToolTip(Mid, "Middle-ring outer boundary. It cannot be smaller than the center boundary.");
         _tips.SetToolTip(Horizontal, "Selects automatic half-rate direction and caps square coarse rates. This setting is shared with fixed VRS / fallback.");
+        _tips.SetToolTip(HorizontalScale, "50–200% of the ring width. Height stays unchanged. Width changes OCU scene rings; shader effects may keep a larger circular quality region. Effects-only uses circular rings; width adjustment is unavailable there.");
+        _tips.SetToolTip(HorizontalOffset, "Percent of one eye's texture width. Positive moves the left eye's rings left and the right eye's rings right. Negative moves both inward. Centers stop at the eye boundary.");
+        _tips.SetToolTip(VerticalOffset, "Percent of one eye's texture height. Positive moves both rings down; negative moves them up. Centers stop at the eye boundary.");
+        _tips.SetToolTip(ClearAdjustments, "Resets width to 100% and both offsets to zero. Keeps ring sizes, rates, all blackout settings, and all other settings.");
+        _tips.SetToolTip(PeripheralMask, "Only while live eye tracking is active: an optional black border after rendering, upscaling and DAPA. By itself this only hides pixels. Enable experimental skipping separately to reduce rendering behind it. Fixed VRS / fallback is unchanged.");
+        _tips.SetToolTip(PeripheralMaskRadius, "Optional outer cutoff using the same adjusted center and width as the rings. It cannot move inside the middle boundary. This number clips the view only when Black out beyond outer boundary is enabled; otherwise the outer rate extends to the screen edge.");
+        _tips.SetToolTip(MiddleBlackout, "Hides the band between the center and middle boundaries, leaving the center and outer region visible. Keeps its saved shading rate. Rendering is skipped only with the separate experimental option.");
+        _tips.SetToolTip(OuterBlackout, "Hides everything beyond the middle boundary. Keeps the outer shading rate for when blackout is turned off. Rendering is skipped only with the separate experimental option.");
+        _tips.SetToolTip(BlackoutCull, "Reduces shading and Density Mask reconstruction only in hidden areas. Effects and upscalers may still need those pixels. Experimental: requires eye tracking, a scene backend, and a selected blackout.");
         foreach (var combo in new[] { InnerRate, MidRate, OuterRate })
             _tips.SetToolTip(combo, "1x1: full density; 1x2/2x1: half; 2x2: quarter; 2x4/4x2: eighth; 4x4: sixteenth. VRS and Density Mask reconstruct differently.");
         Preset.SelectedIndexChanged += (_, _) => { if (!_loading) SetDraft(ReadDraft().WithPreset(Preset.SelectedIndex)); };
         foreach (var combo in new[] { Backend, InnerRate, MidRate, OuterRate }) combo.SelectedIndexChanged += (_, _) => Edited();
-        foreach (var check in new[] { EyeEnabled, CustomRates, Cap, Horizontal, DebugRings }) check.CheckedChanged += (_, _) => Edited();
+        foreach (var check in new[] { EyeEnabled, CustomRates, Cap, Horizontal, DebugRings, PeripheralMask, MiddleBlackout, OuterBlackout, BlackoutCull }) check.CheckedChanged += (_, _) => Edited();
         Inner.ValueChanged += (_, _) => Edited(); Mid.ValueChanged += (_, _) => Edited();
+        foreach (var value in new[] { HorizontalScale, HorizontalOffset, VerticalOffset, PeripheralMaskRadius }) value.ValueChanged += (_, _) => Edited();
         SetDraft(settings);
     }
     internal EyeFoveationSettings ReadDraft() => new() { Enabled = EyeEnabled.Checked, Backend = Math.Max(0, Backend.SelectedIndex),
         DebugRings = DebugRings.Checked, Radii = new(Inner.Value, Mid.Value), CustomRates = CustomRates.Checked,
         Compatibility = Cap.Checked, FavorHorizontal = Horizontal.Checked, InnerRate = InnerRate.SelectedItem?.ToString() ?? EyeFoveationSettings.DefaultInnerRate,
+        HorizontalScale = HorizontalScale.Value / 100m, HorizontalOffset = HorizontalOffset.Value / 100m, VerticalOffset = VerticalOffset.Value / 100m,
+        PeripheralMask = PeripheralMask.Checked, PeripheralMaskRadius = PeripheralMaskRadius.Value,
+        MiddleBlackout = MiddleBlackout.Checked, OuterBlackout = OuterBlackout.Checked,
+        BlackoutCull = BlackoutCull.Checked,
         MidRate = MidRate.SelectedItem?.ToString() ?? EyeFoveationSettings.DefaultMidRate,
         OuterRate = OuterRate.SelectedItem?.ToString() ?? EyeFoveationSettings.DefaultOuterRate };
     internal void SetDraft(EyeFoveationSettings settings)
@@ -262,6 +329,12 @@ internal sealed class EyeFoveationEditor : Form
             EyeEnabled.Checked = settings.Enabled; Backend.SelectedIndex = Math.Clamp(settings.Backend, 0, 3);
             DebugRings.Checked = settings.DebugRings; Inner.Value = settings.Radii.Inner; Mid.Value = settings.Radii.Mid;
             CustomRates.Checked = settings.CustomRates; Cap.Checked = settings.Compatibility; Horizontal.Checked = settings.FavorHorizontal;
+            HorizontalScale.Value = Math.Clamp(settings.HorizontalScale, .5m, 2m) * 100m;
+            HorizontalOffset.Value = Math.Clamp(settings.HorizontalOffset, -.25m, .25m) * 100m;
+            VerticalOffset.Value = Math.Clamp(settings.VerticalOffset, -.25m, .25m) * 100m;
+            PeripheralMask.Checked = settings.PeripheralMask; PeripheralMaskRadius.Value = settings.EffectivePeripheralMaskRadius;
+            MiddleBlackout.Checked = settings.MiddleBlackout; OuterBlackout.Checked = settings.OuterBlackout;
+            BlackoutCull.Checked = settings.BlackoutCull;
             InnerRate.SelectedItem = settings.InnerRate; MidRate.SelectedItem = settings.MidRate; OuterRate.SelectedItem = settings.OuterRate;
             Preset.SelectedIndex = settings.PresetIndex;
         } finally { _loading = false; }
@@ -273,8 +346,16 @@ internal sealed class EyeFoveationEditor : Form
         _loading = true;
         try {
             if (Mid.Value < Inner.Value) Mid.Value = Inner.Value;
+            if (PeripheralMaskRadius.Value < Mid.Value) PeripheralMaskRadius.Value = Mid.Value;
             var settings = ReadDraft(); Preset.SelectedIndex = settings.PresetIndex;
-            InnerRate.Enabled = MidRate.Enabled = OuterRate.Enabled = settings.CustomRates && settings.Backend != 3;
+            bool rateEnabled = settings.CustomRates && settings.Backend != 3;
+            InnerRate.Enabled = rateEnabled;
+            MidRate.Enabled = rateEnabled && !settings.MiddleBlackout;
+            OuterRate.Enabled = rateEnabled && !settings.OuterBlackout;
+            HorizontalScale.Enabled = settings.Backend != 3;
+            BlackoutCull.Enabled = settings.CanCullBlackout;
+            _geometryHint.Text = (settings.Backend == 3 ? "Effects-only uses circular rings; width adjustment is unavailable. " : "") +
+                "Positive horizontal offset moves right in this preview and mirrors outward in the headset; vertical moves down. Fixed VRS / fallback is unchanged.";
             Preview.Settings = settings;
             Status.Text = settings.Backend == 3 ? "Effects-only backend: shading rates do not apply. A matching shader build is required."
                 : !settings.Enabled ? "Eye tracking is disabled. The preview shows the configured eye profile."
@@ -282,6 +363,7 @@ internal sealed class EyeFoveationEditor : Form
                 : "Eye cap OFF · requested rates apply on eligible scene passes.";
             if (!settings.CustomRates && !settings.Compatibility && settings.Backend is 0 or 2)
                 Status.Text += " Legacy Density Mask can reduce detail more at the far edge. Choose each ring's rate for explicit three-ring control.";
+            if (settings.Backend == 3) Status.Text += " Width adjustment is unavailable; the effects API uses circular rings.";
         } finally { _loading = false; }
     }
     internal void AcceptChanges() { AcceptedSettings = ReadDraft(); DialogResult = DialogResult.OK; Close(); }
@@ -307,5 +389,10 @@ internal sealed class EyeFoveationEditor : Form
     private static NumericUpDown Number(decimal maximum, string accessible) => new() { DecimalPlaces = 2, Increment = .01m,
         Minimum = .10m, Maximum = maximum, Dock = DockStyle.Top, AccessibleName = accessible,
         BackColor = ModernUiTheme.Input, ForeColor = ModernUiTheme.TextPrimary, Margin = new Padding(0, 3, 8, 7) };
+    private static NumericUpDown Percentage(decimal minimum, decimal maximum, decimal value, string accessible) => new() {
+        DecimalPlaces = 1, Increment = 1m, Minimum = minimum, Maximum = maximum, Value = value,
+        Dock = DockStyle.Top, AccessibleName = accessible, BackColor = ModernUiTheme.Input,
+        ForeColor = ModernUiTheme.TextPrimary, Margin = new Padding(0, 3, 8, 7)
+    };
     protected override void Dispose(bool disposing) { if (disposing) _tips.Dispose(); base.Dispose(disposing); }
 }

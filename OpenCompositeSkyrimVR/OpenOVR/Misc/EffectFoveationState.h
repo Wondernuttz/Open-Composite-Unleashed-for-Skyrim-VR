@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EffectFoveationAPI.h"
+#include "FoveationBlackout.h"
 #include <mutex>
 
 namespace ocu_effect_foveation {
@@ -10,7 +11,7 @@ namespace ocu_effect_foveation {
 class State {
 public:
     void BeginFrame(std::int64_t publicationQpc, std::int64_t qpcFrequency);
-    bool Publish(const Snapshot& value);
+    bool Publish(const Snapshot& value, float horizontalScale = 1.f);
     void Clear(std::int64_t publicationQpc);
     Result Query(std::uint32_t requestedVersion, std::uint32_t outputBytes,
         Snapshot* output) const;
@@ -18,12 +19,15 @@ public:
     // Fixed profiles last until the next frame/publication decision; tracked
     // profiles also expire by age so old gaze is not displayed as current.
     Snapshot ReadForPresentation(std::int64_t now) const;
+    bool LatchBlackout(const ocu_foveation::BlackoutFrame& value);
+    ocu_foveation::BlackoutFrame ReadBlackout() const;
 
 private:
     mutable std::mutex mutex;
     Snapshot snapshot{};
     Snapshot presentation{};
     bool frameOpen = false;
+    ocu_foveation::BlackoutFrame blackout{};
 };
 
 State& GetState();

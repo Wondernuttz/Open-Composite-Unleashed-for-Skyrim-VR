@@ -102,6 +102,26 @@ add_executable(RaceMenuKeyboardRecoveryTest EXCLUDE_FROM_ALL tests/RaceMenuKeybo
 add_executable(RaceMenuNativeInputTest EXCLUDE_FROM_ALL tests/RaceMenuNativeInputTest.cpp)
 target_link_libraries(RaceMenuNativeInputTest PRIVATE CommonLibSSE::CommonLibSSE)
 target_precompile_headers(RaceMenuNativeInputTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/PCH.h")
+
+# Exercise the actual producer helpers with instrumented engine/COM fixtures.
+# Python is needed only when explicitly building these diagnostics.
+foreach(diagnostic IN ITEMS BridgeRefresh MenuActivity BridgeMaintenance BridgeStartup)
+    set(extractor "${CMAKE_CURRENT_SOURCE_DIR}/tests/Extract${diagnostic}Test.py")
+    if(diagnostic STREQUAL "BridgeMaintenance")
+        set(extractor "${CMAKE_CURRENT_SOURCE_DIR}/tests/ExtractBridgeMaintenance.py")
+    endif()
+    set(extracted "${CMAKE_CURRENT_BINARY_DIR}/tests/${diagnostic}Production.inl")
+    add_custom_command(OUTPUT "${extracted}"
+        COMMAND ${CMAKE_COMMAND}
+            -DEXTRACTOR=${extractor}
+            -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/Main.cpp
+            -DOUTPUT=${extracted}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/RunProductionExtractor.cmake
+        DEPENDS src/Main.cpp "${extractor}" tests/RunProductionExtractor.cmake
+        VERBATIM)
+    add_executable(${diagnostic}Test EXCLUDE_FROM_ALL "tests/${diagnostic}Test.cpp" "${extracted}")
+    target_include_directories(${diagnostic}Test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/tests")
+endforeach()
 target_link_libraries(DapaCsxDrawTest PRIVATE bcrypt d3d11 d3dcompiler dxgi)
 target_link_libraries(${PROJECT_NAME} PRIVATE bcrypt)
 

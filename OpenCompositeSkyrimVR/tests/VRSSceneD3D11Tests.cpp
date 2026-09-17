@@ -170,6 +170,45 @@ int main()
         Require(fullL>0 && fullR>0 && coarseL<fullL*0.8 && coarseR<fullR*0.8,"both eyes must shade fewer pixels");
         Require(restoredL==fullL && restoredR==fullR,"disabling VRS must restore both eyes to full rate");
 
+        // A recreated main-depth target is different scene ownership even when
+        // its dimensions and the submitted eye textures have not changed.
+        // Model the current SKSE publisher's ~1-second refresh interval at 90Hz
+        // without sleeping: each real frame still sees the old bridge pointer.
+        // The production scope must refuse that identity; actual PS invocation
+        // queries show the resulting coverage lapse rather than trusting rings.
+        {
+            ComPtr<ID3D11Texture2D> replacementDepth;
+            ComPtr<ID3D11DepthStencilView> replacementDsv;
+            HR(dev->CreateTexture2D(&dd,nullptr,&replacementDepth));
+            HR(dev->CreateDepthStencilView(replacementDepth.Get(),nullptr,&replacementDsv));
+            rtv=scene.view.Get();
+            ctx->OMSetRenderTargets(1,&rtv,replacementDsv.Get());
+            unsigned withheldFrames=0;
+            for(unsigned frame=0;frame<90;++frame) {
+                manager.Disable();
+                scope.Arm(ctx.Get(),depth.Get(),nullptr,w,h);
+                const bool admitted=scope.Matches(ctx.Get(),1,&rtv,replacementDsv.Get());
+                Require(!admitted,"retired bridge depth must not identify a replacement resource");
+                if(admitted) Require(manager.ApplyStereo(),"admitted delayed-refresh VRS apply");
+                const auto delayedL=draw(0),delayedR=draw(1);
+                Require(delayedL==fullL && delayedR==fullR,
+                    "stale bridge depth must demonstrate actual full-rate scene work");
+                ++withheldFrames;
+            }
+            // The next boundary after publication must recover immediately.
+            scope.Arm(ctx.Get(),replacementDepth.Get(),nullptr,w,h);
+            Require(scope.Matches(ctx.Get(),1,&rtv,replacementDsv.Get()),
+                "fresh bridge depth must identify replacement scene immediately");
+            Require(manager.ApplyStereo(),"fresh depth publication VRS apply");
+            const auto recoveredL=draw(0),recoveredR=draw(1);
+            Require(recoveredL==coarseL && recoveredR==coarseR,
+                "fresh depth publication must recover original foveated GPU work");
+            manager.Disable(); scope.Reset();
+            ctx->OMSetRenderTargets(1,&rtv,dsv.Get());
+            std::printf("Delayed bridge refresh reproduction: %u simulated 90Hz frames full=%llu/%llu; fresh publication=%llu/%llu PS invocations (no wall-clock delay)\n",
+                withheldFrames,fullL,fullR,recoveredL,recoveredR);
+        }
+
         manager.SetProjectionCenters(0.25f,0.5f,0.75f,0.5f);
         Require(manager.UpdateStereoPattern(w,h,{0,0,int(w/2),int(h)},{int(w/2),0,int(w/2),int(h)},0.3f,0.6f,
             {ocu_foveation::Rate::X1x1,ocu_foveation::Rate::X2x2,ocu_foveation::Rate::X2x2}),"moving gaze update");
@@ -178,6 +217,22 @@ int main()
         Require(!pairIsFullRate(64,64) && !pairIsFullRate(192,64),"previous gaze centers must become coarse");
         manager.Disable();
         std::puts("Moving gaze preserves detail and updates both eyes: PASS");
+
+        manager.SetProjectionCenters(.5f,.5f,.5f,.5f);
+        UINT64 shapeWork[3]{}; unsigned shapeIndex=0;
+        for(float width:{.5f,1.f,2.f}) {
+            manager.SetHorizontalScale(width);
+            Require(manager.UpdateStereoPattern(w,h,{0,0,int(w/2),int(h)},{int(w/2),0,int(w/2),int(h)},.4f,.7f,
+                {ocu_foveation::Rate::X1x1,ocu_foveation::Rate::X2x2,ocu_foveation::Rate::X2x2}),"ellipse pattern update");
+            Require(manager.ApplyStereo(),"ellipse VRS apply");
+            const auto leftWork=draw(0),rightWork=draw(1);
+            Require(leftWork==rightWork,"ellipse shading work agrees between symmetric eyes");
+            Require(pairIsFullRate(64,64) && pairIsFullRate(192,64),"elliptical center remains full rate");
+            shapeWork[shapeIndex++]=leftWork;manager.Disable();
+        }
+        Require(shapeWork[0]<shapeWork[1] && shapeWork[1]<shapeWork[2],"wider actual VRS rings retain more shading work");
+        manager.SetHorizontalScale(1.f);
+        std::printf("Ellipse widths .5/1/2 actual scene PS invocations=%llu/%llu/%llu: PASS\n",shapeWork[0],shapeWork[1],shapeWork[2]);
 
         manager.SetProjectionCenters(0.5f,0.5f,0.5f,0.5f);
         Require(manager.UpdateStereoPattern(w,h,{0,0,int(w/2),int(h)},{int(w/2),0,int(w/2),int(h)},0.3f,0.6f,

@@ -38,13 +38,30 @@ static class Program
         using var bitmap = new Bitmap(form.Width, form.Height);
         form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size));
         bitmap.Save(path);
+        if (Path.GetFileName(path).StartsWith("eye-editor-adjusted-")) {
+            var scroll = (Panel)form.PeripheralMask.Parent!.Parent!;
+            scroll.AutoScrollPosition = new Point(0, Math.Max(0, form.PeripheralMaskRadius.Parent!.Top - 20));
+            Application.DoEvents();
+            var fieldPosition = scroll.PointToClient(form.PeripheralMaskRadius.PointToScreen(Point.Empty));
+            Check(fieldPosition.Y >= 0 && fieldPosition.Y + form.PeripheralMaskRadius.Height <= scroll.ClientSize.Height,
+                "Blackout controls cannot scroll into view at scale " + scale);
+            using var scrolled = new Bitmap(form.Width, form.Height);
+            form.DrawToBitmap(scrolled, new Rectangle(Point.Empty, scrolled.Size));
+            scrolled.Save(Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileNameWithoutExtension(path) + "-scrolled.png"));
+        }
         form.Hide();
         var colors = new System.Collections.Generic.HashSet<int>();
         for (int y = 80; y < bitmap.Height - 60; y += 13) for (int x = 40; x < bitmap.Width / 2; x += 13) colors.Add(bitmap.GetPixel(x, y).ToArgb());
         Check(colors.Count > 20, "Empty or unpainted preview render");
         Check(form.Inner.Visible == form.Mid.Visible, "Ring control visibility diverged");
         Check(form.Preview.Width > 300 && form.Preview.Height > 350, "Preview shrank below readable size");
+        Check(form.Preview.PlotBounds().Width > 150 * scale, "Screen-height constraints shrank the photo excessively at scale " + scale);
         Check(form.AcceptButton is Button b && b.Right <= b.Parent!.ClientSize.Width, "Apply button clipped");
+        foreach (var field in new[] { form.HorizontalScale, form.HorizontalOffset, form.VerticalOffset, form.PeripheralMaskRadius })
+            Check(field.Width > 55 * scale && field.Right <= field.Parent!.ClientSize.Width,
+                "Geometry field clipped at scale " + scale);
+        Check(form.BlackoutCull.Width >= form.BlackoutCull.GetPreferredSize(Size.Empty).Width,
+            "Experimental blackout label clipped at scale " + scale);
     }
     static System.Collections.Generic.IEnumerable<Control> Descendants(Control root)
     {
@@ -57,6 +74,9 @@ static class Program
         var plot = new RectangleF(0, 0, 400, 400); var gaze = new PointF(200, 200);
         Check(EyeFoveationPhoto.RingBounds(plot, gaze, .20m) == new RectangleF(160, 160, 80, 80), "Center geometry does not match runtime UV boundary");
         Check(EyeFoveationPhoto.RingBounds(plot, gaze, .40m) == new RectangleF(120, 120, 160, 160), "Middle geometry does not match runtime UV boundary");
+        var wideBounds = EyeFoveationPhoto.RingBounds(plot, gaze, .20m, 1.5m);
+        Check(Math.Abs(wideBounds.X - 140) < .001f && Math.Abs(wideBounds.Width - 120) < .001f && wideBounds.Y == 160 && wideBounds.Height == 80,
+            "Width adjustment changed ring height or center");
         using var photo = new EyeFoveationPhoto();
         var defaults = new EyeFoveationSettings();
         Bitmap render(EyeFoveationSettings settings, PointF at, bool effect = true) {
@@ -91,6 +111,39 @@ static class Program
         Check(!same(reduced, moved), "Moving gaze did not move quality regions");
         Check(reduced.GetPixel(350, 350) == moved.GetPixel(350, 350), "Gaze movement shifted the image or outer sampling grid");
         Check(ReferenceEquals(halfX, photo.ImageForRate(400, "2x1")), "Gaze movement rebuilt rate cache");
+        var adjusted = defaults with { HorizontalScale = 1.5m, HorizontalOffset = .1m, VerticalOffset = -.05m };
+        Check(EyeFoveationPhoto.AdjustedGaze(plot, gaze, adjusted) == new PointF(240, 180), "Preview offset direction or units wrong");
+        Check(EyeFoveationPhoto.AdjustedGaze(plot, new PointF(390, 5), adjusted) == new PointF(400, 0), "Adjusted gaze crossed an eye boundary");
+        using var wider = render(defaults with { HorizontalScale = 1.5m }, gaze);
+        Check(!same(reduced, wider), "Width adjustment did not move the photo quality boundary");
+        using var shifted = render(adjusted, gaze);
+        Check(!same(reduced, shifted), "Offsets did not move the preview quality regions");
+        Check(shifted.GetPixel(350, 350) == reduced.GetPixel(350, 350), "Offsets shifted the photo or its sample grid");
+        var blackout = adjusted with { PeripheralMask = true, PeripheralMaskRadius = .6m };
+        using var blacked = render(blackout, gaze);
+        Check(blacked.GetPixel(0, 0).ToArgb() == Color.Black.ToArgb(), "Peripheral blackout did not paint the outer view black");
+        Check(blacked.GetPixel(240, 180) == shifted.GetPixel(240, 180), "Peripheral blackout altered the adjusted center");
+        using var disabledMask = render(blackout with { Enabled = false }, gaze);
+        Check(same(original, disabledMask), "Disabled eye tracking left blackout active in preview");
+        using var shapedMask = render(blackout with { HorizontalScale = .5m }, gaze);
+        Check(!same(blacked, shapedMask), "Blackout did not use the adjusted ellipse width");
+        shifted.Save(Path.Combine(output, "pugdragon-adjusted-gaze.png"));
+        blacked.Save(Path.Combine(output, "pugdragon-adjusted-blackout.png"));
+        foreach (bool middle in new[] { false, true }) foreach (bool outer in new[] { false, true }) {
+            var visibility = defaults with { MiddleBlackout = middle, OuterBlackout = outer };
+            using var zones = render(visibility, gaze);
+            Check(zones.GetPixel(200, 200) == reduced.GetPixel(200, 200), "Ring blackout covered the full-quality center");
+            Check(zones.GetPixel(260, 200) == (middle ? Color.FromArgb(255, 0, 0, 0) : reduced.GetPixel(260, 200)), "Middle blackout did not independently cover only its band");
+            Check(zones.GetPixel(330, 200) == (outer ? Color.FromArgb(255, 0, 0, 0) : reduced.GetPixel(330, 200)), "Outer blackout did not independently cover beyond the middle boundary");
+            using var off = render(visibility with { Enabled = false }, gaze);
+            Check(same(original, off), "Disabled eye tracking left a ring blackout active");
+            using var cutoffOff = render(visibility with { PeripheralMaskRadius = .4m }, gaze);
+            Check(same(zones, cutoffOff), "Disabled outer cutoff invented a third quality transition");
+            using var cutoffOn = render(visibility with { PeripheralMaskRadius = .7m, PeripheralMask = true }, gaze);
+            Check(cutoffOn.GetPixel(350, 200).ToArgb() == Color.Black.ToArgb(), "Finite outer cutoff did not combine with independent ring blackouts");
+            Check(cutoffOn.GetPixel(260, 200) == zones.GetPixel(260, 200), "Outer cutoff changed the middle blackout state");
+            zones.Save(Path.Combine(output, $"pugdragon-middle-{middle}-outer-{outer}.png"));
+        }
         using var edge = render(defaults with { Radii = new(.8m, 1.5m) }, PointF.Empty);
         Check(edge.GetPixel(399, 399).A == 255, "Large off-center rings left unpainted photo pixels");
         original.Save(Path.Combine(output, "dragonpug-full-detail.png"));
@@ -110,6 +163,10 @@ static class Program
             void load(string contents) { File.WriteAllText(path, contents); ini.Load(path); Call(main, "ReadFromIni"); }
             void saveReload() { Call(main, "WriteToIni", false); ini.Save(path); ini.Load(path); Call(main, "ReadFromIni"); }
             var defaults = new EyeFoveationSettings();
+            Check(defaults.HorizontalScale == 1m && defaults.HorizontalOffset == 0m && defaults.VerticalOffset == 0m &&
+                !defaults.PeripheralMask && defaults.PeripheralMaskRadius == 1m && !defaults.MiddleBlackout && !defaults.OuterBlackout &&
+                !defaults.BlackoutCull && !defaults.CanCullBlackout,
+                "Fresh shape/position/blackout defaults changed the old view");
             Check(defaults.Radii == new FoveationRadii(.20m, .40m) &&
                 defaults.EffectiveRates.SequenceEqual(new[] { "1x1", "2x2", "4x2" }) && defaults.Enabled &&
                 defaults.Backend == 0 && !defaults.DebugRings && defaults.CustomRates && !defaults.Compatibility && defaults.FavorHorizontal,
@@ -124,10 +181,17 @@ static class Program
             };
             var unrelated = defaults with { Enabled = false, Backend = 2, DebugRings = true, FavorHorizontal = false,
                 Radii = new(.77m, 1.11m), CustomRates = false, Compatibility = true,
-                InnerRate = "1x2", MidRate = "4x4", OuterRate = "2x4" };
+                InnerRate = "1x2", MidRate = "4x4", OuterRate = "2x4", HorizontalScale = 1.6m,
+                HorizontalOffset = .125m, VerticalOffset = -.075m, PeripheralMask = true, PeripheralMaskRadius = 1.4m,
+                MiddleBlackout = true, OuterBlackout = true, BlackoutCull = true };
             foreach (var sample in presetCases) {
                 var expected = unrelated with { Radii = new(sample.Inner, sample.Mid), CustomRates = true, Compatibility = false,
                     InnerRate = "1x1", MidRate = sample.MidRate, OuterRate = sample.OuterRate };
+                if (sample.Index == 4) expected = expected with {
+                    HorizontalScale = 1m, HorizontalOffset = 0m, VerticalOffset = 0m,
+                    PeripheralMask = true, PeripheralMaskRadius = .82m,
+                    MiddleBlackout = false, OuterBlackout = false, BlackoutCull = false
+                };
                 Check(unrelated.WithPreset(sample.Index) == expected, sample.Name + " did not apply its complete profile");
                 Check(expected.PresetIndex == sample.Index, sample.Name + " was not detected exactly");
                 using var editor = new EyeFoveationEditor(unrelated);
@@ -151,6 +215,19 @@ static class Program
                 }
                 editor.SetDraft(expected with { Enabled = true, DebugRings = false });
                 Render(editor, Path.Combine(output, "eye-preset-" + sample.Name.ToLowerInvariant() + ".png"), new Size(1040, 850));
+                if (sample.Index == 4) foreach (var altered in new[] {
+                    expected with { HorizontalScale = 1.1m }, expected with { HorizontalOffset = .01m },
+                    expected with { VerticalOffset = -.01m }, expected with { PeripheralMask = false },
+                    expected with { PeripheralMaskRadius = .83m }, expected with { MiddleBlackout = true },
+                    expected with { OuterBlackout = true }, expected with { BlackoutCull = true }
+                }) {
+                    editor.SetDraft(altered);
+                    Check(editor.Preset.SelectedIndex == 3 && editor.ReadDraft() == altered,
+                        "Edited Aggressive geometry/blackout was not retained as Custom");
+                    editor.Preset.SelectedIndex = 4;
+                    Check(editor.ReadDraft() == expected && editor.Preview.Settings == expected,
+                        "Selecting Aggressive did not restore its saved geometry and cutoff");
+                }
             }
             Check(unrelated.WithPreset(3) == unrelated && unrelated.WithPreset(-1) == unrelated && unrelated.WithPreset(5) == unrelated,
                 "Custom or invalid preset selection changed stored tuning");
@@ -158,9 +235,11 @@ static class Program
                 Check(FoveationProfiles.Preset(false, fixedPreset.Index) == new FoveationRadii(fixedPreset.Inner, fixedPreset.Mid),
                     "Eye preset ladder changed fixed preset " + fixedPreset.Index);
             foreach (string alias in new[] { "true", "1", "yes", "on", "enabled", "ON", " Enabled " }) {
-                load($"vrsEyeTracked={alias}\nvrsEyeCustomRates={alias}\nvrsEyeCompatibilityMode={alias}\nvrsFavorHorizontal={alias}\nfoveationDebugRings={alias}\n");
+                load($"vrsEyeTracked={alias}\nvrsEyeCustomRates={alias}\nvrsEyeCompatibilityMode={alias}\nvrsFavorHorizontal={alias}\nfoveationDebugRings={alias}\n" +
+                    $"vrsEyeMiddleBlackout={alias}\nvrsEyeOuterBlackout={alias}\nvrsEyePeripheralMask={alias}\nvrsEyeBlackoutCull={alias}\n");
                 var value = Capture(main);
-                Check(value.Enabled && value.CustomRates && value.Compatibility && value.FavorHorizontal && value.DebugRings, "Boolean alias lost: " + alias);
+                Check(value.Enabled && value.CustomRates && value.Compatibility && value.FavorHorizontal && value.DebugRings &&
+                    value.MiddleBlackout && value.OuterBlackout && value.PeripheralMask && value.BlackoutCull, "Boolean alias lost: " + alias);
                 saveReload(); Check(Capture(main) == value, "Boolean alias failed save/reload: " + alias);
             }
             foreach (string section in new[] { "", "[general]\n", "[vrs]\n" }) {
@@ -172,6 +251,21 @@ static class Program
                 saveReload(); Check(Capture(main) == defaults, "Performance save/reload changed settings");
             }
             foreach (string section in new[] { "", "[default]\n", "[vrs]\n" }) {
+                load(section + "vrsEyeHorizontalScale=1.625\nvrsEyeHorizontalOffset=.125\nvrsEyeVerticalOffset=-.075\n" +
+                    "vrsEyePeripheralMask=true\nvrsEyePeripheralMaskRadius=.75\nvrsEyeMiddleBlackout=true\nvrsEyeOuterBlackout=false\n");
+                var shaped = defaults with { HorizontalScale = 1.625m, HorizontalOffset = .125m, VerticalOffset = -.075m,
+                    PeripheralMask = true, PeripheralMaskRadius = .75m, MiddleBlackout = true };
+                Check(Capture(main) == shaped, "Geometry-only settings changed legacy profile defaults or units");
+                saveReload(); Check(Capture(main) == shaped, "Shape/position/blackout failed INI roundtrip");
+                load(section + "vrsEyeHorizontalScale=9\nvrsEyeHorizontalOffset=-1\nvrsEyeVerticalOffset=1\n" +
+                    "vrsEyePeripheralMaskRadius=.1\n");
+                Check(Capture(main) == (defaults with { HorizontalScale = 2m, HorizontalOffset = -.25m, VerticalOffset = .25m,
+                    PeripheralMaskRadius = defaults.Radii.Mid }), "Out-of-range geometry was not clamped or mask entered middle ring");
+                foreach (string invalid in new[] { "NaN", "Infinity", "not-a-number", "" }) {
+                    load(section + "vrsEyeHorizontalScale=" + invalid + "\nvrsEyeHorizontalOffset=" + invalid +
+                        "\nvrsEyeVerticalOffset=" + invalid + "\nvrsEyePeripheralMaskRadius=" + invalid + "\n");
+                    Check(Capture(main) == defaults, "Invalid geometry did not restore neutral defaults: " + invalid);
+                }
                 load(section + "vrsEyeCustomRates=true\nvrsEyeCompatibilityMode=false\n");
                 var partial = Capture(main);
                 Check(partial.MidRate == "2x1" && partial.OuterRate == "2x2", "Partial older profile adopted new missing-rate defaults");
@@ -184,13 +278,26 @@ static class Program
                 load(section + "vrsEyeCustomRates=true\nvrsEyeCompatibilityMode=false\nvrsEyeInnerRadius=.20\nvrsEyeMidRadius=.40\n" +
                     "vrsEyeInnerRate=1x1\nvrsEyeMidRate=2x2\nvrsEyeOuterRate=4x4\n");
                 var savedAggressive = Capture(main);
-                Check(savedAggressive.PresetIndex == 4 && savedAggressive.OuterRate == "4x4",
-                    "Saved former Normal should remain 4x4 and be labeled Aggressive");
-                saveReload(); Check(Capture(main) == savedAggressive, "Renaming saved Normal to Aggressive altered its settings");
+                Check(savedAggressive.PresetIndex == 3 && savedAggressive.OuterRate == "4x4" && !savedAggressive.PeripheralMask,
+                    "Older 4x4 tuning without the cutoff must remain Custom without enabling blackout");
+                saveReload(); Check(Capture(main) == savedAggressive, "Reading older 4x4 tuning altered its settings");
+                load(section + "vrsEyeCustomRates=true\nvrsEyeCompatibilityMode=false\nvrsEyeInnerRadius=.20\nvrsEyeMidRadius=.40\n" +
+                    "vrsEyeInnerRate=1x1\nvrsEyeMidRate=2x2\nvrsEyeOuterRate=4x4\nvrsEyePeripheralMask=true\nvrsEyePeripheralMaskRadius=.82\n");
+                var currentAggressive = Capture(main);
+                Check(currentAggressive.PresetIndex == 4 && currentAggressive.PeripheralMaskRadius == .82m,
+                    "Saved Aggressive cutoff was not recognized");
+                saveReload(); Check(Capture(main) == currentAggressive, "Saved Aggressive cutoff changed on roundtrip");
                 ini.Reset(); Call(main, "ReadFromIni");
                 Check(Capture(main) == defaults, "Master-reset reload did not restore Performance defaults");
                 saveReload(); Check(Capture(main) == defaults, "Reset defaults did not survive save/reload");
             }
+            load("[vrs]\nvrsEyeBlackoutCull=true\nvrsEyeTracked=false\nfoveatedBackend=effects\n");
+            var inactiveCull = Capture(main);
+            Check(inactiveCull.BlackoutCull && !inactiveCull.CanCullBlackout,
+                "Saved experimental option was erased while unavailable");
+            saveReload(); Check(Capture(main) == inactiveCull, "Inactive experimental option failed roundtrip");
+            ini.Reset(); Call(main, "ReadFromIni");
+            Check(Capture(main) == defaults, "Full reset retained experimental blackout skipping");
             foreach (string legacyKey in new[] { "vrsInnerRadius=.35", "vrsMidRadius=.65", "vrsEyeInnerRadius=.35", "vrsEyeMidRadius=.65",
                 "vrsCompatibilityMode=true", "vrsEyeCompatibilityMode=false", "vrsFavorHorizontal=false", "vrsEyeInnerRate=1x1", "vrsEyeMidRate=1x2", "vrsEyeOuterRate=4x4" }) {
                 load(legacyKey + "\n"); var old = Capture(main);
@@ -214,13 +321,17 @@ static class Program
             const string customized = "vrsEnabled=true\nvrsFixedInnerRadius=.66\nvrsFixedMidRadius=.88\nvrsCompatibilityMode=true\n" +
                 "vrsEyeTracked=true\nfoveatedBackend=rdm\nvrsEyeInnerRadius=.31\nvrsEyeMidRadius=.57\nvrsEyeCustomRates=true\n" +
                 "vrsEyeInnerRate=1x2\nvrsEyeMidRate=2x4\nvrsEyeOuterRate=4x4\nvrsEyeCompatibilityMode=true\nvrsFavorHorizontal=false\n" +
-                "aswLocoScale=.75\naswRotationScale=.45\nfoveationDebugRings=true\n";
+                "aswLocoScale=.75\naswRotationScale=.45\nfoveationDebugRings=true\n" +
+                "vrsEyeHorizontalScale=1.6\nvrsEyeHorizontalOffset=.12\nvrsEyeVerticalOffset=-.08\nvrsEyePeripheralMask=true\nvrsEyePeripheralMaskRadius=.9\n" +
+                "vrsEyeMiddleBlackout=true\nvrsEyeOuterBlackout=false\nvrsEyeBlackoutCull=true\n";
             load(customized); var before = Capture(main); string diskBefore = File.ReadAllText(path);
             var openButton = Descendants(main).OfType<EyeFoveationButton>().Single();
             Check(openButton.AccessibleName == "Edit eye-tracked foveation", "Main-page eye button missing");
             foreach (string field in new[] { "_chkVrsEyeTracked", "_chkFoveationDebugRings", "_cboFoveatedBackend",
                 "_cboVrsEyePreset", "_nudVrsEyeInnerRadius", "_nudVrsEyeMidRadius", "_chkVrsEyeCustomRates",
-                "_chkVrsEyeCompatibilityMode", "_chkVrsFavorHorizontal", "_cboVrsEyeInnerRate", "_cboVrsEyeMidRate", "_cboVrsEyeOuterRate" })
+                "_chkVrsEyeCompatibilityMode", "_chkVrsFavorHorizontal", "_cboVrsEyeInnerRate", "_cboVrsEyeMidRate", "_cboVrsEyeOuterRate",
+                "_nudVrsEyeHorizontalScale", "_nudVrsEyeHorizontalOffset", "_nudVrsEyeVerticalOffset",
+                "_chkVrsEyePeripheralMask", "_nudVrsEyePeripheralMaskRadius", "_chkVrsEyeMiddleBlackout", "_chkVrsEyeOuterBlackout", "_chkVrsEyeBlackoutCull" })
                 Check(Field<Control>(main, field).Parent?.Name == "EyeFoveationState", "Duplicate eye field remains on Video: " + field);
             Check(Field<Control>(main, "_nudVrsInnerRadius").Parent == openButton.Parent &&
                 Field<Control>(main, "_chkVrsCompatibilityMode").Parent == openButton.Parent, "Fixed controls were moved out of Video");
@@ -244,6 +355,10 @@ static class Program
             using (var canceled = Editor(main)) {
                 Check(canceled.ReadDraft() == before, "Popup did not receive current page state");
                 canceled.Preset.SelectedIndex = 4; canceled.Backend.SelectedIndex = 1; canceled.DebugRings.Checked = false;
+                canceled.HorizontalScale.Value = 75m; canceled.HorizontalOffset.Value = -10m; canceled.VerticalOffset.Value = 20m;
+                canceled.PeripheralMask.Checked = false; canceled.PeripheralMaskRadius.Value = 1.3m;
+                canceled.MiddleBlackout.Checked = false; canceled.OuterBlackout.Checked = true;
+                canceled.BlackoutCull.Checked = false;
                 Modal(canceled, false); Call(main, "ApplyEyeFoveationEditorResult", canceled);
                 Check(Capture(main) == before, "Cancel mutated main page");
                 Check(canceled.AcceptedSettings == null, "Cancel exposed an accepted result");
@@ -270,6 +385,62 @@ static class Program
             Check(ini.Get("", "vrsFixedInnerRadius", "") == "0.66" && ini.Get("", "vrsFixedMidRadius", "") == "0.88" &&
                 ini.Get("", "vrsCompatibilityMode", "") == "true" && ini.Get("", "vrsEnabled", "") == "true", "Eye edit changed fixed fallback");
             Check(ini.Get("", "aswLocoScale", "") == "0.75" && ini.Get("", "aswRotationScale", "") == "0.45", "Eye edit changed DAPA tuning");
+            using (var shapeEditor = Editor(main)) {
+                var originalDraft = shapeEditor.ReadDraft();
+                Check(!Descendants(shapeEditor).OfType<ComboBox>().Any(c => c.AccessibleName == "Preview eye"), "Eye selector remains in the single-gaze preview");
+                typeof(Button).GetMethod("OnClick", Private)!.Invoke(shapeEditor.ClearAdjustments, new object[] { EventArgs.Empty });
+                Check(shapeEditor.ReadDraft() == originalDraft.ClearAdjustments(), "Clear adjustments reset more than shape and position");
+                Check(shapeEditor.Preview.Settings == originalDraft.ClearAdjustments(), "Clear adjustments did not update preview");
+                shapeEditor.HorizontalScale.Value = 75m; shapeEditor.HorizontalOffset.Value = -15m; shapeEditor.VerticalOffset.Value = 20m;
+                shapeEditor.PeripheralMask.Checked = false;
+                Check(shapeEditor.PeripheralMaskRadius.Enabled, "Optional outer boundary must remain editable when the cutoff is disabled");
+                shapeEditor.PeripheralMask.Checked = true; shapeEditor.PeripheralMaskRadius.Value = .1m;
+                Check(shapeEditor.PeripheralMaskRadius.Value == shapeEditor.Mid.Value, "Blackout boundary entered the middle ring");
+                var acceptedShape = originalDraft with { HorizontalScale = .75m, HorizontalOffset = -.15m, VerticalOffset = .20m,
+                    PeripheralMaskRadius = originalDraft.Radii.Mid };
+                Modal(shapeEditor, true); Call(main, "ApplyEyeFoveationEditorResult", shapeEditor);
+                Check(Capture(main) == acceptedShape, "Geometry Apply changed unrelated tuning or used wrong percent units");
+                saveReload(); Check(Capture(main) == acceptedShape, "Applied shape failed INI save/reload");
+            }
+            foreach (bool middle in new[] { false, true }) foreach (bool outer in new[] { false, true }) {
+                using var editor = new EyeFoveationEditor(defaults);
+                editor.MiddleBlackout.Checked = middle; editor.OuterBlackout.Checked = outer;
+                var visibility = defaults with { MiddleBlackout = middle, OuterBlackout = outer };
+                Check(editor.ReadDraft() == visibility && editor.Preview.Settings == visibility, "Blackout switches changed saved rates or unrelated tuning");
+                Check(editor.InnerRate.Enabled && editor.MidRate.Enabled == !middle && editor.OuterRate.Enabled == !outer,
+                    "A blackout checkbox disabled the wrong rate control");
+                Check(editor.Preset.SelectedIndex == defaults.PresetIndex, "Visibility selection changed the shading preset");
+                Check(editor.PeripheralMaskRadius.Parent == editor.Mid.Parent && editor.MiddleBlackout.Parent == editor.Mid.Parent &&
+                    editor.OuterBlackout.Parent == editor.Mid.Parent, "Blackout controls and optional outer boundary are not in the ring grid");
+                var grid = (TableLayoutPanel)editor.Mid.Parent!;
+                Check(grid.ColumnCount == 4 && grid.GetColumn(editor.MiddleBlackout) == 1 && grid.GetColumn(editor.OuterBlackout) == 1 &&
+                    grid.GetColumn(editor.PeripheralMaskRadius) == 2 && grid.GetColumn(editor.OuterRate) == 3,
+                    "Ring grid does not use Ring | Blackout | Boundary | Rate");
+                Modal(editor, true); Call(main, "ApplyEyeFoveationEditorResult", editor); saveReload();
+                Check(Capture(main) == visibility, "Independent blackout selection failed modal Apply and INI roundtrip");
+            }
+            foreach (bool eyeEnabled in new[] { false, true }) foreach (int backend in new[] { 0, 1, 2, 3 })
+                for (int flags = 0; flags < 8; ++flags) {
+                    var requested = defaults with { Enabled = eyeEnabled, Backend = backend, BlackoutCull = true,
+                        MiddleBlackout = (flags & 1) != 0, OuterBlackout = (flags & 2) != 0, PeripheralMask = (flags & 4) != 0 };
+                    using var editor = new EyeFoveationEditor(requested);
+                    bool canCull = eyeEnabled && backend != 3 && flags != 0;
+                    Check(editor.BlackoutCull.Enabled == canCull && requested.CanCullBlackout == canCull,
+                        "Experimental skipping enabled for the wrong eye/backend/mask combination");
+                    Check(editor.BlackoutCull.Checked && editor.ReadDraft() == requested,
+                        "Disabling experimental control erased its saved value or changed rates");
+                    editor.EyeEnabled.Checked = !eyeEnabled;
+                    Check(editor.BlackoutCull.Checked && editor.BlackoutCull.Enabled == (!eyeEnabled && backend != 3 && flags != 0),
+                        "Eye toggle did not refresh experimental availability while preserving opt-in");
+                }
+            using (var editor = new EyeFoveationEditor(defaults with { OuterBlackout = true })) {
+                editor.BlackoutCull.Checked = true;
+                var requested = defaults with { OuterBlackout = true, BlackoutCull = true };
+                Check(editor.Preview.Settings == requested && editor.Preset.SelectedIndex == defaults.PresetIndex,
+                    "Experimental toggle changed the preset or failed to update the snapshot");
+                Modal(editor, true); Call(main, "ApplyEyeFoveationEditorResult", editor); saveReload();
+                Check(Capture(main) == requested, "Experimental opt-in failed modal Apply and Save/reload");
+            }
             foreach (bool cap in new[] { false, true }) foreach (bool horizontal in new[] { false, true }) foreach (string rate in FoveationProfiles.RateChoices) {
                 var input = defaults with { Compatibility = cap, FavorHorizontal = horizontal, InnerRate = rate, MidRate = rate, OuterRate = rate };
                 using var editor = new EyeFoveationEditor(input);
@@ -278,8 +449,11 @@ static class Program
                 Check(editor.Preview.Settings.EffectiveRates.All(x => x == expected), "Preview cap mismatch across rings");
             }
             foreach (int backend in new[] { 0, 1, 2, 3 }) {
-                using var editor = new EyeFoveationEditor(defaults with { Backend = backend });
+                using var editor = new EyeFoveationEditor(defaults with { Backend = backend, HorizontalScale = 1.5m });
                 Check(editor.ReadDraft().Backend == backend, "Backend failed roundtrip");
+                Check(editor.ReadDraft().HorizontalScale == 1.5m && editor.HorizontalScale.Enabled == (backend != 3), "Backend lost requested width or exposed unsupported effects-only shape");
+                Check(editor.Preview.Settings.EffectiveHorizontalScale == (backend == 3 ? 1m : 1.5m), "Effects-only preview disagrees with circular API shape");
+                Check(editor.HorizontalOffset.Enabled && editor.VerticalOffset.Enabled, "Effects-only incorrectly disabled supported offsets");
                 if (backend == 3) Check(editor.Status.Text.Contains("do not apply") && !editor.OuterRate.Enabled, "Effects-only preview pretended hardware rates apply");
             }
             foreach (var sample in new (int Backend, bool Custom, bool Cap, bool Caveat)[] {
@@ -300,14 +474,20 @@ static class Program
             Directory.CreateDirectory(Path.Combine(executableDirectory, "interface"));
             string mergePath = Path.Combine(executableDirectory, "root", "opencomposite.ini");
             string[] owned = { "vrsEyeTracked", "foveatedBackend", "foveationDebugRings", "vrsEyeInnerRadius", "vrsEyeMidRadius",
-                "vrsEyeCustomRates", "vrsEyeInnerRate", "vrsEyeMidRate", "vrsEyeOuterRate", "vrsEyeCompatibilityMode", "vrsFavorHorizontal" };
+                "vrsEyeCustomRates", "vrsEyeInnerRate", "vrsEyeMidRate", "vrsEyeOuterRate", "vrsEyeCompatibilityMode", "vrsFavorHorizontal",
+                "vrsEyeHorizontalScale", "vrsEyeHorizontalOffset", "vrsEyeVerticalOffset", "vrsEyePeripheralMask", "vrsEyePeripheralMaskRadius",
+                "vrsEyeMiddleBlackout", "vrsEyeOuterBlackout", "vrsEyeBlackoutCull" };
             string duplicates = "";
             foreach (string section in new[] { "", "[default]\n", "[general]\n", "[vrs]\n" })
                 duplicates += section + "vrsEyeTracked=false\nfoveatedBackend=rdm\nfoveationDebugRings=true\nvrsEyeInnerRadius=.31\nvrsEyeMidRadius=.57\n" +
-                    "vrsEyeCustomRates=false\nvrsEyeInnerRate=1x2\nvrsEyeMidRate=4x4\nvrsEyeOuterRate=2x4\nvrsEyeCompatibilityMode=true\nvrsFavorHorizontal=false\n";
+                    "vrsEyeCustomRates=false\nvrsEyeInnerRate=1x2\nvrsEyeMidRate=4x4\nvrsEyeOuterRate=2x4\nvrsEyeCompatibilityMode=true\nvrsFavorHorizontal=false\n" +
+                    "vrsEyeHorizontalScale=1.5\nvrsEyeHorizontalOffset=.1\nvrsEyeVerticalOffset=-.1\nvrsEyePeripheralMask=true\nvrsEyePeripheralMaskRadius=.9\n" +
+                    "vrsEyeMiddleBlackout=true\nvrsEyeOuterBlackout=true\nvrsEyeBlackoutCull=true\n";
             duplicates += "; keep merge sentinel\ncustomSentinel=untouched\naswLocoScale=.75\nvrsFixedInnerRadius=.66\nvrsFixedMidRadius=.88\nvrsCompatibilityMode=true\n";
             File.WriteAllText(mergePath, duplicates); ini.Load(mergePath); Call(main, "ReadFromIni");
-            var merged = Capture(main).WithPreset(4) with { Backend = 1, Enabled = true, DebugRings = false };
+            var merged = Capture(main).WithPreset(4) with { Backend = 1, Enabled = true, DebugRings = false,
+                HorizontalScale = .85m, HorizontalOffset = -.2m, VerticalOffset = .05m, PeripheralMask = false, PeripheralMaskRadius = 1.2m,
+                MiddleBlackout = false, OuterBlackout = false, BlackoutCull = false };
             Call(main, "ApplyEyeFoveationSettings", merged);
             Call(main, "WriteToIni", true); ini.Save(mergePath); ini.Load(mergePath); Call(main, "ReadFromIni");
             Check(Capture(main) == merged, "Production merge Save resurrected a legacy eye setting");
@@ -328,6 +508,13 @@ static class Program
                 Render(editor, Path.Combine(output, "eye-editor-legacy-rdm.png"), new Size(1000, 790));
             using (var editor = new EyeFoveationEditor(defaults)) Render(editor, Path.Combine(output, "eye-editor-small.png"), new Size(880, 700));
             using (var editor = new EyeFoveationEditor(defaults)) Render(editor, Path.Combine(output, "eye-editor-scaled-150.png"), new Size(1000, 790), 1.5f);
+            using (var editor = new EyeFoveationEditor(before with { Compatibility = false }))
+                Render(editor, Path.Combine(output, "eye-editor-adjusted-100.png"), new Size(1040, 850));
+            using (var editor = new EyeFoveationEditor(before with { Compatibility = false })) {
+                Render(editor, Path.Combine(output, "eye-editor-adjusted-150.png"), new Size(1000, 790), 1.5f);
+            }
+            using (var editor = new EyeFoveationEditor(before with { Compatibility = false }))
+                Render(editor, Path.Combine(output, "eye-editor-adjusted-200.png"), new Size(1000, 790), 2f);
             using (var bitmap = new Bitmap(openButton.Width, openButton.Height)) {
                 openButton.DrawToBitmap(bitmap, new Rectangle(Point.Empty, bitmap.Size)); bitmap.Save(Path.Combine(output, "eye-editor-button.png"));
                 Check(((ModernPillButton)(Button)openButton).VisualRole == ModernButtonRole.Positive,
@@ -352,7 +539,7 @@ static class Program
                 video.Parent = oldParent; video.Dock = oldDock; video.Bounds = oldBounds; video.Visible = oldVisible;
                 host.Hide();
             }
-            Console.WriteLine($"PASS {checks} checks ({(perMonitor ? "PerMonitorV2" : "production DpiUnaware")}): main-page button and actual modal Apply/Cancel, shared page/model/INI roundtrip, complete eye preset ladder, Performance defaults, old implicit-rate migration, boolean aliases, fixed/DAPA preservation, all requested rates and caps, effects-only semantics, resize/synthetic150%-scale bitmap artifacts.");
+            Console.WriteLine($"PASS {checks} checks ({(perMonitor ? "PerMonitorV2" : "production DpiUnaware")}): main-page button and actual modal Apply/Cancel, shared page/model/INI roundtrip, complete eye preset ladder, Performance defaults, old implicit-rate migration, boolean aliases, fixed/DAPA preservation, all requested rates and caps, single-gaze preview offsets, eye width, peripheral blackout, Clear adjustments, effects-only semantics, resize/synthetic100/150/200%-scale bitmap artifacts.");
             return 0;
         } catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
     }

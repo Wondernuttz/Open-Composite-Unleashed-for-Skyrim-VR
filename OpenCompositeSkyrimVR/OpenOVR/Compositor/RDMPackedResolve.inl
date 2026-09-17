@@ -6,6 +6,7 @@ constexpr char kPackedResolveShader[] = R"HLSL(
 cbuffer Params : register(b0) {
     float2 eyeOrigin; float2 eyeSize; float2 projectionCenter; float2 packedOrigin;
     float3 radius; float compatibilityMode; uint4 ringRates;
+    float inverseHorizontalScale; float2 invClusterResolution; float aspectPadding;
 };
 Texture2D<float4> S0:register(t0); Texture2D<float4> S1:register(t1);
 Texture2D<float4> S2:register(t2); Texture2D<float4> S3:register(t3);
@@ -73,7 +74,10 @@ uint2 RateSize(uint rate) {
 }
 // x/y = quad stride; z = checkerboard layout; full-rate is (1,1,0).
 uint3 Layout(uint2 cluster) {
-    float distance=length(float2(cluster)*8.0/eyeSize-projectionCenter)*2.0;
+    float2 block=float2(cluster)*invClusterResolution;
+    float2 offset=block-projectionCenter;
+    offset.x*=inverseHorizontalScale;
+    float distance=length(offset)*2.0;
     if(ringRates.w) {
         uint rate=distance<radius.x?ringRates.x:(distance<radius.y?ringRates.y:ringRates.z);
         return uint3(RateSize(rate),0);
@@ -89,6 +93,8 @@ Output Gather(float4 pos:SV_POSITION) {
     if(layout.x==1 && layout.y==1)discard;
     // All supported layouts have a known hole in a complete eligible cluster.
     uint2 hole=uint2(layout.x>1?2:0,layout.y>1?2:0);
+    // Untouched (0) and intentionally omitted (64/255) clusters have no
+    // reconstructable holes. Never gather a stale donor for an omission.
     if(Coverage.Load(int3(uint2(eyeOrigin)+cluster*8+hole,0))<.5)discard;
     uint lane=(compact.y%8)*4+(compact.x%4);uint quad=lane/4;
     uint2 h;
@@ -100,6 +106,7 @@ Output Gather(float4 pos:SV_POSITION) {
 }
 Output Scatter(float4 pos:SV_POSITION) {
     int2 p=int2(pos.xy);
+    // Only coverage 1 owns a reconstruction write, including with blackouts.
     if(Coverage.Load(int3(p,0))<.5)discard;
     uint2 local=uint2(p-int2(eyeOrigin));uint2 cluster=local/8;
     if(any((cluster+1)*8>uint2(eyeSize)))discard;
@@ -130,24 +137,30 @@ void DensityMaskManager::ReleasePackedResources()
         packedFormats[i]=DXGI_FORMAT_UNKNOWN;
     }
     packedWidth=packedHeight=packedCount=packedMask=0;
+    scatterBlendState=nullptr;
 }
 
 bool DensityMaskManager::PrepareMRTTargets(ID3D11Texture2D* const* targets, unsigned count,
-    int width, int height, const EyeRegion& left, const EyeRegion& right)
+    int width, int height, const EyeRegion& left, const EyeRegion& right, const UINT8* writeMasks)
 {
     armed=false;
     if (!available || !targets || !count || count>8 || !ValidateGeometry(width,height,left,right))return false;
     const unsigned compactWidth=unsigned((left.width+7)/8+(right.width+7)/8)*4;
     const unsigned compactHeight=unsigned((std::max(left.height,right.height)+7)/8)*8;
     if (compactWidth!=packedWidth || compactHeight!=packedHeight) ReleasePackedResources();
-    unsigned mask=0;
+    unsigned mask=0; UINT channelKey=0; bool partialChannels=false;
     for (unsigned i=0;i<8;++i) {
         auto* target=i<count?targets[i]:nullptr;
+        const UINT8 channels=target?(writeMasks?writeMasks[i]:D3D11_COLOR_WRITE_ENABLE_ALL):0;
+        if(channels & ~D3D11_COLOR_WRITE_ENABLE_ALL)return false;
+        if(!channels)target=nullptr;
         if (!target) {
             ReleasePtr(originalSRVs[i]); ReleasePtr(originalRTVs[i]); originalOwners[i]=nullptr;
             continue;
         }
         mask|=1u<<i;
+        channelKey|=UINT(channels)<<(i*4);
+        partialChannels=partialChannels || channels!=D3D11_COLOR_WRITE_ENABLE_ALL;
         D3D11_TEXTURE2D_DESC desc{}; target->GetDesc(&desc);
         const auto format=TypedColorFormat(desc.Format);
         if (desc.Width!=UINT(width) || desc.Height!=UINT(height) || desc.MipLevels!=1 || desc.ArraySize!=1 ||
@@ -176,6 +189,31 @@ bool DensityMaskManager::PrepareMRTTargets(ID3D11Texture2D* const* targets, unsi
         }
     }
     if (!mask)return false;
+    scatterBlendState=nullptr;
+    if(partialChannels) {
+        auto found=scatterBlendStates.find(channelKey);
+        if(found==scatterBlendStates.end()) {
+            // Preparation runs only after the preceding batch is resolved.
+            // Bound this cache independently of arbitrary game blend masks.
+            if(scatterBlendStates.size()>=32) {
+                auto evicted=scatterBlendStates.begin();
+                ReleasePtr(evicted->second);scatterBlendStates.erase(evicted);
+            }
+            D3D11_BLEND_DESC desc{};desc.IndependentBlendEnable=TRUE;
+            for(unsigned i=0;i<8;++i) {
+                auto& rt=desc.RenderTarget[i];
+                rt.SrcBlend=rt.SrcBlendAlpha=D3D11_BLEND_ONE;
+                rt.DestBlend=rt.DestBlendAlpha=D3D11_BLEND_ZERO;
+                rt.BlendOp=rt.BlendOpAlpha=D3D11_BLEND_OP_ADD;
+                rt.RenderTargetWriteMask=UINT8((channelKey>>(i*4))&D3D11_COLOR_WRITE_ENABLE_ALL);
+            }
+            ID3D11BlendState* state=nullptr;
+            if(FAILED(device->CreateBlendState(&desc,&state)))return false;
+            NamePacked(state,"OCU RDM scatter owned color channels");
+            found=scatterBlendStates.emplace(channelKey,state).first;
+        }
+        scatterBlendState=found->second;
+    }
     if (!gatherShaders[mask] || !scatterShaders[mask]) {
         ReleasePtr(gatherShaders[mask]);ReleasePtr(scatterShaders[mask]);
         std::string source;
@@ -200,6 +238,9 @@ bool DensityMaskManager::DrawPackedEye(int eye, bool gather, ID3D11ShaderResourc
     const auto& r=eyeRegions[eye];
     const unsigned offset=eye?unsigned((eyeRegions[0].width+7)/8)*4:0;
     ReconstructConstants constants{};
+    constants.inverseHorizontalScale=1.f/patternSettings.horizontalScale;
+    constants.invClusterResolution[0]=8.f/float(r.width);
+    constants.invClusterResolution[1]=8.f/float(r.height);
     constants.eyeOrigin[0]=float(r.left);constants.eyeOrigin[1]=float(r.top);
     constants.eyeSize[0]=float(r.width);constants.eyeSize[1]=float(r.height);
     constants.projectionCenter[0]=projX[eye];constants.projectionCenter[1]=projY[eye];
@@ -218,7 +259,7 @@ bool DensityMaskManager::DrawPackedEye(int eye, bool gather, ID3D11ShaderResourc
     context->GSSetShader(nullptr,nullptr,0);context->HSSetShader(nullptr,nullptr,0);context->DSSetShader(nullptr,nullptr,0);
     context->PSSetConstantBuffers(0,1,&reconstructCB);
     context->IASetInputLayout(nullptr);context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    context->OMSetBlendState(nullptr,nullptr,0xffffffffu);context->OMSetDepthStencilState(noDepthState,0);context->RSSetState(rasterizerState);
+    context->OMSetBlendState(gather?nullptr:scatterBlendState,nullptr,0xffffffffu);context->OMSetDepthStencilState(noDepthState,0);context->RSSetState(rasterizerState);
     ID3D11ShaderResourceView* none[9]{};context->PSSetShaderResources(0,9,none);
     ID3D11RenderTargetView* outputs[8]{};
     for(unsigned i=0;i<packedCount;++i)if(packedMask&(1u<<i))outputs[i]=gather?packedRTVs[i]:originalRTVs[i];

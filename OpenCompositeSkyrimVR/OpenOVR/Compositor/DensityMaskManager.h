@@ -2,7 +2,11 @@
 
 #include <d3d11.h>
 #include <memory>
+#include <unordered_map>
 #include "../Misc/FoveationRates.h"
+#include "../Misc/FoveationBlackout.h"
+
+struct ID3D11DeviceContext1;
 
 // Cross-vendor radial-density masking for D3D11. Unlike hardware VRS, this
 // backend reduces pixel-shader work by writing a sparse pattern into the
@@ -22,8 +26,10 @@ public:
 		bool compatibilityMode = true;
 		bool customEyeRates = false;
 		ocu_foveation::RingRates rates;
+		float horizontalScale = 1.0f;
+		ocu_foveation::Blackout blackout;
 	};
-	void SetPatternSettings(const PatternSettings& settings) { patternSettings = settings; }
+	void SetPatternSettings(const PatternSettings& settings);
 
 	DensityMaskManager();
 	~DensityMaskManager();
@@ -33,7 +39,8 @@ public:
 	    const EyeRegion& leftEye, const EyeRegion& rightEye);
 	// Prepare before masking: allocation/format failures must leave the draw full-rate.
 	bool PrepareMRTTargets(ID3D11Texture2D* const* targets, unsigned count,
-	    int renderWidth, int renderHeight, const EyeRegion& leftEye, const EyeRegion& rightEye);
+	    int renderWidth, int renderHeight, const EyeRegion& leftEye, const EyeRegion& rightEye,
+	    const UINT8* writeMasks = nullptr);
 	bool ResolveMRTs(ID3D11ShaderResourceView* coverage, unsigned eyes);
 	bool PrepareDepthGuide(ID3D11Texture2D* depth);
 	void ClearDepthGuide();
@@ -73,6 +80,10 @@ private:
 		float compatibilityMode;
 		float padding;
 		unsigned ringRates[4]; // inner/mid/outer stable Rate IDs, custom enabled
+		float inverseHorizontalScale;
+		unsigned blackoutFlags;
+		float blackoutCutoff;
+		float blackoutGuardPixels;
 	};
 
 	struct ReconstructConstants {
@@ -83,11 +94,16 @@ private:
 		float radius[3];
 		float compatibilityMode;
 		unsigned ringRates[4];
+		float inverseHorizontalScale;
+		float invClusterResolution[2];
+		float aspectPadding;
 	};
 	static_assert(sizeof(MaskConstants) % 16 == 0,
 	    "Density-mask constants must obey D3D11 constant-buffer alignment");
 	static_assert(sizeof(ReconstructConstants) % 16 == 0,
 	    "Density-mask reconstruction constants must obey D3D11 constant-buffer alignment");
+	static_assert(sizeof(MaskConstants) == 80 && sizeof(ReconstructConstants) == 80,
+	    "Mask, legacy reconstruction, and packed reconstruction must match their HLSL aspect block");
 
 	bool CreateShadersAndStates();
 	bool CreateColorResources(const D3D11_TEXTURE2D_DESC& sourceDesc);
@@ -110,6 +126,10 @@ private:
 
 	ID3D11Device* device = nullptr;
 	ID3D11DeviceContext* context = nullptr;
+	// The immediate context and its optional D3D11.1 interface remain stable
+	// throughout this manager's device session. Retain the interface once;
+	// querying it again for every ownership replay adds CPU driver traffic.
+	ID3D11DeviceContext1* context1 = nullptr;
 	ID3D11Texture2D* sceneTarget = nullptr; // observed game resource; not owned
 	int renderWidth = 0;
 	int renderHeight = 0;
@@ -142,6 +162,10 @@ private:
 	DXGI_FORMAT packedFormats[8]{};
 	ID3D11PixelShader* gatherShaders[256]{};
 	ID3D11PixelShader* scatterShaders[256]{};
+	// Gather reads complete texels; scatter may only update channels owned by
+	// the scene draw. Cache at most 32 immutable blend states across batches.
+	std::unordered_map<UINT, ID3D11BlendState*> scatterBlendStates;
+	ID3D11BlendState* scatterBlendState = nullptr; // Owned by scatterBlendStates.
 	unsigned packedWidth = 0, packedHeight = 0, packedCount = 0, packedMask = 0;
 	struct GuidePass;
 	std::unique_ptr<GuidePass> guidePass;
@@ -150,6 +174,7 @@ private:
 	ID3D11ShaderResourceView* guideSRV = nullptr;
 	ID3D11PixelShader* guidePS = nullptr;
 	ID3D11Buffer* guideCB = nullptr;
+	ID3D11Buffer* guideInvalidationCB = nullptr;
 	ID3D11DepthStencilState* guideInvalidateDepth = nullptr;
 	unsigned guideWidth = 0, guideHeight = 0, guideDraws = 0;
 };

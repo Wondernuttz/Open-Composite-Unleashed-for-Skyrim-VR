@@ -7,6 +7,8 @@
 #include <cstdarg>
 #include <stdexcept>
 #include <cmath>
+#include <limits>
+#include <algorithm>
 #include "OpenOVR/Compositor/DensityMaskManager.h"
 
 using Microsoft::WRL::ComPtr;
@@ -72,6 +74,10 @@ static void Run(D3D_DRIVER_TYPE driver, UINT width, UINT height, IDXGIAdapter* a
     ComPtr<ID3D11Buffer> hostileCB; HR(dev->CreateBuffer(&cbd, &initial, &hostileCB));
     ID3D11Buffer* cb = hostileCB.Get();
 
+    static_assert(DensityMaskManager::PatternSettings{}.horizontalScale == 1.0f,
+        "Existing aggregate callers must retain the original ring geometry");
+    for (float horizontalScale : {.5f, 1.f, 1.3f, 2.f, 0.f, 4.f,
+        std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()})
     for (int pattern = -1; pattern < 14; ++pattern)
     for (bool compatibility : {true, false}) for (float clearDepth : {1.0f, 0.0f}) {
         using namespace ocu_foveation;
@@ -81,7 +87,8 @@ static void Run(D3D_DRIVER_TYPE driver, UINT width, UINT height, IDXGIAdapter* a
             RingRates{rate, static_cast<Rate>((pattern + 2) % 7), static_cast<Rate>((pattern + 4) % 7)};
         RingRates effective = ResolveRates(true, custom, compatibility, true, requested);
         manager.BeginFrame();
-        manager.SetPatternSettings({0.4f, 0.7f, compatibility, custom, effective});
+        manager.SetPatternSettings({0.4f, 0.7f, compatibility, custom, effective, horizontalScale});
+        const float effectiveScale = std::isfinite(horizontalScale) ? std::clamp(horizontalScale, .5f, 2.f) : 1.f;
         manager.SetProjectionCenters(0.45f, 0.55f, 0.6f, 0.4f);
         Require(manager.PrepareStereoTarget(color.Get(), width, height,
             {0, 0, static_cast<int>(eyeWidth), static_cast<int>(height)},
@@ -110,6 +117,7 @@ static void Run(D3D_DRIVER_TYPE driver, UINT width, UINT height, IDXGIAdapter* a
             if (custom && (localX / 8 + 1) * 8 <= eyeWidth && (y / 8 + 1) * 8 <= height) {
                 float dx = (localX / 8) * (8.0f / eyeWidth) - (eye ? 0.6f : 0.45f);
                 float dy = (y / 8) * (8.0f / height) - (eye ? 0.4f : 0.55f);
+                dx *= 1.f / effectiveScale;
                 float distance = 2 * std::sqrt(dx * dx + dy * dy);
                 const auto size = Dimensions(distance < 0.4f ? effective.inner :
                     (distance < 0.7f ? effective.mid : effective.outer));
@@ -148,6 +156,11 @@ static void Run(D3D_DRIVER_TYPE driver, UINT width, UINT height, IDXGIAdapter* a
         for (UINT y = 0; y < height; ++y) for (UINT x = 0; x < width; ++x) {
             const auto* p = actual.data() + (y * width + x) * 4;
             const bool eye = x >= eyeWidth;
+            if (!(p[0] == (eye ? 0 : 220) && p[1] == (eye ? 180 : 0) &&
+                p[2] == (custom ? pixels[sampleOffsets[y * width + x] * 4 + 2] : 70) && p[3] == 64))
+                std::printf("reconstruction mismatch: dimensions=%ux%u aspect=%g pattern=%d compatibility=%d clear=%g pixel=%u,%u donor=%u actual=%u,%u,%u,%u expectedBlue=%u\n",
+                    width,height,horizontalScale,pattern,compatibility,clearDepth,x,y,sampleOffsets[y*width+x],
+                    p[0],p[1],p[2],p[3],custom?pixels[sampleOffsets[y*width+x]*4+2]:70);
             Require(p[0] == (eye ? 0 : 220) && p[1] == (eye ? 180 : 0) &&
                 p[2] == (custom ? pixels[sampleOffsets[y * width + x] * 4 + 2] : 70) && p[3] == 64,
                 "pixel reconstruction failed, sampled masked pixels or crossed eyes");
@@ -159,7 +172,8 @@ static void Run(D3D_DRIVER_TYPE driver, UINT width, UINT height, IDXGIAdapter* a
             manager.ReconstructStereo(color.Get(), 0) == nullptr,
             "previous frame mask survived frame boundary");
     }
-    std::printf("DensityMask D3D11 %s PASS\n", driver == D3D_DRIVER_TYPE_WARP ? "WARP" : "hardware");
+    std::printf("DensityMask D3D11 %s PASS: horizontal scale .5/1/1.3/2, finite clamp and nonfinite fallback, CPU mask/donor parity\n",
+        driver == D3D_DRIVER_TYPE_WARP ? "WARP" : "hardware");
 }
 
 int main()

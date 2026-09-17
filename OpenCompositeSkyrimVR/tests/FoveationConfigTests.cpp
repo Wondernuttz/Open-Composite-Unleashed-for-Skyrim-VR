@@ -45,6 +45,57 @@ int main()
         Check(Near(fixed.inner, .70f) && Near(fixed.mid, .85f), "fixed default radii unchanged");
         Check(fresh.FoveationRates(false) == RingRates{Rate::X1x1, Rate::X2x1, Rate::X2x1}, "fixed default cap unchanged");
         for (const char* section : {"", "default", "vrs"}) {
+            Config blackoutDefaults;
+            Check(!blackoutDefaults.VrsEyeBlackoutCull(), "scene culling requires explicit opt-in");
+            Set(blackoutDefaults, section, "vrsEyeBlackoutCull", "true");
+            Check(blackoutDefaults.VrsEyeBlackoutCull() && !blackoutDefaults.VrsEyeAnyBlackout(),
+                "culling opt-in does not invent a blackout region");
+            Set(blackoutDefaults, section, "vrsEyeBlackoutCull", "false");
+            Check(!blackoutDefaults.VrsEyeBlackoutCull(), "scene culling can be disabled");
+            Check(!blackoutDefaults.VrsEyeAnyBlackout() && !blackoutDefaults.VrsEyeMiddleBlackout() &&
+                !blackoutDefaults.VrsEyeOuterBlackout(), "all region blackouts default off");
+            for (unsigned bits = 0; bits < 8; ++bits) {
+                Config blackout;
+                Set(blackout, section, "vrsEyePeripheralMask", bits & 1 ? "true" : "false");
+                Set(blackout, section, "vrsEyeMiddleBlackout", bits & 2 ? "true" : "false");
+                Set(blackout, section, "vrsEyeOuterBlackout", bits & 4 ? "true" : "false");
+                Check(blackout.VrsEyePeripheralMask() == bool(bits & 1) &&
+                    blackout.VrsEyeMiddleBlackout() == bool(bits & 2) &&
+                    blackout.VrsEyeOuterBlackout() == bool(bits & 4) &&
+                    blackout.VrsEyeAnyBlackout() == (bits != 0), "independent region flags reach overlay gate");
+                Check(blackout.FoveationRates(true) == fresh.FoveationRates(true) &&
+                    blackout.FoveationRates(false) == fresh.FoveationRates(false) &&
+                    Near(blackout.FoveationRadii(true).inner, eye.inner) &&
+                    Near(blackout.FoveationRadii(true).mid, eye.mid) &&
+                    Near(blackout.FoveationRadii(false).inner, fixed.inner) &&
+                    Near(blackout.FoveationRadii(false).mid, fixed.mid),
+                    "visibility controls leave scene rates and geometry unchanged");
+            }
+            Config geometry;
+            Check(Near(geometry.VrsEyeHorizontalScale(),1) && Near(geometry.VrsEyeHorizontalOffset(),0) &&
+                Near(geometry.VrsEyeVerticalOffset(),0) && !geometry.VrsEyePeripheralMask(),"new tools default to unchanged rendering");
+            Set(geometry,section,"vrsEyeHorizontalScale","1.5");
+            Set(geometry,section,"vrsEyeHorizontalOffset","0.1");
+            Set(geometry,section,"vrsEyeVerticalOffset","-0.05");
+            Set(geometry,section,"vrsEyePeripheralMask","true");
+            Set(geometry,section,"vrsEyePeripheralMaskRadius","0.2");
+            Check(Near(geometry.VrsEyeHorizontalScale(),1.5f) && geometry.VrsEyePeripheralMask(),"shape and mask settings parsed");
+            Check(Near(geometry.VrsEyePeripheralMaskRadius(.4f),.4f),"blackout cannot hide the middle ring");
+            Check(geometry.FoveationRates(true)==fresh.FoveationRates(true) &&
+                geometry.FoveationRadii(false).inner==fixed.inner,"tools do not migrate old rates or change fixed fallback");
+            float lx=.5f,ly=.5f,rx=.5f,ry=.5f;
+            OffsetCenter(lx,ly,0,geometry.VrsEyeHorizontalOffset(),geometry.VrsEyeVerticalOffset());
+            OffsetCenter(rx,ry,1,geometry.VrsEyeHorizontalOffset(),geometry.VrsEyeVerticalOffset());
+            Check(Near(lx,.4f) && Near(rx,.6f) && Near(ly,.45f) && Near(ry,.45f),"horizontal offsets mirror, vertical offsets agree");
+            Set(geometry,section,"vrsEyeHorizontalScale","100");
+            Set(geometry,section,"vrsEyeHorizontalOffset","-100");
+            Set(geometry,section,"vrsEyeVerticalOffset","100");
+            Check(Near(geometry.VrsEyeHorizontalScale(),2) && Near(geometry.VrsEyeHorizontalOffset(),-.25f) &&
+                Near(geometry.VrsEyeVerticalOffset(),.25f),"out-of-range geometry is bounded");
+            lx=.99f;ly=.99f;OffsetCenter(lx,ly,0,-.25f,.25f);
+            Check(lx==1 && ly==1,"offsets clamp adjusted gaze to eye bounds");
+            Check(HorizontalScale(NAN)==1 && CenterOffset(INFINITY)==0 && PeripheralMaskRadius(NAN,.4f)==1,
+                "nonfinite tools use neutral defaults");
             Config untuned;
             Set(untuned, section, "vrsEyeTracked", "true");
             Set(untuned, section, "foveationDebugRings", "false");

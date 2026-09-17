@@ -76,12 +76,22 @@ void FoveationDebugOverlay::Reset() { impl = std::make_unique<Impl>(); }
 const char* FoveationDebugOverlay::Status() const { return impl->status; }
 
 bool FoveationDebugOverlay::Update(XrSession session, ID3D11Device* device,
-    const ocu_effect_foveation::Snapshot& profile)
+    const ocu_effect_foveation::Snapshot& profile, float horizontalScale,
+    bool drawRings, bool peripheralMask, float maskRadius, bool middleBlackout, bool outerBlackout)
 {
     if (impl->session != XR_NULL_HANDLE && impl->session != session) Reset();
     auto& state = *impl;
     state.visible = false;
     state.positioned = false;
+    const bool active = ocu_foveation_debug::Active(profile);
+    const bool tracked = active && profile.mode == ocu_effect_foveation::Mode::EyeTracked;
+    const bool masked = tracked && (peripheralMask || middleBlackout || outerBlackout);
+    if (!drawRings && !masked) {
+        // Hide a stale mask immediately on tracking loss. No transparent upload
+        // or extra composition layers are needed when there is nothing to draw.
+        state.status = "off: no active overlay";
+        return false;
+    }
     if (state.failed || (!state.chain && !state.Initialize(session, device))) return false;
     if (!state.acquired) {
         XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -97,7 +107,8 @@ bool FoveationDebugOverlay::Update(XrSession session, ID3D11Device* device,
     if (waited != XR_SUCCESS || state.index >= state.images.size() || !state.images[state.index].texture) {
         state.Fail("overlay wait/image failed"); return false;
     }
-    ocu_foveation_debug::Rasterize(profile, state.bgra, state.pixels);
+    ocu_foveation_debug::Rasterize(profile, state.bgra, state.pixels,
+        horizontalScale, drawRings, peripheralMask, maskRadius, middleBlackout, outerBlackout);
     // No game texture, shader binding or context pipeline state is modified.
     state.context->UpdateSubresource(state.images[state.index].texture, 0, nullptr,
         state.pixels.data(), ocu_foveation_debug::Width * sizeof(uint32_t), 0);
@@ -107,8 +118,9 @@ bool FoveationDebugOverlay::Update(XrSession session, ID3D11Device* device,
     }
     state.acquired = false;
     state.visible = true;
-    state.status = !ocu_foveation_debug::Active(profile) ? "amber X: no active profile" :
-        profile.mode == ocu_effect_foveation::Mode::EyeTracked ? "red: tracked eye profile" : "amber: fixed fallback profile";
+    state.status = !drawRings ? "tracked visibility mask" :
+        !active ? "amber X: no active profile" : tracked ?
+        (masked ? "red: tracked rings with visibility mask" : "red: tracked eye profile") : "amber: fixed fallback profile";
     return true;
 }
 

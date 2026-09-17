@@ -37,6 +37,8 @@ namespace OpenCompositeConfigurator
         private Button _btnTabVideo = null!;
         private Button _btnTabSteamHelp = null!;
         private Button _btnTabHaptics = null!;
+        private Button _btnTabTreadmill = null!;
+        private Panel _tabTreadmill = null!;
         private Panel _tabSettings = null!;
         private Panel _tabKeyboard = null!;
         private Panel _tabVideo = null!;
@@ -677,10 +679,14 @@ namespace OpenCompositeConfigurator
             _btnTabSteamHelp.Click += (s, e) => SwitchTab(4);
             Controls.Add(_btnTabSteamHelp);
 
+            _btnTabTreadmill = MakeButton("KAT VR / Trackers", leftMargin + 575, y, 150, 30);
+            _btnTabTreadmill.Click += (s, e) => SwitchTab(7);
+            Controls.Add(_btnTabTreadmill);
+
             _btnTabHaptics = new ModernPillButton
             {
                 Text = "Haptics",
-                Location = new Point(leftMargin + 575, y),
+                Location = new Point(leftMargin + 730, y),
                 Size = new Size(90, 30),
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 10f),
@@ -697,7 +703,7 @@ namespace OpenCompositeConfigurator
             _btnTabBody = new ModernPillButton
             {
                 Text = "Body Tracking",
-                Location = new Point(leftMargin + (ShowDevTools ? 670 : 575), y),
+                Location = new Point(leftMargin + 825, y),
                 Size = new Size(115, 30),
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 10f),
@@ -795,6 +801,15 @@ namespace OpenCompositeConfigurator
             };
             Controls.Add(_tabBody);
 
+            _tabTreadmill = new Panel
+            {
+                Location = new Point(leftMargin, y),
+                Size = new Size(rightEdge - leftMargin, 800),
+                BackColor = ModernUiTheme.Surface,
+                Visible = false,
+            };
+            Controls.Add(_tabTreadmill);
+
             // Build content for each tab (each auto-sizes its panel)
             BuildSettingsTab();
             BuildKeyboardTab();
@@ -803,9 +818,10 @@ namespace OpenCompositeConfigurator
             BuildSteamVrHelpTab();
             BuildHapticsTab();
             BuildBodyTrackingTab();
+            BuildTreadmillTab();
 
             // Sync all tabs to the same height (tallest content)
-            var tabs = new[] { _tabSettings, _tabKeyboard, _tabGestures, _tabVideo, _tabSteamHelp, _tabHaptics, _tabBody };
+            var tabs = new[] { _tabSettings, _tabKeyboard, _tabGestures, _tabVideo, _tabSteamHelp, _tabHaptics, _tabBody, _tabTreadmill };
             int tallestTab = tabs.Max(tab => tab.Height);
             foreach (Panel tab in tabs)
                 tab.Size = new Size(tab.Width, tallestTab);
@@ -927,7 +943,7 @@ namespace OpenCompositeConfigurator
             int newTabH = Math.Max(200, Math.Min(_tabSettings.Height,
                 ClientSize.Height - _tabSettings.Top - 40));
             int delta = _tabSettings.Height - newTabH;
-            foreach (var tab in new[] { _tabSettings, _tabKeyboard, _tabGestures, _tabVideo, _tabSteamHelp, _tabHaptics, _tabBody })
+            foreach (var tab in new[] { _tabSettings, _tabKeyboard, _tabGestures, _tabVideo, _tabSteamHelp, _tabHaptics, _tabBody, _tabTreadmill })
             {
                 tab.AutoScroll = true;
                 tab.Height = newTabH;
@@ -961,7 +977,7 @@ namespace OpenCompositeConfigurator
             btnSettingsMasterReset.Click += BtnSettingsMasterReset_Click;
             container.Controls.Add(btnSettingsMasterReset);
 
-            _btnSave = MakeButton("Save opencomposite.ini", rightEdge - 310, y, 200, 30);
+            _btnSave = MakeButton("Save settings", rightEdge - 310, y, 200, 30);
             _btnSave.BackColor = Color.FromArgb(40, 120, 40);
             _btnSave.ForeColor = Color.White;
             _btnSave.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
@@ -1184,8 +1200,8 @@ namespace OpenCompositeConfigurator
                     && _cmbKeyboardDesign.SelectedItem is KeyboardDesignOption option)
                 {
                     _lblStatus.Text = option.IsParchment
-                        ? "Parchment selected. Save opencomposite.ini to activate the built-in keyboard."
-                        : $"{option.Name} selected. Save opencomposite.ini to install and activate it.";
+                        ? "Parchment selected. Save settings to activate the built-in keyboard."
+                        : $"{option.Name} selected. Save settings to install and activate it.";
                     _lblStatus.ForeColor = Color.FromArgb(132, 242, 158);
                 }
             };
@@ -1876,6 +1892,9 @@ namespace OpenCompositeConfigurator
         private void ParseControlmapTemplate()
         {
             LoadControlmapTemplateModel(resetContextNames: true);
+            _contextNames.Sort((left, right) => StringComparer.CurrentCultureIgnoreCase.Compare(
+                ContextDisplayNames.GetValueOrDefault(left, left),
+                ContextDisplayNames.GetValueOrDefault(right, right)));
         }
 
         private void LoadControlmapTemplateModel(bool resetContextNames)
@@ -2082,7 +2101,7 @@ namespace OpenCompositeConfigurator
                 string display = ContextDisplayNames.GetValueOrDefault(ctx, ctx);
                 _cmbContext.Items.Add(display);
             }
-            if (_cmbContext.Items.Count > 0) _cmbContext.SelectedIndex = 0;
+            if (_cmbContext.Items.Count > 0) _cmbContext.SelectedIndex = Math.Max(0, _contextNames.IndexOf("Main Gameplay"));
             container.Controls.Add(_cmbContext);
 
             // Disable mouse checkbox
@@ -2213,9 +2232,15 @@ namespace OpenCompositeConfigurator
                 string display = ContextDisplayNames.GetValueOrDefault(ctx, ctx);
                 _cmbCtrlType.Items.Add(display);
             }
-            if (_cmbCtrlType.Items.Count > 0) _cmbCtrlType.SelectedIndex = 0;
+            if (_cmbCtrlType.Items.Count > 0) _cmbCtrlType.SelectedIndex = Math.Max(0, _contextNames.IndexOf("Main Gameplay"));
             _cmbCtrlType.SelectedIndexChanged += CmbCtrlType_SelectedIndexChanged;
             container.Controls.Add(_cmbCtrlType);
+
+            var btnInventoryDrop = MakeButton("Drop on left A/X", rightEdge - 185, y, 175, 24);
+            btnInventoryDrop.BackColor = Color.FromArgb(40, 120, 40);
+            btnInventoryDrop.Font = new Font("Segoe UI", 8f);
+            btnInventoryDrop.Click += (_, _) => BindInventoryDropToLeftFaceButton();
+            container.Controls.Add(btnInventoryDrop);
 
             var tipCtrlType = new ToolTip { AutoPopDelay = 12000, InitialDelay = 400 };
             tipCtrlType.SetToolTip(_cmbCtrlType,
@@ -2337,7 +2362,7 @@ namespace OpenCompositeConfigurator
                 Enabled = false
             };
             _cmbCtrlAction.Items.Add("(none)");
-            PopulateActionComboFromTemplate(_cmbCtrlAction);
+            RefreshControllerActionChoices();
             _cmbCtrlAction.SelectedIndex = 0;
             _cmbCtrlAction.SelectedIndexChanged += CmbCtrlAction_SelectedIndexChanged;
             container.Controls.Add(_cmbCtrlAction);
@@ -2723,6 +2748,7 @@ namespace OpenCompositeConfigurator
 
         private void RefreshSelectedControllerBinding(bool updateStatus)
         {
+            RefreshControllerActionChoices();
             if (_selectedCtrlButton == null) return;
             if (!_activeControllerButtons.TryGetValue(_selectedCtrlButton, out var info)) return;
 
@@ -2784,7 +2810,7 @@ namespace OpenCompositeConfigurator
                 if (_controllerModelKey == "knuckles" && _selectedCtrlButton is "l_grip" or "r_grip")
                     _lblKbStatus.Text += " | Squeeze = this binding. Grip touch is automatic for HIGGS (GripInputMethod 0/Auto or 2/Touch).";
                 if (IsTrackpadButton(_selectedCtrlButton))
-                    _lblKbStatus.Text += " — choose an action for this half; face-button assignments stay unchanged. Save Custom, then restart Skyrim.";
+                    _lblKbStatus.Text += " — choose an action for this half; face-button assignments stay unchanged. Save settings or Save All Bindings, then restart Skyrim.";
             }
 
             _picBindingsController.Invalidate();
@@ -2805,6 +2831,13 @@ namespace OpenCompositeConfigurator
             if (newAction.StartsWith("Multiple: ", StringComparison.Ordinal))
                 return;
             bool isNone = newAction == "(none)";
+            // Reject stale/foreign context choices before clearing any binding.
+            if (!isNone && !actions.Any(fields => fields.Length > 9 && fields[0] == newAction))
+            {
+                RefreshSelectedControllerBinding(updateStatus: false);
+                _lblKbStatus.Text = $"{newAction} is unavailable in {ctx}; existing bindings were kept.";
+                return;
+            }
             bool trackpad = IsTrackpadButton(_selectedCtrlButton);
             if (trackpad)
             {
@@ -2886,6 +2919,7 @@ namespace OpenCompositeConfigurator
                 ? $"{btnInfo.display}: Unbound (unsaved)"
                 : $"{btnInfo.display} → {newAction} (unsaved)";
             _lblKbStatus.ForeColor = Color.FromArgb(200, 180, 80);
+            MarkDirty();
         }
 
         private static bool TryRemoveControllerHex(string currentValue, string hexValue, out string newValue)
@@ -3288,6 +3322,7 @@ namespace OpenCompositeConfigurator
 
             string filePath = GetExistingControlmapPath();
             _indexTrackpadCustomRegions = 0;
+            _savedIndexTrackpadCustomRegions = 0;
             if (string.IsNullOrEmpty(filePath))
             {
                 UpdateAllKeyColors();
@@ -3299,6 +3334,7 @@ namespace OpenCompositeConfigurator
             {
                 string controlmapText = File.ReadAllText(filePath);
                 _indexTrackpadCustomRegions = ReadTrackpadRegions(controlmapText);
+                _savedIndexTrackpadCustomRegions = _indexTrackpadCustomRegions;
                 _ini.Set("", "indexTrackpadCustomRegions", _indexTrackpadCustomRegions.ToString());
                 LoadControlmapModelFromText(controlmapText, resetContextNames: false);
                 RefreshKeyboardBindingsFromControlmapModel();
@@ -4139,10 +4175,15 @@ namespace OpenCompositeConfigurator
 
         private int SaveCurrentBindingEdits()
         {
+            _ini.Set("", "disableTrackPad", _chkDisableTrackpad.Checked ? "true" : "false");
+            _ini.Set("", "enableVRIKKnucklesTrackPadSupport", _chkVRIKKnuckles.Checked ? "true" : "false");
             SaveControlmapVR();
             var (bindingRepairs, _, _) = ValidateAndRepairControlmap();
             if (_combos.Count > 0 || _ini.GetAllInSection("combos").Count > 0)
                 SaveCombosToIniFiles();
+            AcceptTrackedControlAsSaved(_chkDisableTrackpad);
+            AcceptTrackedControlAsSaved(_chkVRIKKnuckles);
+            MarkDirty();
             return bindingRepairs;
         }
 
@@ -4683,6 +4724,7 @@ namespace OpenCompositeConfigurator
             File.WriteAllLines(filePath, outputLines);
             PersistTrackpadRouting();
             _controllerChanges.Clear();
+            _savedIndexTrackpadCustomRegions = _indexTrackpadCustomRegions;
         }
 
         private void ResetControlmapToDefaults()
@@ -5993,7 +6035,7 @@ namespace OpenCompositeConfigurator
             y += 8;
 
             // ── SAVE BUTTON ──
-            var btnSaveVideo = MakeButton("Save opencomposite.ini", leftMargin, y, 200, 30);
+            var btnSaveVideo = MakeButton("Save settings", leftMargin, y, 200, 30);
             btnSaveVideo.BackColor = Color.FromArgb(40, 120, 40);
             btnSaveVideo.ForeColor = Color.White;
             btnSaveVideo.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
@@ -6098,7 +6140,7 @@ namespace OpenCompositeConfigurator
             int c1 = leftMargin + 6;
             int c2 = leftMargin + 300;
 
-            var btnHapticsSave = MakeButton("Save opencomposite.ini", rightEdge - 200, y - 4, 200, 30);
+            var btnHapticsSave = MakeButton("Save settings", rightEdge - 200, y - 4, 200, 30);
             btnHapticsSave.BackColor = Color.FromArgb(40, 120, 40);
             btnHapticsSave.ForeColor = Color.White;
             btnHapticsSave.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold);
@@ -6584,11 +6626,12 @@ namespace OpenCompositeConfigurator
             _tabSteamHelp.Visible = (index == 4);
             _tabHaptics.Visible = (index == 5);
             _tabBody.Visible = (index == 6);
+            _tabTreadmill.Visible = (index == 7);
 
             Button[] tabs =
             {
                 _btnTabSettings, _btnTabKeyboard, _btnTabGestures, _btnTabVideo,
-                _btnTabSteamHelp, _btnTabHaptics, _btnTabBody
+                _btnTabSteamHelp, _btnTabHaptics, _btnTabBody, _btnTabTreadmill
             };
             for (int i = 0; i < tabs.Length; i++)
                 ModernUiTheme.StyleNavigationButton(tabs[i], i == index);
@@ -7140,6 +7183,8 @@ namespace OpenCompositeConfigurator
             try
             {
                 WriteToIni();
+                if (HasPendingControllerEdits)
+                    SaveCurrentBindingEdits();
                 ApplySelectedKeyboardDesign();
                 var savePaths = GetOpenCompositeIniSavePaths(createDirectories: true).ToList();
                 foreach (string path in savePaths)
@@ -7176,19 +7221,21 @@ namespace OpenCompositeConfigurator
             if (_isLoading)
                 return;
 
-            bool hasActualChanges = _dirtyTrackedControls.Any(IsTrackedControlDirty);
+            bool hasActualChanges = HasPendingControllerEdits || _dirtyTrackedControls.Any(IsTrackedControlDirty);
 
-            _lblUnsavedBanner.Text = hasActualChanges && IsTrackedControlDirty(_cmbBindingPreset)
-                ? PresetUnsavedMessage
-                : GeneralUnsavedMessage;
+            _lblUnsavedBanner.Text = HasPendingControllerEdits
+                ? "Unsaved controller bindings — Save settings or Save Custom to keep them."
+                : hasActualChanges && IsTrackedControlDirty(_cmbBindingPreset)
+                    ? PresetUnsavedMessage
+                    : GeneralUnsavedMessage;
 
             SetDirtyState(hasActualChanges);
         }
 
         private void ClearDirty()
         {
-            // Save opencomposite.ini accepts only INI-backed settings. The
-            // controller picture and binding preset each have their own Save.
+            // Settings save also commits explicit controller edits. Controller
+            // picture and preset previews still have their own apply operations.
             CaptureSavedState(includeIndependentlySaved: false);
             MarkDirty();
         }
@@ -7589,6 +7636,7 @@ namespace OpenCompositeConfigurator
             _chkNetTrackersEnabled.Checked = ParseBool(_ini.Get("", "networkTrackersEnabled", "false"));
             _chkCameraLegCalibration.Checked = ParseBool(_ini.Get("", "cameraLegCalibrationEnabled", "true"));
             _chkWalkInPlace.Checked = ParseBool(_ini.Get("", "walkInPlaceEnabled", "false"));
+            LoadTreadmillSettings();
             SelectWalkActivation(_ini.Get("", "walkInPlaceActivation", "none"));
             if (int.TryParse(_ini.Get("", "combatHapticStrength", "80"), out int chs))
                 _nudCombatHapticStrength.Value = Math.Clamp(chs, 0, 100);
@@ -7908,6 +7956,7 @@ namespace OpenCompositeConfigurator
                 _ini.Set("", "networkTrackersEnabled", _chkNetTrackersEnabled.Checked ? "true" : "false");
                 _ini.Set("", "cameraLegCalibrationEnabled", _chkCameraLegCalibration.Checked ? "true" : "false");
                 _ini.Set("", "walkInPlaceEnabled", _chkWalkInPlace.Checked ? "true" : "false");
+                SaveTreadmillSettings();
                 _ini.Set("", "walkInPlaceActivation", WalkActivationKey());
                 _ini.Set("", "combatHapticStrength", ((int)_nudCombatHapticStrength.Value).ToString());
                 _ini.Set("", "leftDeadZoneSize", _nudLeftDeadZone.Value.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));

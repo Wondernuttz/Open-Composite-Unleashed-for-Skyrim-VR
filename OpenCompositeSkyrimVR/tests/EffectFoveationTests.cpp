@@ -161,6 +161,39 @@ static void CheckPresentationLifetime()
         "invalid clock frequency cannot create fixed rings");
 }
 
+static void CheckEllipseCompatibility()
+{
+    State state;
+    auto profile = Profile(12);
+    profile.innerRadius = .2f; profile.midRadius = .4f;
+    for (float width : {.5f, 1.f, 1.5f, 2.f}) {
+        state.BeginFrame(119, 10000000);
+        Check(state.Publish(profile, width), "elliptical scene profile publishes");
+        const auto exported = Read(state);
+        const auto shown = state.ReadForPresentation(120);
+        Check(exported.shape == Shape::UVRadialHalfExtent && sizeof(exported) == 128,
+            "elliptical scene retains the existing circular V1 ABI");
+        Check(shown.innerRadius == profile.innerRadius && shown.midRadius == profile.midRadius &&
+            std::memcmp(shown.centerUV,profile.centerUV,sizeof(profile.centerUV)) == 0,
+            "presentation retains actual scene radii and centers");
+        for (unsigned i=0;i<360;++i) {
+            const float angle=float(i)*.0174532925199433f;
+            const float x=profile.innerRadius*width*std::cos(angle);
+            const float y=profile.innerRadius*std::sin(angle);
+            Check(std::sqrt(x*x+y*y)<=exported.innerRadius+1.e-6f,
+                "V1 quality circle encloses the full-quality scene ellipse");
+        }
+    }
+    profile.innerRadius=.8f;profile.midRadius=1.f;
+    state.BeginFrame(119,10000000);
+    Check(state.Publish(profile,2),"large scene ellipse remains valid");
+    Check(Read(state).mode==Mode::Disabled && state.ReadForPresentation(120).mode==Mode::EyeTracked,
+        "unrepresentable V1 envelope preserves scene presentation and gives effects native quality");
+    profile.mode=Mode::Fixed;
+    state.BeginFrame(119,10000000);Check(state.Publish(profile,2),"fixed fallback profile publishes");
+    Check(Read(state).innerRadius==profile.innerRadius,"eye width cannot change fixed fallback");
+}
+
 static void CheckConcurrentReaders()
 {
     State state;
@@ -204,11 +237,43 @@ static void CheckConcurrentReaders()
         static_cast<unsigned long long>(reads.load()));
 }
 
+static void CheckBlackoutLifetime()
+{
+    State state;
+    ocu_foveation::BlackoutFrame frame{};
+    frame.mask.outer = true;
+    frame.frameId = 1;
+    Check(!state.LatchBlackout(frame), "closed frames cannot acquire omissions");
+    state.BeginFrame(119, 10000000);
+    auto profile = Profile(12);
+    profile.mode = Mode::EyeTracked;
+    Check(state.Publish(profile), "blackout source publishes");
+    frame.frameId = state.ReadForPresentation(120).frameId;
+    auto stale = frame; ++stale.frameId;
+    Check(!state.LatchBlackout(stale), "different-frame blackout rejected");
+    Check(state.LatchBlackout(frame), "current rendered frame owns blackout");
+    auto moved = frame; moved.centers[0][0] = .7f;
+    Check(!state.LatchBlackout(moved), "a rendered mask cannot move within its frame");
+    state.Clear(121);
+    Check(state.ReadBlackout().Active(), "first-eye submit does not unmask second eye");
+    Check(state.ReadForPresentation(1000000000).mode == Mode::Disabled && state.ReadBlackout().Active(),
+        "gaze expiry cannot reveal omitted pixels");
+    Check(!state.LatchBlackout(frame), "closed submitted frame cannot change mask");
+    state.BeginFrame(122, 10000000);
+    Check(!state.ReadBlackout().Active(), "next real frame starts without stale omissions");
+    profile.mode = Mode::Fixed;
+    Check(state.Publish(profile), "fixed fallback publishes");
+    frame.frameId = state.ReadForPresentation(123).frameId;
+    Check(!state.LatchBlackout(frame), "eye blackout cannot cull fixed fallback");
+}
+
 int main()
 {
     CheckContract();
     CheckPresentationLifetime();
+    CheckEllipseCompatibility();
     CheckConcurrentReaders();
+    CheckBlackoutLifetime();
     std::printf("Effect foveation ABI/state tests: %u failures\n", failures.load());
     return failures == 0 ? 0 : 1;
 }

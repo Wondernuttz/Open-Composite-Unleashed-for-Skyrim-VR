@@ -10,6 +10,10 @@ namespace OpenCompositeConfigurator
         // while applying a built-in/old preset restores its legacy Menu/A routing.
         private const string TrackpadMetadata = "// OCU IndexTrackpadCustomRegions=";
         private int _indexTrackpadCustomRegions;
+        private int _savedIndexTrackpadCustomRegions;
+
+        private bool HasPendingControllerEdits => _controllerChanges.Count != 0
+            || _indexTrackpadCustomRegions != _savedIndexTrackpadCustomRegions;
 
         private static int TrackpadRegion(string? id) => id switch
         {

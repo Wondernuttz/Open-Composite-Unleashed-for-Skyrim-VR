@@ -1,5 +1,6 @@
 #include "ASWProvider.h"
 #include "DapaCaptureControl.h"
+#include "DapaComputeState.h"
 
 #include "../OpenOVR/Misc/xr_ext.h"
 #include "../OpenOVR/Misc/Config.h"
@@ -168,6 +169,7 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 	m_ready = true;
 	InvalidateCachedFrame();
 	OOVR_LOGF("ASW: Initialized — %ux%u per eye, compute shader ready", eyeWidth, eyeHeight);
+	OOVR_LOG("DAPA: compute-state-restore-v1 / depth-read-hazard-v1");
 	return true;
 }
 
@@ -205,7 +207,7 @@ bool ASWProvider::CreateComputeShader(ID3D11Device* device)
 	// Constant buffer
 	D3D11_BUFFER_DESC cbDesc = {};
 	cbDesc.ByteWidth = sizeof(WarpConstants);
-	// Pad to 16-byte alignment (WarpConstants is 128 bytes, already aligned)
+	// Pad to 16-byte alignment (WarpConstants is 272 bytes, already aligned)
 	cbDesc.ByteWidth = (cbDesc.ByteWidth + 15) & ~15;
 	cbDesc.Usage = D3D11_USAGE_DYNAMIC;
 	cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
@@ -213,6 +215,15 @@ bool ASWProvider::CreateComputeShader(ID3D11Device* device)
 	hr = device->CreateBuffer(&cbDesc, nullptr, &m_constantBuffer);
 	if (FAILED(hr)) {
 		OOVR_LOGF("ASW: CreateBuffer (CB) failed hr=0x%08x", (unsigned)hr);
+		return false;
+	}
+
+	cbDesc.ByteWidth = sizeof(BlackoutConstants);
+	m_uploadedBlackout = {};
+	D3D11_SUBRESOURCE_DATA initialBlackout = { &m_uploadedBlackout, 0, 0 };
+	hr = device->CreateBuffer(&cbDesc, &initialBlackout, &m_blackoutConstantBuffer);
+	if (FAILED(hr)) {
+		OOVR_LOGF("ASW: CreateBuffer (blackout CB) failed hr=0x%08x", (unsigned)hr);
 		return false;
 	}
 
@@ -535,7 +546,8 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
     ID3D11Texture2D* mvTex, const D3D11_BOX* mvRegion,
     ID3D11Texture2D* depthTex, const D3D11_BOX* depthRegion,
     const XrPosef& eyePose, const XrFovf& eyeFov,
-    float nearZ, float farZ, ID3D11Texture2D* bodyDepthMask)
+    float nearZ, float farZ, ID3D11Texture2D* bodyDepthMask,
+    const ocu_foveation::BlackoutFrame& blackout)
 {
 	auto failGeneration = [this]() {
 		InvalidateCachedFrame();
@@ -553,6 +565,7 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		// resize invalidation still resets it through InvalidateCachedFrame().
 		m_hasCachedFrame = false;
 		m_cacheBuildEyeMask = 0;
+		m_cachedBlackout[0] = m_cachedBlackout[1] = {};
 		m_motionGeometryValid[0] = m_motionGeometryValid[1] = false;
 	} else if (m_cacheBuildEyeMask != 0x1) {
 		// Never combine a right eye with a left eye from an older generation.
@@ -569,6 +582,7 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	    || !validRegion(colorRegion) || !validRegion(depthRegion)) {
 		return failGeneration();
 	}
+	DapaPredicationState unpredicated(ctx);
 
 	// ── Adaptive sizing ──
 	// External render-scale mods (Community Shaders VR) upscale the submitted
@@ -598,6 +612,20 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	}
 	if (!m_cachedColor[eye] || !m_cachedDepth[eye])
 		return failGeneration();
+	// The complete inverse solve, including foreground seeds and bilinear
+	// colour support, must fit within the scene's retained sampling guard.
+	if ((blackout.mask.Active() && !blackout.Active()) ||
+	    !ocu_foveation::BlackoutSupportsDapaSource(blackout, eye, m_eyeWidth, m_eyeHeight)) {
+		OOVR_LOG_LIMITEDF(5000, "DAPA blackout cache withheld: eye=%d source=%ux%u scene=%.0fx%.0f guard=%.1fpx; awaiting a frame with sufficient source support",
+		    eye, m_eyeWidth, m_eyeHeight, blackout.sceneEyeSize[eye][0],
+		    blackout.sceneEyeSize[eye][1], blackout.mask.guardPixels);
+		return failGeneration();
+	}
+	if (eye == 1 && (m_cachedBlackout[0].mask.Active() || blackout.mask.Active())) {
+		if (!m_cachedBlackout[0].Active() || !blackout.Active() ||
+		    m_cachedBlackout[0].frameId != blackout.frameId)
+			return failGeneration();
+	}
 
 	// The XR depth layer needs depth at the eye size; the parallax warp does not.
 	m_depthLayerValid = (m_depthWidth == m_eyeWidth && m_depthHeight == m_eyeHeight);
@@ -626,7 +654,8 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	}
 
 	// A mask is usable only for this source eye, source resolution and device.
-	// Cache it before the game starts drawing the next frame into its mask.
+	// The caller holds the shared mask lease before passing this pointer and
+	// until this copy is queued, including every COM method below.
 	m_bodyValid[eye] = false;
 	if (bodyDepthMask) {
 		D3D11_TEXTURE2D_DESC bd{},dd{};
@@ -637,7 +666,7 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		    bd.Width==dd.Width && bd.Height==dd.Height && bd.ArraySize==1 && bd.SampleDesc.Count==1) {
 			D3D11_TEXTURE2D_DESC cached{};
 			if(m_bodyDepth[eye])m_bodyDepth[eye]->GetDesc(&cached);
-			if(cached.Width!=m_depthWidth || cached.Height!=m_depthHeight) {
+			if(!m_bodySrv[eye] || cached.Width!=m_depthWidth || cached.Height!=m_depthHeight) {
 				m_bodySrv[eye].Reset();m_bodyDepth[eye].Reset();
 				bd.Width=m_depthWidth;bd.Height=m_depthHeight;bd.MipLevels=1;
 				bd.BindFlags=D3D11_BIND_SHADER_RESOURCE;bd.Usage=D3D11_USAGE_DEFAULT;
@@ -647,10 +676,17 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 			}
 			if(m_bodySrv[eye])m_bodyValid[eye]=SafeBridgeCopy(ctx,m_bodyDepth[eye].Get(),0,0,0,0,bodyDepthMask,0,depthRegion);
 		}
+		if (!m_bodyValid[eye])
+			return failGeneration(); // A required player mask must never disappear silently.
 	}
 	m_cachedPose[eye] = eyePose;
 	m_cachedFov[eye] = eyeFov;
 	m_cachedSourceFlipV[eye] = sourceFlipV;
+	m_cachedBlackout[eye] = blackout;
+	// Cached colour remains in source texture orientation; the warp samples it
+	// through RawUV. Express the scene mask in the warp's canonical output UV.
+	if (sourceFlipV && m_cachedBlackout[eye].Active())
+		m_cachedBlackout[eye].centers[eye][1] = 1.f - blackout.centers[eye][1];
 	m_cachedNear = nearZ;
 	m_cachedFar = farZ;
 
@@ -718,7 +754,9 @@ void ASWProvider::SetMotionGeometry(int eye, const float* view, const float* vp)
 bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
     const XrPosef& newPose)
 {
-	if (!m_ready || m_paused || !m_hasCachedFrame || eye < 0 || eye > 1) return false;
+	if (!ctx || !m_ready || m_paused || !m_hasCachedFrame || eye < 0 || eye > 1) return false;
+	// Includes optional capture copies that precede the compute-state guard.
+	DapaPredicationState unpredicated(ctx);
 
 	// Build pose delta matrix
 	WarpConstants cb = {};
@@ -815,6 +853,27 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 	memcpy(mapped.pData, &cb, sizeof(cb));
 	ctx->Unmap(m_constantBuffer, 0);
 
+	BlackoutConstants blackoutCB{};
+	const auto& blackout = m_cachedBlackout[eye];
+	if (blackout.Active()) {
+		blackoutCB.center[0] = blackout.centers[eye][0];
+		blackoutCB.center[1] = blackout.centers[eye][1];
+		blackoutCB.inner = blackout.inner;
+		blackoutCB.middle = blackout.middle;
+		blackoutCB.scale = blackout.horizontalScale;
+		blackoutCB.cutoff = static_cast<float>(ocu_foveation::BlackoutCutoff(blackout.mask, blackout.middle));
+		blackoutCB.flags = (blackout.mask.middle ? 1u : 0u) |
+		    (blackout.mask.outer ? 2u : 0u) | (blackout.mask.cutoff ? 4u : 0u);
+		blackoutCB.enabled = 1;
+	}
+	if (memcmp(&blackoutCB, &m_uploadedBlackout, sizeof(blackoutCB)) != 0) {
+		hr = ctx->Map(m_blackoutConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+		if (FAILED(hr)) return false;
+		memcpy(mapped.pData, &blackoutCB, sizeof(blackoutCB));
+		ctx->Unmap(m_blackoutConstantBuffer, 0);
+		m_uploadedBlackout = blackoutCB;
+	}
+
 	// Capture variant adds clean colour and diagnostic UAVs only for the requested
 	// stereo pair. Its normal output still contains the configured game tint.
 	ID3D11ComputeShader* captureShader = m_capture.BeginEye(eye, ctx,
@@ -822,6 +881,7 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 	    m_motion.time, m_warpDisplayTime, m_cachedSourceFlipV[eye],
 	    reinterpret_cast<const float*>(&m_cachedPose[eye]), reinterpret_cast<const float*>(&newPose),
 	    reinterpret_cast<const float*>(&m_cachedFov[eye]),m_bodyValid[eye]?m_bodyDepth[eye].Get():nullptr);
+	DapaComputeState savedComputeState(ctx, captureShader != nullptr);
 	ctx->CSSetShader(captureShader ? captureShader : m_warpCS, nullptr, 0);
 	ID3D11ShaderResourceView* srvs[] = { m_srvColor[eye], m_bodyValid[eye] ? m_bodySrv[eye].Get() : nullptr, m_srvDepth[eye] };
 	ctx->CSSetShaderResources(0, 3, srvs);
@@ -829,7 +889,8 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 	    captureShader ? m_capture.Diagnostic(eye) : nullptr };
 	const UINT uavCount = captureShader ? 3 : 1;
 	ctx->CSSetUnorderedAccessViews(0, uavCount, uavs, nullptr);
-	ctx->CSSetConstantBuffers(0, 1, &m_constantBuffer);
+	ID3D11Buffer* constants[] = { m_constantBuffer, m_blackoutConstantBuffer };
+	ctx->CSSetConstantBuffers(0, 2, constants);
 	ctx->CSSetSamplers(0, 1, &m_linearSampler);
 
 	uint32_t groupsX = (m_eyeWidth + 7) / 8;
@@ -853,7 +914,7 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx, double displayPeriodMs)
 {
 	m_depthSubmittedThisFrame = false;
-	if (!m_ready || m_paused || !m_hasCachedFrame) return false;
+	if (!ctx || !m_ready || m_paused || !m_hasCachedFrame) return false;
 
 	const auto deadline = std::chrono::steady_clock::now() +
 	    std::chrono::nanoseconds(DapaTiming::ImageWaitBudget(displayPeriodMs));
@@ -883,6 +944,7 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx, double displayPer
 	ID3D11Texture2D* target = m_outputSwapchainImages[idx];
 	// Copy warped output (translation-corrected) into stereo-combined swapchain
 	{
+		DapaPredicationState unpredicated(ctx);
 		auto gpuSample = MeasureGpu(ctx, DapaGpuTiming::Stage::Output);
 		ctx->CopySubresourceRegion(target, 0,
 		    0, 0, 0, m_warpedOutput[0], 0, nullptr); // left eye at x=0
@@ -909,6 +971,7 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx, double displayPer
 			bool copied = false;
 			if (depthIdx < m_depthSwapchainImages.size()) {
 				ID3D11Texture2D* depthTarget = m_depthSwapchainImages[depthIdx];
+				DapaPredicationState unpredicated(ctx);
 				auto gpuSample = MeasureGpu(ctx, DapaGpuTiming::Stage::DepthOutput);
 				copied = m_depthTransfer.Copy(ctx, depthTarget, m_cachedDepth[0], m_cachedDepth[1]);
 			}
@@ -970,6 +1033,8 @@ void ASWProvider::Shutdown()
 	if (m_linearSampler) { m_linearSampler->Release(); m_linearSampler = nullptr; }
 	for(int eye=0;eye<2;++eye){m_bodySrv[eye].Reset();m_bodyDepth[eye].Reset();m_bodyValid[eye]=false;}
 	if (m_constantBuffer) { m_constantBuffer->Release(); m_constantBuffer = nullptr; }
+	if (m_blackoutConstantBuffer) { m_blackoutConstantBuffer->Release(); m_blackoutConstantBuffer = nullptr; }
+	m_uploadedBlackout = {};
 	if (m_warpCS) { m_warpCS->Release(); m_warpCS = nullptr; }
 	if (m_device) { m_device->Release(); m_device = nullptr; }
 

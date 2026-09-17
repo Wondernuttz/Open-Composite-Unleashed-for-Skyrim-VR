@@ -979,6 +979,7 @@ void BaseSystem::ResetSeatedZeroPose()
 			auto oldSpace = xr_gbl->seatedSpace;
 			OOVR_FAILED_XR_ABORT(xrCreateReferenceSpace(xr_session.get(), &spaceInfo, &xr_gbl->seatedSpace));
 			xrDestroySpace(oldSpace);
+			// This replaces LOCAL seated space only; treadmill heading uses STAGE.
 		}
 	}
 }

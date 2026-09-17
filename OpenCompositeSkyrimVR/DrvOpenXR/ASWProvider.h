@@ -6,6 +6,7 @@
 #include "DapaCapture.h"
 #include "DapaDepthTransfer.h"
 #include "DapaGpuTiming.h"
+#include "../OpenOVR/Misc/FoveationBlackout.h"
 #include <d3d11.h>
 #include <vector>
 
@@ -14,6 +15,7 @@ class ASWProvider;
 extern ASWProvider* g_aswProvider;
 // Shared SKSE bridge menu state, independent of render-target readiness.
 bool OCBridge_DapaMenuPaused();
+bool OCBridge_DapaMaskCacheValid();
 
 class ASWProvider {
 public:
@@ -35,13 +37,16 @@ public:
 	/// Call on each eye during the real frame's Invoke. Returns true when this
 	/// eye was cached successfully; eye 1 only succeeds after eye 0 from the
 	/// same cache generation has also succeeded.
+	/// A non-null bodyDepthMask must remain leased against producer mutation
+	/// and release for the entire call. Failure to cache it rejects this pair.
 	bool CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	    ID3D11Texture2D* colorTex, const D3D11_BOX* colorRegion,
 	    bool sourceFlipV,
 	    ID3D11Texture2D* mvTex, const D3D11_BOX* mvRegion,
 	    ID3D11Texture2D* depthTex, const D3D11_BOX* depthRegion,
 	    const XrPosef& eyePose, const XrFovf& eyeFov,
-	    float nearZ, float farZ, ID3D11Texture2D* bodyDepthMask = nullptr);
+	    float nearZ, float farZ, ID3D11Texture2D* bodyDepthMask = nullptr,
+	    const ocu_foveation::BlackoutFrame& blackout = {});
 
 	/// Warp cached frame to new pose, write result to output texture.
 	/// Call for each eye during the injected frame.
@@ -79,6 +84,7 @@ public:
 		m_capture.HistoryInvalidated();
 		m_hasCachedFrame = false;
 		m_cacheBuildEyeMask = 0;
+		m_cachedBlackout[0] = m_cachedBlackout[1] = {};
 		m_motion.Reset();
 		m_captureMovement.Reset();
 		m_turn.Reset();
@@ -172,6 +178,7 @@ private:
 	// Compute shader
 	ID3D11ComputeShader* m_warpCS = nullptr;
 	ID3D11Buffer* m_constantBuffer = nullptr;
+	ID3D11Buffer* m_blackoutConstantBuffer = nullptr;
 	ID3D11SamplerState* m_linearSampler = nullptr;
 
 	// Per-eye cached textures (staging copies of game frame data)
@@ -205,6 +212,7 @@ private:
 	XrPosef m_cachedPose[2] = {};
 	XrFovf m_cachedFov[2] = {};
 	bool m_cachedSourceFlipV[2] = {};
+	ocu_foveation::BlackoutFrame m_cachedBlackout[2];
 	float m_cachedNear = 0.1f;
 	float m_cachedFar = 10000.0f;
 	bool m_hasCachedFrame = false;
@@ -230,4 +238,12 @@ private:
 		float padding[3];
 	};
 	static_assert(sizeof(WarpConstants) == 272);
+	// Separate b1 keeps the existing capture/replay b0 layout unchanged.
+	struct BlackoutConstants {
+		float center[2], inner, middle;
+		float scale, cutoff;
+		uint32_t flags, enabled;
+	};
+	static_assert(sizeof(BlackoutConstants) == 32);
+	BlackoutConstants m_uploadedBlackout{};
 };

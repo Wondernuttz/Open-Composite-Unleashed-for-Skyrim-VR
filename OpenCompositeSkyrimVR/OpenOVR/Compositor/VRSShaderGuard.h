@@ -49,9 +49,13 @@ SampledTexture2DSlots ShaderSampledTexture2DSlots(ID3D11PixelShader* shader) noe
 std::uint32_t ShaderColorOutputs(ID3D11PixelShader* shader) noexcept;
 
 using StateChanged = void (*)(ID3D11DeviceContext*, bool renderTargetsChanged);
+using BeforeContextMutation = void (*)(ID3D11DeviceContext*);
 // The owner serializes this immediate context, as required by D3D11. Deferred
 // contexts and unrelated devices never update its current shading decision.
-bool WatchContext(ID3D11DeviceContext* context, StateChanged callback);
+// Optional owner flush before ClearState or a context-state capture/swap.
+// Hardware VRS has no private render-target state and does not need this.
+bool WatchContext(ID3D11DeviceContext* context, StateChanged callback,
+    BeforeContextMutation beforeMutation = nullptr);
 void UnwatchContext(ID3D11DeviceContext* context = nullptr);
 std::uint32_t CurrentReasons(ID3D11DeviceContext* context) noexcept;
 std::uint32_t CurrentCoarseHazards(ID3D11DeviceContext* context) noexcept;

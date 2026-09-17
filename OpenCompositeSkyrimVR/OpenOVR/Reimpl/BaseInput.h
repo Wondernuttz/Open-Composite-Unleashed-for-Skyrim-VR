@@ -17,6 +17,9 @@
 #include "Misc/Input/InputData.h"
 #include "Misc/Input/InteractionProfile.h"
 #include "Misc/Input/LegacyControllerActions.h"
+#include "Misc/Input/LocomotionCalibrationGesture.h"
+#include "Misc/BodyTrackerBindings.h"
+#include "Misc/BodyTrackerRoles.h"
 #include "Misc/smooth_input.h"
 #include "../../DrvOpenXR/DapaCaptureControl.h"
 #include "../../DrvOpenXR/InputSessionRecovery.h"
@@ -338,6 +341,14 @@ public: // INTERNAL FUNCTIONS
 	// Camera-fed feet should yield to VRIK's normal leg animation while
 	// artificial locomotion is active. Physical HTCX trackers are untouched.
 	bool ShouldReleaseNetworkFeetForLocomotion() const;
+	struct ExternalMovement {
+		float x = 0, y = 0;
+		bool ownsAxis = false, allowSynthetic = false, treadmillSelected = false;
+	};
+	ExternalMovement ReadExternalMovement(float physicalX, float physicalY) const;
+	bool treadmillTouchPrevious = false;
+	bool treadmillTouchChanged = false;
+	uint64_t treadmillTouchSync = ~uint64_t{0};
 
 	/**
 	 * Bind all the inputs to the current OpenXR session. This must be called after swapping the session to keep
@@ -375,6 +386,8 @@ public: // INTERNAL FUNCTIONS
 	 */
 	void InternalUpdate();
 	void UpdateDapaCaptureGesture(bool focused);
+	void UpdateTreadmillCalibrationGesture(bool focused);
+	OcuLocomotionCalibrationGesture treadmillCalibrationGesture;
 	DapaCaptureControl::GripLatch dapaCaptureGrip;
 	DapaCaptureControl::FeedbackPulses dapaCaptureFeedback;
 
@@ -399,6 +412,7 @@ public: // INTERNAL FUNCTIONS
 	 * XR_NULL_HANDLE when body trackers are unavailable or not yet created.
 	 */
 	void GetTrackerSpace(int role, XrSpace& space);
+	uint64_t GetTrackerSpaceGeneration() const { return bodyTrackerSpaceGeneration; }
 
 	// Called by XrBackend when it exposes a body tracker device, so haptic
 	// pulses aimed at that device index can find the role's output action.
@@ -764,9 +778,11 @@ private:
 	// Body tracker pose actions (XR_HTCX_vive_tracker_interaction), one per
 	// role in OCU_TRACKER_ROLES; only ini-enabled roles get created. Live in
 	// legacyInputsSet so they attach and sync with zero extra lifecycle work.
-	XrAction bodyTrackerActions[14] = {};
-	XrSpace bodyTrackerSpaces[14] = {};
-	XrAction bodyTrackerHaptics[14] = {}; // vibration outputs; null if runtime rejected them
+	XrAction bodyTrackerActions[OCU_TRACKER_ROLE_COUNT] = {};
+	XrSpace bodyTrackerSpaces[OCU_TRACKER_ROLE_COUNT] = {};
+	XrAction bodyTrackerHaptics[OCU_TRACKER_ROLE_COUNT] = {}; // vibration outputs; null if runtime rejected them
+	OcuBodyTrackerBindings bodyTrackerBindings;
+	uint64_t bodyTrackerSpaceGeneration = 0;
 	std::map<vr::TrackedDeviceIndex_t, int> bodyTrackerDeviceRoles; // OpenVR device index -> role
 	void CreateBodyTrackerActions();
 	void CreateBodyTrackerSpaces();

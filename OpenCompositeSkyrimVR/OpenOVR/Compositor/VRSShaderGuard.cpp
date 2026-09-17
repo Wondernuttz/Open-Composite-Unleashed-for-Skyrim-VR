@@ -31,6 +31,7 @@ std::atomic<std::uint64_t> compatibleCount{0}, protectedCount{0}, unknownCount{0
 std::atomic<std::uint64_t> rasterDepthTextureLoadCount{0};
 std::atomic<ID3D11DeviceContext*> watched{nullptr};
 StateChanged changed = nullptr;
+BeforeContextMutation beforeMutation = nullptr;
 std::uint32_t shaderReasons = NoPixelShader, blendReasons = 0;
 std::uint32_t coarseHazards = CoarseUnclassified;
 int singleSampledTexture2D = -1;
@@ -240,6 +241,12 @@ void Notify(ID3D11DeviceContext* context, bool targetsChanged)
         changed(context, targetsChanged);
 }
 
+void NotifyBeforeMutation(ID3D11DeviceContext* context)
+{
+    if (context == watched.load(std::memory_order_acquire) && beforeMutation)
+        beforeMutation(context);
+}
+
 std::uint32_t BlendReasons(ID3D11BlendState* state)
 {
     D3D11_BLEND_DESC desc{};
@@ -346,6 +353,7 @@ struct ViewportHandler {
 struct ClearHandler {
     static void Call(Clear original, ID3D11DeviceContext* context)
     {
+        NotifyBeforeMutation(context);
         original(context);
         if (context != watched.load(std::memory_order_acquire)) return;
         shaderReasons = NoPixelShader;
@@ -380,6 +388,7 @@ struct SwapHandler {
     static void Call(Swap original, ID3D11DeviceContext1* context, ID3DDeviceContextState* state,
         ID3DDeviceContextState** previous)
     {
+        NotifyBeforeMutation(context);
         original(context, state, previous);
         if (context != watched.load(std::memory_order_acquire)) return;
         Refresh(context);
@@ -458,7 +467,8 @@ bool InstallShaderCapture(ID3D11Device* device)
     return MethodHook<CreatePS, CreateHandler>::Install(table[15]);
 }
 
-bool WatchContext(ID3D11DeviceContext* context, StateChanged callback)
+bool WatchContext(ID3D11DeviceContext* context, StateChanged callback,
+    BeforeContextMutation beforeCallback)
 {
     if (!context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || !callback || !InitializeHooks())
         return false;
@@ -475,6 +485,7 @@ bool WatchContext(ID3D11DeviceContext* context, StateChanged callback)
     }
     watched.store(nullptr, std::memory_order_release);
     changed = callback;
+    beforeMutation = beforeCallback;
     commandDepth = 0;
     Refresh(context);
     watched.store(context, std::memory_order_release);
@@ -486,6 +497,7 @@ void UnwatchContext(ID3D11DeviceContext* context)
     if (context && watched.load(std::memory_order_acquire) != context) return;
     watched.store(nullptr, std::memory_order_release);
     changed = nullptr;
+    beforeMutation = nullptr;
     shaderReasons = NoPixelShader;
     coarseHazards = CoarseUnclassified;
     singleSampledTexture2D = -1;

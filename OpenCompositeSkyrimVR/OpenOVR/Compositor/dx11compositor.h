@@ -2,6 +2,7 @@
 
 #include "dxcompositor.h"
 #include "RDMRenderScope.h"
+#include "RDMDiagnosticSchedule.h"
 #include "VRSManager.h"
 
 class DX11Compositor : public Compositor {
@@ -89,6 +90,7 @@ protected:
 	// Foveated rendering backends: native NVIDIA VRS and cross-vendor RDM.
 	VRSManager vrsManager;
 	RDMRenderScope densityMaskManager;
+	RDMDiagnosticSchedule rdmDiagnosticSchedule;
 
 	std::vector<XrSwapchainImageD3D11KHR> imagesHandles;
 	std::vector<ID3D11RenderTargetView*> swapchain_rtvs;

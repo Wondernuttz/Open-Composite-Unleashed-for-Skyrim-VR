@@ -2,6 +2,7 @@
 
 #include "FoveationProfiles.h"
 #include "FoveationRates.h"
+#include "FoveationGeometrySettings.h"
 
 class Config {
 public:
@@ -122,6 +123,10 @@ public:
 	const std::string& BodyTrackerRoles() const { return bodyTrackerRoles; }
 	bool NetworkTrackersEnabled() const { return networkTrackersEnabled; }
 	int NetworkTrackerPort() const { return networkTrackerPort; }
+	bool TreadmillEnabled() const { return treadmillEnabled; }
+	bool TreadmillControllerCalibration() const { return treadmillControllerCalibration; }
+	int TreadmillPort() const { return treadmillPort; }
+	float TreadmillFullSpeed() const { return treadmillFullSpeed; }
 	bool CameraLegCalibrationEnabled() const { return cameraLegCalibrationEnabled; }
 	bool MenuLaserEnabled() const { return menuLaserEnabled; }
 	bool EnableLaserSmoothing() const { return enableLaserSmoothing; }
@@ -236,6 +241,16 @@ public:
 	inline bool VrsEnabled() const { return vrsEnabled; }
 	inline bool VrsFixedEnabled() const { return vrsEnabled; }
 	inline bool VrsEyeTracked() const { return vrsEyeTracked; }
+	float VrsEyeHorizontalScale() const { return ocu_foveation::HorizontalScale(vrsEyeHorizontalScale); }
+	float VrsEyeHorizontalOffset() const { return ocu_foveation::CenterOffset(vrsEyeHorizontalOffset); }
+	float VrsEyeVerticalOffset() const { return ocu_foveation::CenterOffset(vrsEyeVerticalOffset); }
+	bool VrsEyePeripheralMask() const { return vrsEyePeripheralMask; }
+	bool VrsEyeMiddleBlackout() const { return vrsEyeMiddleBlackout; }
+	bool VrsEyeOuterBlackout() const { return vrsEyeOuterBlackout; }
+	bool VrsEyeAnyBlackout() const { return vrsEyePeripheralMask || vrsEyeMiddleBlackout || vrsEyeOuterBlackout; }
+	bool VrsEyeBlackoutCull() const { return vrsEyeBlackoutCull; }
+	float VrsEyePeripheralMaskRadius(float middle) const
+	{ return ocu_foveation::PeripheralMaskRadius(vrsEyePeripheralMaskRadius, middle); }
 	inline bool FoveationDebugRings() const { return foveationDebugRings; }
 	inline bool VrsAnyEnabled() const { return vrsEnabled || vrsEyeTracked; }
 	inline const std::string& FoveatedBackend() const { return foveatedBackend; }
@@ -464,6 +479,14 @@ private:
 	// Cross-vendor foveated rendering
 	bool vrsEnabled = false;   // explicit fixed-center mode (legacy key name)
 	bool vrsEyeTracked = true; // Auto gaze only; no implicit fixed fallback
+	float vrsEyeHorizontalScale = 1.f;
+	float vrsEyeHorizontalOffset = 0.f;
+	float vrsEyeVerticalOffset = 0.f;
+	bool vrsEyePeripheralMask = false;
+	bool vrsEyeMiddleBlackout = false;
+	bool vrsEyeOuterBlackout = false;
+	bool vrsEyeBlackoutCull = false;
+	float vrsEyePeripheralMaskRadius = 1.f;
 	bool foveationDebugRings = false;
 	std::string foveatedBackend = "auto"; // auto, vrs (NVIDIA), rdm, or effects (renderer integration only)
 	float vrsInnerRadius = -1.0f; // legacy explicit values migrate to both profiles
@@ -531,6 +554,10 @@ private:
 	// Off by default: opening a UDP port should be a user choice.
 	bool networkTrackersEnabled = false;
 	int networkTrackerPort = 9000; // the de-facto default OSC tracker port
+	bool treadmillEnabled = false;
+	bool treadmillControllerCalibration = true;
+	int treadmillPort = 9020; // loopback OSC locomotion, independent of body trackers
+	float treadmillFullSpeed = 3.0f; // metres per second mapped to full stick
 	bool cameraLegCalibrationEnabled = false; // dev-only: arm live camera-foot trim controls
 	bool menuLaserEnabled = true; // laser menu pointing; false = classic gamepad-only menus
 	bool enableLaserSmoothing = true; // ray-only smoothing for OCU menu and keyboard lasers

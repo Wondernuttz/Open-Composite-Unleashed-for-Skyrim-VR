@@ -8,7 +8,7 @@
     <RootNamespace>OpenCompositeConfigurator</RootNamespace>
     <Nullable>enable</Nullable>
     <AssemblyName>OC Unleashed Configurator for Skyrim VR</AssemblyName>
-    <Version>4.3.7-eye-editor-preview6</Version>
+    <Version>4.3.11-kat-input3-qol</Version>
   </PropertyGroup>
 
   <PropertyGroup>

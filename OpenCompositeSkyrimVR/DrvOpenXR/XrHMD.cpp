@@ -5,6 +5,7 @@
 #include "XrHMD.h"
 
 #include "../OpenOVR/Misc/Config.h"
+#include "../OpenOVR/Misc/Input/LocomotionHeading.h"
 #include "../OpenOVR/Misc/xrmoreutils.h"
 #include "../OpenOVR/Reimpl/BaseSystem.h"
 #include "../OpenOVR/convert.h"
@@ -479,9 +480,22 @@ void XrHMD::GetPose(vr::ETrackingUniverseOrigin origin, vr::TrackedDevicePose_t*
 		XrSpaceVelocity velocity{ XR_TYPE_SPACE_VELOCITY };
 		XrSpaceLocation locInfo{ XR_TYPE_SPACE_LOCATION, &velocity, 0, {} };
 		XrResult locateRes = XR_ERROR_RUNTIME_FAILURE;
+		auto& locomotionHeading = OcuLocomotionHeading::Instance();
+		// Keep the treadmill's standing-space convention. Timing queries may
+		// request seated space; those must not rotate a cached standing heading.
+		const auto headingToken = oovr_global_configuration.TreadmillEnabled() && origin == vr::TrackingUniverseStanding
+		    ? locomotionHeading.CaptureToken() : 0;
+		XrTime headingPoseTime = 0;
 		{
 			std::lock_guard<std::mutex> xrCallGuard(xr_session_call_mutex);
-			locateRes = xrLocateSpace(xr_gbl->viewSpace, baseSpace, xr_gbl->nextPredictedFrameTime, &locInfo);
+			headingPoseTime = xr_gbl->nextPredictedFrameTime;
+			locateRes = xrLocateSpace(xr_gbl->viewSpace, baseSpace, headingPoseTime, &locInfo);
+		}
+		if (headingToken) {
+			const auto& q = locInfo.pose.orientation;
+			locomotionHeading.Publish(headingToken, OcuLocomotionHeading::NowMs(),
+			    XR_SUCCEEDED(locateRes) && (locInfo.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0,
+			    q.x, q.y, q.z, q.w, headingPoseTime);
 		}
 		if (XR_SUCCEEDED(locateRes)) {
 			pose->vVelocity = X2S_v3f(velocity.linearVelocity);
