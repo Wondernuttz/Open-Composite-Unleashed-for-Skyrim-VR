@@ -58,6 +58,7 @@ target_include_directories(minhook_skse PUBLIC ${MINHOOK_DIR}/include)
 # Plugin source files
 set(SOURCES
     src/Main.cpp
+    src/SkyrimMenuTargets.cpp
     src/DapaHiggs.cpp
     src/DapaSpellWheel.cpp
     src/DapaCrossbow.cpp
@@ -99,13 +100,15 @@ add_executable(DapaGeometryOwnershipTest EXCLUDE_FROM_ALL tests/DapaGeometryOwne
 add_executable(DapaCsxDrawTest EXCLUDE_FROM_ALL tests/DapaCsxDrawTest.cpp)
 add_executable(DapaCsxApiTest EXCLUDE_FROM_ALL tests/DapaCsxApiTest.cpp)
 add_executable(RaceMenuKeyboardRecoveryTest EXCLUDE_FROM_ALL tests/RaceMenuKeyboardRecoveryTest.cpp)
+add_executable(MCMLaserTest EXCLUDE_FROM_ALL tests/MCMLaserTest.cpp)
+add_executable(LaserMenuHitTest EXCLUDE_FROM_ALL tests/LaserMenuHitTest.cpp)
 add_executable(RaceMenuNativeInputTest EXCLUDE_FROM_ALL tests/RaceMenuNativeInputTest.cpp)
 target_link_libraries(RaceMenuNativeInputTest PRIVATE CommonLibSSE::CommonLibSSE)
 target_precompile_headers(RaceMenuNativeInputTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/PCH.h")
 
 # Exercise the actual producer helpers with instrumented engine/COM fixtures.
 # Python is needed only when explicitly building these diagnostics.
-foreach(diagnostic IN ITEMS BridgeRefresh MenuActivity BridgeMaintenance BridgeStartup)
+foreach(diagnostic IN ITEMS BridgeRefresh MenuActivity BridgeMaintenance BridgeStartup JournalFocus)
     set(extractor "${CMAKE_CURRENT_SOURCE_DIR}/tests/Extract${diagnostic}Test.py")
     if(diagnostic STREQUAL "BridgeMaintenance")
         set(extractor "${CMAKE_CURRENT_SOURCE_DIR}/tests/ExtractBridgeMaintenance.py")
@@ -123,6 +126,24 @@ foreach(diagnostic IN ITEMS BridgeRefresh MenuActivity BridgeMaintenance BridgeS
     target_include_directories(${diagnostic}Test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/tests")
 endforeach()
 target_link_libraries(DapaCsxDrawTest PRIVATE bcrypt d3d11 d3dcompiler dxgi)
+
+
+# Standalone D3D11 ownership checks; this target does not link CommonLib.
+set(menu_target_extractor "${CMAKE_CURRENT_SOURCE_DIR}/tests/ExtractSkyrimMenuTargetsTest.py")
+set(menu_target_extracted "${CMAKE_CURRENT_BINARY_DIR}/tests/SkyrimMenuTargetsProduction.inl")
+add_custom_command(OUTPUT "${menu_target_extracted}"
+    COMMAND ${CMAKE_COMMAND}
+        -DEXTRACTOR=${menu_target_extractor}
+        -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/SkyrimMenuTargets.cpp
+        -DOUTPUT=${menu_target_extracted}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/RunProductionExtractor.cmake
+    DEPENDS src/SkyrimMenuTargets.cpp "${menu_target_extractor}"
+    VERBATIM)
+add_executable(SkyrimMenuTargetsTest EXCLUDE_FROM_ALL
+    tests/SkyrimMenuTargetsTest.cpp "${menu_target_extracted}")
+target_include_directories(SkyrimMenuTargetsTest PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/tests")
+target_link_libraries(SkyrimMenuTargetsTest PRIVATE d3d11)
+
 target_link_libraries(${PROJECT_NAME} PRIVATE bcrypt)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

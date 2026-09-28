@@ -12,11 +12,30 @@
 #include "DepthExtract.h"
 #include "RDMRenderDiagnostics.h"
 #include "FoveationBlackoutRenderer.h"
+#include "MenuLayerRenderer.h"
+#include "SkyrimMenuTargets.h"
 #include "PublishedBridge.h"
 
 // Shared by the eye compositors; prepared before either eye can omit scene work.
 static FoveationBlackoutRenderer s_blackoutRenderer;
 static bool s_blackoutPresentationFailed = false;
+static MenuLayerRenderer s_menuLayerRenderer;
+// The scheduler may run after the game closes a popup but before this captured
+// stereo frame has left the compositor. Keep that frame out of DAPA as well.
+static std::atomic<bool> s_menuLayerFrameActive{false};
+static bool s_menuLayerPresentationFailed = false;
+static bool s_menuJitterPaused = false;
+static std::uint64_t s_menuFrameId = 0;
+struct MenuSubmittedEye {
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+	D3D11_TEXTURE2D_DESC desc{};
+	D3D11_BOX region{};
+	UINT outputWidth = 0, outputHeight = 0;
+};
+static MenuSubmittedEye s_menuSubmitted[2];
+static unsigned s_menuSubmittedMask = 0;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_menuAdmittedTexture;
+static UINT s_menuRenderWidth = 0, s_menuRenderHeight = 0;
 
 
 #include "../Misc/Config.h"
@@ -322,19 +341,29 @@ int OCBridge_ConsoleState()
 // Read-only menu signal from the same bridge CSX/ASW already share. VRS uses
 // it only as a safety gate: menus render at full shading rate. No bridge image,
 // dimension, renderScale, depth, or motion-vector field is read or modified.
+static bool OCBridge_CachedFoveationMenuPaused()
+{
+	// The view lives for the runtime's lifetime. Draw hooks only read the
+	// published flags; never open a mapping or query the game from a draw.
+	const auto* bridge = s_pBridge.Get();
+	return bridge && (bridge->isMenuOpen || bridge->isMainMenu ||
+	    bridge->isLoadingScreen || bridge->isConsoleOpen);
+}
+
 static int OCBridge_MenuState()
 {
 	OpenRenderTargetBridge();
 	if (!s_pBridge)
 		return -1;
-	return s_pBridge->isMenuOpen ? 1 : 0;
+	return OCBridge_CachedFoveationMenuPaused() ? 1 : 0;
 }
 
 bool OCBridge_DapaMenuPaused()
 {
 	OpenRenderTargetBridge();
-	return s_pBridge && (s_pBridge->isMenuOpen != 0 ||
-	    s_pBridge->isLoadingScreen != 0 || s_pBridge->isMainMenu != 0);
+	return s_menuLayerFrameActive.load(std::memory_order_acquire) ||
+	    (s_pBridge && (s_pBridge->isMenuOpen != 0 ||
+	    s_pBridge->isLoadingScreen != 0 || s_pBridge->isMainMenu != 0));
 }
 
 // Input eligibility is independent of render-resource readiness. Unknown menu
@@ -616,6 +645,7 @@ static std::uint32_t s_vrsTerrainDepthBindings = 0;
 static void ResetVRSInputGeometry();
 static bool s_vrsFrameArmed = false;
 static bool s_vrsHookApplied = false;
+static bool s_vrsPatternReady = false;
 static void SyncVRSForShaderState(ID3D11DeviceContext* ctx)
 {
 	if (!s_vrsHookManager || ctx != s_sceneHookContext) return;
@@ -673,6 +703,7 @@ static void VRSShaderStateChanged(ID3D11DeviceContext* ctx, bool targetsChanged)
 
 static void DisarmSceneVRS()
 {
+	RDMRenderScope::SetDrawBoundaryCallback(nullptr, nullptr);
 	if (s_vrsHookManager && s_vrsHookApplied)
 		s_vrsHookManager->Disable();
 	s_vrsFrameArmed = false;
@@ -684,6 +715,16 @@ static void DisarmSceneVRS()
 	if (s_densityMaskHookManager)
 		s_densityMaskHookManager->EndFrame();
 	s_densityMaskHookManager = nullptr;
+}
+
+static void CheckFoveationMenuBeforeDraw(ID3D11DeviceContext* ctx)
+{
+	if (ctx != s_sceneHookContext || !OCBridge_CachedFoveationMenuPaused()) return;
+	// Stay disarmed for the remainder of this frame, even if the popup closes
+	// again. The next BeginVRSGameFrame chooses a fresh gameplay profile.
+	DisarmSceneVRS();
+	ocu_effect_foveation::Clear();
+	s_vrsPatternReady = false;
 }
 
 static void STDMETHODCALLTYPE Hook_OMSetRenderTargets(
@@ -2767,6 +2808,16 @@ DX11Compositor::~DX11Compositor()
 {
 	// [KB-DIAG] Log which compositor is being destroyed and check proximity to dxcomp
 	bool iAmDxcomp = (BaseCompositor::dxcomp == this);
+	if (iAmDxcomp) {
+		RDMRenderScope::SetDrawInterceptor(nullptr, nullptr);
+		s_menuLayerRenderer.ResetFrame(true);
+		s_menuLayerFrameActive.store(false, std::memory_order_release);
+		s_menuLayerPresentationFailed = false;
+		s_menuJitterPaused = false;
+		s_menuSubmitted[0] = {}; s_menuSubmitted[1] = {};
+		s_menuSubmittedMask = 0;
+		s_menuAdmittedTexture.Reset();
+	}
 	ID3D11Device* preDtorDev = nullptr;
 	if (BaseCompositor::dxcomp && !iAmDxcomp) {
 		preDtorDev = BaseCompositor::dxcomp->GetDevice();
@@ -3265,7 +3316,6 @@ static Microsoft::WRL::ComPtr<ID3D11Texture2D> s_vrsRenderTexture[2];
 static VRSManager::EyeRegion s_vrsEyeRegion[2];
 static std::uint8_t s_vrsGeometryMask = 0;
 static bool s_vrsInitialFrameDone = false;
-static bool s_vrsPatternReady = false;
 static std::uint32_t s_vrsGazeDiagnosticCounter = 0;
 static int s_currentEyeIdx = 0;
 
@@ -3274,6 +3324,99 @@ static void ResetVRSInputGeometry()
 	s_vrsRenderTexture[0].Reset();
 	s_vrsRenderTexture[1].Reset();
 	s_vrsGeometryMask = 0;
+}
+
+static bool OCUMenusUseTemporalUpscaling()
+{
+	return Fsr3TemporalRequested() ||
+	    (oovr_global_configuration.DlssEnabled() &&
+	     (oovr_global_configuration.FsrRenderScale() < .99f || oovr_global_configuration.DlssPreset() == 4));
+}
+
+static bool CaptureSeparatedMenuDraw(ID3D11DeviceContext* ctx, void (*draw)(void*), void* token)
+{
+	if (!OCBridge_CachedFoveationMenuPaused() && !s_menuLayerRenderer.HasLayer()) return false;
+	const bool captured = s_menuLayerRenderer.Capture(ctx, draw, token);
+	if (captured) {
+		s_menuLayerFrameActive.store(true, std::memory_order_release);
+		static bool reported = false;
+		if (!reported) {
+			reported = true;
+			OOVR_LOG("Menu separation v1: first projected/HUD menu draw captured for post-upscale composition");
+		}
+	}
+	return captured;
+}
+
+static void PreserveSeparatedMenuCopy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src, bool whole)
+{
+	s_menuLayerRenderer.BeforeCopy(ctx, dst, src, whole);
+}
+
+static void PreserveSeparatedMenuResource(ID3D11DeviceContext* ctx, ID3D11Resource* resource)
+{
+	s_menuLayerRenderer.BeforeClear(ctx, resource);
+}
+
+static void BeginSeparatedMenuFrame(ID3D11Device* device, ID3D11DeviceContext* context, bool menuOpen,
+    const std::vector<ID3D11RenderTargetView*>& outputs)
+{
+	RDMRenderScope::SetDrawInterceptor(nullptr, nullptr);
+	const auto previousStats = s_menuLayerRenderer.Stats();
+	if (oovr_global_configuration.DebugLogging() && previousStats.candidates) {
+		static ULONGLONG lastReport = 0;
+		const auto now = GetTickCount64();
+		if (now - lastReport >= 5000) {
+			lastReport = now;
+			OOVR_LOGF("Menu separation: candidates=%u captured=%u restored=%u retained=%d lastRejection=%s",
+			    previousStats.candidates, previousStats.captures, previousStats.restores,
+			    s_menuLayerRenderer.HasLayer(), previousStats.lastRejection);
+		}
+	}
+	s_menuLayerRenderer.ResetFrame(!menuOpen);
+	s_menuLayerFrameActive.store(false, std::memory_order_release);
+	// An incompatible target ends this popup's separation, not future menus.
+	if (!menuOpen) s_menuLayerPresentationFailed = false;
+	s_menuAdmittedTexture.Reset();
+	++s_menuFrameId;
+	const unsigned pair = s_menuSubmittedMask;
+	s_menuSubmittedMask = 0;
+	auto left = std::move(s_menuSubmitted[0]);
+	auto right = std::move(s_menuSubmitted[1]);
+	s_menuSubmitted[0] = {}; s_menuSubmitted[1] = {};
+	if (!menuOpen || !OCUMenusUseTemporalUpscaling() || s_menuLayerPresentationFailed) return;
+	// Main/loading and physical world-space menu geometry keep the native path.
+	if (!s_pBridge || s_pBridge->isMainMenu || s_pBridge->isLoadingScreen) return;
+	if (pair != 3 || !left.texture || left.texture != right.texture ||
+	    left.desc.SampleDesc.Count != 1 || left.desc.ArraySize != 1 ||
+	    left.desc.Width % 2 || left.desc.Width != right.desc.Width || left.desc.Height != right.desc.Height ||
+	    left.region.left != 0 || left.region.right != left.desc.Width / 2 ||
+	    right.region.left != left.desc.Width / 2 || right.region.right != left.desc.Width ||
+	    left.region.top != 0 || right.region.top != 0 ||
+	    left.region.bottom != left.desc.Height || right.region.bottom != left.desc.Height ||
+	    !left.outputWidth || !left.outputHeight || left.outputWidth != right.outputWidth ||
+	    left.outputHeight != right.outputHeight) return;
+	auto module = GetModuleHandleW(L"OpenCompositeInput.dll");
+	auto acquire = module ? reinterpret_cast<ocu_menu::AcquireFn>(GetProcAddress(module, ocu_menu::AcquireExportName)) : nullptr;
+	if (!acquire) return;
+	ocu_menu::Targets targets;
+	if (!acquire(&targets)) return;
+	bool prepared = targets.context == context && !outputs.empty() && s_menuLayerRenderer.Initialize(device, context) &&
+	    s_menuLayerRenderer.BeginFrame(s_menuFrameId, left.desc.Width, left.desc.Height,
+	        left.outputWidth * 2, left.outputHeight, targets);
+	D3D11_VIEWPORT outputViewport{0, 0, float(left.outputWidth), float(left.outputHeight), 0, 1};
+	if (prepared) for (auto* output : outputs)
+		prepared = s_menuLayerRenderer.CanComposite(context, output, outputViewport) && prepared;
+	for (auto* source : targets.sources) if (source) source->Release();
+	for (auto* destination : targets.destinations) if (destination) destination->Release();
+	if (targets.context) targets.context->Release();
+	if (!prepared || !RDMRenderScope::SetDrawInterceptor(context, CaptureSeparatedMenuDraw,
+	        PreserveSeparatedMenuCopy, PreserveSeparatedMenuResource)) {
+		s_menuLayerRenderer.ResetFrame();
+	} else {
+		s_menuAdmittedTexture = left.texture;
+		s_menuRenderWidth = left.desc.Width; s_menuRenderHeight = left.desc.Height;
+	}
 }
 
 void DX11Compositor::BeginVRSGameFrame()
@@ -3302,6 +3445,18 @@ void DX11Compositor::BeginVRSGameFrame()
 	// menus open, geometry is unavailable, or the selected backend changes.
 	DisarmSceneVRS();
 	densityMaskManager.EndFrame();
+	BeginSeparatedMenuFrame(device, context, menuOpen, swapchain_rtvs);
+	s_menuJitterPaused = menuOpen;
+#if defined(OC_HAS_FSR3) || defined(OC_HAS_DLSS)
+	if (menuOpen) {
+		// Start the menu frame without world-camera jitter. Resetting temporal
+		// history at Submit alone cannot undo jitter in a captured UI projection.
+		g_fsr3JitterEnabled = false;
+		g_fsr3JitterX = g_fsr3JitterY = 0;
+		s_fsr3RenderJitterX = s_fsr3RenderJitterY = 0;
+		s_temporalJitterSubmittedEyeMask = 0;
+	}
+#endif
 	if (!oovr_global_configuration.VrsAnyEnabled() || menuOpen) {
 		DisarmSceneVRS();
 		s_vrsSceneTarget = nullptr;
@@ -3697,6 +3852,13 @@ void DX11Compositor::BeginVRSGameFrame()
 			s_lastBackend = 1;
 		}
 	}
+	if (!RDMRenderScope::SetDrawBoundaryCallback(context, &CheckFoveationMenuBeforeDraw)) {
+		DisarmSceneVRS();
+		vrsManager.Disable();
+		s_vrsPatternReady = false;
+		OOVR_LOG_LIMITEDF(5000, "Foveation: menu draw guard unavailable; scene foveation withheld");
+		return;
+	}
 	if (blackout.Active() && !ocu_effect_foveation::GetState().LatchBlackout(blackout)) {
 		DisarmSceneVRS();
 		densityMaskManager.EndFrame();
@@ -3710,6 +3872,7 @@ void DX11Compositor::BeginVRSGameFrame()
 		    useHardwareVrs ? "VRS" : "RDM", blackout.mask.guardPixels);
 
 	if (!s_vrsInitialFrameDone) {
+		OOVR_LOG("Foveation menu-draw-guard-v1: popup/pause protection at frame admission and before scene draws");
 		OOVR_LOGF("Foveation: first pre-render stereo atlas armed — target %dx%d, eye regions %dx%d + %dx%d",
 		    s_vrsRenderWidth[0], s_vrsRenderHeight[0],
 		    s_vrsEyeRegion[0].width, s_vrsEyeRegion[0].height,
@@ -3973,6 +4136,47 @@ void DX11Compositor::Invoke(const vr::Texture_t* texture, const vr::VRTextureBou
 	D3D11_BOX sourceRegion{};
 	if (!ResolveSubmittedTextureRegion(srcDesc, bounds, sourceRegion))
 		OOVR_ABORTF("Invalid submitted eye texture region");
+	float menuEyeUV[4] = {0, 0, 1, 1};
+	bool menuRestoredInInput = false;
+	if (!isOverlay && s_menuLayerRenderer.HasLayer()) {
+		D3D11_VIEWPORT fullOutput{0, 0, float(createInfo.width), float(createInfo.height), 0, 1};
+		const UINT half = s_menuRenderWidth / 2, eyeLeft = UINT(s_currentEyeIdx) * half;
+		const bool sameAtlas = src == s_menuAdmittedTexture.Get() &&
+		    srcDesc.Width == s_menuRenderWidth && srcDesc.Height == s_menuRenderHeight;
+		if (sameAtlas && sourceRegion.left >= eyeLeft && sourceRegion.right <= eyeLeft + half) {
+			menuEyeUV[0] = float(sourceRegion.left - eyeLeft) / half;
+			menuEyeUV[1] = float(sourceRegion.top) / s_menuRenderHeight;
+			menuEyeUV[2] = float(sourceRegion.right - eyeLeft) / half;
+			menuEyeUV[3] = float(sourceRegion.bottom) / s_menuRenderHeight;
+		} else {
+			// Preserve this frame per-eye even if another renderer switched to
+			// separate eye textures. Do not squeeze a stereo atlas into one eye.
+			s_menuLayerPresentationFailed = true;
+			OOVR_LOG("Menu separation v1: submit layout changed; finishing retained UI per-eye, subsequent capture disabled");
+		}
+		if (!s_menuLayerRenderer.CanComposite(context, swapchain_rtvs[currentIndex], fullOutput)) {
+			// Repair only this submitted eye before filtering. The other eye
+			// retains its own layer until its submission, including split textures.
+			Microsoft::WRL::ComPtr<ID3D11RenderTargetView> sourceView;
+			HRESULT result = device->CreateRenderTargetView(src, nullptr, &sourceView);
+			if (FAILED(result)) {
+				DxgiFormatInfo format{};
+				if (GetFormatInfo(srcDesc.Format, format)) {
+					D3D11_RENDER_TARGET_VIEW_DESC view{};
+					view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+					view.Format = texture->eColorSpace == vr::ColorSpace_Linear ? format.linear : format.srgb;
+					result = device->CreateRenderTargetView(src, &view, &sourceView);
+				}
+			}
+			D3D11_VIEWPORT sourceViewport{float(sourceRegion.left), float(sourceRegion.top),
+			    float(sourceRegion.right - sourceRegion.left), float(sourceRegion.bottom - sourceRegion.top), 0, 1};
+			menuRestoredInInput = SUCCEEDED(result) && s_menuLayerRenderer.Composite(context, sourceView.Get(),
+			    s_currentEyeIdx, sourceViewport, false, menuEyeUV, true);
+			s_menuLayerPresentationFailed = true;
+			OOVR_LOGF("Menu separation v1: output contract changed; eye=%d input restored=%d; subsequent capture disabled",
+			    s_currentEyeIdx, menuRestoredInInput);
+		}
+	}
 
 #ifdef OC_HAS_FSR3
 	// FSR3 debug modes are only visible when the temporal FSR3 submit path is
@@ -5749,6 +5953,21 @@ void CS(uint3 id : SV_DispatchThreadID) {
 		}
 	}
 
+	// UI bypasses reconstruction, sharpening and the scene's foveation blackout.
+	// The viewport can be render-sized during a temporal warmup/failure; fit the
+	// retained layer to that actual viewport rather than cropping menu corners.
+	if (!isOverlay && s_menuLayerRenderer.HasLayer() && !menuRestoredInInput) {
+		D3D11_VIEWPORT menuViewport{};
+		menuViewport.Width = float(bounds && s_fsr3ViewportW ? s_fsr3ViewportW : createInfo.width);
+		menuViewport.Height = float(bounds && s_fsr3ViewportH ? s_fsr3ViewportH : createInfo.height);
+		menuViewport.MaxDepth = 1.f;
+		if (!s_menuLayerRenderer.Composite(context, swapchain_rtvs[currentIndex], s_currentEyeIdx,
+		        menuViewport, copiedWithVerticalFlip, menuEyeUV)) {
+			s_menuLayerPresentationFailed = true;
+			OOVR_LOG("Menu separation v1: output composition failed; subsequent frames retain native menu draws");
+		}
+	}
+
 	// Release the swapchain - OpenXR will use the last-released image in a swapchain
 	// No manual Flush() needed — xrReleaseSwapchainImage handles GPU synchronization internally.
 	XrSwapchainImageReleaseInfo releaseInfo{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -5801,6 +6020,8 @@ void DX11Compositor::InvokeCubemap(const vr::Texture_t* textures)
 void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::VRTextureBounds_t* ptrBounds,
     vr::EVRSubmitFlags submitFlags, XrCompositionLayerProjectionView& layer)
 {
+	// Capture is game-only. Seal the stereo layer before any submit-time draws.
+	RDMRenderScope::SetDrawInterceptor(nullptr, nullptr);
 	// All game-side effects must already be complete before the first Submit.
 	// Prevent later compositor/overlay work from consuming an old active profile.
 	ocu_effect_foveation::Clear();
@@ -5919,7 +6140,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 			// skipped and nothing resolves the sub-pixel jitter — the game would render jittered
 			// frames that never get reconstructed, showing as shimmer/jitter while moving.
 			if (!oovr_global_configuration.MotionVectorsEnabled()
-			    || (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen))) {
+			    || s_menuJitterPaused || (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen))) {
 				g_fsr3JitterEnabled = false;
 				s_temporalJitterSubmittedEyeMask = 0;
 			} else {
@@ -5949,7 +6170,7 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 	if (oovr_global_configuration.DlssEnabled()
 	    && (oovr_global_configuration.FsrRenderScale() < 0.99f || oovr_global_configuration.DlssPreset() == 4)
 	    && s_dlssUpscaler && s_dlssUpscaler->IsReady()) {
-		if (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen)) {
+		if (s_menuJitterPaused || (s_pBridge && (s_pBridge->isMainMenu || s_pBridge->isLoadingScreen))) {
 			g_fsr3JitterEnabled = false;
 			s_temporalJitterSubmittedEyeMask = 0;
 		} else {
@@ -6161,6 +6382,14 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 				const float* view = reinterpret_cast<const float*>(rss + 0x3E0 + eyeIdx * 0x250 + 0x30);
 				const float* vp = reinterpret_cast<const float*>(rss + 0x3E0 + eyeIdx * 0x250 + 0x130);
 				g_aswProvider->SetMotionGeometry(eyeIdx, view, vp);
+                DapaNativePlayerMotion::Camera camera{};
+                const auto* cameraData=rss+0x3E0+eyeIdx*0x250;
+                memcpy(camera.jittered,cameraData+0xB0,sizeof(camera.jittered));
+                memcpy(camera.current,cameraData+0x130,sizeof(camera.current));
+                memcpy(camera.previous,cameraData+0x170,sizeof(camera.previous));
+                memcpy(camera.position,rss+0x3A4+eyeIdx*12,sizeof(camera.position));
+                memcpy(camera.previousPosition,rss+0x3BC+eyeIdx*12,sizeof(camera.previousPosition));
+                g_aswProvider->SetNativePlayerCamera(eyeIdx,camera,s_dapaMaskCacheFrame,xr_gbl->nextPredictedFrameTime);
 			}
 			if (aswEyeCached && eyeIdx == 1 && g_aswProvider->HasCachedFrame()) {
 				if (s_pBridge->actorPosPtr) {
@@ -6285,6 +6514,22 @@ void DX11Compositor::Invoke(XruEye eye, const vr::Texture_t* texture, const vr::
 		} else {
 			s_vrsGeometryMask &= (std::uint8_t)~(1u << eyeIdx);
 			s_vrsRenderTexture[eyeIdx] = nullptr;
+		}
+	}
+
+	// Keep a separate pair for UI capture: this must also work with foveation
+	// disabled. Full-eye external submissions never qualify as a stereo atlas.
+	if (OCUMenusUseTemporalUpscaling()) {
+		auto& submitted = s_menuSubmitted[s_currentEyeIdx];
+		submitted.texture = static_cast<ID3D11Texture2D*>(gameTexture->handle);
+		submitted.texture->GetDesc(&submitted.desc);
+		if (ResolveSubmittedTextureRegion(submitted.desc, ptrBounds, submitted.region)) {
+			submitted.outputWidth = createInfo.width;
+			submitted.outputHeight = createInfo.height;
+			s_menuSubmittedMask |= 1u << s_currentEyeIdx;
+		} else {
+			submitted = {};
+			s_menuSubmittedMask &= ~(1u << s_currentEyeIdx);
 		}
 	}
 

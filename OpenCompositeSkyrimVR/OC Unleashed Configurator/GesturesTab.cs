@@ -28,6 +28,10 @@ namespace OpenCompositeConfigurator
         private ComboBox _cmbGestureHold = null!;
         private ComboBox _cmbGestureKeyPick = null!;
         private FlowLayoutPanel _pnlGestureLibrary = null!;
+        private int _gestureLibraryPage;
+        private Button _gestureLibraryPrevious = null!;
+        private Button _gestureLibraryNext = null!;
+        private Label _gestureLibraryPageLabel = null!;
         private Label _lblGestureStatus = null!;
 
         // Stable ids the runtime recognizer will match against, split button by
@@ -66,7 +70,9 @@ namespace OpenCompositeConfigurator
         };
 
         private (string id, string label)[] CurrentHoldOptions =>
-            _controllerModelKey == "knuckles" ? HoldOptionsKnuckles : HoldOptionsTouch;
+            _controllerModelKey == "knuckles" ? HoldOptionsKnuckles :
+            _controllerModelKey == "frame" ? HoldOptionsTouch.Select(o =>
+                (o.id, o.id == "l_a" ? "D-pad Down (left)" : o.id == "l_b" ? "D-pad Up (left)" : o.label)).ToArray() : HoldOptionsTouch;
 
         // Rebuild the hold dropdown for the active controller model, keeping
         // the selected id when it exists on both controllers.
@@ -285,17 +291,23 @@ namespace OpenCompositeConfigurator
             };
             container.Controls.Add(_gestureRight);
 
-            // ── Library: scrollable column beside the boxes ──
+            // ── Library: paged column beside the boxes ──
             int libX = startX + pairW + 12;
             var lblLib = new Label
             {
-                Text = "Gesture Library",
+                Text = "Library",
                 Location = new Point(libX, boxTop),
                 AutoSize = true,
                 Font = new Font("Segoe UI", 10f, FontStyle.Bold),
                 ForeColor = Color.White,
             };
             container.Controls.Add(lblLib);
+            _gestureLibraryPrevious = new ModernPillButton { Text = "‹", AccessibleName = "Previous gesture page", Location = new Point(rightEdge - 108, boxTop - 2), Size = new Size(28, 24) };
+            _gestureLibraryNext = new ModernPillButton { Text = "›", AccessibleName = "Next gesture page", Location = new Point(rightEdge - 28, boxTop - 2), Size = new Size(28, 24) };
+            _gestureLibraryPageLabel = new Label { Text = "1 / 1", Location = new Point(rightEdge - 78, boxTop + 2), Size = new Size(48, 20), TextAlign = ContentAlignment.MiddleCenter };
+            _gestureLibraryPrevious.Click += (_, _) => { if (_gestureLibraryPage > 0) { --_gestureLibraryPage; RefreshGestureLibrary(); } };
+            _gestureLibraryNext.Click += (_, _) => { ++_gestureLibraryPage; RefreshGestureLibrary(); };
+            container.Controls.Add(_gestureLibraryPrevious); container.Controls.Add(_gestureLibraryPageLabel); container.Controls.Add(_gestureLibraryNext);
 
             _pnlGestureLibrary = new FlowLayoutPanel
             {
@@ -303,7 +315,7 @@ namespace OpenCompositeConfigurator
                 // Bottom edge lines up with the Smooth Shapes row under the boxes
                 Size = new Size(rightEdge - libX, boxSide + 46),
                 BackColor = Color.FromArgb(24, 25, 31),
-                AutoScroll = true,
+                AutoScroll = false,
                 WrapContents = true,
                 FlowDirection = FlowDirection.LeftToRight,
             };
@@ -921,6 +933,9 @@ namespace OpenCompositeConfigurator
         // ── Library cards ──
         private void RefreshGestureLibrary()
         {
+            _gestureLibraryPrevious.Enabled = false;
+            _gestureLibraryNext.Enabled = false;
+            _gestureLibraryPageLabel.Text = "1 / 1";
             foreach (Control c in _pnlGestureLibrary.Controls.Cast<Control>().ToList())
             {
                 if (c.Tag is Image img) img.Dispose();
@@ -941,14 +956,20 @@ namespace OpenCompositeConfigurator
                 return;
             }
 
-            foreach (string jsonPath in files)
+            int pageCount = Math.Max(1, (files.Length + 1) / 2);
+            _gestureLibraryPage = Math.Clamp(_gestureLibraryPage, 0, pageCount - 1);
+            _gestureLibraryPrevious.Enabled = _gestureLibraryPage > 0;
+            _gestureLibraryNext.Enabled = _gestureLibraryPage + 1 < pageCount;
+            _gestureLibraryPageLabel.Text = $"{_gestureLibraryPage + 1} / {pageCount}";
+            foreach (string jsonPath in files.Skip(_gestureLibraryPage * 2).Take(2))
             {
                 GestureData? data = null;
                 try { data = JsonSerializer.Deserialize<GestureData>(File.ReadAllText(jsonPath)); }
                 catch { /* skip corrupt files */ }
                 if (data == null) continue;
 
-                _pnlGestureLibrary.Controls.Add(MakeGestureCard(jsonPath, data));
+                var card = MakeGestureCard(jsonPath, data);
+                DpiLayout.AddLogicalControl(_pnlGestureLibrary, card);
             }
         }
 

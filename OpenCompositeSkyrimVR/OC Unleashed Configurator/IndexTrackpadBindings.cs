@@ -36,6 +36,7 @@ namespace OpenCompositeConfigurator
 
         private bool TryGetControllerBindingHex(string id, out (string hexRight, string hexLeft) hex)
         {
+            if (_controllerModelKey == "frame" && FrameButtonHex.TryGetValue(id, out hex)) return true;
             int region = TrackpadRegion(id);
             if (region < 0) return ControllerButtonHex.TryGetValue(id, out hex);
             bool upper = (region & 1) == 0;

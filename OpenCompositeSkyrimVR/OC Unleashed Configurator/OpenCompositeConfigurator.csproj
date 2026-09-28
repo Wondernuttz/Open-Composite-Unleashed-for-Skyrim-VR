@@ -8,7 +8,7 @@
     <RootNamespace>OpenCompositeConfigurator</RootNamespace>
     <Nullable>enable</Nullable>
     <AssemblyName>OC Unleashed Configurator for Skyrim VR</AssemblyName>
-    <Version>4.3.11-kat-input3-qol</Version>
+    <Version>5.0.1</Version>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -19,8 +19,10 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Resources\controllers.png" />
+    <EmbeddedResource Include="Resources\frame.png" />
     <EmbeddedResource Include="Resources\knuckles.png" />
     <EmbeddedResource Include="Resources\psvr2_sense.png" />
+    <EmbeddedResource Include="Resources\buymeacoffee.png" />
     <EmbeddedResource Include="Resources\kofi.png" />
     <EmbeddedResource Include="Resources\Bluefox.png" />
     <EmbeddedResource Include="Resources\DragonPug.png" />

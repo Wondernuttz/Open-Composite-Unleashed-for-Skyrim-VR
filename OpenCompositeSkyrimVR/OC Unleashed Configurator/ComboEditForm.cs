@@ -54,7 +54,7 @@ namespace OpenCompositeConfigurator
                 "long_press" => "Long Press",
                 _ => Mode
             };
-            string keyName = keyScancodes.FirstOrDefault(kv => kv.Value == Scancode).Key ?? $"0x{Scancode:x2}";
+            string keyName = Scancode == 0x7f01 ? "Cable tracker: Show" : Scancode == 0x7f02 ? "Cable tracker: Reset zero" : keyScancodes.FirstOrDefault(kv => kv.Value == Scancode).Key ?? $"0x{Scancode:x2}";
             return $"{buttons}  \u2192  {modeStr}  \u2192  {keyName}";
         }
 
@@ -182,7 +182,10 @@ namespace OpenCompositeConfigurator
 
         public ComboEditForm(Dictionary<string, int> keyScancodes, ComboEntry? existing = null)
         {
-            _keyScancodes = keyScancodes;
+            _keyScancodes = new Dictionary<string, int>(keyScancodes) {
+                ["Cable tracker: Show"] = 0x7f01,
+                ["Cable tracker: Reset zero"] = 0x7f02
+            };
 
             _buttons = ComboButtons.ToDictionary(kv => kv.Key, kv => kv.Value);
             if (ModelPositionOverrides != null)
@@ -202,12 +205,17 @@ namespace OpenCompositeConfigurator
                 }
             }
 
+            if (ControllerModelKey == "frame") {
+                var down = _buttons["x"]; _buttons["x"] = ("D-pad Down", down.pos, down.isStickDir);
+                var up = _buttons["y"]; _buttons["y"] = ("D-pad Up", up.pos, up.isStickDir);
+            }
             LoadControllerImage();
             InitializeUI();
-            ModernUiTheme.Apply(this);
+            ModernUiTheme.Apply(this, windowBands: false);
 
             if (existing != null)
                 LoadExisting(existing);
+            DpiLayout.Popup(this);
         }
 
         private void LoadControllerImage()
@@ -217,6 +225,7 @@ namespace OpenCompositeConfigurator
             {
                 "knuckles" => "OpenCompositeConfigurator.Resources.knuckles.png",
                 "psvr2" => "OpenCompositeConfigurator.Resources.psvr2_sense.png",
+                "frame" => "OpenCompositeConfigurator.Resources.frame.png",
                 _ => "OpenCompositeConfigurator.Resources.controllers.png",
             };
             using var stream = assembly.GetManifestResourceStream(resource);
@@ -357,7 +366,7 @@ namespace OpenCompositeConfigurator
 
             _lblKeyHint = new Label
             {
-                Text = "Skyrim reads this as a keyboard press",
+                Text = "Keyboard key or OCU cable-tracker action",
                 Location = new Point(leftMargin + 350, y + 3),
                 AutoSize = true,
                 ForeColor = Color.FromArgb(130, 130, 130),

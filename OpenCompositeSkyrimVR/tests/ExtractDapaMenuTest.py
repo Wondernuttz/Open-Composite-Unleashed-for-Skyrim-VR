@@ -18,7 +18,10 @@ def function(source, signature):
     return source[start:end]
 
 output.mkdir(parents=True, exist_ok=True)
-(output / "DapaMenuBridge.inc").write_text(function(dx, "bool OCBridge_DapaMenuPaused()"), encoding="utf-8")
+(output / "DapaMenuBridge.inc").write_text("\n".join(function(dx, signature) for signature in (
+    "static bool OCBridge_CachedFoveationMenuPaused()", "static int OCBridge_MenuState()",
+    "bool OCBridge_DapaMenuPaused()")), encoding="utf-8")
+(output / "FoveationMenuDraw.inc").write_text(function(dx, "static void CheckFoveationMenuBeforeDraw("), encoding="utf-8")
 methods = "\n".join(function(header, signature) for signature in (
     "void InvalidateCachedFrame()", "void SetPaused(bool paused)", "void SetInjectionWanted(bool wanted)"))
 cache = function(provider, "bool ASWProvider::CacheFrame(")

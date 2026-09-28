@@ -40,7 +40,7 @@ internal sealed record EyeFoveationSettings
     };
 
     public static readonly string[] BackendNames = {
-        "Auto (recommended)", "NVIDIA VRS", "Density Mask (AMD / Intel)", "Shader effects only (test)"
+        "Auto (recommended)", "NVIDIA VRS", "Density Mask (AMD / Intel, experimental)", "Shader effects only (test)"
     };
     public string[] RequestedRates => CustomRates ? new[] { InnerRate, MidRate, OuterRate }
         : new[] { "1x1", FavorHorizontal ? "2x1" : "1x2", "2x2" };

@@ -50,6 +50,9 @@ std::uint32_t ShaderColorOutputs(ID3D11PixelShader* shader) noexcept;
 
 using StateChanged = void (*)(ID3D11DeviceContext*, bool renderTargetsChanged);
 using BeforeContextMutation = void (*)(ID3D11DeviceContext*);
+// Independent pre-execution barrier sharing the existing command-list detour.
+// It remains active when the scene/VRS watcher is removed. Both nullptr remove it.
+bool SetCommandListBarrier(ID3D11DeviceContext* context, BeforeContextMutation callback);
 // The owner serializes this immediate context, as required by D3D11. Deferred
 // contexts and unrelated devices never update its current shading decision.
 // Optional owner flush before ClearState or a context-state capture/swap.

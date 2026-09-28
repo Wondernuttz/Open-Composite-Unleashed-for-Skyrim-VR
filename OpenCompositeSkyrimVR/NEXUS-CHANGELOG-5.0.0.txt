@@ -1,0 +1,49 @@
+OpenComposite Unleashed 5 for Skyrim VR
+Release highlights
+
+Index grip test fix: Added 20 ms release confirmation to protect HIGGS Auto/Touch grabs against brief zero or inactive reports. Custom thresholds retain relaxed holds after short input interruptions. Device removal, profile changes and lost input focus clear the hold. Debug logging now records grip transitions and release reasons. Headset verification remains pending.
+
+VR console paste: Copy a single console command on your PC, open the Skyrim console with the VR keyboard, then tap Ctrl and V to insert it. Review it and press Enter to run. Clipboard contents are not logged.
+
+Keyboard feedback: Restored keyboard haptic strength below press-sound volume on Settings. It adjusts both hover and key-press vibration independently of keyboard sounds. Removed the inactive hover-audio control and aligned the percentage fields.
+
+Latest corrections: Separated the deadzone, keyboard sound-volume and FSR Camera MV controls. Removed the overlapping keyboard hint. Journal focus repair now runs on the UI task queue after transitions settle and rejects stale or unready menu targets. Local lifecycle checks passed; in-game crash retesting remains pending.
+
+1. Major DAPA overhaul: Reworked frame pacing and recovery for smoother playback through performance fluctuations, loading screens and menu transitions. Corrected stall accounting and period-feedback problems, with faster recovery after frame-time spikes.
+
+2. Expanded DAPA masking: Protection for the player's body, hands, equipped weapons, HIGGS-held objects including potions, held/nocked arrows, crossbow reload bolts and Spell Wheel geometry. Improved mask lifetime and stereo-frame matching address ghosting and stale protection.
+
+3. NVIDIA eye-tracked VRS: Per-eye gaze alignment, moving shading regions, improved gaze recovery and independently configurable fixed foveation.
+
+4. Dedicated eye-tracking menu: A complete Configurator interface with the animated PugDragon preview, Quality/Balanced/Performance/Aggressive presets, individual ring sizes and shading rates, width and alignment adjustments, blackout controls and visible in-headset debug rings. Performance is the fresh-install default; existing saved settings are preserved.
+
+5. AMD/Intel RDM: A separate foveated-rendering path with draw-interception repairs, reconstruction corrections, reduced repeated processing and expanded diagnostics. AMD support is experimental, clearly labeled in the Configurator. Performance gains depend on the rendering workload and are not guaranteed.
+
+6. Terrain and foliage compatibility: Added protection for incompatible terrain, grass, leaf and cutout shader passes to address flat-color terrain and peripheral white-pixel artifacts.
+
+7. CSX integration APIs: Added accepted-draw integration for DAPA masking and a separate foveation interface for compatible shader builds. Retained compatibility paths for supported builds without those APIs. A replacement CSX/Open Shaders build is not bundled.
+
+8. Rendering and upscaler compatibility: Improved graphics-state preservation, safer depth access and faster recovery when CSX or upscalers recreate rendering resources. Added menu-layer safeguards for stereo alignment, texture copies, clears and unsupported rendering passes, with restoration to normal rendering when separation cannot continue.
+
+9. KAT VR treadmill integration: Added Gateway reader setup, remembered SDK location, optional automatic reader startup, connection indicators, speed controls, controller/sensor calibration and recenter handling. Stale or disconnected input stops treadmill movement.
+
+10. Body-tracker integration: Added tracker-role configuration, tracked/inferred connection indicators, pose validation and more stable device discovery for compatible runtime-exposed trackers. Avatar tracking requires a compatible Skyrim body-tracking mod and its dependencies.
+
+11. Index controllers and binding improvements: Added grip-touch support for HIGGS and optional Custom sensitivity with separate grab/release thresholds; Runtime default preserves existing behavior. Grip controls remain visible and are disabled for non-Index controller layouts; Save settings also remembers the selected controller layout. Repaired trackpad assignment persistence, added inventory Drop binding repair, improved context-aware action selection and alphabetized binding lists. Added a themed Help button with the paired Spell Wheel MCM settings for Index trackpad-press gestures.
+
+12. Menus and keyboard fixes: Improved RaceMenu character completion and name-entry handling, modal laser input, Favorites-menu DAPA protection and recovery when menus close. DAPA remains suspended for frames containing a separated menu layer, even if the menu closes before that frame finishes.
+
+13. Menu protection from fixed and eye-tracked foveation: Protected Skyrim popup and pause menus, including Inventory and MCM, render at full shading rate. Protection applies before the next draw even when a menu opens partway through a frame; normal foveation resumes on a fresh gameplay frame. Existing map protection is retained.
+
+14. Separate menu composition for OCU DLSS/FSR: Added an OCU-owned path that captures compatible projected/HUD menu layers and composites them after OCU's upscaling, sharpening and blackout processing. This keeps captured menu text out of world-image reconstruction. Unsupported passes retain normal rendering. The path does not replace CSX/Open Shaders' own menu handling, and source menu-texture resolution still limits final detail.
+
+15. Runtime and controller startup fixes: Corrected PICO action-space initialization ordering, improved controller/session recovery, fixed first-frame stereo submission and prevented competing runtime selection during startup. HMD-presence queries now handle an existing OpenXR instance without the invalid startup assertion.
+
+16. Configurator display and layout fixes: Enabled per-monitor DPI awareness for sharper text on scaled displays. Main pages and dialogs fit the available screen without scrollbars, scaling down proportionally when needed. Only the foveation editor scrolls; the gesture library uses previous/next pages. Corrected clipped button labels and bottom-of-window content. Reworked scaling from stable design coordinates, preserved native numeric input controls, and fit against the actual Windows client area to prevent missing fields and accumulated layout drift. Existing controller-circle calibration is preserved. Fixed the screen-fitting exception when maximizing and verified minimize/restore handling.
+
+Testing status: The latest DLSS/FSR menu-separation changes have passed local GPU, stereo, graphics-state and VRS/RDM regression tests. In-headset Inventory/MCM validation and the new Index Custom sensitivity hold test are still pending. AMD RDM remains experimental. DPI layout checks cover modeled 100–300% scaling, startup fitting, input visibility and editability, repeated scale changes, and popup layouts. Native checks cover the attached 100%-scale monitors; physical transitions between different DPI levels still require user confirmation.
+
+
+17. Cable tracking: Optional physical headset-turn counter on KAT VR / Trackers, with an in-headset unwind direction, assignable keyboard/controller shortcuts, reset zero and configurable turn warnings. Tracks while hidden, flags tracking gaps and rebases after runtime recentering. No treadmill or body trackers required.
+
+18. VR keyboard shortcuts: Shift now applies to function/control keys, including Ctrl+Shift+F8 for cable tracking. Caps no longer adds Shift to Ctrl+letter shortcuts. Shared modifiers remain held until both controller-owned keys are released, with cleanup when the keyboard closes or controller input is lost.

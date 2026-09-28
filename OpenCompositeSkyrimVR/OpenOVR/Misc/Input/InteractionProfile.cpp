@@ -10,6 +10,7 @@
 #include "IndexControllerInteractionProfile.h"
 #include "InteractionProfile.h"
 #include "KhrGenericInteractionProfile.h"
+#include "FrameInteractionProfile.h"
 #include "KhrSimpleInteractionProfile.h"
 #include "OculusInteractionProfile.h"
 #include "ReverbG2InteractionProfile.h"
@@ -94,6 +95,10 @@ void InteractionProfile::AddLegacyBindings(const LegacyControllerActions& ctrl, 
 	create(ctrl.gripClick, paths->gripClick != NULL ? paths->gripClick : paths->grip);
 	create(ctrl.gripTouch, paths->gripTouch); // No press/value fallback on controllers without grip touch.
 	create(ctrl.thumbrestTouch, paths->thumbrestTouch);
+	for (size_t i = 0; i < ctrl.frameExtra.size(); ++i) {
+		create(ctrl.frameExtra[i], paths->frameExtra[i]);
+		create(ctrl.frameExtraTouch[i], paths->frameExtraTouch[i]);
+	}
 	create(ctrl.haptic, paths->haptic);
 	create(ctrl.gripPoseAction, paths->gripPoseAction);
 	create(ctrl.aimPoseAction, paths->aimPoseAction);
@@ -110,6 +115,8 @@ const InteractionProfile::ProfileList& InteractionProfile::GetProfileList()
 		profiles.emplace_back(std::make_unique<IndexControllerInteractionProfile>());
 		profiles.emplace_back(std::make_unique<ViveWandInteractionProfile>());
 		profiles.emplace_back(std::make_unique<OculusTouchInteractionProfile>());
+		if (xr_valveFrameController)
+			profiles.emplace_back(std::make_unique<FrameInteractionProfile>());
 		if (xr_khrGenericController)
 			profiles.emplace_back(std::make_unique<KhrGenericInteractionProfile>());
 		profiles.emplace_back(std::make_unique<KhrSimpleInteractionProfile>());

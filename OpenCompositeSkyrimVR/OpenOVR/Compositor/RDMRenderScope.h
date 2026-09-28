@@ -54,6 +54,24 @@ public:
     static bool RegisterDrawObserver(ID3D11DeviceContext* context, const DrawObserver* observer);
     static void RemoveDrawObserver(ID3D11DeviceContext* context);
 
+    // Runs before ownership/observer capture so a menu transition can finish
+    // pending reconstruction and disarm either backend before the next draw.
+    // Serialized by the immediate-context owner, like observer registration.
+    // Passing nullptr for both arguments removes the callback.
+    using DrawBoundaryCallback = void (*)(ID3D11DeviceContext*);
+    static bool SetDrawBoundaryCallback(ID3D11DeviceContext* context, DrawBoundaryCallback callback);
+
+    // Independent menu interception. The callback may synchronously issue the
+    // supplied native draw into a reserved layer and return true to consume it.
+    // It never runs during RDM replay, and must leave all game state intact.
+    using DrawInterceptor = bool (*)(ID3D11DeviceContext*, void (*)(void*), void*);
+    using BeforeResourceCopy = void (*)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*, bool);
+    // Restore deferred menu pixels before a resource is consumed or overwritten.
+    // nullptr means an operation with unknown resource access (for example compute).
+    using BeforeResourceAccess = void (*)(ID3D11DeviceContext*, ID3D11Resource*);
+    static bool SetDrawInterceptor(ID3D11DeviceContext* context, DrawInterceptor callback,
+        BeforeResourceCopy beforeCopy = nullptr, BeforeResourceAccess beforeAccess = nullptr);
+
     // Counts describe first-failing state queries, not rejected draw totals.
     // Cached eligibility can reject several draws after one state query.
     enum class QueryReject : unsigned {

@@ -18,6 +18,8 @@ static partial class Program
     static int Main(string[] args)
     {
         try {
+            if (args.Length > 0 && args[0] == "--frame-presets") return AuditFramePresets();
+            if (args.Length > 0 && args[0] == "--frame") return AuditFrame();
             if (args.Length > 0 && args[0] == "--layout") return AuditLayout();
             if (args.Length > 0 && args[0] == "--foveation") return AuditFoveation();
             if (args.Length > 0 && args[0] == "--trackpads") return AuditTrackpads();

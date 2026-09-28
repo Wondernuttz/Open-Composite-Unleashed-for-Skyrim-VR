@@ -219,15 +219,16 @@ internal sealed class EyeFoveationEditor : Form
         AccessibleName = Text;
         BackColor = ModernUiTheme.Window; ForeColor = ModernUiTheme.TextPrimary;
         Font = new Font("Segoe UI", 10);
-        AutoScaleDimensions = new SizeF(96, 96); AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(1040, 850); MinimumSize = new Size(880, 720);
         StartPosition = FormStartPosition.CenterParent; ShowInTaskbar = false; MinimizeBox = false;
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), ColumnCount = 1, RowCount = 3 };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 65));
         Controls.Add(root);
         var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         header.RowStyles.Add(new RowStyle(SizeType.AutoSize)); header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         var title = TextLabel("Eye-tracked foveation"); title.Font = new Font(Font.FontFamily, 18, FontStyle.Bold);
         header.Controls.Add(title); header.Controls.Add(TextLabel("Shape the detail around your gaze. The preview updates as you edit."));
@@ -245,6 +246,8 @@ internal sealed class EyeFoveationEditor : Form
         void add(Control control) { control.Margin = new Padding(0, 0, 0, 9); fields.Controls.Add(control, 0, fields.RowCount++); }
         add(EyeEnabled);
         add(TextLabel("Backend · shared with fixed VRS / fallback")); add(Backend);
+        var backendNote = TextLabel("AMD foveation (RDM) is experimental.");
+        backendNote.Font = new Font(Font.FontFamily, 9); add(backendNote);
         add(TextLabel("Eye preset")); add(Preset);
         var grid = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 4, RowCount = 4 };
         for (int row = 0; row < 4; ++row) grid.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -312,6 +315,7 @@ internal sealed class EyeFoveationEditor : Form
         Inner.ValueChanged += (_, _) => Edited(); Mid.ValueChanged += (_, _) => Edited();
         foreach (var value in new[] { HorizontalScale, HorizontalOffset, VerticalOffset, PeripheralMaskRadius }) value.ValueChanged += (_, _) => Edited();
         SetDraft(settings);
+        DpiLayout.Popup(this, new Size(880, 720));
     }
     internal EyeFoveationSettings ReadDraft() => new() { Enabled = EyeEnabled.Checked, Backend = Math.Max(0, Backend.SelectedIndex),
         DebugRings = DebugRings.Checked, Radii = new(Inner.Value, Mid.Value), CustomRates = CustomRates.Checked,

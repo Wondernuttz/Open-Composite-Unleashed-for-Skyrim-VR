@@ -1,0 +1,216 @@
+#include <windows.h>
+#include <openxr/openxr.h>
+#include "DrvOpenXR/HmdPresenceState.h"
+#include <chrono>
+#include <functional>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <thread>
+
+#define VR_INTERFACE
+#define VR_CALLTYPE
+#define OOVR_LOG_LIMITEDF(...) ((void)0)
+#define OOVR_LOG(...) ((void)0)
+#define OOVR_LOGF(...) ((void)0)
+#define OOVR_FAILED_XR_ABORT(expr) do { if (XR_FAILED(expr)) throw std::runtime_error("unexpected lifecycle failure"); } while (0)
+
+namespace DrvOpenXR {
+bool IsHmdPresent();
+void FullShutdown();
+void ShutdownSession();
+void GetXRAppName(char (&name)[128]) { name[0] = 'T'; name[1] = 0; }
+HmdPresenceState& PresenceState();
+}
+bool VR_IsHmdPresent();
+static auto presenceStorage = std::make_unique<HmdPresenceState>();
+#define hmdPresence (*presenceStorage)
+HmdPresenceState& DrvOpenXR::PresenceState() { return hmdPresence; }
+XrInstance quarantinedPresenceInstance = XR_NULL_HANDLE;
+bool running = false;
+XrInstance xr_instance = XR_NULL_HANDLE;
+struct Session { XrSession get() const { return XR_NULL_HANDLE; } } xr_session;
+bool initialised = false, xr_htcxViveTrackers = false;
+unsigned viveTrackerInteractionVersion = 0;
+void* currentBackend = nullptr;
+std::shared_ptr<int> sessionInputKeepalive;
+void DrvOpenXR::ShutdownSession() { throw std::runtime_error("unused session"); }
+
+XrResult createResult = XR_SUCCESS, systemResult = XR_SUCCESS, destroyResult = XR_SUCCESS;
+unsigned creates = 0, systems = 0, destroys = 0;
+std::atomic<unsigned> checks{0};
+XrInstance queried = XR_NULL_HANDLE, destroyed = XR_NULL_HANDLE;
+std::function<void()> onCreate, onSystem, onDestroy;
+const XrInstance live = reinterpret_cast<XrInstance>(0x100);
+const XrInstance temporary = reinterpret_cast<XrInstance>(0x200);
+
+void Check(bool ok, const char* message) {
+    ++checks;
+    if (!ok) throw std::runtime_error(message);
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrCreateInstance(const XrInstanceCreateInfo* info, XrInstance* output) {
+    ++creates;
+    Check(info->type == XR_TYPE_INSTANCE_CREATE_INFO && info->applicationInfo.apiVersion == XR_CURRENT_API_VERSION,
+        "probe creation info invalid");
+    if (onCreate) onCreate();
+    if (XR_SUCCEEDED(createResult)) *output = temporary;
+    return createResult;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrGetSystem(XrInstance instance, const XrSystemGetInfo* info, XrSystemId* output) {
+    ++systems; queried = instance;
+    Check(info->formFactor == XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY, "wrong form factor");
+    if (onSystem) onSystem();
+    if (XR_SUCCEEDED(systemResult)) *output = 1;
+    return systemResult;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrDestroyInstance(XrInstance instance) {
+    ++destroys; destroyed = instance;
+    if (onDestroy) onDestroy();
+    return destroyResult;
+}
+
+/*PRESENCE*/
+/*OPENVR_ENTRY*/
+/*SHUTDOWN*/
+void ShutdownInternalImpl() { DrvOpenXR::FullShutdown(); }
+/*SHUTDOWN_GUARD*/
+/*OPENVR_SHUTDOWN*/
+void* BackendEntryForTest() {
+    /*BACKEND_ENTRY*/
+    return live;
+}
+
+void Reset() {
+    xr_instance = XR_NULL_HANDLE;
+    quarantinedPresenceInstance = XR_NULL_HANDLE;
+    presenceStorage = std::make_unique<HmdPresenceState>();
+    createResult = systemResult = destroyResult = XR_SUCCESS;
+    creates = systems = destroys = 0;
+    queried = destroyed = XR_NULL_HANDLE;
+    onCreate = onSystem = onDestroy = {};
+}
+
+int main() {
+    try {
+        Reset();
+        Check(VR_IsHmdPresent(), "cold HMD probe failed");
+        Check(creates == 1 && systems == 1 && destroys == 1, "cold probe ownership incorrect");
+        Check(queried == temporary && destroyed == temporary && xr_instance == XR_NULL_HANDLE,
+            "probe changed shared instance");
+
+        Reset(); xr_instance = live; hmdPresence.Publish(true);
+        Check(VR_IsHmdPresent(), "live instance must work without a front-end running flag");
+        Check(creates == 0 && systems == 0 && destroys == 0, "live backend was reprobed");
+
+        Reset(); xr_instance = live;
+        Check(VR_IsHmdPresent(), "existing unconfirmed instance was not queried");
+        Check(creates == 0 && systems == 1 && destroys == 0 && queried == live && xr_instance == live,
+            "existing instance was replaced or destroyed");
+
+        for (XrResult failure : {XR_ERROR_INITIALIZATION_FAILED, XR_ERROR_RUNTIME_FAILURE, XR_ERROR_LIMIT_REACHED}) {
+            Reset(); createResult = failure;
+            Check(!VR_IsHmdPresent(), "probe creation failure must return false");
+            Check(creates == 1 && systems == 0 && destroys == 0, "failed creation used an uninitialized handle");
+        }
+        for (XrResult failure : {XR_ERROR_FORM_FACTOR_UNAVAILABLE, XR_ERROR_FORM_FACTOR_UNSUPPORTED,
+                 XR_ERROR_RUNTIME_FAILURE, XR_ERROR_INSTANCE_LOST}) {
+            Reset(); systemResult = failure;
+            Check(!VR_IsHmdPresent(), "system probe failure must return false");
+            Check(destroys == 1 && destroyed == temporary, "failed system probe leaked its instance");
+        }
+        Reset(); xr_instance = live; systemResult = XR_ERROR_HANDLE_INVALID;
+        Check(!VR_IsHmdPresent() && destroys == 0 && creates == 0, "invalid shared handle must not abort or be destroyed");
+        Reset(); destroyResult = XR_ERROR_RUNTIME_FAILURE;
+        Check(!VR_IsHmdPresent() && destroys == 1, "failed probe cleanup must not advertise success");
+        Check(quarantinedPresenceInstance == temporary, "ambiguous cleanup discarded instance ownership");
+        Check(!VR_IsHmdPresent() && creates == 1 && destroys == 1, "failed cleanup allowed another probe");
+        Check(!BackendEntryForTest(), "ambiguous probe cleanup allowed backend initialization");
+
+        for (unsigned phase = 0; phase < 3; ++phase) {
+            Reset();
+            auto callback = [] {
+                Check(!VR_IsHmdPresent(), "reentrant probe must use previous presence hint");
+                Check(creates == 1, "reentrant query created another instance");
+            };
+            if (phase == 0) onCreate = callback;
+            if (phase == 1) onSystem = callback;
+            if (phase == 2) onDestroy = callback;
+            Check(VR_IsHmdPresent(), "outer probe failed after callback");
+            Check(creates == 1 && destroys == 1, "callback changed probe lifetime");
+        }
+
+        Reset();
+        onCreate = [] { Check(!BackendEntryForTest(), "probe callback allowed nested backend initialization"); };
+        Check(VR_IsHmdPresent() && creates == 1 && destroys == 1, "nested init disturbed outer probe");
+
+        Reset();
+        {
+            HmdPresenceState::RuntimeCall startup(hmdPresence);
+            Check(!VR_IsHmdPresent() && creates == 0, "startup callback started a probe");
+            xr_instance = live; hmdPresence.Publish(true);
+            Check(VR_IsHmdPresent() && systems == 0, "startup HMD result not available to callback");
+        }
+        onDestroy = [] { Check(!VR_IsHmdPresent(), "teardown callback must not use dying instance"); };
+        VR_ShutdownInternal();
+        Check(xr_instance == XR_NULL_HANDLE && !hmdPresence.LastKnown() && destroys == 1 && creates == 0,
+            "teardown failed to invalidate presence safely");
+        onDestroy = {};
+        Check(VR_IsHmdPresent() && creates == 1, "post-shutdown presence probe failed");
+
+        // Reproduce the existing /EHsc + SEH teardown boundary. The presence
+        // guard must release even when foreign runtime code raises an AV.
+        Reset(); xr_instance = live; hmdPresence.Publish(true);
+        onDestroy = [] { RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr); };
+        VR_ShutdownInternal();
+        onDestroy = {};
+        Check(!hmdPresence.LastKnown(), "failed teardown kept positive presence");
+        Check(!VR_IsHmdPresent() && creates == 0 && systems == 0 && destroys == 1,
+            "presence called runtime again after failed teardown");
+        Check(!BackendEntryForTest(), "failed teardown allowed backend initialization");
+        std::atomic<bool> afterFaultEntered{false};
+        auto afterFault = std::async(std::launch::async, [&] {
+            HmdPresenceState::RuntimeCall runtime(hmdPresence);
+            afterFaultEntered.store(true);
+            return hmdPresence.LastKnown();
+        });
+        Check(!afterFault.get() && afterFaultEntered.load(), "SEH teardown leaked presence lock or busy state");
+
+        // A query from another thread must not block a runtime callback waiting
+        // for it during startup/teardown. Check both possible cached answers.
+        for (bool hint : {false, true}) {
+            Reset(); hmdPresence.Publish(hint);
+            std::promise<void> locked, release;
+            auto released = release.get_future();
+            std::thread owner([&] {
+                HmdPresenceState::RuntimeCall runtime(hmdPresence);
+                locked.set_value(); released.wait();
+            });
+            locked.get_future().wait();
+            auto query = std::async(std::launch::async, [] { return VR_IsHmdPresent(); });
+            const bool ready = query.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+            release.set_value(); owner.join();
+            Check(ready && query.get() == hint, "cross-thread presence callback blocked or lost cached answer");
+            Check(creates == 0 && systems == 0 && destroys == 0, "cross-thread callback entered runtime");
+        }
+        // Initialization cannot overlap a temporary instance created by a query.
+        Reset();
+        std::promise<void> probeEntered, allowProbe;
+        auto probeRelease = allowProbe.get_future();
+        onCreate = [&] { probeEntered.set_value(); probeRelease.wait(); };
+        auto probe = std::async(std::launch::async, [] { return VR_IsHmdPresent(); });
+        probeEntered.get_future().wait();
+        std::atomic<bool> initEntered{false};
+        auto init = std::async(std::launch::async, [&] {
+            HmdPresenceState::RuntimeCall startup(hmdPresence);
+            initEntered.store(true);
+            Check(destroys == 1, "startup began before temporary instance cleanup");
+        });
+        Check(!initEntered.load(), "initialization overlapped pending probe");
+        allowProbe.set_value();
+        Check(probe.get(), "concurrent probe failed"); init.get();
+        std::cout << "PASS: " << checks.load() << " production presence/ownership/lifecycle checks\n";
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL: " << error.what() << '\n'; return 1;
+    }
+}

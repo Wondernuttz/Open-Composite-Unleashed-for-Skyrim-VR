@@ -71,6 +71,9 @@ namespace OpenCompositeConfigurator
             ["disableThumbrestTouch"] = "input",
             ["disableTrackPad"] = "input",
             ["enableVRIKKnucklesTrackPadSupport"] = "input",
+            ["indexGripCustom"] = "input",
+            ["indexGripGrabThreshold"] = "input",
+            ["indexGripReleaseThreshold"] = "input",
             ["leftDeadZoneSize"] = "input",
             ["leftDeadZoneXSize"] = "input",
             ["leftDeadZoneYSize"] = "input",
@@ -314,7 +317,17 @@ namespace OpenCompositeConfigurator
         {
             section = section.ToLowerInvariant();
             if (section == "")
+            {
                 section = RootKeySections.GetValueOrDefault(key, "general");
+                // Old root/default entries must not shadow a newly saved value
+                // in its organized section. Keep one canonical entry in place.
+                var canonical = _lines.Find(l => l.Type == IniLineType.KeyValue
+                    && l.Section == section && string.Equals(l.Key, key, StringComparison.OrdinalIgnoreCase));
+                var aliases = new HashSet<string>(OrganizedRootSections, StringComparer.OrdinalIgnoreCase)
+                    { "", "default", section };
+                _lines.RemoveAll(l => l != canonical && l.Type == IniLineType.KeyValue
+                    && aliases.Contains(l.Section) && string.Equals(l.Key, key, StringComparison.OrdinalIgnoreCase));
+            }
 
             // Try to update existing key
             foreach (var line in _lines)

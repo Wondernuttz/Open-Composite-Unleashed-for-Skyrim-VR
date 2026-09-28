@@ -1,8 +1,11 @@
-"""Extract the production menu publication helper without rewriting its policy."""
+"""Extract the production menu watcher and publication without rewriting policy."""
 from pathlib import Path
 import sys
 
 source = Path(sys.argv[1]).read_text(encoding="utf-8-sig")
+tracked_start = source.index("\tstatic constexpr std::string_view kTrackedMenus[] = {")
+tracked_end = source.index("\n\t};", tracked_start) + len("\n\t};")
+tracked = source[tracked_start:tracked_end]
 startup_start = source.index("\tvoid ObserveInitialBridgeMenuState()")
 startup_end = source.index("\n\t// Reconcile on the game thread", startup_start)
 startup = source[startup_start:startup_end]
@@ -28,4 +31,4 @@ if maintenance.index("ObserveInitialBridgeMenuState();") > maintenance.index("Re
     raise RuntimeError("Game-thread maintenance must observe startup menus before reconciliation")
 output = Path(sys.argv[2])
 output.parent.mkdir(parents=True, exist_ok=True)
-output.write_text(startup + "\n" + body, encoding="utf-8")
+output.write_text(tracked + "\n" + startup + "\n" + body + "\n" + watcher, encoding="utf-8")

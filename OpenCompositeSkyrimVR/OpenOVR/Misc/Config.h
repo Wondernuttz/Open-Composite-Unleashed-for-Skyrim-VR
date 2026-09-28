@@ -1,11 +1,14 @@
 #pragma once
 
+#include "Input/IndexGripSettings.h"
+#include "CableTracking.h"
 #include "FoveationProfiles.h"
 #include "FoveationRates.h"
 #include "FoveationGeometrySettings.h"
 
 class Config {
 public:
+	const ocu_cable::Settings& CableTracking() const { return cableTracking; }
 	Config();
 	~Config();
 
@@ -91,6 +94,8 @@ public:
 	inline bool DisableTrackPad() { return disableTrackPad; }
 	inline unsigned IndexTrackpadCustomRegions() const { return indexTrackpadCustomRegions >= 0 && indexTrackpadCustomRegions <= 15 ? static_cast<unsigned>(indexTrackpadCustomRegions) : 0u; }
 	inline bool EnableControllerSmoothing() { return enableControllerSmoothing; }
+	bool IndexGripCustom() const { return indexGripCustom; }
+    ocu_index_grip::Thresholds IndexGripThresholds() const { return ocu_index_grip::Normalize(indexGripGrabThreshold, indexGripReleaseThreshold); }
 	inline bool EnableVRIKKnucklesTrackPadSupport() { return enableVRIKKnucklesTrackPadSupport; }
 	std::string KeyboardText() { return keyboardText; }
 
@@ -297,6 +302,7 @@ public:
 	std::string kbLayout = "auto";      // auto, embedded, or a .kb filename beside openvr_api.dll
 
 private:
+	ocu_cable::Settings cableTracking;
 	static int ini_handler(
 	    void* user, const char* section,
 	    const char* name, const char* value,
@@ -401,6 +407,9 @@ private:
 	int indexTrackpadCustomRegions = 0;
 	bool enableControllerSmoothing = false;
 	bool enableVRIKKnucklesTrackPadSupport = false;
+    bool indexGripCustom = false;
+    float indexGripGrabThreshold = 0.50f;
+    float indexGripReleaseThreshold = 0.25f;
 	bool swapThumbsticks = false; // Swap stick values and Axis0 touch; keep press/click physical
 	float posSmoothMinCutoff = 1.25;
 	float posSmoothBeta = 20;

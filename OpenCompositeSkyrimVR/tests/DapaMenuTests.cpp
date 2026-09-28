@@ -6,14 +6,22 @@
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
+#include <atomic>
 #include "DrvOpenXR/DapaTiming.h"
 #include "OpenOVR/Misc/FoveationBlackout.h"
 #define OOVR_LOGF(...) ((void)0)
 template<class T> T Handle(unsigned n) { return reinterpret_cast<T>(static_cast<uintptr_t>(n)); }
 static unsigned checks=0;
+static std::atomic<bool> s_menuLayerFrameActive{false};
 void Check(bool value,const char* reason) { ++checks; if(!value) throw std::runtime_error(reason); }
-struct Bridge { unsigned char isMenuOpen=0,isMainMenu=0,isLoadingScreen=0; } bridge;
-Bridge* s_pBridge=&bridge;
+struct Bridge { unsigned char isMenuOpen=0,isMainMenu=0,isLoadingScreen=0,isConsoleOpen=0; } bridge;
+struct BridgeView {
+    Bridge* value = &bridge;
+    Bridge* Get() const { return value; }
+    Bridge* operator->() const { return value; }
+    explicit operator bool() const { return value != nullptr; }
+    BridgeView& operator=(Bridge* p) { value=p; return *this; }
+} s_pBridge;
 static unsigned bridgeReads=0,openOnRead=0;
 static bool maskCacheValid=true;
 static unsigned maskReads=0,invalidateMaskOnRead=0;
@@ -27,8 +35,15 @@ enum class Phase { None, Wait, Begin, Locate, Warp, Copy, End };
 static Phase openAt=Phase::None;
 void Enter(Phase phase) { if(phase==openAt) bridge.isMenuOpen=1; }
 struct ID3D11DeviceContext { unsigned releases=0; void Release() {++releases;} } context;
+static ID3D11DeviceContext* s_sceneHookContext = &context;
+static bool s_vrsPatternReady = true;
+static unsigned foveationDisarms=0,effectClears=0;
+void DisarmSceneVRS() { ++foveationDisarms; }
+namespace ocu_effect_foveation { void Clear() { ++effectClears; } }
+#include "FoveationMenuDraw.inc"
 struct Device { void GetImmediateContext(ID3D11DeviceContext** out) { *out=&context; } } device;
 struct ResetState { unsigned resets=0; void Reset() {++resets;} void HistoryInvalidated() {++resets;} };
+struct PlayerHistoryState : ResetState { unsigned pairs=0; void BeginPair() {++pairs;} };
 class ASWProvider {
 public:
     bool m_ready=true,m_paused=false,m_hasCachedFrame=false,m_injectionWanted=true;
@@ -36,6 +51,7 @@ public:
     bool m_motionGeometryValid[2]{};
     ocu_foveation::BlackoutFrame m_cachedBlackout[2]{};
     ResetState m_capture,m_motion,m_captureMovement,m_turn;
+    PlayerHistoryState m_nativePlayer;
     unsigned warps=0,copies=0;
 #include "DapaMenuProvider.inc"
     bool IsReady() const {return m_ready;}
@@ -101,6 +117,7 @@ XrResult xrEndFrame(XrSession,const XrFrameEndInfo* frame){
 }
 #include "DapaMenuScheduler.inc"
 void Reset() {
+    s_menuLayerFrameActive.store(false);
     provider=ASWProvider{};bridge={};s_pBridge=&bridge;bridgeReads=openOnRead=0;openAt=Phase::None;
     maskCacheValid=true;maskReads=invalidateMaskOnRead=0;
     trouble=pacingObserved=waits=begins=ends=emptyEnds=renderedEnds=0;context={};dapaStats={};
@@ -111,11 +128,43 @@ void Pair() {Check(CanCache(),"cache admitted for gameplay");Check(provider.Cach
     Check(provider.HasCachedFrame(),"complete fresh pair published");}
 int main() {
  try {
+    for(unsigned state=0;state<16;++state) {
+        Reset();bridge.isMenuOpen=state&1;bridge.isMainMenu=(state>>1)&1;
+        bridge.isLoadingScreen=(state>>2)&1;bridge.isConsoleOpen=(state>>3)&1;
+        foveationDisarms=effectClears=0;s_vrsPatternReady=true;
+        const auto reads=bridgeReads;
+        Check(OCBridge_CachedFoveationMenuPaused()==bool(state),"every published pause flag protects foveation");
+        ID3D11DeviceContext other;
+        CheckFoveationMenuBeforeDraw(&other);
+        Check(foveationDisarms==0&&effectClears==0,"foreign context does not change scene state");
+        CheckFoveationMenuBeforeDraw(&context);
+        Check(foveationDisarms==unsigned(state!=0)&&effectClears==unsigned(state!=0)&&
+            s_vrsPatternReady==!state,"midframe menu stops scene and effect foveation before draw");
+        Check(bridgeReads==reads,"per-draw policy performs no mapping initialization");
+        Check(OCBridge_MenuState()==int(state!=0),"frame admission uses all menu flags");
+    }
+    Reset();s_pBridge=nullptr;
+    Check(!OCBridge_CachedFoveationMenuPaused()&&OCBridge_MenuState()==-1,"missing bridge remains explicit unknown");
+    Reset();s_vrsPatternReady=true;foveationDisarms=effectClears=0;
+    bridge.isMenuOpen=1;CheckFoveationMenuBeforeDraw(&context);
+    bridge.isMenuOpen=0;CheckFoveationMenuBeforeDraw(&context);
+    Check(!s_vrsPatternReady&&foveationDisarms==1&&effectClears==1,"closing popup cannot rearm an interrupted frame");
+    s_vrsPatternReady=true;CheckFoveationMenuBeforeDraw(&context);
+    Check(s_vrsPatternReady&&foveationDisarms==1,"fresh gameplay frame retains its new profile");
     Reset();Pair();RunScheduler();Check(renderedEnds==1&&provider.warps==2,"ordinary gameplay injects once");
+    Reset();Pair();s_menuLayerFrameActive.store(true);
+    RunScheduler();
+    Check(waits==0&&provider.IsPaused()&&!CanCache(),"captured UI pauses DAPA after menu flag closes");
+    s_pBridge=nullptr;
+    Check(OCBridge_DapaMenuPaused(),"captured UI pause does not depend on surviving bridge");
+    s_pBridge=&bridge;s_menuLayerFrameActive.store(false);RunScheduler();
+    Check(!provider.IsPaused()&&!provider.HasCachedFrame()&&waits==0,"next real frame cannot reuse captured-menu pair");
+    Pair();RunScheduler();Check(renderedEnds==1,"fresh gameplay pair resumes after captured menu frame");
     for(unsigned state=1;state<8;++state){
         Reset();Pair();bridge.isMenuOpen=state&1;bridge.isMainMenu=(state>>1)&1;bridge.isLoadingScreen=(state>>2)&1;
         RunScheduler();Check(waits==0&&provider.IsPaused(),"every menu combination prevents slot claim");
         Check(!provider.HasCachedFrame()&&!provider.IsInjectionWanted()&&!CanCache(),"menu invalidates pair and blocks caching");
+        Check(provider.m_nativePlayer.resets>0,"menu invalidates player-motion history with the world pair");
         Check(!provider.CacheEye(0),"provider refuses paused cache even if caller bypassed");
         const auto resets=provider.m_motion.resets;
         for(unsigned frame=0;frame<100;++frame)RunScheduler();

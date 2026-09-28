@@ -1,4 +1,4 @@
-// CommonLibVR headers MUST come before Windows.h (REX/W32/BASE.h enforces this)
+﻿// CommonLibVR headers MUST come before Windows.h (REX/W32/BASE.h enforces this)
 #include <RE/B/BSInputDeviceManager.h>
 #include <RE/B/BSInputEventQueue.h>
 #include <RE/B/BSOpenVR.h>
@@ -3718,6 +3718,8 @@ namespace
 		return true;
 	}
 
+#include "MCMLaser.inl"
+
 	bool ResolveMCMScrollTarget(RE::GFxMovieView& movie, float viewportX,
 	    float viewportY, bool& listHit, RE::GFxValue& scrollBar)
 	{
@@ -3727,15 +3729,8 @@ namespace
 		// SkyUI's MCM is an overlay inside Journal Menu. Its ConfigPanel object
 		// exists even while the ordinary Journal is visible, so require positive
 		// proof that the Journal fader has yielded before claiming its lists.
-		if (JournalMainFaderIsInteractive(movie))
-			return false;
-
 		RE::GFxValue panel;
-		if (!movie.GetVariable(&panel, "_root.ConfigPanelFader.configPanel") ||
-		    (!panel.IsObject() && !panel.IsDisplayObject())) {
-			return false;
-		}
-		if (!DisplayObjectIsUsable(panel))
+		if (!GetReadyMCMPanel(movie, panel))
 			return false;
 
 		float rootX = 0.0f;
@@ -3752,8 +3747,7 @@ namespace
 		for (const char* listMember : listMembers) {
 			RE::GFxValue list;
 			if (!panel.GetMember(listMember, &list) ||
-			    (!list.IsObject() && !list.IsDisplayObject()) ||
-			    !DisplayObjectIsUsable(list)) {
+			    !MCMListAcceptsInput(list)) {
 				continue;
 			}
 
@@ -3912,13 +3906,75 @@ namespace
 	// back and forth naturally.
 	bool RepairJournalSystemFocus(RE::GFxMovieView& movie, int systemState)
 	{
-		RE::GFxValue stateArg;
-		stateArg.SetNumber(static_cast<double>(systemState));
-		return movie.Invoke(
-		           "_root.QuestJournalFader.Menu_mc.SystemFader.Page_mc.UpdateStateFocus",
-		           nullptr, &stateArg, 1) ||
-		    movie.Invoke("_root.Menu_mc.SystemFader.Page_mc.UpdateStateFocus",
-		        nullptr, &stateArg, 1);
+		const char* target = nullptr;
+		switch (systemState) {
+		case 0: target = "CategoryList"; break;
+		case 1: case 14: case 15: target = "SaveLoadListHolder.List_mc"; break;
+		case 2: case 5: case 7: case 9: case 10: target = "ConfirmPanel"; break;
+		case 3: target = "SettingsList"; break;
+		case 4: target = "OptionsListsPanel.OptionsLists.List_mc"; break;
+		case 6: target = "MappingList"; break;
+		case 8: target = "PCQuitList"; break;
+		case 11: target = "HelpList"; break;
+		case 12: target = "HelpText"; break;
+		default: return false; // Includes the transitioning state.
+		}
+		int tab = -1, currentState = -1;
+		if (!JournalMainFaderIsInteractive(movie) ||
+		    !GetNumberVariable(movie, "_root.QuestJournalFader.Menu_mc.iCurrentTab",
+		        "_root.Menu_mc.iCurrentTab", tab) || tab != 2 ||
+		    !GetNumberVariable(movie,
+		        "_root.QuestJournalFader.Menu_mc.SystemFader.Page_mc.iCurrentState",
+		        "_root.Menu_mc.SystemFader.Page_mc.iCurrentState", currentState) ||
+		    currentState != systemState)
+			return false;
+		for (const char* path : { "_root.QuestJournalFader.Menu_mc.SystemFader.Page_mc",
+		         "_root.Menu_mc.SystemFader.Page_mc" }) {
+			RE::GFxValue page, clip;
+			if (!movie.GetVariable(&page, path) || !page.IsDisplayObject() ||
+			    !DisplayObjectIsUsable(page))
+				continue;
+			for (const char* flag : { "pageWasEnded", "bMenuClosing", "bSavingSettings" }) {
+				RE::GFxValue value;
+				if (page.GetMember(flag, &value) && value.IsBool() && value.GetBool())
+					return false;
+			}
+			const std::string targetPath = std::string(path) + "." + target;
+			if (!movie.GetVariable(&clip, targetPath.c_str()) || !clip.IsDisplayObject() ||
+			    !DisplayObjectIsUsable(clip))
+				return false;
+			RE::GFxValue stateArg, result;
+			stateArg.SetNumber(static_cast<double>(systemState));
+			return page.Invoke("UpdateStateFocus", &result, &stateArg, 1);
+		}
+		return false;
+	}
+
+	std::atomic<std::uint64_t> g_journalFocusRequestSerial{ 0 };
+
+	void CancelJournalSystemFocusRepair()
+	{
+		g_journalFocusRequestSerial.fetch_add(1, std::memory_order_acq_rel);
+	}
+
+	// General game tasks may overlap Scaleform advancement. Perform this focus
+	// mutation on SKSE's UI queue and revalidate the retained movie and state.
+	void QueueJournalSystemFocusRepair(RE::GPtr<RE::GFxMovieView> movie, int state)
+	{
+		const auto serial = g_journalFocusRequestSerial.fetch_add(1,
+		    std::memory_order_acq_rel) + 1;
+		SKSE::GetTaskInterface()->AddUITask([movie, state, serial]() {
+			if (serial != g_journalFocusRequestSerial.load(std::memory_order_acquire))
+				return;
+			auto* ui = RE::UI::GetSingleton();
+			if (!ui || !ui->IsMenuOpen("Journal Menu"))
+				return;
+			auto menu = ui->GetMenu("Journal Menu");
+			if (!menu || !movie || menu->uiMovie.get() != movie.get())
+				return;
+			const bool repaired = RepairJournalSystemFocus(*movie, state);
+			SKSE::log::debug("MENU Journal System state={} UI focus repair={}", state, repaired);
+		});
 	}
 
 	// StatsPage's right-hand scrollbar deliberately assigns Scaleform focus to
@@ -4525,6 +4581,8 @@ namespace
 		return true;
 	}
 
+	#include "LaserMenuHit.inl"
+
 	// Game-thread pump body. Scheduled by the scheduler thread below.
 	void LaserCursorPumpOnce()
 	{
@@ -4573,6 +4631,7 @@ namespace
 		static float    s_journalReplayY = 0.0f;
 		static ULONGLONG s_journalReplayNotBefore = 0;
 		static int      s_journalObservedSystemState = -1;
+		static ULONGLONG s_journalFocusNotBefore = 0;
 		static int      s_messageBoxHoveredButton = -1;
 		static bool     s_laserOwnsFocus = false;
 		static std::uint64_t s_seenControllerIntentSerial = 0;
@@ -4602,7 +4661,7 @@ namespace
 			float x = 0.0f;
 			float y = 0.0f;
 			bool alternatePerspectiveMenu = false;
-			bool buttonHit = false;
+			bool pointerTargetHit = false;
 			JournalLeftPaneAction journalTarget = JournalLeftPaneAction::kNone;
 			bool itemListHit = false;
 			RaceMenuLaserTarget alternatePerspectiveTarget;
@@ -4611,6 +4670,10 @@ namespace
 			bool messageBoxButtonHit = false;
 			RaceMenuLaserTarget raceMenuTarget;
 			bool raceMenuTargetHit = false;
+			MCMLaserTarget mcmOption;
+			bool mcmOptionHit = false;
+			bool mcmOptionArea = false;
+			bool mcmReady = false;
 			bool mcmListHit = false;
 			RE::GFxValue mcmScrollBar;
 			bool mcmScrollBarHit = false;
@@ -4757,6 +4820,8 @@ namespace
 			s_journalReplayCategoryClick = false;
 			s_journalReplayNotBefore = 0;
 			s_journalObservedSystemState = -1;
+			CancelJournalSystemFocusRepair();
+			s_journalFocusNotBefore = 0;
 			s_messageBoxHoveredButton = -1;
 			s_laserOwnsFocus = false;
 			s_seenControllerIntentSerial = g_controllerMenuIntentSerial.load(std::memory_order_acquire);
@@ -4803,6 +4868,8 @@ namespace
 			s_journalReplayCategoryClick = false;
 			s_journalReplayNotBefore = 0;
 			s_journalObservedSystemState = -1;
+			CancelJournalSystemFocusRepair();
+			s_journalFocusNotBefore = 0;
 			s_messageBoxHoveredButton = -1;
 			s_laserOwnsFocus = false;
 			s_seenControllerIntentSerial = g_controllerMenuIntentSerial.load(std::memory_order_acquire);
@@ -5122,20 +5189,26 @@ namespace
 				s_lastReleaseSeq = g_pTransform->laserReleaseSeq;
 			}
 
-			if (readable && currentTab == 2 && systemState != 13) {
+			if (readable && currentTab == 2 && systemState >= 0 && systemState <= 15 && systemState != 13) {
+				const auto now = GetTickCount64();
 				if (systemState != s_journalObservedSystemState) {
-					const bool repaired = RepairJournalSystemFocus(
-					    *advertisedTopMenu->uiMovie, systemState);
-					SKSE::log::info(
-					    "MENU Journal System state={} native focus repair={}",
-					    systemState, repaired);
+					CancelJournalSystemFocusRepair();
 					s_journalObservedSystemState = systemState;
+					s_journalFocusNotBefore = now + 80;
+				} else if (s_journalFocusNotBefore && now >= s_journalFocusNotBefore &&
+				    now >= s_clickRearmNotBefore) {
+					QueueJournalSystemFocusRepair(advertisedTopMenu->uiMovie, systemState);
+					s_journalFocusNotBefore = 0;
 				}
-			} else if (!readable || currentTab != 2) {
+			} else {
 				s_journalObservedSystemState = -1;
+				CancelJournalSystemFocusRepair();
+				s_journalFocusNotBefore = 0;
 			}
 		} else {
 			s_journalObservedSystemState = -1;
+			CancelJournalSystemFocusRepair();
+			s_journalFocusNotBefore = 0;
 		}
 
 		if (!mc)
@@ -5215,15 +5288,15 @@ namespace
 				next.alternatePerspectiveMenu = strcmp(s_planeMenuName, "CustomMenu") == 0 &&
 				    IsAlternatePerspectiveMenu(*laserMovie);
 				if (!dialogueOpen) {
-					next.buttonHit = laserMovie->HitTest(
-					    targetX, targetY, RE::GFxMovieView::HitTestType::kButtonEvents, 0);
+					next.pointerTargetHit = ProbeLaserPointerTarget(*laserMovie, s_planeMenuName,
+					    targetX, targetY, rangeX, rangeY, menuSemanticInputReady);
 					if (journalOpen) {
 						int ignoredSystemState = -1;
 						next.journalTarget = ResolveJournalLeftPaneAction(
 						    *laserMovie, targetX, targetY, ignoredSystemState);
 					}
 				}
-				next.itemListHit = !next.buttonHit &&
+				next.itemListHit = !next.pointerTargetHit &&
 				    PointerOverVRItemList(*laserMovie, s_planeMenuName, targetX, targetY);
 				next.alternatePerspectiveTargetHit = next.alternatePerspectiveMenu &&
 				    ResolveAlternatePerspectiveLaserTarget(
@@ -5234,6 +5307,10 @@ namespace
 				next.raceMenuTargetHit = raceMenuOpen &&
 				    ResolveRaceMenuLaserTarget(
 				        *laserMovie, targetX, targetY, next.raceMenuTarget);
+				RE::GFxValue mcmPanel;
+				next.mcmReady = journalOpen && GetReadyMCMPanel(*laserMovie, mcmPanel);
+				next.mcmOptionHit = next.mcmReady &&
+				    ResolveMCMOptionTarget(*laserMovie, targetX, targetY, next.mcmOption, &next.mcmOptionArea);
 				next.mcmScrollBarHit = journalOpen &&
 				    ResolveMCMScrollTarget(
 				        *laserMovie, targetX, targetY, next.mcmListHit, next.mcmScrollBar);
@@ -5251,7 +5328,7 @@ namespace
 
 			const bool alternatePerspectiveMenu = s_semanticProbe.valid &&
 			    s_semanticProbe.alternatePerspectiveMenu;
-			const bool buttonHit = s_semanticProbe.valid && s_semanticProbe.buttonHit;
+			const bool pointerTargetHit = s_semanticProbe.valid && s_semanticProbe.pointerTargetHit;
 			const JournalLeftPaneAction journalTarget = s_semanticProbe.valid ?
 			    s_semanticProbe.journalTarget : JournalLeftPaneAction::kNone;
 			const bool itemListHit = s_semanticProbe.valid && s_semanticProbe.itemListHit;
@@ -5266,6 +5343,9 @@ namespace
 			RaceMenuLaserTarget& raceMenuTarget = s_semanticProbe.raceMenuTarget;
 			const bool raceMenuTargetHit = s_semanticProbe.valid &&
 			    s_semanticProbe.raceMenuTargetHit;
+			const bool mcmReady = s_semanticProbe.valid && s_semanticProbe.mcmReady;
+			const bool mcmOptionHit = s_semanticProbe.valid && s_semanticProbe.mcmOptionHit;
+			const bool mcmOptionArea = s_semanticProbe.valid && s_semanticProbe.mcmOptionArea;
 			const bool mcmListHit = s_semanticProbe.valid && s_semanticProbe.mcmListHit;
 			RE::GFxValue& mcmScrollBar = s_semanticProbe.mcmScrollBar;
 			const bool mcmScrollBarHit = s_semanticProbe.valid &&
@@ -5274,8 +5354,8 @@ namespace
 			// not always advertise kButtonEvents. Treat its whole proven quad as an
 			// input surface; the SWF still decides whether the pointed control reacts.
 			const bool laserTargetInteractive = dialogueOpen ||
-			    (menuSemanticInputReady && raceMenuOpen) || buttonHit ||
-			    itemListHit || alternatePerspectiveTargetHit || messageBoxButtonHit || mcmListHit ||
+			    (menuSemanticInputReady && raceMenuOpen) || pointerTargetHit ||
+			    itemListHit || alternatePerspectiveTargetHit || messageBoxButtonHit || mcmListHit || mcmOptionHit ||
 			    s_verticalScrollBarDragging ||
 			    journalTarget != JournalLeftPaneAction::kNone;
 
@@ -5305,6 +5385,8 @@ namespace
 						SKSE::log::debug("MENU INPUT owner=CONTROLLER menu='{}' (native input)",
 						    s_planeMenuName);
 					}
+					const bool restoreMCM = journalOpen &&
+					    (s_laserOwnsFocus || s_verticalScrollBarDragging || s_mouseHeld);
 					s_laserOwnsFocus = false;
 					s_controllerLaserLockUntil = intentNow + 180;
 					s_laserMotionAnchorValid = true;
@@ -5313,6 +5395,12 @@ namespace
 					s_laserMotionAnchorTick = intentNow;
 					if (s_mouseHeld || s_pressedMovie)
 						releasePressedMovie("native controller intent");
+					if (restoreMCM) {
+						s_verticalScrollBarDragging = false;
+						s_verticalDragScrollBar.SetUndefined();
+						const bool restored = RestoreMCMControllerFocus(*laserMovie);
+						SKSE::log::debug("LASER MCM controller handoff restored={}", restored);
+					}
 					s_gfxMousePrimed = false;
 				}
 			}
@@ -5353,8 +5441,8 @@ namespace
 			} else if (explicitLaserIntent && !s_laserOwnsFocus) {
 				s_laserOwnsFocus = true;
 				SKSE::log::debug(
-				    "MENU INPUT owner=LASER menu='{}' intent={} target(button={}, itemList={}, altStart={}, messageBox={}, journal={})",
-				    s_planeMenuName, newLaserPress ? "trigger" : "motion", buttonHit,
+				    "MENU INPUT owner=LASER menu='{}' intent={} target(pointer={}, itemList={}, altStart={}, messageBox={}, journal={})",
+				    s_planeMenuName, newLaserPress ? "trigger" : "motion", pointerTargetHit,
 				    itemListHit, alternatePerspectiveTargetHit, messageBoxHoverButton,
 				    static_cast<int>(journalTarget));
 			}
@@ -5375,6 +5463,11 @@ namespace
 
 				if (newLaserPress) {
 					s_lastPressSeq = pressSeq;
+					// An unrecognized MCM row must not activate an old focused option.
+					if (mcmReady) {
+						SKSE::log::debug("LASER MCM missed target at ({:.1f},{:.1f}); no focused fallback", targetX, targetY);
+						return;
+					}
 					bool activated = false;
 					if (strcmp(s_planeMenuName, "TweenMenu") == 0) {
 						activated = ActivateHighlightedTweenSelection(*laserMovie);
@@ -5555,7 +5648,12 @@ namespace
 				// so never duplicate it with HandleEvent there. Other flat menus retain
 				// the proven GFx event path; Dialogue only synchronizes position before
 				// activating its focused choice with Return.
-				if (journalOpen) {
+				if (journalOpen && mcmOptionArea && !mcmScrollBarHit) {
+					// Dynamic MCM rows use their actual geometry and native selection
+					// callback, avoiding the VR AS2 mouse hit-test mismatch.
+					laserMovie->NotifyMouseState(-10000.0f, -10000.0f, 0u, 0);
+					HoverMCMOption(s_semanticProbe.mcmOption);
+				} else if (journalOpen) {
 					const bool notifyMouseHeld = s_mouseHeld && s_pressedMovieUsesNotifyMouse &&
 					    s_pressedMovie && s_pressedMovie.get() == laserMovie.get();
 					laserMovie->NotifyMouseState(targetX, targetY, notifyMouseHeld ? 1u : 0u, 0);
@@ -5578,11 +5676,9 @@ namespace
 					float mouseX = 0.0f, mouseY = 0.0f;
 					std::uint32_t mouseButtons = 0;
 					laserMovie->GetMouseState(0, &mouseX, &mouseY, &mouseButtons);
-					const bool diagnosticButtonHit = laserMovie->HitTest(
-					    targetX, targetY, RE::GFxMovieView::HitTestType::kButtonEvents, 0);
 					SKSE::log::debug(
-					    "LASER GFx state menu='{}' target({:.1f},{:.1f}) mouse({:.1f},{:.1f}) buttons={} buttonHit={}",
-					    s_planeMenuName, targetX, targetY, mouseX, mouseY, mouseButtons, diagnosticButtonHit);
+					    "LASER GFx state menu='{}' target({:.1f},{:.1f}) mouse({:.1f},{:.1f}) buttons={} pointerTarget={}",
+					    s_planeMenuName, targetX, targetY, mouseX, mouseY, mouseButtons, pointerTargetHit);
 					s_gfxMousePrimed = true;
 				}
 				s_lastGfxDriveTick = semanticNow;
@@ -5684,6 +5780,13 @@ namespace
 						SKSE::log::debug(
 						    "LASER Alternate Perspective item ACTIVATE index={} result={} at ({:.1f},{:.1f})",
 						    activatedIndex, activated, targetX, targetY);
+					} else if (mcmOptionArea && !mcmScrollBarHit) {
+						const bool activated = mcmOptionHit && ActivateMCMOption(*laserMovie, targetX, targetY);
+						s_mouseHeld = false;
+						s_pressedMovie = nullptr;
+						s_pressedMovieUsesNotifyMouse = false;
+						SKSE::log::debug("LASER MCM option ACTIVATE index={} result={} at ({:.1f},{:.1f})",
+						    s_semanticProbe.mcmOption.index, activated, targetX, targetY);
 					} else if (mcmScrollBarHit) {
 						// MCM's dynamic CLIK scrollbar is not reported consistently by
 						// GFx's button-event hit test. Drive its public position setter
@@ -7288,7 +7391,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	SetupLogging();
 
 	SKSE::log::info("OpenCompositeInput v3.2.0 loaded");
-	SKSE::log::info("OCU SKSE package: 4.3.7-custom-eye-test-hotfix6 / prompt-bridge-refresh-v1 / menu-reconcile-v1 / DAPA exact-mask-v1 / accepted-draw-api-v1 / held-geometry ownership / startup-menu-state-v1 / dapa-mask-lease-v1");
+	SKSE::log::info("OCU SKSE package: 5.0.1 / journal-ui-focus-v2 / menu-targets-v1 / prompt-bridge-refresh-v1 / menu-reconcile-v1 / DAPA exact-mask-v1 / accepted-draw-api-v1 / held-geometry ownership / startup-menu-state-v1 / dapa-mask-lease-v1");
 	SKSE::log::info("  VR keyboard bridge + Scaleform char injection + menu state tracking");
 		SKSE::log::info("  RaceMenu keyboard test: confirmed-naming-v4 / VR-button-slot-8");
 	SKSE::log::info("  + Render target bridge (MV + depth) for FSR 2/3 integration");

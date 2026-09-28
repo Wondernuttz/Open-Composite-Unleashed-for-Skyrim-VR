@@ -6,6 +6,7 @@
 #include "../OpenOVR/InputTrace.h"
 #include "DapaTiming.h"
 #include "FoveationDebugOverlay.h"
+#include "CableTrackingOverlay.h"
 #include "../OpenOVR/Misc/EffectFoveationState.h"
 #include "generated/interfaces/vrtypes.h"
 
@@ -759,6 +760,25 @@ void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
 			OOVR_LOG_LIMITEDF(5000, "Eye-tracking overlay unavailable: D3D11 graphics and two spare OpenXR composition layers required");
 		}
 	}
+#endif
+
+#if defined(SUPPORT_DX11)
+	std::vector<const XrCompositionLayerBaseHeader*> cableLayers;
+	if (oovr_global_configuration.CableTracking().enabled) {
+		if (!cableTrackingOverlay) cableTrackingOverlay = std::make_unique<CableTrackingOverlay>();
+		const auto* binding = static_cast<const XrBaseInStructure*>(GetCurrentGraphicsBinding());
+		const auto* d3d = binding && binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR ?
+		    reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(binding) : nullptr;
+		const auto& limits = xr_gbl->systemProperties.graphicsProperties;
+		const bool room = app_layer && d3d && uint32_t(layer_count) < limits.maxLayerCount &&
+		    limits.maxSwapchainImageWidth >= 640 && limits.maxSwapchainImageHeight >= 192;
+		if (auto* layer = cableTrackingOverlay->Update(xr_session.get(), xr_gbl->viewSpace, xr_gbl->GetBestTime(),
+		        sessionState == XR_SESSION_STATE_FOCUSED, room, d3d ? d3d->device : nullptr,
+		        oovr_global_configuration.CableTracking())) {
+			if (layer_count) cableLayers.assign(headers, headers + layer_count);
+			cableLayers.push_back(layer); headers = cableLayers.data(); layer_count = static_cast<int>(cableLayers.size());
+		}
+	} else ocu_cable::requests.exchange(0, std::memory_order_relaxed);
 #endif
 
 	// It's ok if no layers have been added at this point,
@@ -2015,6 +2035,11 @@ void XrBackend::PumpEvents()
 			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
 			const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&ev);
+#if defined(SUPPORT_DX11)
+			if (cableTrackingOverlay && changed->session == xr_session.get() &&
+			    changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL)
+				cableTrackingOverlay->ReferenceChange(changed->changeTime);
+#endif
 			if (oovr_global_configuration.TreadmillEnabled() && OcuInputSession::Matches(xr_session.get(), changed->session)) {
 				if (changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE) {
 					const auto q = changed->poseValid ? changed->poseInPreviousSpace.orientation : XrQuaternionf{};
@@ -2142,6 +2167,8 @@ void XrBackend::PrepareForSessionShutdown()
 	OscLocomotion::Instance().Invalidate();
 #if defined(SUPPORT_DX11)
 	foveationDebugOverlay.reset();
+	cableTrackingOverlay.reset();
+	ocu_cable::requests.exchange(0, std::memory_order_relaxed);
 #endif
 	// Body-tracker actions live in the instance-owned legacy action set, while
 	// their XrSpaces belong to this session. Destroy only the spaces here;

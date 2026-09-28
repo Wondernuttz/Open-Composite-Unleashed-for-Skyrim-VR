@@ -61,6 +61,25 @@ void Changed(ID3D11DeviceContext* context,bool targetsChanged) {
 
 void CoverageChanged(ID3D11DeviceContext* context) { Changed(context,false); }
 
+struct PopupDrawBoundary {
+    static inline PopupDrawBoundary* active=nullptr;
+    unsigned calls=0;
+    bool menuOpen=false,cleared=false;
+    explicit PopupDrawBoundary(ID3D11DeviceContext* context) {
+        active=this;
+        Check(RDMRenderScope::SetDrawBoundaryCallback(context,&BeforeDraw),"VRS popup boundary registration failed");
+    }
+    static void BeforeDraw(ID3D11DeviceContext* context) {
+        auto& self=*active;++self.calls;
+        if(!self.menuOpen)return;
+        self.cleared=RDMRenderScope::SetDrawBoundaryCallback(nullptr,nullptr);
+        if(coverage)coverage->EndFrame();
+        coverage=nullptr;ocu_vrs_guard::UnwatchContext(context);
+        manager->Disable();applied=false;
+    }
+    ~PopupDrawBoundary(){RDMRenderScope::SetDrawBoundaryCallback(nullptr,nullptr);active=nullptr;}
+};
+
 // Independent post-draw observer, outside the production native hook broker.
 // It models a renderer consuming the game bindings immediately after Draw.
 // No RDM instance is armed in this fixture mode; VRS may still use the broker.
@@ -250,6 +269,65 @@ float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{return float4(ba
     context->OMSetDepthStencilState(writeDepth.Get(),0);auto* rtv=diffuse.rtv.Get();context->OMSetRenderTargets(1,&rtv,dsv.Get());context->PSSetShader(opaquePS.Get(),nullptr,0);
     const auto fullOpaque=draw();coverage=&alphaCoverage;Check(alphaCoverage.Arm(context.Get(),depth.Get(),&CoverageChanged),"opaque scope armed");Check(ocu_vrs_guard::WatchContext(context.Get(),&Changed),"opaque control hook");Changed(context.Get(),true);const auto coarseOpaque=draw();
     std::printf("OPAQUE fullPS=%llu coarsePS=%llu saved=%.2f%%\n",fullOpaque,coarseOpaque,100.*(1.-double(coarseOpaque)/fullOpaque));Check(coarseOpaque<fullOpaque*.8,"opaque retains VRS shading reduction");
+
+    // No PS/OM/viewport setter separates gameplay from the first popup draw.
+    // The current right-eye opaque shader writes exact pixel coordinates, so
+    // neither leaving VRS active nor dropping/replaying the native draw can pass.
+    {
+        D3D11_QUERY_DESC description{D3D11_QUERY_PIPELINE_STATISTICS,0};ComPtr<ID3D11Query> menuQuery;
+        HR(device->CreateQuery(&description,&menuQuery));
+        PopupDrawBoundary popup(context.Get());
+        context->Draw(3,0);
+        Check(popup.calls==1 && applied,"VRS popup fixture was not armed on a normal draw");
+        const auto pending=alphaCoverage.Stats();
+        popup.menuOpen=true;context->Begin(menuQuery.Get());
+        context->Draw(3,0); // Query bracketing changes no scene binding.
+        context->End(menuQuery.Get());
+        const auto stopped=alphaCoverage.Stats();
+        Check(popup.cleared && popup.calls==2 && !coverage && !applied,
+            "same-state popup draw failed to remove alpha observation and disable VRS");
+        Check(stopped.depthDraws==pending.depthDraws && stopped.materials==pending.materials &&
+            stopped.protectedDraws==pending.protectedDraws && stopped.stateQueries==pending.stateQueries &&
+            stopped.untrackedDepthDraws==pending.untrackedDepthDraws && stopped.ambiguousDraws==pending.ambiguousDraws,
+            "retired alpha observer still processed the popup draw");
+        D3D11_QUERY_DATA_PIPELINE_STATISTICS menuStats{};HRESULT ready=S_FALSE;
+        for(unsigned i=0;i<1000 && ready==S_FALSE;++i){ready=context->GetData(menuQuery.Get(),&menuStats,sizeof(menuStats),0);if(ready==S_FALSE)Sleep(1);}
+        Check(ready==S_OK && menuStats.PSInvocations==UINT64(width/2)*height,
+            "VRS popup native draw did not run exactly once at full pixel rate");
+        const auto pixels=read();
+        for(UINT y=0;y<height;++y)for(UINT x=width/2;x<width;++x){const auto& p=pixels[y*width+x];
+            Check(p[0]==float(x)+0.5f && p[1]==float(y)+0.5f && p[2]==0.25f && p[3]==1,
+                "VRS popup draw retained coarse pixel coordinates");}
+        context->Draw(3,0);
+        Check(popup.calls==2 && !applied && alphaCoverage.Stats().stateQueries==stopped.stateQueries,
+            "removed popup callback or alpha observer ran again while the menu stayed open");
+        popup.menuOpen=false;
+        coverage=&alphaCoverage;Check(alphaCoverage.Arm(context.Get(),depth.Get(),&CoverageChanged),"popup alpha scope rearm failed");
+        Check(ocu_vrs_guard::WatchContext(context.Get(),&Changed),"popup VRS state watch rearm failed");
+        Check(RDMRenderScope::SetDrawBoundaryCallback(context.Get(),&PopupDrawBoundary::BeforeDraw),"popup VRS boundary rearm failed");
+        Changed(context.Get(),true);
+        context->Begin(menuQuery.Get());context->Draw(3,0);context->End(menuQuery.Get());
+        D3D11_QUERY_DATA_PIPELINE_STATISTICS resumed{};ready=S_FALSE;
+        for(unsigned i=0;i<1000 && ready==S_FALSE;++i){ready=context->GetData(menuQuery.Get(),&resumed,sizeof(resumed),0);if(ready==S_FALSE)Sleep(1);}
+        Check(ready==S_OK && popup.calls==3 && applied && resumed.PSInvocations>0 && resumed.PSInvocations<menuStats.PSInvocations*.8,
+            "opaque shading reduction did not resume after closing the popup");
+
+        // A disarmed alpha implementation deliberately ignores AfterDraw. A
+        // sentinel makes a stale broker before/after callback observable even
+        // when that defensive no-op would otherwise conceal incorrect ordering.
+        struct RetiredObserver { unsigned before=0,after=0; } retired;
+        RDMRenderScope::DrawObserver sentinel{};sentinel.owner=&retired;
+        sentinel.beforeDraw=[](void* p,ID3D11DeviceContext*){++static_cast<RetiredObserver*>(p)->before;};
+        sentinel.afterDraw=[](void* p,ID3D11DeviceContext*){++static_cast<RetiredObserver*>(p)->after;};
+        Check(RDMRenderScope::RegisterDrawObserver(context.Get(),&sentinel),"popup retirement sentinel registration failed");
+        popup.menuOpen=true;context->Draw(3,0);
+        Check(popup.calls==4 && popup.cleared && !applied && retired.before==0 && retired.after==0,
+            "draw broker retained an observer across the popup callback's EndFrame removal");
+        context->Draw(3,0);
+        Check(retired.before==0 && retired.after==0,"retired draw observer remained registered after the popup");
+        std::printf("VRS POPUP PASS: same-state full-rate PS=%llu exact pixels, observer retirement before/after=0, resumed opaque PS=%llu\n",
+            menuStats.PSInvocations,resumed.PSInvocations);
+    }
 
     // State/lifecycle regressions use the real D3D Draw detours, not direct
     // BeforeDraw calls or a fixture-only shader pointer exemption.

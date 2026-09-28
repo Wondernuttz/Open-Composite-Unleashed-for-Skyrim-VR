@@ -25,8 +25,18 @@ std::atomic<ID3D11DeviceContext*> activeContext{nullptr};
 std::atomic<void*> externalTargets{nullptr}, externalTargetsUav{nullptr};
 std::atomic<ID3D11DeviceContext*> drawObserverContext{nullptr};
 const RDMRenderScope::DrawObserver* drawObserver = nullptr;
+std::atomic<ID3D11DeviceContext*> drawBoundaryContext{nullptr};
+RDMRenderScope::DrawBoundaryCallback drawBoundaryCallback = nullptr;
+std::atomic<ID3D11DeviceContext*> drawInterceptorContext{nullptr};
+RDMRenderScope::DrawInterceptor drawInterceptor = nullptr;
+RDMRenderScope::BeforeResourceCopy menuBeforeCopy = nullptr;
+RDMRenderScope::BeforeResourceAccess menuBeforeAccess = nullptr;
 thread_local unsigned observerDrawDepth = 0;
 thread_local ID3D11DeviceContext* nativeDrawContext = nullptr;
+RDMRenderScope::BeforeResourceAccess MenuResourceAccess(ID3D11DeviceContext* ctx)
+{
+    return ctx == drawInterceptorContext.load(std::memory_order_acquire) ? menuBeforeAccess : nullptr;
+}
 const RDMRenderScope::DrawObserver* Observer(ID3D11DeviceContext* ctx)
 {
     if (ctx != drawObserverContext.load(std::memory_order_acquire) ||
@@ -128,7 +138,6 @@ struct DrawHandler {
             explicit DrawContextScope(ID3D11DeviceContext* context) { nativeDrawContext = context; }
             ~DrawContextScope() { nativeDrawContext = previous; }
         } drawContextScope(ctx);
-        auto* owner = RDMRenderScope::Active(ctx);
         bool hasWork = true;
         if constexpr (sizeof...(A) > 0) {
             const auto values = std::forward_as_tuple(args...);
@@ -138,6 +147,23 @@ struct DrawHandler {
             }
         }
         if (!hasWork) { original(ctx, args...); return; }
+        // A popup can open after frame admission without changing any D3D
+        // bindings. Check before capturing an owner or replaying coverage.
+        // Internal RDM work outside a Draw detour must finish uninterrupted.
+        if (ctx == drawBoundaryContext.load(std::memory_order_acquire) &&
+            (ctx != activeContext.load(std::memory_order_acquire) || RDMRenderScope::Active(ctx))) {
+            if (const auto callback = drawBoundaryCallback) callback(ctx);
+        }
+        auto* owner = RDMRenderScope::Active(ctx);
+        // A menu frame has already disarmed scene foveation. Keep this separate
+        // from the VRS observer, whose lifetime ends when the menu opens.
+        if (!owner && !observerDrawDepth &&
+            ctx != activeContext.load(std::memory_order_acquire) &&
+            ctx == drawInterceptorContext.load(std::memory_order_acquire)) {
+            auto native = [&] { original(ctx, args...); };
+            if (drawInterceptor && drawInterceptor(ctx,
+                    [](void* token) { (*static_cast<decltype(native)*>(token))(); }, &native)) return;
+        }
         const auto* observer = hasWork && !observerDrawDepth ? Observer(ctx) : nullptr;
         if (observer) {
             ++observerDrawDepth;
@@ -219,6 +245,12 @@ struct ReadHandler {
         UINT count, ID3D11ShaderResourceView* const* views)
     {
         if (auto* owner = RDMRenderScope::Active(ctx)) owner->BeforeReads(count, views);
+        if (const auto callback = MenuResourceAccess(ctx); callback && views) {
+            for (UINT i = 0; i < count; ++i) if (views[i]) {
+                ComPtr<ID3D11Resource> resource; views[i]->GetResource(&resource);
+                callback(ctx, resource.Get());
+            }
+        }
         original(ctx, slot, count, views);
         RDMRenderScope::NotifyGeometryState(ctx);
         if (const auto* observer = Observer(ctx); observer && observer->stateChanged)
@@ -229,6 +261,7 @@ struct ComputeHandler {
     template<class F, class Context, class... A> static void Call(F original, Context* ctx, A... args)
     {
         if (auto* owner = RDMRenderScope::Active(ctx)) owner->BeforeCompute();
+        if (const auto callback = MenuResourceAccess(ctx)) callback(ctx, nullptr);
         original(ctx, args...);
     }
 };
@@ -244,6 +277,13 @@ struct ResourceWriteHandler {
                 owner->BeforeWrite(resource.Get());
             } else owner->BeforeWrite(destination);
         }
+        if (const auto callback = MenuResourceAccess(ctx)) {
+            if constexpr (std::is_same_v<Resource, ID3D11View>) {
+                ComPtr<ID3D11Resource> resource;
+                if (destination) destination->GetResource(&resource);
+                callback(ctx, resource.Get());
+            } else callback(ctx, destination);
+        }
         original(ctx,destination,args...);
     }
 };
@@ -251,6 +291,8 @@ struct CopyHandler {
     template<class F> static void Call(F original, ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src)
     {
         if (auto* o = RDMRenderScope::Active(ctx)) { o->BeforeRead(src); o->BeforeWrite(dst); }
+        if (ctx == drawInterceptorContext.load(std::memory_order_acquire) && menuBeforeCopy)
+            menuBeforeCopy(ctx, dst, src, true);
         original(ctx, dst, src);
     }
 };
@@ -259,7 +301,21 @@ struct CopyRegionHandler {
         UINT ds, UINT x, UINT y, UINT z, ID3D11Resource* src, UINT ss, const D3D11_BOX* box)
     {
         if (auto* o = RDMRenderScope::Active(ctx)) { o->BeforeRead(src); o->BeforeWrite(dst); }
+        if (ctx == drawInterceptorContext.load(std::memory_order_acquire) && menuBeforeCopy)
+            menuBeforeCopy(ctx, dst, src, ds == 0 && ss == 0 && x == 0 && y == 0 && z == 0 && !box);
         original(ctx, dst, ds, x, y, z, src, ss, box);
+    }
+};
+struct CopyRegion1Handler {
+    template<class F> static void Call(F original, ID3D11DeviceContext1* ctx, ID3D11Resource* dst,
+        UINT ds, UINT x, UINT y, UINT z, ID3D11Resource* src, UINT ss, const D3D11_BOX* box, UINT flags)
+    {
+        if (auto* o = RDMRenderScope::Active(ctx)) {
+            o->BeforeCompute(); o->BeforeRead(src); o->BeforeWrite(dst);
+        }
+        if (ctx == drawInterceptorContext.load(std::memory_order_acquire) && menuBeforeCopy)
+            menuBeforeCopy(ctx, dst, src, ds == 0 && ss == 0 && x == 0 && y == 0 && z == 0 && !box && flags == 0);
+        original(ctx, dst, ds, x, y, z, src, ss, box, flags);
     }
 };
 struct ResolveHandler {
@@ -267,6 +323,8 @@ struct ResolveHandler {
         ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss, DXGI_FORMAT format)
     {
         if (auto* o = RDMRenderScope::Active(ctx)) { o->BeforeRead(src); o->BeforeWrite(dst); }
+        if (ctx == drawInterceptorContext.load(std::memory_order_acquire) && menuBeforeCopy)
+            menuBeforeCopy(ctx, dst, src, false);
         original(ctx, dst, ds, src, ss, format);
     }
 };
@@ -277,6 +335,7 @@ struct MapHandler {
         if (auto* o = RDMRenderScope::Active(ctx)) {
             if(type==D3D11_MAP_READ)o->BeforeRead(resource);else o->BeforeWrite(resource);
         }
+        if (const auto callback = MenuResourceAccess(ctx)) callback(ctx, resource);
         return original(ctx, resource, sub, type, flags, map);
     }
 };
@@ -285,6 +344,7 @@ struct UpdateHandler {
         ID3D11Resource* dst, UINT sub, const D3D11_BOX* box, const void* data, UINT row, UINT depth)
     {
         if (auto* o = RDMRenderScope::Active(ctx)) o->BeforeWrite(dst);
+        if (const auto callback = MenuResourceAccess(ctx)) callback(ctx, dst);
         original(ctx, dst, sub, box, data, row, depth);
     }
 };
@@ -295,6 +355,10 @@ struct ClearRTHandler {
         if (auto* o = RDMRenderScope::Active(ctx)) {
             ComPtr<ID3D11Resource> resource; if (view) view->GetResource(&resource);
             o->BeforeRead(resource.Get());
+        }
+        if (const auto callback = MenuResourceAccess(ctx)) {
+            ComPtr<ID3D11Resource> resource; if (view) view->GetResource(&resource);
+            callback(ctx, resource.Get());
         }
         original(ctx, view, color);
     }
@@ -523,7 +587,8 @@ bool Install(ID3D11DeviceContext* ctx)
         if (snapshot->hasContext1) {
             const auto& v1 = snapshot->extended;
 #define INSTALL1(slot, ...) ok = Hook<void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, __VA_ARGS__), ResourceWriteHandler>::Install(v1[slot], slot) && ok
-            INSTALL1(115, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT, const D3D11_BOX*, UINT);
+            ok = Hook<void(STDMETHODCALLTYPE*)(ID3D11DeviceContext1*, ID3D11Resource*, UINT, UINT, UINT, UINT,
+                ID3D11Resource*, UINT, const D3D11_BOX*, UINT), CopyRegion1Handler>::Install(v1[115], 115) && ok;
             INSTALL1(116, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT, UINT);
             INSTALL1(117, ID3D11Resource*);
             INSTALL1(118, ID3D11View*);
@@ -1326,6 +1391,36 @@ void RDMRenderScope::RemoveDrawObserver(ID3D11DeviceContext* ctx)
     if (ctx && ctx != drawObserverContext.load(std::memory_order_acquire)) return;
     drawObserverContext.store(nullptr, std::memory_order_release);
     drawObserver = nullptr;
+}
+bool RDMRenderScope::SetDrawBoundaryCallback(ID3D11DeviceContext* ctx, DrawBoundaryCallback callback)
+{
+    if ((ctx == nullptr) != (callback == nullptr)) return false;
+    // Arm/observer registration already prepared the native draw hooks. The
+    // color-only VRS fallback still needs them even without a depth observer.
+    if (ctx && (ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE ||
+        (ctx != activeContext.load(std::memory_order_acquire) &&
+         ctx != drawObserverContext.load(std::memory_order_acquire) && !Install(ctx)))) return false;
+    drawBoundaryContext.store(nullptr, std::memory_order_release);
+    drawBoundaryCallback = callback;
+    drawBoundaryContext.store(ctx, std::memory_order_release);
+    return true;
+}
+bool RDMRenderScope::SetDrawInterceptor(ID3D11DeviceContext* ctx, DrawInterceptor callback,
+    BeforeResourceCopy beforeCopy, BeforeResourceAccess beforeAccess)
+{
+    if ((ctx == nullptr) != (callback == nullptr)) return false;
+    if (ctx && (ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || !Install(ctx))) return false;
+    const bool commandBarrier = callback && beforeAccess;
+    if (!ocu_vrs_guard::SetCommandListBarrier(commandBarrier ? ctx : nullptr,
+            commandBarrier ? +[](ID3D11DeviceContext* context) {
+                if (const auto notify = MenuResourceAccess(context)) notify(context, nullptr);
+            } : nullptr)) return false;
+    drawInterceptorContext.store(nullptr, std::memory_order_release);
+    drawInterceptor = callback;
+    menuBeforeCopy = callback ? beforeCopy : nullptr;
+    menuBeforeAccess = callback ? beforeAccess : nullptr;
+    drawInterceptorContext.store(ctx, std::memory_order_release);
+    return true;
 }
 bool RDMRenderScope::BeginColorCoverage(const std::array<std::uint64_t, 8>& key, bool reusable)
 {

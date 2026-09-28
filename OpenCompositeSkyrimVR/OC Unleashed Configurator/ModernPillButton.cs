@@ -259,7 +259,7 @@ namespace OpenCompositeConfigurator
             using (var outline = new Pen(border, Enabled ? 1.35f : 1f))
                 graphics.DrawPath(outline, path);
 
-            Rectangle textBounds = Rectangle.Inflate(ClientRectangle, -9, -2);
+            Rectangle textBounds = Rectangle.Inflate(ClientRectangle, -Math.Min(9, Width / 6), -2);
             DrawContent(graphics, textBounds, text);
 
             if (Enabled && _shinePosition >= 0f)
@@ -294,6 +294,7 @@ namespace OpenCompositeConfigurator
                 | TextFormatFlags.VerticalCenter
                 | TextFormatFlags.SingleLine
                 | TextFormatFlags.EndEllipsis
+                | TextFormatFlags.NoPadding
                 | TextFormatFlags.NoPrefix);
         }
 

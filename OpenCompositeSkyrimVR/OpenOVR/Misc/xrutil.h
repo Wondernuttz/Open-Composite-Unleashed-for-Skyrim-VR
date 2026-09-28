@@ -103,6 +103,8 @@ extern bool xr_htcxViveTrackers;
 // supplies full generic motion-controller input (buttons, thumbstick, squeeze,
 // trigger, poses, and haptics), unlike khr/simple_controller.
 extern bool xr_khrGenericController;
+extern bool xr_valveFrameController;
+extern bool xr_valveAnalogThresholds;
 // True only when XR_EXT_eye_gaze_interaction was advertised and enabled on
 // the OpenXR instance. The per-system supportsEyeGazeInteraction bit above is
 // still authoritative; extension presence alone never enables gaze use.

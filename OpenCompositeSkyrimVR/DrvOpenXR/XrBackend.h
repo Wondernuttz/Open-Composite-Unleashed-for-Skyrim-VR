@@ -77,6 +77,7 @@ private:
 	std::unique_ptr<Compositor> compositors[XruEyeCount];
 #if defined(SUPPORT_DX11)
 	std::unique_ptr<class FoveationDebugOverlay> foveationDebugOverlay;
+	std::unique_ptr<class CableTrackingOverlay> cableTrackingOverlay;
 #endif
 
 	/**

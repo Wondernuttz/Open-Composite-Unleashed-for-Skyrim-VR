@@ -20,7 +20,9 @@ start = dx.index("\t\t\tbool aswEyeCached = false;")
 end = dx.index("\n\t\t\t// Only BeginVRSGameFrame", start)
 (output / "DapaMaskConsumerProduction.inc").write_text(dx[start:end], encoding="utf-8")
 start = asw.index("\tm_bodyValid[eye] = false;", asw.index("bool ASWProvider::CacheFrame("))
-end = asw.index("\n\tm_cachedPose[eye]", start)
+# Stop at the optional character-motion stage; this fixture verifies the mask
+# lease/copy itself. Character correction has its own D3D11 integration tests.
+end = asw.index("\n    // Extra character work", start)
 (output / "DapaBodyMaskCopyProduction.inc").write_text(asw[start:end], encoding="utf-8")
 (output / "DapaMaskCacheValidProduction.inc").write_text(
     function(dx, "bool OCBridge_DapaMaskCacheValid()"), encoding="utf-8")

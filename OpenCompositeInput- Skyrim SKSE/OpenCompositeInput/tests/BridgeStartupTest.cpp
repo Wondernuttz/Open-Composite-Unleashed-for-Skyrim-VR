@@ -7,6 +7,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include "../../../OpenCompositeSkyrimVR/DrvOpenXR/DapaMaskBridge.h"
 
 using HANDLE = void*;
 using HWND = void*;
@@ -104,6 +105,8 @@ int main()
 		Check(g_pBridge->status == 1 && g_pBridge->isMenuOpen == 1, "resource-ready startup is still menu-protected");
 		Check(g_pBridge->isMainMenu == 0 && g_pBridge->isLoadingScreen == 0 && g_pBridge->isConsoleOpen == 0,
 		    "startup protection does not invent named menu events");
+		Check(g_pBridge->_padPreFP[0] == DapaMaskBridge::Format,
+		    "startup retains the independent DAPA mask protocol");
 		g_gameHwnd = reinterpret_cast<HWND>(1);
 		RefreshMenuActivityFromGameState();
 		Check(g_pBridge->isMenuOpen == 1 && publishedProperty == 1, "missing UI preserves protected startup");

@@ -14,9 +14,11 @@ threshold and hysteresis; OCU does not invent a `/squeeze/touch` component or
 reuse a force press as touch.
 
 For the active physical Index profile, the current active touch action populates
-OpenVR Grip and Axis2 touched bits. It bypasses peak-hold input smoothing so an
-open hand releases immediately. Other controller profiles leave grip touch
-unbound. Inactive actions and a switch away from Index cannot keep it touched.
+OpenVR Grip and Axis2 touched bits. It bypasses frame-count peak-hold smoothing. A 20 ms elapsed-time release
+confirmation bridges brief zero/inactive reports. Sustained release is delivered
+on the next input update at or after the deadline. Focus loss, device removal,
+profile changes and session resets clear the hold without this grace period.
+Other controller profiles leave grip touch unbound.
 Neither swapped thumbsticks, controller pictures, nor VRIK trackpad options
 control this route.
 

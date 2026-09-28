@@ -17,6 +17,8 @@
 #include "Misc/Input/InputData.h"
 #include "Misc/Input/InteractionProfile.h"
 #include "Misc/Input/LegacyControllerActions.h"
+#include "Misc/Input/IndexGripSettings.h"
+#include "Misc/Input/IndexGripBindings.h"
 #include "Misc/Input/LocomotionCalibrationGesture.h"
 #include "Misc/BodyTrackerBindings.h"
 #include "Misc/BodyTrackerRoles.h"
@@ -822,6 +824,9 @@ private:
 	static int DeviceIndexToHandId(vr::TrackedDeviceIndex_t idx);
 
 	LegacyControllerActions legacyControllers[2] = {};
+    ocu_index_grip::HoldState indexGripHolds[2];
+    bool indexGripRuntimeThresholds = false;
+    XrResult SuggestBindingsWithIndexGrip(const std::string& profile, const XrInteractionProfileSuggestedBinding& suggestion);
 
 	// From https://github.com/ValveSoftware/openvr/wiki/Hand-Skeleton
 	// Used as indexes into the skeleton output data

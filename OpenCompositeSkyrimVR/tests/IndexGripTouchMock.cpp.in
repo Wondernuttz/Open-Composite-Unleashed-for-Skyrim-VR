@@ -2,16 +2,21 @@
 #include <openxr/openxr.h>
 #include "generated/interfaces/vrtypes.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <initializer_list>
 #include <map>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include "OpenOVR/Misc/smooth_input.h"
 #include "OpenOVR/Misc/Input/IndexTrackpadRouting.h"
+#include "OpenOVR/Misc/Input/IndexGripSettings.h"
+#include "OpenOVR/Misc/Input/IndexGripBindings.h"
 using namespace vr;
 struct ITrackedDevice {
     enum HandType { HAND_LEFT, HAND_RIGHT, HAND_NONE };
@@ -23,6 +28,7 @@ struct VRSkeletalSummaryData_t { float flFingerCurl[5]{}; };
 #define OOVR_FAILED_XR_ABORT(expr) do { if ((expr) != XR_SUCCESS) throw std::runtime_error(#expr); } while (0)
 #define OOVR_FAILED_XR_SOFT_ABORT(expr) OOVR_FAILED_XR_ABORT(expr)
 #define OOVR_LOG_ONCE(...) do {} while (0)
+#define OOVR_LOGF(...) do {} while (0)
 #define OOVR_FALSE_ABORT(expr) do { if (!(expr)) throw std::runtime_error(#expr); } while (0)
 #define OOVR_ABORTF(...) throw std::runtime_error("invalid binding")
 #define strcpy_arr(dst, src) strcpy_s(dst, src)
@@ -32,6 +38,30 @@ struct Sample { XrActionType type; bool active=false, boolean=false; float scala
 std::map<XrAction, Sample> samples;
 std::map<std::string, XrPath> xrPaths;
 unsigned actionStateReads=0;
+bool xr_valveAnalogThresholds=false, rejectThresholds=false;
+bool xr_valveFrameController=true;
+uint64_t mockNowMs=1000;
+bool autoAdvanceTime=true, focused=true;
+bool oovr_debug_logging_enabled() { return false; }
+unsigned thresholdSuggestions=0, plainSuggestions=0;
+XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfileBindings(XrInstance, const XrInteractionProfileSuggestedBinding* suggestion) {
+    if (!suggestion->next) { ++plainSuggestions; return XR_SUCCESS; }
+    ++thresholdSuggestions;
+    auto* modifications=static_cast<const XrBindingModificationsKHR*>(suggestion->next);
+    if (modifications->type != XR_TYPE_BINDING_MODIFICATIONS_KHR || modifications->bindingModificationCount != 2)
+        throw std::runtime_error("wrong threshold chain/count");
+    for (unsigned i=0;i<2;++i) {
+        const auto* value=reinterpret_cast<const XrInteractionProfileAnalogThresholdVALVE*>(modifications->bindingModifications[i]);
+        if (value->type!=XR_TYPE_INTERACTION_PROFILE_ANALOG_THRESHOLD_VALVE || value->onThreshold!=.5f || value->offThreshold!=.25f
+            || value->onHaptic || value->offHaptic || value->next) throw std::runtime_error("wrong thresholds or unexpected haptics");
+        bool found=false;
+        for (unsigned j=0;j<suggestion->countSuggestedBindings;++j)
+            if (suggestion->suggestedBindings[j].action==value->action && suggestion->suggestedBindings[j].binding==value->binding) found=true;
+        if (!found || samples.at(value->action).name.find("grip-touch")==std::string::npos)
+            throw std::runtime_error("threshold modified a non-touch binding");
+    }
+    return rejectThresholds ? XR_ERROR_FEATURE_UNSUPPORTED : XR_SUCCESS;
+}
 std::vector<XrAction> hapticActions;
 XRAPI_ATTR XrResult XRAPI_CALL xrStringToPath(XrInstance, const char* path, XrPath* result) {
     if (!xrPaths.count(path)) xrPaths[path] = xrPaths.size()+1;
@@ -65,13 +95,15 @@ public:
     LegacyBindings paths{};
     std::string kind="index";
     void Configure(const std::string& value) { kind=value; paths={}; /*PROFILE_ASSIGNMENTS*/ }
-    const LegacyBindings* GetLegacyBindings(const std::string&) const { return &paths; }
+    const LegacyBindings* GetFrameLegacyBindings(const std::string&) const;
+    const LegacyBindings* GetLegacyBindings(const std::string& hand) const { return kind=="frame" ? GetFrameLegacyBindings(hand) : &paths; }
     bool IsInputPathValid(const std::string& path) const {
-        return path.find("/input/squeeze/value") != std::string::npos || path.find("/input/squeeze/force") != std::string::npos || path.find("/input/squeeze/click") != std::string::npos;
+        return path.find("/input/") != std::string::npos || path.find("/output/haptic") != std::string::npos;
     }
-    std::string GetPath() const { return kind=="index" ? "/interaction_profiles/valve/index_controller" : "/interaction_profiles/oculus/touch_controller"; }
+    std::string GetPath() const { return kind=="frame" ? "/interaction_profiles/valve/frame_controller_valve" : kind=="index" ? "/interaction_profiles/valve/index_controller" : "/interaction_profiles/oculus/touch_controller"; }
     void AddLegacyBindings(const LegacyControllerActions&, std::vector<XrActionSuggestedBinding>&) const;
 };
+/*FRAME_BINDINGS*/
 /*BINDINGS*/
 struct Device : ITrackedDevice { InteractionProfile profile; const InteractionProfile* GetInteractionProfile() const { return &profile; } } devices[2], hmd;
 bool devicePresent[2]={true,true};
@@ -85,13 +117,18 @@ struct BackendManager {
 };
 struct Configuration {
     bool smoothing=false, swap=false, vrik=false, disablePad=false;
+    unsigned customRegions=0;
+    bool customGrip=false;
+    float releaseThreshold=.25f;
+    bool IndexGripCustom() const { return customGrip; }
+    ocu_index_grip::Thresholds IndexGripThresholds() const { return {.5f,releaseThreshold}; }
     bool DisableTriggerTouch() const { return false; }
     bool DisableThumbrestTouch() const { return true; }
     bool EnableInputSmoothing() const { return smoothing; }
     bool SwapThumbsticks() const { return swap; }
     bool EnableVRIKKnucklesTrackPadSupport() const { return vrik; }
     bool DisableTrackPad() const { return disablePad; }
-    unsigned IndexTrackpadCustomRegions() const { return 0; }
+    unsigned IndexTrackpadCustomRegions() const { return customRegions; }
     float LeftDeadZoneSize() const { return 0; }
     float LeftDeadZoneXSize() const { return 0; }
     float LeftDeadZoneYSize() const { return 0; }
@@ -99,6 +136,7 @@ struct Configuration {
     float RightDeadZoneXSize() const { return 0; }
     float RightDeadZoneYSize() const { return 0; }
     bool WalkInPlaceEnabled() const { return false; }
+    bool TreadmillEnabled() const { return false; }
     float HapticStrength() const { return 1; }
 } oovr_global_configuration;
 struct Global { struct { bool supportsHandTracking=false; } handTrackingProperties; } globals;
@@ -110,9 +148,16 @@ struct CameraLegCalibration { static bool CapturesInput() { return false; } };
 void RememberPhysicalMove(float) {}
 float GetWalkInPlaceStickY() { return 0; }
 float GetWalkInPlaceTurnX() { return 0; }
+struct ExternalMovement { float x=0, y=0; bool ownsAxis=false, allowSynthetic=false; };
+ExternalMovement ReadExternalMovement(float, float) { return {}; }
 class BaseInput {
 public:
     LegacyControllerActions legacyControllers[2]{};
+    ocu_index_grip::HoldState indexGripHolds[2];
+    bool indexGripRuntimeThresholds=false;
+    static uint64_t InputNowMs() { if(autoAdvanceTime) mockNowMs+=25; return mockNowMs; }
+    bool HasFocusedActionSync(XrSession) const { return focused; }
+    XrResult SuggestBindingsWithIndexGrip(const std::string&, const XrInteractionProfileSuggestedBinding&);
     XrActionSet legacyInputsSet{};
     void CreateEyeGazeAction() {}
     void CreateLegacyActions();
@@ -126,6 +171,8 @@ public:
 /*DEVICE_ROUTING*/
 /*CONTROLLER_STATE*/
 /*HAPTIC_PULSE*/
+/*SPELLWHEEL_PREDICATE*/
+#include "IndexGripDropoutTests.inc"
 
 int main() {
     unsigned checks=0;
@@ -173,13 +220,26 @@ int main() {
                 if(b.action==ctrl.gripClick && profile=="index") check(b.binding==xrPaths.at(ctrl.handPath+"/input/squeeze/force"),"press keeps force binding");
             }
             check(touchBound==(profile=="index"),"only Index suggests capacitive grip touch");
+            if(profile=="index") {
+                auto boundTo=[&](XrAction action, const char* path) {
+                    return std::any_of(bindings.begin(),bindings.end(),[&](const auto& binding) {
+                        return binding.action==action && binding.binding==xrPaths.at(ctrl.handPath+path);
+                    });
+                };
+                check(boundTo(ctrl.btnATouch,"/input/a/touch"),"Index A touch retains its physical sensor");
+                check(boundTo(ctrl.menuTouch,"/input/b/touch"),"Index B touch retains its physical sensor");
+                check(boundTo(ctrl.trackPadTouch,"/input/trackpad/touch"),"Index pad touch retains its physical sensor");
+                check(boundTo(ctrl.trackPadClick,"/input/trackpad/force"),"Index pad press uses force, not capacitive touch");
+            }
         }
     }
     // Runtime supplies thresholded boolean values; OCU must preserve touch and
     // force as independent signals for every relevant user-option combination.
     for(bool smoothing:{false,true}) for(bool swap:{false,true}) for(bool vrik:{false,true}) for(bool disable:{false,true}) {
         oovr_global_configuration={smoothing,swap,vrik,disable};
+        for(auto& hold:input.indexGripHolds) hold.Reset();
         for(int hand=0;hand<2;++hand) {
+            for(auto& hold:input.indexGripHolds) hold.Reset();
             for(auto& entry:samples) { entry.second.active=false; entry.second.boolean=false; entry.second.scalar=0; }
             smoothInput=SmoothInput(3);
             for(auto& device:devices) device.profile.Configure("index");
@@ -195,14 +255,134 @@ int main() {
             input.GetLegacyControllerState(2-hand,&other); check(!(other.ulButtonTouched&grip),"touch cannot cross hands when sticks are swapped");
             press.boolean=true; read(); check((state.ulButtonPressed&(grip|axis))==(grip|axis),"squeeze remains available while touching");
             touch.boolean=false; press.boolean=false; samples.at(ctrl.grip).scalar=0;
-            read(); check(!(state.ulButtonTouched&(grip|axis)),"release is immediate despite peak-hold input smoothing");
+            read(); check(state.ulButtonTouched&grip,"first low sample starts bounded release confirmation");
+            read(); check(!(state.ulButtonTouched&(grip|axis)),"sustained opening releases independently of smoothing");
             touch.boolean=true; touch.active=false; read(); check(!(state.ulButtonTouched&(grip|axis)),"inactive/disconnected source cannot stick touched");
             touch.active=true; read(); check(state.ulButtonTouched&grip,"touch recovers when source returns");
             devices[hand].profile.Configure("touch"); read(); check(!(state.ulButtonTouched&(grip|axis)),"profile switch cannot leak old Index touch to Quest");
             devices[hand].profile.Configure("index"); read(); check(state.ulButtonTouched&grip,"Index can return without stale controller classification");
         }
     }
+    // Test production binding-chain selection and its unsupported-runtime fallback.
+    oovr_global_configuration={};
+    for(auto& device:devices) device.profile.Configure("index");
+    std::vector<XrActionSuggestedBinding> gripBindings;
+    for(auto& ctrl:input.legacyControllers) devices[0].profile.AddLegacyBindings(ctrl,gripBindings);
+    XrInteractionProfileSuggestedBinding suggestion{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+    suggestion.suggestedBindings=gripBindings.data(); suggestion.countSuggestedBindings=(uint32_t)gripBindings.size();
+    const std::string indexProfile="/interaction_profiles/valve/index_controller";
+    xr_valveAnalogThresholds=true;
+    input.SuggestBindingsWithIndexGrip(indexProfile,suggestion);
+    check(!input.indexGripRuntimeThresholds && thresholdSuggestions==0,"default mode must not modify runtime thresholds");
+    oovr_global_configuration.customGrip=true;
+    input.SuggestBindingsWithIndexGrip(indexProfile,suggestion);
+    check(input.indexGripRuntimeThresholds && thresholdSuggestions==1,"custom mode attaches both runtime threshold structs");
+    const auto previous=thresholdSuggestions;
+    input.SuggestBindingsWithIndexGrip("/interaction_profiles/oculus/touch_controller",suggestion);
+    check(thresholdSuggestions==previous,"other controller suggestions do not acquire Index thresholds");
+    rejectThresholds=true;
+    const auto plainBefore=plainSuggestions;
+    input.SuggestBindingsWithIndexGrip(indexProfile,suggestion);
+    check(!input.indexGripRuntimeThresholds && plainSuggestions==plainBefore+1,"runtime rejection retries ordinary binding then uses software thresholds");
+    rejectThresholds=false;
+    xr_valveAnalogThresholds=false;
+    input.SuggestBindingsWithIndexGrip(indexProfile,suggestion);
+    check(!input.indexGripRuntimeThresholds,"runtime without extensions uses software thresholds");
+    for (int hand=0;hand<2;++hand) {
+        for(auto& entry:samples) { entry.second.active=false; entry.second.boolean=false; entry.second.scalar=0; }
+        for(auto& hold:input.indexGripHolds) hold.Reset();
+        auto& sample=samples.at(input.legacyControllers[hand].grip);
+        sample.active=true;
+        auto readGrip=[&](float value) { sample.scalar=value; VRControllerState_t state{}; input.GetLegacyControllerState(hand+1,&state);
+            check(!(state.ulButtonPressed&grip),"custom touch cannot become a squeeze press"); return (state.ulButtonTouched&grip)!=0; };
+        check(!readGrip(.4f),"below grab threshold cannot begin holding");
+        check(readGrip(.5f),"grab threshold begins holding");
+        for(int i=0;i<100;++i) check(readGrip(i%2?.3f:.49f),"noise between thresholds keeps the item held");
+        VRControllerState_t other{}; input.GetLegacyControllerState(2-hand,&other);
+        check(!(other.ulButtonTouched&grip),"holding state does not leak across hands");
+        check(readGrip(.25f),"release boundary remains held per Valve semantics");
+        check(readGrip(.24f),"below release starts confirmation");
+        check(!readGrip(.24f),"sustained release clears hold");
+        check(!readGrip(.4f),"released grip needs a new grab crossing");
+        check(readGrip(.8f),"regrab works");
+        sample.active=false; check(readGrip(.8f),"single inactive sample preserves held state");
+        check(!readGrip(.8f),"sustained inactive action clears held state");
+        sample.active=true; check(!readGrip(.4f),"reconnect cannot reuse the stale hold");
+        check(readGrip(.8f),"regrab before profile switch");
+        devices[hand].profile.Configure("touch"); check(!readGrip(.8f),"non-Index ignores custom grip");
+        devices[hand].profile.Configure("index"); check(!readGrip(.4f),"profile return starts released");
+        check(readGrip(.8f),"regrab before invalid sensor sample");
+        check(readGrip(std::numeric_limits<float>::quiet_NaN()),"one invalid sample preserves an existing hold");
+        check(!readGrip(std::numeric_limits<float>::quiet_NaN()),"sustained invalid sample clears hold");
+        check(!readGrip(.4f),"invalid sample resets hysteresis");
+        check(readGrip(.8f),"regrab before full opening");
+        check(readGrip(0),"opening hand starts release confirmation");
+        check(!readGrip(0),"opening hand releases after confirmation");
+    }
+    for(float grabValue:{-5.f,0.f,.02f,.5f,1.f,5.f,std::numeric_limits<float>::quiet_NaN()})
+    for(float releaseValue:{-5.f,0.f,.01f,.5f,1.f,5.f,std::numeric_limits<float>::infinity()}) {
+        auto t=ocu_index_grip::Normalize(grabValue,releaseValue);
+        check(t.grab<=1 && t.grab>=.02f && t.release>=.01f && t.release<t.grab,"manual INI thresholds sanitize to ordered finite values");
+        ocu_index_grip::HoldState hold;
+        auto update=[&](float value,uint64_t time) { return hold.Update(true,true,value,false,true,t,time,hold.Generation()).held; };
+        check(update(1,0) && update(0,1) && !update(0,21),"every valid threshold pair releases an open hand after 20ms");
+    }
+    RunGripDropoutTests(input,check);
+    oovr_global_configuration={};
+    const auto aButton=ButtonMaskFromId(k_EButton_A);
+    const auto menu=ButtonMaskFromId(k_EButton_ApplicationMenu);
+    const auto pad=ButtonMaskFromId(k_EButton_SteamVR_Touchpad);
+    for(bool smoothing:{false,true}) for(bool swap:{false,true}) for(bool vrik:{false,true})
+    for(bool disable:{false,true}) for(unsigned custom:{0u,15u}) for(int hand=0;hand<2;++hand) {
+        oovr_global_configuration={smoothing,swap,vrik,disable,custom};
+        for(auto& device:devices) device.profile.Configure("index");
+        const auto& ctrl=input.legacyControllers[hand];
+        auto readCase=[&](std::initializer_list<XrAction> activeButtons) {
+            for(auto& entry:samples) { entry.second.active=true; entry.second.boolean=false; entry.second.scalar=0; }
+            smoothInput=SmoothInput(3);
+            for(auto action:activeButtons) samples.at(action).boolean=true;
+            samples.at(ctrl.trackPadY).scalar=0.75f;
+            VRControllerState_t state{}, other{};
+            check(input.GetLegacyControllerState(hand+1,&state),"Index face/pad sample succeeds");
+            check(input.GetLegacyControllerState(2-hand,&other),"other Index hand sample succeeds");
+            check(!(other.ulButtonTouched&(aButton|menu|pad)),"face and pad touch stay on the physical hand with swapped sticks");
+            return state;
+        };
+        auto faceA=readCase({ctrl.btnATouch});
+        check(faceA.ulButtonTouched==(vrik?menu:aButton),"VRIK mode keeps physical A touch away from its gesture bit");
+        check(faceA.ulButtonPressed==0,"resting on A is never a press");
+        auto faceB=readCase({ctrl.menuTouch});
+        check(faceB.ulButtonTouched==menu && faceB.ulButtonPressed==0,"B touch remains Menu touch, never pad touch or a press");
+        auto bothFaces=readCase({ctrl.btnATouch,ctrl.menuTouch});
+        check(bothFaces.ulButtonTouched==(vrik?menu:(aButton|menu)),"combined face touches cannot masquerade as a trackpad touch");
+        auto padTouch=readCase({ctrl.trackPadTouch});
+        check(padTouch.ulButtonTouched==pad && padTouch.ulButtonPressed==0,"capacitive pad contact alone is not VRIK pad pressure");
+        auto padPress=readCase({ctrl.trackPadClick});
+        const auto upperPress=custom?ButtonMaskFromId(k_EButton_DPad_Right):menu;
+        check(padPress.ulButtonTouched==(vrik?aButton:0),"VRIK pressure still emits A touch");
+        check(padPress.ulButtonPressed==(!vrik&&!disable?upperPress:0),"legacy/custom pad press routing remains independent of VRIK touch");
+        auto facePress=readCase({ctrl.btnA,ctrl.menu});
+        check(facePress.ulButtonPressed==(aButton|menu),"both face clicks retain their button identities");
+#ifdef OCU_TEST_SPELLWHEEL_SOURCE
+        SpellWheelConsumer::Configure(99,-1);
+        check(SpellWheelConsumer::MainHandButtonsArePressed(&padPress)==vrik,"matched Spell Wheel option opens only from VRIK-routed pad pressure");
+        check(SpellWheelConsumer::MainHandButtonsArePressed(&faceA)==!vrik,"special Spell Wheel binding requires matching OCU VRIK mode to exclude A touch");
+        check(!SpellWheelConsumer::MainHandButtonsArePressed(&faceB),"B touch cannot open the matched Spell Wheel option");
+        check(!SpellWheelConsumer::MainHandButtonsArePressed(&padTouch),"Spell Wheel pad PRESS option does not promise touch-only opening");
+        check(!SpellWheelConsumer::MainHandButtonsArePressed(&facePress),"face-button clicks cannot trigger Spell Wheel's special touch binding");
+        auto padWithA=readCase({ctrl.trackPadClick,ctrl.btnA});
+        check(!SpellWheelConsumer::MainHandButtonsArePressed(&padWithA),"Spell Wheel excludes A touch while A is physically pressed");
+        SpellWheelConsumer::Configure(99,33);
+        check(!SpellWheelConsumer::MainHandButtonsArePressed(&padPress),"configured Spell Wheel modifier must be held");
+        auto modifiedPad=readCase({ctrl.trackPadClick,ctrl.triggerClick});
+        check(SpellWheelConsumer::MainHandButtonsArePressed(&modifiedPad)==vrik,"matched pad pressure and trigger satisfy Spell Wheel's real combination predicate");
+#endif
+    }
+    /*FRAME_TESTS*/
     VRControllerState_t state{};
     check(!input.GetLegacyControllerState(999,&state),"unknown controller rejected");
     std::cout<<"PASS: "<<checks<<" checks; production device routing, haptics, action creation, profile suggestions, controller state and smoothing under an OpenXR mock\n";
+#ifdef OCU_TEST_SPELLWHEEL_SOURCE
+    std::cout<<"PASS: supplied Spell Wheel source mask selection and wheel-opening predicate exercised against production OCU input\n";
+#endif
 }

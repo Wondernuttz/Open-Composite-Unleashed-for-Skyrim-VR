@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Open Composite Unleashed Setup Readme</title>
+  <title>OpenComposite Unleashed 5 Setup Readme</title>
   <style>
     :root {
       color-scheme: dark;
@@ -416,7 +416,7 @@
   <header>
     <div class="header-inner">
       <p class="eyebrow">OpenXR for Skyrim VR</p>
-      <h1>Open Composite Unleashed Setup Readme</h1>
+      <h1>OpenComposite Unleashed 5 Setup Readme</h1>
       <p class="lead">
         Set up OCU, choose the right OpenXR runtime, configure controls and video features,
         and troubleshoot the full Skyrim VR integration.
@@ -735,7 +735,9 @@
       <p>
         This reference follows the labels in the current OCU Configurator. Settings stored in
         <code>opencomposite.ini</code> do not affect a game that is already running: click
-        <strong>Save opencomposite.ini</strong>, close Skyrim VR, and start it again. Bindings use their own save button.
+        <strong>Save settings</strong>, close Skyrim VR, and start it again. Save settings also saves pending controller
+        bindings and Index trackpad assignments. <strong>Save All Bindings</strong> saves the complete control map;
+        <strong>Save Custom…</strong> also creates a named controller preset.
         Gesture edits hot-load within a few seconds unless the control itself says otherwise.
       </p>
       <div class="tab-jumps">
@@ -743,6 +745,7 @@
         <a href="#tab-bindings">Bindings</a>
         <a href="#tab-gestures">Gestures</a>
         <a href="#tab-video">Video</a>
+        <a href="#tab-kat">KAT VR / Trackers</a>
         <a href="#tab-steam-help">SteamVR / Help</a>
       </div>
 
@@ -752,7 +755,7 @@
           <p class="subhead">Page controls</p>
           <ul class="setting-list">
             <li><strong>Master Reset:</strong> resets and saves only the Settings page. It does not alter keyboard or controller bindings.</li>
-            <li><strong>Save opencomposite.ini:</strong> writes all INI-backed settings to OCU's installed locations. Restart Skyrim VR afterward.</li>
+            <li><strong>Save settings:</strong> writes INI-backed settings and pending controller bindings, including Index trackpad assignments, to OCU's installed locations. Restart Skyrim VR afterward.</li>
             <li><strong>Reload:</strong> discards unsaved INI edits in the window and reloads the currently installed configuration.</li>
           </ul>
 
@@ -769,6 +772,9 @@
             <li><strong>Keyboard feedback:</strong> master switch for keyboard hover and press audio.</li>
             <li><strong>Hover / Press:</strong> set the volume of hover and keypress feedback sounds.</li>
           </ul>
+
+          <h4>Paste console commands in VR</h4>
+          <p>Copy one command on your Windows desktop or through Virtual Desktop. Open the Skyrim console using the OCU VR keyboard, tap <strong>Ctrl</strong>, then <strong>V</strong>. The text is inserted without running it; review the game console and press <strong>Enter</strong> when ready. Paste is limited to 256 characters including existing input. Multiline commands are rejected; a trailing line break is removed. Clipboard text is not logged. Other game text fields do not gain clipboard support from this feature.</p>
 
           <p class="subhead">General Settings</p>
           <ul class="setting-list">
@@ -789,7 +795,8 @@
             <li><strong>Disable trigger touch:</strong> ignores capacitive finger contact on the trigger. Pulling and clicking the trigger still work.</li>
             <li><strong>Disable thumbrest touch:</strong> prevents capacitive thumbrest contact from being exposed as the legacy bindable D-pad Up input.</li>
             <li><strong>Disable legacy trackpad routing:</strong> disables Skyrim's upper/lower physical-trackpad click translation. It does not disable or emulate thumbsticks.</li>
-            <li><strong>VRIK Knuckles trackpad mode:</strong> routes the Index/Knuckles trackpad in the compatibility mode expected by VRIK gestures. Leave it off for other controllers.</li>
+            <li><strong>VRIK Knuckles trackpad mode:</strong> routes the Index/Knuckles trackpad in the compatibility mode expected by VRIK gestures. Leave it off for other controllers. The adjacent <strong>Help</strong> button explains the matching Spell Wheel MCM options when you want to open its wheel with a physical trackpad press.</li>
+            <li><strong>Index grip holding:</strong> select the Index controller picture to show these controls. Runtime default preserves the runtime's grip thresholds. Custom sensitivity enables Grab and Release thresholds for HIGGS Auto/Touch holding; Release must remain lower than Grab. Lower Grab makes pickup easier; lower Release makes a relaxed grip easier to maintain. The initial 0.50/0.25 values are tuning starting points, not factory calibration. Both modes confirm grip-touch release for 20 ms to filter brief dropouts; release completes on the next input update at or after that interval. Confirmed device removal or loss of input focus clears the hold immediately. Custom sensitivity retains a relaxed hold when input recovers within that interval. Squeeze-button bindings remain independent. Applies to detected Index controllers with any headset; no headset connection is needed to configure it. Save settings and restart Skyrim.</li>
             <li><strong>L/R dead zone:</strong> ignores small X/Y movement around the center of each physical stick. Raise only far enough to stop drift.</li>
             <li><strong>Swap sticks: right moves, left turns:</strong> swaps stick axes and stick-touch state. Stick clicks and other buttons remain on their physical hands.</li>
           </ul>
@@ -822,7 +829,7 @@
       <details id="tab-bindings" class="tab-reference">
         <summary>Bindings Tab</summary>
         <div>
-          <div class="warn">To keep a custom controller layout: edit the buttons, click <strong>Save Custom…</strong>, and give it a name. This saves your current edits too. Restart Skyrim VR to use the changes.</div>
+          <div class="warn">After editing controller buttons, click <strong>Save settings</strong> or <strong>Save All Bindings</strong> to keep the changes. Use <strong>Save Custom…</strong> to save them as a named controller preset too. Restart Skyrim VR to use the changes.</div>
           <ul class="setting-list">
             <li><strong>Keyboard Type:</strong> selects the Skyrim input context being edited, such as gameplay, menus, or inventory. Each context has independent mappings.</li>
             <li><strong>Disable Mouse Bindings (VR):</strong> unbinds the mouse column in the VR control map to prevent conflicting desktop-style mouse actions.</li>
@@ -832,9 +839,10 @@
             <li><strong>Reset to Game Defaults:</strong> restores the embedded baseline game control map rather than the VR Safe preset.</li>
             <li><strong>Validate Bindings:</strong> scans the live control map for known deterministic crash patterns, repairs known-safe cases, and reports ambiguous conflicts.</li>
             <li><strong>Controller Type:</strong> selects the input context for controller editing, independently of the keyboard Type selector.</li>
-            <li><strong>Button / Action:</strong> click a dot on the controller picture and assign its Skyrim action for the selected context. Fixed trackpad translations are displayed but are not separately remappable.</li>
+            <li><strong>Button / Action:</strong> click a dot on the controller picture and assign an action available in that input context. Index trackpad halves can have separate assignments when the VRIK trackpad-gesture option is off; their saved assignments are retained when that option is on.</li>
+            <li><strong>Drop on left A/X:</strong> adds the left face button to Item Menus / XButton (inventory Drop), preserving existing Drop buttons. Save and restart Skyrim afterward.</li>
             <li><strong>Preset:</strong> selects a built-in or user-saved controller layout.</li>
-            <li><strong>Use Preset:</strong> use the selected controller layout. Keyboard, mouse, gamepad mappings and combos stay unchanged.</li>
+            <li><strong>Use Preset:</strong> applies and saves the selected controller layout. Selecting a preset alone is a preview. Keyboard, mouse, gamepad mappings and combos stay unchanged.</li>
             <li><strong>Save Custom…:</strong> save the edits currently shown in the editor and store a named preset in one step. No separate save is needed. Presets restore controller mappings; combos remain separate installation settings.</li>
             <li><strong>Remove:</strong> deletes a user-created preset. Built-in presets are embedded and cannot be removed.</li>
             <li><strong>Controller Combos:</strong> maps a button chord or one-to-four-tap sequence to a keyboard key. If the same button has multiple tap counts, OCU waits through the configured tap window so it can resolve the intended count.</li>
@@ -901,7 +909,7 @@
 
           <p class="subhead">DAPA &mdash; Depth Aware Positional Approximation</p>
           <ul class="setting-list">
-            <li><strong>Enable DAPA:</strong> generates synthetic frames from the previous color frame, depth, and positional change. It is not conventional ASW and does not apply per-pixel motion vectors. Do not combine it with SSW or runtime motion smoothing.</li>
+            <li><strong>Enable DAPA:</strong> generates synthetic frames from the previous color frame, depth, and positional change. World reprojection remains depth-based. Where valid native motion vectors are available, a separate pass corrects pixels inside player and held-item masks. Do not combine it with SSW or runtime motion smoothing.</li>
             <li><strong>Advanced &mdash; Auto mode:</strong> leaves native rendering alone while the game is fast enough and engages DAPA below the FPS threshold.</li>
             <li><strong>Advanced &mdash; Debug highlight:</strong> tints synthetic frames so cadence and engagement can be verified.</li>
             <li><strong>Advanced &mdash; Warp Strength:</strong> master correction strength; zero shows the cached frame without pose correction and 1.0 applies full correction.</li>
@@ -929,14 +937,43 @@
 
           <p class="subhead">Foveated Rendering</p>
           <ul class="setting-list">
-            <li><strong>Backend:</strong> Auto prefers native NVIDIA VRS and otherwise uses OCU's cross-vendor D3D11 Radial Density Mask. NVIDIA VRS forces the hardware path; Density Mask explicitly selects the AMD/Intel-compatible path. The backends never stack.</li>
-            <li><strong>Eye Tracking AUTO:</strong> uses OpenXR gaze data when the headset/runtime exposes it. It does not silently enable fixed foveation on a headset without gaze.</li>
-            <li><strong>Fixed ENABLE:</strong> enables head-centered fixed foveation for non-eye-tracking headsets. When Eye Tracking is also checked, Fixed is only the fallback if gaze becomes unavailable.</li>
-            <li><strong>Preset:</strong> Compatibility avoids 2x2 shading; Conservative, Balanced, and Aggressive trade progressively more peripheral quality for performance; Custom preserves manual radius values.</li>
-            <li><strong>Inner:</strong> radius of the full-rate 1x1 region around gaze or view center.</li>
-            <li><strong>Mid:</strong> radius of the half-rate ring before the outer rate begins in performance presets.</li>
-            <li><strong>Compatibility (max 2x1):</strong> limits NVIDIA VRS to half-rate tiles and Density Mask to its half-density pattern, reducing Skyrim terrain, foliage, derivative, and mip-selection artifacts.</li>
-            <li><strong>Favor Horizontal:</strong> selects 2x1 rather than 1x2 for NVIDIA half-rate tiles. Density Mask uses its fixed checker reconstruction pattern.</li>
+            <li><strong>Backend:</strong> Auto prefers supported NVIDIA hardware VRS and otherwise selects Radial Density Mask (RDM). <strong>Density Mask (AMD / Intel, experimental)</strong> explicitly selects RDM. AMD/Intel image correctness and performance need hardware validation; successful activation does not guarantee a gain. The scene backends never stack. <strong>Shader effects only (test)</strong> publishes a profile for an enabled compatible renderer effect, without reducing scene shading through VRS or RDM.</li>
+            <li><strong>Eye Tracking AUTO / Enable automatic eye tracking:</strong> enabled by default, but activates only with valid OpenXR gaze. Auto can select RDM on AMD when gaze is available. Without gaze, foveation stays off unless Fixed is explicitly enabled.</li>
+            <li><strong>Fixed ENABLE:</strong> disabled by default. Enables a separate head-centered profile, also used as the fallback when eye tracking is enabled but gaze is unavailable.</li>
+            <li><strong>Edit eye-tracked rings:</strong> opens the moving-eye preview and eye-specific settings. Apply accepts the draft into the Configurator; Save settings and restart Skyrim to use it. Cancel discards the draft.</li>
+            <li><strong>Eye preset:</strong> Quality uses center/middle radii 0.30/0.65 and rates 1x1 / 1x2 / 2x2. Balanced uses 0.22/0.45 and 1x1 / 2x2 / 4x2. Performance uses 0.20/0.40 and 1x1 / 2x2 / 4x2; it is the fresh-profile default. Aggressive uses 0.20/0.40 and 1x1 / 2x2 / 4x4, resets shape/offset adjustments, and enables the optional outer cutoff at 0.82. Custom preserves manual choices. Named eye presets turn off the half-rate cap; existing saved profiles remain authoritative.</li>
+            <li><strong>Center / Middle:</strong> set the inner and middle ring boundaries. The outer rate continues beyond the middle boundary unless an optional blackout hides it. <strong>Choose each ring's rate</strong> exposes separate center, middle and outer rates; the preview shows requested and effective values.</li>
+            <li><strong>Limit eye rings to half rate:</strong> caps coarse eye-profile rates at 2x1/1x2. Fixed foveation has its own compatibility setting. <strong>Favor horizontal half rate</strong> is shared with Fixed and controls automatic half-rate direction and the cap for square coarse rates.</li>
+            <li><strong>Width / Horizontal offset / Vertical offset:</strong> adjust eye-ring shape and alignment. Positive horizontal offset moves both eyes outward; positive vertical offset moves down. <strong>Clear adjustments</strong> restores width to 100% and offsets to zero while retaining ring sizes, rates and blackout choices. Effects-only uses circular rings and disables width adjustment.</li>
+            <li><strong>Blackout / Outer boundary:</strong> hide the selected middle ring, outer ring or area beyond an optional cutoff while live eye tracking is active. By themselves these controls hide pixels after rendering. <strong>Skip rendering behind blackout (experimental)</strong> separately allows omitted scene work; effects and upscalers may still need those pixels. It requires a scene backend and a selected blackout, and does not alter Fixed fallback.</li>
+            <li><strong>Show rings inside the headset (debug):</strong> displays the current profile for alignment checks. Turn this and detailed logging off for normal performance comparisons.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details id="tab-kat" class="tab-reference">
+        <summary>KAT VR / Trackers Tab</summary>
+        <div>
+          <p>KAT treadmill input is experimental. Install and start KAT Gateway with the treadmill connected; the optional reader uses <code>KATNativeSDK.dll</code> from that installation. Gateway, its SDK and its runtime prerequisites are not bundled with OCU.</p>
+          <ol>
+            <li>Enable <strong>KAT treadmill input (experimental)</strong>, click <strong>Save settings</strong>, and restart Skyrim. Select headset-directed movement in Skyrim.</li>
+            <li>Open <strong>Reader setup</strong>, choose your installed Gateway's <code>KATNativeSDK.dll</code>, and start the reader. The SDK choice is remembered; optional automatic startup runs the reader with the Configurator when KAT input is enabled. Keep the Configurator open while playing. Closing Reader setup alone leaves the reader running; closing the Configurator stops it.</li>
+            <li>After gameplay loads, stand still and face forward. Press the direction-sensor button, or enable <strong>Controller calibration (both thumbstick clicks)</strong> and hold both centered thumbstick clicks for two seconds. Release before repeating. Haptics confirm accepted alignment when enabled; the shortcut requires fresh headset, controller and treadmill data with gameplay focused and menus closed.</li>
+          </ol>
+          <ul class="setting-list">
+            <li><strong>Port / Full-stick speed:</strong> reader and OCU ports must match (default 9020). Full-stick speed defaults to 3.0 m/s; raising it reduces movement sensitivity. Run only one reader.</li>
+            <li><strong>Connection status:</strong> green means fresh connected reader data, including while standing still. It does not confirm calibration or delivery to Skyrim. Stale, disconnected or invalid input stops treadmill movement; missing data expires within 250 ms. Physical stick input takes priority, and menus, keyboard use or unavailable game input suppress treadmill movement.</li>
+            <li><strong>Recalibration:</strong> align again after a data dropout, Gateway/reader restart or unknown reference-space change. A runtime recenter can preserve alignment when its transform is supplied. Headset system/recenter buttons are not the OCU controller-calibration shortcut.</li>
+            <li><strong>Body trackers:</strong> waist/foot indicators distinguish tracked poses (green), inferred poses (amber), and invalid or stale poses (gray). Other dots are reference points. Tracker software and the active OpenXR runtime must expose usable poses; KAT MoCap is separate from the walking reader and needs a compatible vendor setup. OCU does not make unavailable tracker poses appear.</li>
+          </ul>
+          <h4>Cable tracking</h4>
+          <p>Enable <strong>Track headset turns</strong> in the Cable tracking panel, save settings and restart Skyrim. No treadmill, body trackers or separate SteamVR overlay app are required.</p>
+          <ul class="setting-list">
+            <li><strong>Show:</strong> F8 displays the accumulated physical turns and which direction to unwind. <strong>Reset zero:</strong> Ctrl+Shift+F8, only after physically untwisting the cable. Both keyboard shortcuts are editable in <strong>Shortcuts &amp; display</strong>.</li>
+            <li><strong>VR keyboard:</strong> in PC mode, tap Ctrl, tap Shift, then press F8 to reset zero. Shift applies to function-key shortcuts; Caps does not add Shift to them. Release the trigger to release the shortcut keys.</li>
+            <li><strong>Controller shortcuts:</strong> on Bindings, add a Button combo and select <strong>Cable tracker: Show</strong> or <strong>Cable tracker: Reset zero</strong> as the target. Use a deliberate chord or long press for reset. Combos keep their normal game actions and are suspended while the VR keyboard is open.</li>
+            <li><strong>Automatic warning:</strong> choose a turn threshold (default 2; zero disables warnings) and display duration. The counter continues while hidden. It measures physical headset rotation, not joystick turns, and requires no Configurator process while playing.</li>
+            <li><strong>Start untwisted:</strong> each runtime session starts at zero. Tracking gaps or long pauses make the estimate incomplete and show an amber message. Untwist and reset to restore a known zero. This estimates cable twists; it cannot sense the cable itself.</li>
           </ul>
         </div>
       </details>
@@ -1011,8 +1048,11 @@
         With DAPA on, the game renders at a throttled rate (for example 45 fps) and OCU generates a synthetic frame
         between each real frame by re-projecting the last real frame with depth-based parallax. Rotation smoothing is
         left to the runtime's own reprojection; OCU's warp corrects position, locomotion, and depth parallax. Standard
-        DAPA does not use per-pixel motion vectors, so independently moving objects can still ghost or distort.
+        world reprojection does not use per-pixel motion vectors. Version 5.0.1 adds a separate native-motion correction inside the player and held-item mask; NPCs and other moving world objects can still ghost or distort.
       </p>
+
+      <p>Player correction preserves the mask silhouette and falls back during locomotion, stick turns, menus, or invalid motion history. Thin or rotating objects can still show ghosting. It does not guarantee full-rate body animation or an FPS gain.</p>
+      <p>Capture, preparation, and correction costs are sampled together for the same stereo frame pair. Three consecutive samples above 1.5 ms pause the extra correction. Normal DAPA continues. The correction retries automatically with fresh history after 2 seconds; repeated failures increase the delay up to 30 seconds. Ten under-budget samples restore the initial retry delay. This is a sampled guard, not a strict per-frame time limit.</p>
 
       <h3>DAPA Advanced Settings Reference</h3>
       <p>All of these live in <code>opencomposite.ini</code> and most are exposed in the Configurator's DAPA panel. The existing <code>asw*</code> key names are retained for compatibility with older configurations.</p>

@@ -9,6 +9,7 @@
 #include "../OpenOVR/Misc/xr_ext.h"
 #include "../OpenOVR/Reimpl/BaseInput.h"
 #include "XrBackend.h"
+#include "HmdPresenceState.h"
 #include "generated/static_bases.gen.h"
 
 #include <chrono>
@@ -21,6 +22,61 @@ static XrBackend* currentBackend;
 static bool initialised = false;
 static std::shared_ptr<BaseInput> sessionInputKeepalive;
 static uint32_t viveTrackerInteractionVersion = 0;
+// Backend destruction can run during DLL/static teardown, after other globals.
+// Keep this synchronization state alive until the process releases its memory.
+static HmdPresenceState& hmdPresence = *new HmdPresenceState;
+// An unsuccessful destroy does not establish whether the runtime released its
+// instance. Retain ownership and stop probing/initializing until process exit.
+static XrInstance quarantinedPresenceInstance = XR_NULL_HANDLE;
+
+HmdPresenceState& DrvOpenXR::PresenceState()
+{
+	return hmdPresence;
+}
+
+bool DrvOpenXR::IsHmdPresent()
+{
+	return hmdPresence.Query([] {
+		if (quarantinedPresenceInstance != XR_NULL_HANDLE)
+			return false;
+		// The backend owns instance lifetime. A late query must not create a
+		// competing instance just because the OpenVR front-end flag differs.
+		if (xr_instance != XR_NULL_HANDLE && hmdPresence.LastKnown())
+			return true;
+
+		XrInstance instance = xr_instance;
+		const bool temporary = instance == XR_NULL_HANDLE;
+		if (temporary) {
+			XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
+			GetXRAppName(createInfo.applicationInfo.applicationName);
+			createInfo.applicationInfo.applicationVersion = 1;
+			createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+			const XrResult result = xrCreateInstance(&createInfo, &instance);
+			if (XR_FAILED(result)) {
+				OOVR_LOG_LIMITEDF(5000, "HMD presence: probe instance unavailable (result=%d); returning false", int(result));
+				return false;
+			}
+		}
+
+		XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
+		systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+		XrSystemId system = XR_NULL_SYSTEM_ID;
+		const XrResult result = xrGetSystem(instance, &systemInfo, &system);
+		// Destroy only the instance created by this probe, never the live one.
+		if (temporary) {
+			const XrResult destroyResult = xrDestroyInstance(instance);
+			if (XR_FAILED(destroyResult)) {
+				quarantinedPresenceInstance = instance;
+				hmdPresence.Quarantine();
+				OOVR_LOG_LIMITEDF(5000, "HMD presence: probe cleanup failed (result=%d); returning false", int(destroyResult));
+				return false;
+			}
+		}
+		if (XR_FAILED(result) && result != XR_ERROR_FORM_FACTOR_UNAVAILABLE && result != XR_ERROR_FORM_FACTOR_UNSUPPORTED)
+			OOVR_LOG_LIMITEDF(5000, "HMD presence: system unavailable (result=%d); returning false", int(result));
+		return result == XR_SUCCESS;
+	});
+}
 
 uint32_t DrvOpenXR::GetViveTrackerInteractionVersion()
 {
@@ -197,7 +253,17 @@ static void CreateSystemID()
 
 IBackend* DrvOpenXR::CreateOpenXRBackend()
 {
-	OOVR_LOG("OCU runtime build: 4.3.11-rdm-color-coverage1 / dapa-mask-lease-v1 / stage-recenter-v1 + controller-calibration-v1 / external-locomotion-v1 + cached-head-v1 + bridge-publish-v1 + startup-checkpoints-v1 / body-tracker-validation-v2 + live-pose-status-v1 / eye-shape-offset-v1 + ring-visual-masks-v2 + scene-blackout-cull-v1 + dapa-blackout-guard-v1 / rdm-thread-hooks2-perf4 + rdm-color-coverage-v1 + rdm-depth-binding-batch-v1 + rdm-mask-reuse-v1 + guide-state-cache-v2 + rdm-work-sampling-v1 / rdm-reject-diag-v2 / rdm-sampled-diagnostics-v1 + immutable-guide-zero-v1 / compute-state-restore-v1 + depth-read-hazard-v1 / fixed-ring-no-timeout-v1 / foveation-geometry-v3-fixed-separate + rdm-depth-scope-v3 / eye-presets-v3-performance-1x1-2x2-4x2 + gaze-upload-v3 / DAPA menu-pause-v1 / DAPA mask-frame-v1 + exact-mask-v1 / terrain-depth-guard-v1 / cutout-material-guard-v1 / ring-debug-v2-quads / runtime-route-v2 / first-stereo-frame-v1 / controller-index-v1 / moving-gaze-v2 + effect-foveation-v1 / Index-grip-touch-v1 / input-recovery-v5 / DAPA render-permission-v4 + GPU timing v1");
+	HmdPresenceState::RuntimeCall presenceCall(hmdPresence);
+	if (presenceCall.Nested()) {
+		OOVR_LOG("OpenXR initialization refused: a presence probe or lifecycle call is already active on this thread");
+		return nullptr;
+	}
+	hmdPresence.Publish(false);
+	if (hmdPresence.IsQuarantined()) {
+		OOVR_LOG("OpenXR initialization refused: previous probe cleanup or teardown did not complete; restart the process before retrying");
+		return nullptr;
+	}
+	OOVR_LOG("OCU runtime build: 5.0.0 / index-grip-thresholds-v1 / menu-separation-v1 / hmd-presence-v1 / dapa-mask-lease-v1 / stage-recenter-v1 + controller-calibration-v1 / external-locomotion-v1 + cached-head-v1 + bridge-publish-v1 + startup-checkpoints-v1 / body-tracker-validation-v2 + live-pose-status-v1 / eye-shape-offset-v1 + ring-visual-masks-v2 + scene-blackout-cull-v1 + dapa-blackout-guard-v1 / rdm-thread-hooks2-perf4 + rdm-color-coverage-v1 + rdm-depth-binding-batch-v1 + rdm-mask-reuse-v1 + guide-state-cache-v2 + rdm-work-sampling-v1 / rdm-reject-diag-v2 / rdm-sampled-diagnostics-v1 + immutable-guide-zero-v1 / compute-state-restore-v1 + depth-read-hazard-v1 / fixed-ring-no-timeout-v1 / foveation-geometry-v3-fixed-separate + rdm-depth-scope-v3 / eye-presets-v3-performance-1x1-2x2-4x2 + gaze-upload-v3 / DAPA menu-pause-v1 / DAPA mask-frame-v1 + exact-mask-v1 / terrain-depth-guard-v1 / cutout-material-guard-v1 / ring-debug-v2-quads / runtime-route-v2 / first-stereo-frame-v1 / controller-index-v1 / moving-gaze-v2 + effect-foveation-v1 / Index-grip-touch-v1 / input-recovery-v5 / DAPA render-permission-v4 + GPU timing v1");
 	LogRuntimeProcessIdentity();
 	// TODO handle something like Unity which stops and restarts the instance
 	if (initialised) {
@@ -257,6 +323,13 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	appInfo.apiVersion = XR_CURRENT_API_VERSION;
 
 	std::vector<const char*> extensions;
+    xr_valveAnalogThresholds = oovr_global_configuration.IndexGripCustom()
+        && availableExtensions.count("XR_VALVE_analog_threshold")
+        && availableExtensions.count("XR_KHR_binding_modification");
+    if (xr_valveAnalogThresholds) {
+        extensions.push_back("XR_VALVE_analog_threshold");
+        extensions.push_back("XR_KHR_binding_modification");
+    }
 	XrGraphicsApiSupportedFlags apiFlags = 0;
 
 #if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
@@ -324,6 +397,11 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	// OpenXR interaction profile. SteamVR's PSVR2 runtime advertises this and maps
 	// Sense primary/secondary buttons, thumbsticks, triggers, grips, poses, and
 	// haptics into it. This prevents fallback to the input-starved Simple profile.
+	if (availableExtensions.count("XR_VALVE_frame_controller_interaction")) {
+		extensions.push_back("XR_VALVE_frame_controller_interaction");
+		xr_valveFrameController = true;
+		OOVR_LOG("Steam Frame native controller extension enabled");
+	}
 	if (availableExtensions.count("XR_KHR_generic_controller")) {
 		extensions.push_back("XR_KHR_generic_controller");
 		xr_khrGenericController = true;
@@ -396,6 +474,7 @@ IBackend* DrvOpenXR::CreateOpenXRBackend()
 	CreateSystemID();
 
 	// List off the views and store them locally for easy access
+	hmdPresence.Publish(true);
 	uint32_t viewCount = 0;
 	OOVR_FAILED_XR_ABORT(xrEnumerateViewConfigurationViews(xr_instance, xr_system,
 	    XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr));
@@ -537,6 +616,10 @@ void DrvOpenXR::ShutdownSession()
 
 void DrvOpenXR::FullShutdown()
 {
+	// Explicit shutdown already owns this outside its SEH guard. Nested guards
+	// take no extra ownership; implicit backend destruction still gets a guard.
+	HmdPresenceState::RuntimeCall presenceCall(hmdPresence);
+	hmdPresence.Publish(false);
 	if (xr_session.get())
 		ShutdownSession();
 

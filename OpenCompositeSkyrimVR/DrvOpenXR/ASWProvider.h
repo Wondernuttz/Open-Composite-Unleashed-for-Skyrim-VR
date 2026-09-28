@@ -3,6 +3,7 @@
 #include "XrDriverPrivate.h"
 #include "DapaTiming.h"
 #include "DapaMotion.h"
+#include "DapaNativePlayerMotion.h"
 #include "DapaCapture.h"
 #include "DapaDepthTransfer.h"
 #include "DapaGpuTiming.h"
@@ -86,6 +87,7 @@ public:
 		m_cacheBuildEyeMask = 0;
 		m_cachedBlackout[0] = m_cachedBlackout[1] = {};
 		m_motion.Reset();
+        m_nativePlayer.Reset();
 		m_captureMovement.Reset();
 		m_turn.Reset();
 		m_motionGeometryValid[0] = m_motionGeometryValid[1] = false;
@@ -134,7 +136,9 @@ public:
 	}
 	bool IsInjectionWanted() const { return m_injectionWanted; }
 
+    void SetNativePlayerCamera(int eye,const DapaNativePlayerMotion::Camera& camera,uint32_t frame,int64_t time) { m_nativePlayer.Observe(eye,camera,frame,time); }
 private:
+    DapaNativePlayerMotion m_nativePlayer;
 	DapaGpuTiming m_gpuTiming;
 	DapaGpuTiming::Scope MeasureGpu(ID3D11DeviceContext* ctx, DapaGpuTiming::Stage stage);
 	bool CreateComputeShader(ID3D11Device* device);
@@ -183,13 +187,11 @@ private:
 
 	// Per-eye cached textures (staging copies of game frame data)
 	ID3D11Texture2D* m_cachedColor[2] = {};
-	ID3D11Texture2D* m_cachedMV[2] = {};
 	ID3D11Texture2D* m_cachedDepth[2] = {};
 	Microsoft::WRL::ComPtr<ID3D11Texture2D> m_bodyDepth[2];
 	Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_bodySrv[2];
 	bool m_bodyValid[2] = {};
 	ID3D11ShaderResourceView* m_srvColor[2] = {};
-	ID3D11ShaderResourceView* m_srvMV[2] = {};
 	ID3D11ShaderResourceView* m_srvDepth[2] = {};
 
 	// Per-eye warped output (compute shader writes here)

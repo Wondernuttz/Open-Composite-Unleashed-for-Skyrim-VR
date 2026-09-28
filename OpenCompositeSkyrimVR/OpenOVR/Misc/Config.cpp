@@ -299,6 +299,9 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(int, indexTrackpadCustomRegions);
 		CFGOPT(bool, enableControllerSmoothing);
 		CFGOPT(bool, enableVRIKKnucklesTrackPadSupport);
+        CFGOPT(bool, indexGripCustom);
+        CFGOPT(float, indexGripGrabThreshold);
+        CFGOPT(float, indexGripReleaseThreshold);
 		CFGOPT(bool, swapThumbsticks);
 		CFGOPT(string, keyboardText);
 		CFGOPT(string, controllerModel);
@@ -439,6 +442,16 @@ int Config::ini_handler(void* user, const char* pSection,
 		CFGOPT(float, dlssBiasDepthFalloffStart);
 		CFGOPT(float, dlssBiasDepthFalloffEnd);
 		CFGOPT(float, dlssJitterScale);
+	}
+
+	if (section == "cabletracking") {
+		if (name == "enabled") { cfg->cableTracking.enabled = parse_bool(value, name, lineno); return true; }
+		if (name == "showKey") { cfg->cableTracking.showKey = parse_int(value, name, lineno); return true; }
+		if (name == "showModifiers") { cfg->cableTracking.showModifiers = parse_int(value, name, lineno); return true; }
+		if (name == "resetKey") { cfg->cableTracking.resetKey = parse_int(value, name, lineno); return true; }
+		if (name == "resetModifiers") { cfg->cableTracking.resetModifiers = parse_int(value, name, lineno); return true; }
+		if (name == "displaySeconds") { cfg->cableTracking.displaySeconds = parse_int(value, name, lineno); return true; }
+		if (name == "warningTurns") { cfg->cableTracking.warningTurns = parse_float(value, name, lineno); return true; }
 	}
 
 	// Combos are parsed separately by BaseOverlay; just skip them here

@@ -128,7 +128,8 @@ namespace OpenCompositeConfigurator
                 ForeColor = ModernUiTheme.TextSecondary,
             };
             container.Controls.Add(_lblTrackerHelp);
-            container.Height = Math.Max(650, y + 312);
+            BuildCableTrackingPanel(container, 12, 600, 284);
+            container.Height = Math.Max(760, y + 312);
 
             var poseTimer = new System.Windows.Forms.Timer { Interval = 250 };
             void RefreshPoses()
@@ -238,6 +239,7 @@ namespace OpenCompositeConfigurator
 
         private void LoadTreadmillSettings()
         {
+            LoadCableTrackingSettings();
             _chkTreadmillEnabled.Checked = ParseBool(_ini.Get("", "treadmillEnabled", "false"));
             _chkTreadmillControllerCalibration.Checked = ParseBool(_ini.Get("", "treadmillControllerCalibration", "true"));
             if (int.TryParse(_ini.Get("", "treadmillPort", "9020"), out int port))
@@ -261,6 +263,7 @@ namespace OpenCompositeConfigurator
 
         private void SaveTreadmillSettings()
         {
+            SaveCableTrackingSettings();
             _ini.Set("", "treadmillEnabled", _chkTreadmillEnabled.Checked ? "true" : "false");
             _ini.Set("", "treadmillControllerCalibration", _chkTreadmillControllerCalibration.Checked ? "true" : "false");
             _ini.Set("", "treadmillPort", _nudTreadmillPort.Value.ToString(CultureInfo.InvariantCulture));
@@ -291,8 +294,7 @@ namespace OpenCompositeConfigurator
             }
             var dialog = new Form { Text = "KAT Reader setup — experimental", ClientSize = new Size(780, 396),
                 StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog,
-                MaximizeBox = false, MinimizeBox = true, BackColor = ModernUiTheme.Window, ForeColor = ModernUiTheme.TextPrimary,
-                AutoScaleMode = AutoScaleMode.Dpi };
+                MaximizeBox = false, MinimizeBox = true, BackColor = ModernUiTheme.Window, ForeColor = ModernUiTheme.TextPrimary };
             dialog.Controls.Add(new Label { Location = new Point(18, 24), Size = new Size(744, 70),
                 Text = "Start Gateway with your treadmill connected. Select KATNativeSDK.dll from that installed Gateway.\n"
                     + "Your SDK choice is remembered on this PC. Closing setup leaves the reader running; closing the Configurator stops it." });
@@ -429,6 +431,7 @@ namespace OpenCompositeConfigurator
                 if (ReferenceEquals(_treadmillReaderDialog, dialog)) _treadmillReaderDialog = null;
             };
             ModernUiTheme.Apply(dialog, windowBands: false);
+            DpiLayout.Popup(dialog);
             _treadmillReaderDialog = dialog;
             if (startAutomatically) StartReader();
             else dialog.Show(this);

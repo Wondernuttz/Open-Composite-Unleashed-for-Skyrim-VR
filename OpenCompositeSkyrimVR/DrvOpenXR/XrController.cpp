@@ -188,6 +188,8 @@ uint64_t XrController::GetUint64TrackedDeviceProperty(vr::ETrackedDeviceProperty
 		supported |= vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu);
 		supported |= vr::ButtonMaskFromId(vr::k_EButton_Grip);
 		supported |= vr::ButtonMaskFromId(vr::k_EButton_Axis2);
+		if (profile.GetPath() == "/interaction_profiles/valve/frame_controller_valve")
+			supported |= vr::ButtonMaskFromId(vr::k_EButton_Axis3);
 		supported |= vr::ButtonMaskFromId(vr::k_EButton_DPad_Left);
 		supported |= vr::ButtonMaskFromId(vr::k_EButton_DPad_Up);
 		supported |= vr::ButtonMaskFromId(vr::k_EButton_DPad_Down);
@@ -208,12 +210,24 @@ uint32_t XrController::GetStringTrackedDeviceProperty(vr::ETrackedDeviceProperty
 	if (pErrorL)
 		*pErrorL = vr::TrackedProp_Success;
 
-	std::optional<std::string> ret = profile.GetProperty<std::string>(prop, GetHand());
+	// Legacy meshes have their own stable, handed model names. Do this before
+	// profile lookup: several profiles advertise a shared controller model name
+	// with no left/right suffix, which cannot select an embedded hand mesh.
+	std::optional<std::string> ret;
+	if (prop == vr::Prop_RenderModelName_String && oovr_global_configuration.UseLegacyGreyHands()
+	    && (type == XCT_LEFT || type == XCT_RIGHT)) {
+		ret = type == XCT_LEFT ? "renderLeftHand" : "renderRightHand";
+	} else {
+		ret = profile.GetProperty<std::string>(prop, GetHand());
+	}
 	if (ret.has_value()) {
-		if (value != NULL && bufferSize > 0) {
-			strcpy_s(value, bufferSize, ret->c_str());
+		const auto required = static_cast<uint32_t>(ret->size() + 1);
+		if (value && bufferSize >= required) {
+			memcpy(value, ret->c_str(), required);
+		} else if (pErrorL) {
+			*pErrorL = vr::TrackedProp_BufferTooSmall;
 		}
-		return ret->size() + 1;
+		return required;
 	}
 
 #define PROP(in, out)                                                                                  \

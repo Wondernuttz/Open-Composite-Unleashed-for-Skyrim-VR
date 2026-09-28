@@ -7,6 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../OC Unleashed Configurator/DpiLayout.cs" Link="DpiLayout.cs" />
     <Compile Include="../../OC Unleashed Configurator/TreadmillReaderPreferences.cs" Link="TreadmillReaderPreferences.cs" />
     <Compile Include="../../OC Unleashed Configurator/TreadmillSettings.cs" Link="TreadmillSettings.cs" />
   </ItemGroup>

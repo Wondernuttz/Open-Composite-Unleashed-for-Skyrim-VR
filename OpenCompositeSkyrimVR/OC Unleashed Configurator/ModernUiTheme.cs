@@ -73,7 +73,7 @@ namespace OpenCompositeConfigurator
             button.Cursor = Cursors.Hand;
             button.BackColor = selected ? Color.FromArgb(27, 65, 57) : Surface;
             button.ForeColor = selected ? TextPrimary : TextSecondary;
-            button.Font = new Font("Segoe UI", 9.5f,
+            button.Font = new Font("Segoe UI", button.Font.SizeInPoints,
                 selected ? FontStyle.Bold : FontStyle.Regular);
             button.FlatAppearance.BorderSize = selected ? 1 : 0;
             button.FlatAppearance.BorderColor = selected ? KeyGlowBright : Surface;
@@ -189,6 +189,10 @@ namespace OpenCompositeConfigurator
                     break;
 
                 case Label label:
+                    // Fixed logical label widths were authored for GDI+ text
+                    // metrics. Keep those metrics in the shipped app as well as
+                    // previews, rather than clipping an extra GDI padding column.
+                    label.UseCompatibleTextRendering = true;
                     StyleLabel(label);
                     break;
 

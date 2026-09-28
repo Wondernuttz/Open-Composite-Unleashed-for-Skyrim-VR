@@ -202,6 +202,8 @@ add_library(DrvOpenXR STATIC
 
 	DrvOpenXR/XrBackend.cpp
 	DrvOpenXR/XrBackend.h
+	DrvOpenXR/CableTrackingOverlay.cpp
+	DrvOpenXR/CableTrackingOverlay.h
 	DrvOpenXR/FoveationDebugOverlay.cpp
 	DrvOpenXR/FoveationDebugOverlay.h
 
@@ -279,6 +281,9 @@ add_library(OCCore STATIC
 	OpenOVR/Compositor/VRSManager.cpp
 	OpenOVR/Compositor/FoveationBlackoutRenderer.cpp
 	OpenOVR/Compositor/FoveationBlackoutRenderer.h
+	OpenOVR/Compositor/MenuLayerRenderer.cpp
+	OpenOVR/Compositor/MenuLayerRenderer.h
+	OpenOVR/Compositor/SkyrimMenuTargets.h
 	OpenOVR/Compositor/VRSShaderGuard.cpp
 	OpenOVR/Compositor/VRSShaderGuard.h
 	OpenOVR/Compositor/ExactPixelShader.h
@@ -331,6 +336,7 @@ add_library(OCCore STATIC
 	OpenOVR/Misc/Keyboard/VRMenuLaser.cpp
 	OpenOVR/Misc/Input/InteractionProfile.cpp
 	OpenOVR/Misc/Input/OculusInteractionProfile.cpp
+	OpenOVR/Misc/Input/FrameInteractionProfile.cpp
 	OpenOVR/Misc/Input/KhrGenericInteractionProfile.cpp
 	OpenOVR/Misc/Input/KhrSimpleInteractionProfile.cpp
 	OpenOVR/Misc/Input/ViveInteractionProfile.cpp
@@ -400,6 +406,7 @@ add_library(OCCore STATIC
 	OpenOVR/Misc/Keyboard/VRKeyboard.h
 	OpenOVR/Misc/Input/InteractionProfile.h
 	OpenOVR/Misc/Input/OculusInteractionProfile.h
+	OpenOVR/Misc/Input/FrameInteractionProfile.h
 	OpenOVR/Misc/Input/KhrGenericInteractionProfile.h
 	OpenOVR/Misc/Input/KhrSimpleInteractionProfile.h
 	OpenOVR/Misc/lodepng.h
@@ -820,6 +827,14 @@ if (WIN32)
         target_link_libraries(OCURDMHandoffD3D11Test PRIVATE "${OCU_RDM_TEST_DETOURS_ROOT}/lib/detours.lib")
     endif()
     set_target_properties(OCURDMHandoffD3D11Test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_executable(OCUMenuLayerHookD3D11Test EXCLUDE_FROM_ALL
+        tests/MenuLayerHookD3D11Tests.cpp OpenOVR/Compositor/MenuLayerRenderer.cpp
+        OpenOVR/Compositor/RDMRenderScope.cpp OpenOVR/Compositor/DensityMaskManager.cpp
+        OpenOVR/Compositor/VRSShaderGuard.cpp)
+    target_compile_definitions(OCUMenuLayerHookD3D11Test PRIVATE NOMINMAX)
+    target_include_directories(OCUMenuLayerHookD3D11Test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} libs/minhook/include)
+    target_link_libraries(OCUMenuLayerHookD3D11Test PRIVATE d3d11 d3dcompiler dxgi dxguid minhook)
+    set_target_properties(OCUMenuLayerHookD3D11Test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_executable(OCURDMPerformanceD3D11Test EXCLUDE_FROM_ALL
         tests/RDMPerformanceD3D11Tests.cpp OpenOVR/Compositor/RDMRenderScope.cpp
         OpenOVR/Compositor/DensityMaskManager.cpp OpenOVR/Compositor/VRSShaderGuard.cpp)
@@ -887,6 +902,21 @@ if (WIN32)
 	target_link_libraries(OCUDensityMaskD3D11Test PRIVATE d3d11 d3dcompiler dxgi dxguid)
 	set_target_properties(OCUDensityMaskD3D11Test PROPERTIES
 		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/tests/KeyboardModifierProduction.inc"
+        COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/ExtractKeyboardModifierTest.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/OpenOVR/Misc/Keyboard/VRKeyboard.cpp" "${CMAKE_BINARY_DIR}/tests/KeyboardModifierProduction.inc"
+        DEPENDS tests/ExtractKeyboardModifierTest.py OpenOVR/Misc/Keyboard/VRKeyboard.cpp VERBATIM)
+    add_executable(OCUKeyboardModifierTest EXCLUDE_FROM_ALL tests/KeyboardModifierTests.cpp "${CMAKE_BINARY_DIR}/tests/KeyboardModifierProduction.inc")
+    target_include_directories(OCUKeyboardModifierTest PRIVATE "${CMAKE_BINARY_DIR}/tests" "${CMAKE_CURRENT_SOURCE_DIR}")
+    set_target_properties(OCUKeyboardModifierTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_executable(OCUCableTrackingTest EXCLUDE_FROM_ALL tests/CableTrackingTests.cpp)
+    target_include_directories(OCUCableTrackingTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(OCUCableTrackingTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_executable(OCUCableOverlayTest EXCLUDE_FROM_ALL tests/CableOverlayTests.cpp DrvOpenXR/CableTrackingOverlay.cpp)
+    target_compile_definitions(OCUCableOverlayTest PRIVATE NOMINMAX SUPPORT_DX11)
+    target_include_directories(OCUCableOverlayTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${XrDir}/include)
+    target_link_libraries(OCUCableOverlayTest PRIVATE d3d11 gdi32)
+    set_target_properties(OCUCableOverlayTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 	add_executable(OCUFoveationDebugOverlayTest EXCLUDE_FROM_ALL
 		tests/FoveationDebugOverlayTests.cpp DrvOpenXR/FoveationDebugOverlay.cpp)
 	add_executable(OCURDMBlackoutCullTest EXCLUDE_FROM_ALL
@@ -894,7 +924,17 @@ if (WIN32)
 	add_executable(OCUFoveationBlackoutD3D11Test EXCLUDE_FROM_ALL
 		tests/FoveationBlackoutD3D11Tests.cpp OpenOVR/Compositor/FoveationBlackoutRenderer.cpp)
 	add_executable(OCUDapaBlackoutShaderTest EXCLUDE_FROM_ALL tests/DapaBlackoutShaderTests.cpp)
-	foreach(cullTest OCURDMBlackoutCullTest OCUFoveationBlackoutD3D11Test OCUDapaBlackoutShaderTest)
+	add_executable(OCUMenuLayerD3D11Test EXCLUDE_FROM_ALL
+		tests/MenuLayerD3D11Tests.cpp OpenOVR/Compositor/MenuLayerRenderer.cpp
+		OpenOVR/Compositor/VRSShaderGuard.cpp)
+	target_link_libraries(OCUMenuLayerD3D11Test PRIVATE minhook)
+	add_executable(OCUMenuShaderMetadataD3D11Test EXCLUDE_FROM_ALL
+		tests/MenuShaderMetadataD3D11Tests.cpp OpenOVR/Compositor/VRSShaderGuard.cpp)
+	target_compile_definitions(OCUMenuShaderMetadataD3D11Test PRIVATE NOMINMAX)
+	target_include_directories(OCUMenuShaderMetadataD3D11Test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} libs/minhook/include)
+	target_link_libraries(OCUMenuShaderMetadataD3D11Test PRIVATE d3d11 d3dcompiler dxgi minhook)
+	set_target_properties(OCUMenuShaderMetadataD3D11Test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+	foreach(cullTest OCURDMBlackoutCullTest OCUFoveationBlackoutD3D11Test OCUDapaBlackoutShaderTest OCUMenuLayerD3D11Test)
 		target_compile_definitions(${cullTest} PRIVATE NOMINMAX)
 		target_include_directories(${cullTest} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 		target_link_libraries(${cullTest} PRIVATE d3d11 d3dcompiler dxgi dxguid)
@@ -915,6 +955,7 @@ if (WIN32)
 	set_target_properties(OCUEyeGazeSamplerTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 	add_executable(OCUDapaTimingTest EXCLUDE_FROM_ALL tests/DapaTimingTests.cpp)
 	set(OCU_DAPA_MENU_GENERATED
+		"${CMAKE_BINARY_DIR}/tests/FoveationMenuDraw.inc"
 		"${CMAKE_BINARY_DIR}/tests/DapaMenuBridge.inc" "${CMAKE_BINARY_DIR}/tests/DapaMenuProvider.inc"
 		"${CMAKE_BINARY_DIR}/tests/DapaMenuCacheAdmission.inc" "${CMAKE_BINARY_DIR}/tests/DapaMenuScheduler.inc")
 	add_custom_command(OUTPUT ${OCU_DAPA_MENU_GENERATED}
@@ -982,3 +1023,9 @@ if (WIN32)
 	set_target_properties(OCUDapaTimingTest PROPERTIES
 		RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 endif()
+
+target_sources(DrvOpenXR PRIVATE DrvOpenXR/DapaNativePlayerMotion.cpp)
+add_executable(OCUDapaCharacterMotionTest EXCLUDE_FROM_ALL tests/DapaCharacterMotionTests.cpp DrvOpenXR/DapaNativePlayerMotion.cpp)
+target_include_directories(OCUDapaCharacterMotionTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(OCUDapaCharacterMotionTest PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(OCUDapaCharacterMotionTest PRIVATE d3d11 d3dcompiler)

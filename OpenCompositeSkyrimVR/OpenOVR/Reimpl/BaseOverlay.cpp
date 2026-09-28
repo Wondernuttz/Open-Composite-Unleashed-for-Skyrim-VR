@@ -11,6 +11,7 @@
 #include "Compositor/compositor.h"
 #include "Drivers/Backend.h"
 #include "Misc/Config.h"
+#include "Misc/CableTracking.h"
 #include "Misc/ScopeGuard.h"
 #include "convert.h"
 #include "generated/static_bases.gen.h"
@@ -489,6 +490,7 @@ static HWND GetGameWindowLocal();
 // when the game window is unfocused, which it usually is in VR.
 static void SendComboKey(int scancode, bool up)
 {
+	if (ocu_cable::Shortcut(scancode, up)) return;
 	constexpr UINT WM_OC_KB_COMBO = WM_APP + 0x4F43; // same channel as keyboard/gestures
 	HWND hwnd = GetGameWindowLocal();
 	if (hwnd) {

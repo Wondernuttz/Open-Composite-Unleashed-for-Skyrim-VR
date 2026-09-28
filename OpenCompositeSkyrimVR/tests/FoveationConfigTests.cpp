@@ -37,6 +37,18 @@ int main()
     try {
         using namespace ocu_foveation;
         Config fresh;
+        Check(!fresh.IndexGripCustom(), "Index grip defaults to runtime thresholds");
+        for (const char* section : {"", "input"}) {
+            Config grip;
+            Set(grip, section, "indexGripCustom", "enabled");
+            Set(grip, section, "indexGripGrabThreshold", "0.35");
+            Set(grip, section, "indexGripReleaseThreshold", "0.15");
+            Check(grip.IndexGripCustom() && Near(grip.IndexGripThresholds().grab,.35f)
+                && Near(grip.IndexGripThresholds().release,.15f), "custom grip INI reaches runtime thresholds");
+            Set(grip, section, "indexGripGrabThreshold", "0");
+            Set(grip, section, "indexGripReleaseThreshold", "2");
+            Check(Near(grip.IndexGripThresholds().grab,.02f) && Near(grip.IndexGripThresholds().release,.01f), "invalid INI grip values normalize safely");
+        }
         const auto eye = fresh.FoveationRadii(true);
         const auto fixed = fresh.FoveationRadii(false);
         Check(Near(eye.inner, .20f) && Near(eye.mid, .40f), "fresh gaze uses Performance radii");

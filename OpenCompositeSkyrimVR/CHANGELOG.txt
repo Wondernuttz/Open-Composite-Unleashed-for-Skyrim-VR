@@ -1,3 +1,68 @@
+OpenComposite Unleashed 5.0.1 for Skyrim VR
+
+1. DAPA player motion: Added native-motion-vector correction inside the existing player, hands, equipped-weapon and held-item masks. Camera motion is removed before prediction; the original world warp is preserved. Motion is prepared at render resolution, and output regions without usable motion are skipped.
+2. Automatic recovery: Extra player correction pauses after three consecutive complete stereo samples above 1.5 ms, then retries with fresh history. Repeated failures increase the retry delay from 2 seconds up to 30 seconds; sustained recovery restores the short delay. Original masked DAPA continues during cooldown.
+3. Steam Frame controls: Added controller artwork, calibrated binding circles, presets and extension-gated native bindings for the D-pad, ABXY, bumpers, triggers, grips, sticks and View/Menu buttons. Gaze uses the existing OpenXR eye-gaze path. Physical Steam Frame validation remains pending.
+4. Index grip holding: Added short touch-release confirmation and recovery for custom grip thresholds, with cleanup when focus, controller or interaction profile changes.
+5. Menu interaction: Improved MCM option targeting and laser/thumbstick handoff. Removed the unsafe Crafting-menu hit test and hardened Journal focus handling across menu transitions.
+6. Configurator: Included DPI/layout corrections, restored keyboard haptic controls, clearer disabled text and working setup-guide access.
+7. VR keyboard and cable tracking: Added console clipboard paste with Ctrl+V, corrected modifier handling, and an optional physical-turn counter with an unwind overlay and assignable shortcuts.
+
+Player-motion correction remains experimental. It preserves the original mask outline; thin and rotating objects can still ghost. It pauses during locomotion, stick turns, menus, and invalid history. The GPU guard is sampled, and an FPS improvement is not guaranteed. AMD RDM remains experimental.
+
+Install the complete package, including root/openvr_api.dll and SKSE/Plugins/OpenCompositeInput.dll. Preserve your existing settings when updating. No CSX/Open Shaders shader-cache deletion is required. Fixed VRS and verbose logging are off in the shipped configuration.
+
+
+Steam Frame controller support
+- Added Frame artwork and Quest-sized binding circles for D-pad, ABXY, bumpers, triggers, grips, View/Menu and sticks.
+- Added extension-gated native OpenXR Frame bindings with independent extra buttons and Frame pose offsets. Eye gaze uses the existing EXT eye-gaze path; physical Frame testing is pending.
+
+Index grip: Added bounded 20 ms touch-release confirmation and custom-hysteresis recovery, immediate focus/device/profile reset, and optional transition diagnostics. Local tests passed; headset retest pending.
+
+VR keyboard: Added Windows clipboard paste into Skyrim console via Ctrl+V. Enter remains separate.
+
+VR keyboard: Added Shift to function/control-key shortcuts and repaired shared modifier releases.
+
+Cable tracking: Added optional headset-turn counter, unwind overlay, keyboard/controller shortcuts and turn warnings on KAT VR / Trackers.
+
+5.0.0 (release candidate)
+
+CONFIGURATOR DISPLAY SCALING
+- Restored keyboard haptic strength below press-sound volume on Settings, with aligned percentage fields. This controls both hover and key-press vibration. Removed the inactive hover-audio control; keyboard vibration remains independent of the sound switch.
+- Separated deadzone labels from their fields and spaced the FSR motion-vector controls. Removed the overlapping keyboard hint and labeled both keyboard sound volumes explicitly.
+- Reworked DPI fitting from stable design coordinates. Native numeric inputs retain ownership of their edit/spin controls; actual Windows client bounds prevent clipped fields after oversized window requests. Repeated scale changes no longer accumulate layout drift.
+- Corrected clipped button labels and bottom-of-window content, with additional space for the bottom row and layout checks across simulated display scales.
+- Kept Index grip settings visible for every controller layout, with disabled controls and guidance when Index is not selected. Save settings also remembers the controller picture selection.
+- Fixed the screen-fit exception when maximizing a window. Maximized layouts use the client area and preserve Windows-managed borders and restore bounds.
+- Enabled per-monitor DPI scaling with a 96-DPI design baseline for sharper text on scaled displays. Main pages and dialogs fit the available screen without scrollbars; oversized layouts scale down proportionally. Scrolling is retained only in the foveation editor. The gesture library uses previous/next pages. Saved controller calibration stays in normalized image coordinates.
+
+MENU RENDERING AND UPSCALING
+- Moved Journal System focus repair to the UI task queue, delayed it during menu transitions, and rejected stale movies and unready focus targets. Local lifecycle regression checks passed; the reported in-game crash requires tester confirmation.
+- Added an OCU-owned projected/HUD menu capture path for OCU DLSS/FSR. Compatible menu layers are composited after upscaling, sharpening and blackout processing, keeping captured UI out of world-image reconstruction. Source menu-texture resolution still limits final detail; this does not rerender fonts or replace CSX/Open Shaders' own menu handling.
+- Added stereo crop/alignment handling and restoration before unsupported draws, texture reads, copies, clears and deferred command playback. Unsupported rendering passes retain normal rendering. Menu composition uses an isolated command list to preserve the game's graphics state.
+- Pause temporal camera jitter during protected menu frames and keep DAPA suspended for a frame containing captured UI, including when the menu closes before submission finishes. Resume gameplay using fresh frame state.
+- Local GPU tests passed on WARP and NVIDIA hardware with and without the Direct3D debug layer, alongside VRS/RDM regression checks. In-headset Inventory/MCM validation of the new separation path remains pending.
+
+EYE TRACKING AND FOVEATION
+- Fixed and eye-tracked scene foveation now stop before the next draw when a Skyrim popup or pause menu opens during a frame. Pending RDM work finishes first; full-rate menu rendering stays active until a fresh gameplay frame. Existing map protection remains.
+- Added the PugDragon gaze-preview editor with Quality, Balanced, Performance and Aggressive profiles, independent ring sizes/rates, width and alignment controls, and in-headset diagnostic rings. Performance is the fresh-install default; saved profiles are preserved.
+- Added optional middle/outer blackout, an adjustable peripheral cutoff and a separate experimental option to skip rendering in hidden areas. Blackout alone does not establish a rendering-performance gain.
+- Improved gaze compatibility with runtimes whose timestamps are absent or unsuitable for freshness checks. Valid pose flags determine gaze eligibility; timestamps remain available for diagnostics.
+- Retained separate NVIDIA VRS and Density Mask rendering paths. AMD foveation (RDM) is now explicitly labeled experimental in the Configurator, including beside the Auto selection.
+- Corrected RDM reconstruction writing outside the current color draw when an earlier depth prepass covered a larger area. Current-draw coverage now restricts reconstruction, with incomplete edge clusters kept at full rate. Net AMD gameplay performance still requires matched testing.
+- Added selectable shader-effects-only foveation for compatible shader integrations; this mode requires a matching consumer and does not apply scene shading rates.
+
+KAT VR AND TRACKERS
+- Added KAT Gateway treadmill input through the bundled reader and a themed KAT VR / Trackers setup page. Users select the SDK from their installed Gateway; the reader remembers that location and offers automatic startup.
+- Added fresh connection indicators, speed and port controls, and direction calibration using the sensor button or the optional two-thumbstick controller shortcut after gameplay loads.
+- Added handling for stale/disconnected input, menus, lost focus and recentering. Physical stick input takes priority over treadmill movement. Calibration is required before walking input is delivered.
+- Added tracker-role configuration and connection feedback for compatible runtime-exposed body trackers. Avatar tracking requires a compatible Skyrim body-tracking mod and its dependencies.
+
+STARTUP AND CONTROLLER HELP
+- Added optional Index grip sensitivity: Runtime default or Custom with separate grab/release thresholds. The section stays visible; tuning controls are disabled unless the Index layout and Custom mode are selected. In-game tuning applies only to detected Index controllers. Custom mode uses Valve OpenXR thresholds where available and analog hysteresis otherwise; HIGGS Auto/Touch holding remains separate from squeeze-button bindings. Save settings and restart Skyrim.
+- Corrected HMD-presence queries during initialization, active runtime use and teardown so they do not create a competing OpenXR instance or assert solely because an instance already exists.
+- Added a themed Help button beside the Index trackpad gesture setting, with the paired Spell Wheel MCM options and physical press guidance. Existing bindings remain unchanged.
+
 4.3.7 Hotfix 6 (2026-09-12)
 - Fixed slow resource-identity recovery after CSX/upscaler render-target recreation. Coalesced game-thread maintenance replaces the approximately one-second poll; unchanged resources return before COM/descriptor work. Exact scene ownership and safe resource retirement remain.
 - Reconcile menu activity after events so a later pause-count release can restore foveation/DAPA without another menu event. Tracked menus and real pauses remain protected.

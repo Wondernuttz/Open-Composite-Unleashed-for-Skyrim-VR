@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -121,7 +121,7 @@ namespace OpenCompositeConfigurator
                 if (!File.Exists(UiStatePath)) return "touch";
                 var state = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(UiStatePath));
                 if (state != null && state.TryGetValue("controllerModel", out var model) &&
-                    model is "knuckles" or "psvr2")
+                    model is "knuckles" or "psvr2" or "frame")
                     return model;
                 return "touch";
             }
@@ -158,6 +158,7 @@ namespace OpenCompositeConfigurator
 
         private Image? ActiveControllerImage => _controllerModelKey switch
         {
+            "frame" when _frameImage != null => _frameImage,
             "knuckles" when _knucklesImage != null => _knucklesImage,
             "psvr2" when _psvr2Image != null => _psvr2Image,
             _ => _controllerImage,
@@ -223,6 +224,7 @@ namespace OpenCompositeConfigurator
             _cmbControllerModel.Items.Add("Oculus / Quest Touch");
             _cmbControllerModel.Items.Add("Valve Index Knuckles");
             _cmbControllerModel.Items.Add("PlayStation VR2 Sense");
+            _cmbControllerModel.Items.Add("Steam Frame");
             _cmbControllerModel.SelectedIndex = 0; // default Meta / Quest Touch
 
             // Explicit Save button so the choice only sticks when the user commits it.
@@ -247,9 +249,13 @@ namespace OpenCompositeConfigurator
                 {
                     1 => "knuckles",
                     2 => "psvr2",
+                    3 => "frame",
                     _ => "touch",
                 };
+                bool frameChanged = (_controllerModelKey == "frame") != (model == "frame");
                 ApplyControllerModel(model);
+                if (frameChanged && _lblKbStatus != null && !HasPendingControllerEdits)
+                    PreviewSelectedBindingPreset();
                 btnSaveController.Text = "Save";
             };
             container.Controls.Add(_cmbControllerModel);
@@ -276,6 +282,7 @@ namespace OpenCompositeConfigurator
             {
                 "knuckles" => 1,
                 "psvr2" => 2,
+                "frame" => 3,
                 _ => 0,
             };
 
@@ -293,10 +300,12 @@ namespace OpenCompositeConfigurator
         private void ApplyControllerModel(string key)
         {
             _controllerModelKey = key;
+            if (_indexGrip != null) _indexGrip.SetIndexSelected(key == "knuckles");
             var defaults = key switch
             {
                 "knuckles" => ControllerButtonsKnuckles,
                 "psvr2" => ControllerButtonsPsvr2,
+                "frame" => ControllerButtonsFrame,
                 _ => ControllerButtons,
             };
             _activeControllerButtons = defaults.ToDictionary(kv => kv.Key, kv => kv.Value);
@@ -325,6 +334,11 @@ namespace OpenCompositeConfigurator
             if (_lblTrackpadSwipe != null) _lblTrackpadSwipe.Visible = knuckles;
             if (_cmbTrackpadSwipe != null) _cmbTrackpadSwipe.Visible = knuckles;
             if (_lblTrackpadSwipeHint != null) _lblTrackpadSwipeHint.Visible = knuckles;
+
+            if (_chkLeftX != null) _chkLeftX.Text = key == "frame" ? "D-pad Down" : "X Button";
+            if (_chkLeftY != null) _chkLeftY.Text = key == "frame" ? "D-pad Up" : "Y Button";
+            if (key == "frame" && _lblKbStatus != null)
+                _lblKbStatus.Text = "Frame buttons require the matching OCU runtime and native Frame support in the OpenXR runtime.";
 
             // Gestures tab: hold-button options follow the controller model
             RefreshGestureHoldOptions();

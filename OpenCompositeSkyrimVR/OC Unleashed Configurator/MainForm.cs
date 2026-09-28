@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -178,6 +178,7 @@ namespace OpenCompositeConfigurator
         private CheckBox _chkDisableThumbrestTouch = null!;
         private CheckBox _chkDisableTrackpad = null!;
         private CheckBox _chkVRIKKnuckles = null!;
+        private IndexGripControl _indexGrip = null!;
         private CheckBox _chkCombatHapticShield = null!;
         private CheckBox _chkCombatHapticWeapon = null!;
         private CheckBox _chkCombatHapticBow = null!;
@@ -194,7 +195,6 @@ namespace OpenCompositeConfigurator
 
         // Keyboard sound settings
         private CheckBox _chkSoundsEnabled = null!;
-        private NumericUpDown _nudHoverVolume = null!;
         private NumericUpDown _nudPressVolume = null!;
         private NumericUpDown _nudKbHapticStrength = null!;
 
@@ -239,9 +239,8 @@ namespace OpenCompositeConfigurator
         private NumericUpDown _nudRightLaserRotZ = null!;
 
         // Support footer
-        private PictureBox _picKofi = null!;
+        private Image? _coffeeImage;
         private Image? _kofiImage;
-        private readonly List<Control> _footerControls = new();
 
         // Bottom buttons
         private Button _btnSave = null!;
@@ -458,7 +457,7 @@ namespace OpenCompositeConfigurator
             _gameName = gameType == "skyrim" ? "Skyrim VR" : "Fallout 4 VR";
 
             LoadControllerImage();
-            LoadKofiImage();
+            LoadCoffeeImage();
             LoadWindowIcon();
             LoadConfiguratorSettings();
             InitializeUI();
@@ -484,6 +483,8 @@ namespace OpenCompositeConfigurator
             _activeGlowTimer.Start();
             Activated += (_, _) => RefreshKeyboardDesignChoices();
             FormClosed += (_, _) => _skyrimSettingsTip?.Dispose();
+            _dpiDesignClientSize = ClientSize;
+            DpiLayout.Popup(this);
         }
 
         private void LoadControllerImage()
@@ -494,14 +495,24 @@ namespace OpenCompositeConfigurator
                 _controllerImage = Image.FromStream(stream);
             LoadKnucklesImage();
             LoadPsvr2Image();
+            LoadFrameImage();
         }
 
-        private void LoadKofiImage()
+        private void LoadCoffeeImage()
         {
             var assembly = Assembly.GetExecutingAssembly();
-            using var stream = assembly.GetManifestResourceStream("OpenCompositeConfigurator.Resources.kofi.png");
+            using var stream = assembly.GetManifestResourceStream("OpenCompositeConfigurator.Resources.buymeacoffee.png");
             if (stream != null)
-                _kofiImage = Image.FromStream(stream);
+            {
+                using var source = Image.FromStream(stream);
+                _coffeeImage = new Bitmap(source);
+            }
+            using var kofiStream = assembly.GetManifestResourceStream("OpenCompositeConfigurator.Resources.kofi.png");
+            if (kofiStream != null)
+            {
+                using var source = Image.FromStream(kofiStream);
+                _kofiImage = new Bitmap(source);
+            }
         }
 
         private void LoadWindowIcon()
@@ -538,8 +549,8 @@ namespace OpenCompositeConfigurator
 
         private void InitializeUI()
         {
-            Text = "OpenComposite Configurator";
-            Size = new Size(1280, 1060);
+            Text = "OpenComposite Unleashed 5 - Configurator";
+            ClientSize = new Size(1264, 1021);
             MinimumSize = new Size(1260, 800);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.FromArgb(30, 30, 35);
@@ -822,82 +833,78 @@ namespace OpenCompositeConfigurator
 
             // Sync all tabs to the same height (tallest content)
             var tabs = new[] { _tabSettings, _tabKeyboard, _tabGestures, _tabVideo, _tabSteamHelp, _tabHaptics, _tabBody, _tabTreadmill };
-            int tallestTab = tabs.Max(tab => tab.Height);
+            int tallestTab = tabs.Max(tab => Math.Max(tab.Height,
+                tab.Controls.Cast<Control>().Select(c => c.Bottom + 12).DefaultIfEmpty(0).Max()));
             foreach (Panel tab in tabs)
                 tab.Size = new Size(tab.Width, tallestTab);
 
             // Support footer right after the tabs
-            int kofiY = _tabSettings.Location.Y + tallestTab + 4;
-            const string supportUrl = "https://buymeacoffee.com/coldbomb1f";
-
-            // Support footer
-            var kofiSep = new Label
+            int footerY = _tabSettings.Location.Y + tallestTab + 8;
+            var supportSeparator = new Label
             {
-                Location = new Point(leftMargin, kofiY),
+                Location = new Point(leftMargin, footerY),
                 Size = new Size(rightEdge - leftMargin, 1),
                 BackColor = Color.FromArgb(60, 60, 65)
             };
-            Controls.Add(kofiSep);
-            _footerControls.Add(kofiSep);
-            kofiY += 6;
-
-            // One line: italic text + bold link + icon
-            var lblKofiMsg = new Label
+            Controls.Add(supportSeparator);
+            var supportFooter = new FlowLayoutPanel
             {
-                Text = "OCU is maintained for the VR community. If you want to support ColdBomb,",
-                Location = new Point(leftMargin, kofiY),
+                Name = "SupportFooter",
+                Location = new Point(leftMargin, footerY + 7),
+                Size = new Size(rightEdge - leftMargin, 44),
+                WrapContents = false,
+                AutoScroll = false,
+                BackColor = Color.Transparent
+            };
+            supportFooter.Controls.Add(new Label
+            {
+                Text = "If you want to support us at OCU:",
                 AutoSize = true,
+                Margin = new Padding(0, 10, 12, 0),
                 Font = new Font("Segoe UI", 9f, FontStyle.Italic),
-                ForeColor = Color.FromArgb(160, 160, 160)
-            };
-            Controls.Add(lblKofiMsg);
-            _footerControls.Add(lblKofiMsg);
+                ForeColor = ModernUiTheme.TextSecondary
+            });
+            void AddSupportLink(string name, string url, Image? image)
+            {
+                void OpenLink()
+                {
+                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true }); }
+                    catch { }
+                }
+                var icon = new PictureBox
+                {
+                    Size = new Size(28, 28), Margin = new Padding(0, 4, 6, 0),
+                    SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.Transparent,
+                    Image = image, Cursor = Cursors.Hand,
+                    AccessibleName = $"Support {name}", Tag = url
+                };
+                icon.Click += (_, _) => OpenLink();
+                var link = new LinkLabel
+                {
+                    Text = $"Support {name}", AutoSize = true,
+                    Margin = new Padding(0, 9, 20, 0),
+                    Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                    LinkColor = ModernUiTheme.KeyGlowBright,
+                    ActiveLinkColor = ModernUiTheme.KeyGlowHover,
+                    VisitedLinkColor = ModernUiTheme.KeyGlowBright,
+                    Tag = url
+                };
+                link.LinkClicked += (_, _) => OpenLink();
+                supportFooter.Controls.Add(icon);
+                supportFooter.Controls.Add(link);
+            }
+            AddSupportLink("Wondernutts", "https://ko-fi.com/wondernutts", _kofiImage);
+            AddSupportLink("ColdBomb1", "https://buymeacoffee.com/coldbomb1f", _coffeeImage);
+            Controls.Add(supportFooter);
 
-            int linkX = leftMargin + lblKofiMsg.PreferredWidth + 4;
-            var lblKofiLink = new LinkLabel
-            {
-                Text = "buy him a coffee",
-                Location = new Point(linkX, kofiY),
-                AutoSize = true,
-                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-                LinkColor = Color.FromArgb(41, 171, 226),
-                ActiveLinkColor = Color.FromArgb(80, 200, 255),
-                VisitedLinkColor = Color.FromArgb(41, 171, 226)
-            };
-            lblKofiLink.LinkClicked += (s, e) =>
-            {
-                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(supportUrl) { UseShellExecute = true }); }
-                catch { }
-            };
-            Controls.Add(lblKofiLink);
-            _footerControls.Add(lblKofiLink);
-
-            int iconX = linkX + lblKofiLink.PreferredWidth + 4;
-            _picKofi = new PictureBox
-            {
-                Location = new Point(iconX, kofiY - 2),
-                Size = new Size(22, 22),
-                SizeMode = PictureBoxSizeMode.Zoom,
-                BackColor = Color.Transparent,
-                Image = _kofiImage,
-                Cursor = Cursors.Hand
-            };
-            _picKofi.Click += (s, e) =>
-            {
-                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(supportUrl) { UseShellExecute = true }); }
-                catch { }
-            };
-            Controls.Add(_picKofi);
-            _footerControls.Add(_picKofi);
-
-            // Size form to fit tabs + support footer
-            ClientSize = new Size(ClientSize.Width, kofiY + 26);
+            // Reserve the entire footer plus bottom padding before DPI fitting.
+            ClientSize = new Size(ClientSize.Width, supportFooter.Bottom + 12);
+            supportSeparator.Anchor = supportFooter.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
         }
 
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            FitWindowToScreen();
 
             // Vortex / manual installs: sync the game-root runtime files from
             // the mod's root payload (install on first run, update on change).
@@ -924,38 +931,10 @@ namespace OpenCompositeConfigurator
             }
         }
 
-        // Keep the entire window, including the support footer at the very bottom,
-        // inside the screen's usable area. Runs after the form is shown and placed,
-        // so it reads the real position and the actual monitor. If the content is
-        // taller than the working area, shrink the TAB PANELS (they scroll
-        // internally) and pull the footer up so it is always visible — scrolling
-        // the whole form hid the footer below the fold.
-        private void FitWindowToScreen()
-        {
-            Rectangle wa = Screen.FromControl(this).WorkingArea;
-            if (MinimumSize.Height > wa.Height)
-                MinimumSize = new Size(MinimumSize.Width, wa.Height);
-            Height = Math.Min(Height, wa.Height);
+        private Size _dpiDesignClientSize;
 
-            // Windows may already have constrained the form before OnShown.
-            // Use the actual client space, not Height - WorkingArea, which then
-            // reports zero overflow even while the tab and Save extend outside it.
-            int newTabH = Math.Max(200, Math.Min(_tabSettings.Height,
-                ClientSize.Height - _tabSettings.Top - 40));
-            int delta = _tabSettings.Height - newTabH;
-            foreach (var tab in new[] { _tabSettings, _tabKeyboard, _tabGestures, _tabVideo, _tabSteamHelp, _tabHaptics, _tabBody, _tabTreadmill })
-            {
-                tab.AutoScroll = true;
-                tab.Height = newTabH;
-            }
-            foreach (Control c in _footerControls)
-                c.Top -= delta;
-            if (Bottom > wa.Bottom)
-                Top = wa.Bottom - Height;
-            if (Top < wa.Top)
-                Top = wa.Top;
-        }
-
+        internal void FitWindowToArea(Rectangle area, float scale)
+            => DpiLayout.FitPopup(this, (Panel)Controls["DpiContent"]!, _dpiDesignClientSize, area, scale);
         // ═══════════════════════════════════════════════════════════════════════
         // SETTINGS TAB
         // ═══════════════════════════════════════════════════════════════════════
@@ -1216,41 +1195,41 @@ namespace OpenCompositeConfigurator
             container.Controls.Add(_btnKeyboardStudio);
             ry += 34;
 
-            _chkSoundsEnabled = MakeCheckBox("Keyboard feedback", rx, ry + 4);
+            _chkSoundsEnabled = MakeCheckBox("Keyboard Feedback", rx, ry + 4);
             _chkSoundsEnabled.Checked = true;
             container.Controls.Add(_chkSoundsEnabled);
-
-            var studioHint = MakeLabel("Studio imports and saved designs appear in the Keyboard list automatically.", rx + 170, ry + 4, 330);
-            studioHint.ForeColor = Color.FromArgb(145, 155, 167);
-            studioHint.Font = new Font("Segoe UI", 8.25f);
-            container.Controls.Add(studioHint);
             ry += 30;
 
-            // Row 4: The runtime has separate hover and key-press volumes.
-            // Inset this row from the column edge so DPI scaling cannot clip the
-            // Hover label against the controller/feedback layout boundary.
-            int feedbackX = rx + 56;
-            container.Controls.Add(MakeLabel("Hover:", feedbackX, ry + 3, 58));
-            _nudHoverVolume = new NumericUpDown
-            {
-                Location = new Point(feedbackX + 60, ry), Width = 55,
-                Minimum = 0, Maximum = 100, Increment = 5, Value = 50,
-                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
-            };
-            container.Controls.Add(_nudHoverVolume);
-            container.Controls.Add(MakeLabel("%", feedbackX + 118, ry + 3, 20));
-
-            container.Controls.Add(MakeLabel("Press:", feedbackX + 158, ry + 3, 48));
+            // Hover audio is disabled in the runtime. Expose only active feedback
+            // settings, keeping both rows aligned and clear of the controller hints.
+            int feedbackX = rx + 90;
+            int feedbackInputX = feedbackX + 148;
+            container.Controls.Add(MakeLabel("Press sound:", feedbackX, ry + 3, 140));
             _nudPressVolume = new NumericUpDown
             {
-                Location = new Point(feedbackX + 208, ry), Width = 55,
+                Location = new Point(feedbackInputX, ry), Width = 55,
                 Minimum = 0, Maximum = 100, Increment = 5, Value = 50,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             container.Controls.Add(_nudPressVolume);
-            container.Controls.Add(MakeLabel("%", feedbackX + 266, ry + 3, 20));
+            container.Controls.Add(MakeLabel("%", feedbackInputX + 59, ry + 3, 20));
+            ry += 36;
 
-            // Keyboard haptic strength moved to the dedicated Haptics tab
+            container.Controls.Add(MakeLabel("Keyboard haptics:", feedbackX, ry + 3, 140));
+            _nudKbHapticStrength = new NumericUpDown
+            {
+                Location = new Point(feedbackInputX, ry), Width = 55,
+                Minimum = 0, Maximum = 100, Increment = 5, Value = 50,
+                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White,
+                AccessibleName = "Keyboard haptics",
+                AccessibleDescription = "Vibration strength for hovering over and pressing keyboard keys. Zero disables keyboard vibration."
+            };
+            container.Controls.Add(_nudKbHapticStrength);
+            container.Controls.Add(MakeLabel("%", feedbackInputX + 59, ry + 3, 20));
+            var keyboardFeedbackTip = new ToolTip { AutoPopDelay = 12000, InitialDelay = 350 };
+            keyboardFeedbackTip.SetToolTip(_nudKbHapticStrength, _nudKbHapticStrength.AccessibleDescription);
+            keyboardFeedbackTip.SetToolTip(_chkSoundsEnabled, "Enables keyboard sounds. Keyboard haptics remain independent.");
+            container.Disposed += (_, _) => keyboardFeedbackTip.Dispose();
             ry += 36;
 
             // No reset-position control: the keyboard spawns head-relative and clamped to
@@ -1279,11 +1258,12 @@ namespace OpenCompositeConfigurator
 
             int gc1 = leftMargin;
             int gc2 = leftMargin + 220;
+            int generalFieldX = gc1 + 140;
 
             container.Controls.Add(MakeLabel("Supersampling:", gc1, y + 3, 120));
             _nudSuperSample = new NumericUpDown
             {
-                Location = new Point(gc1 + 120, y), Width = 75,
+                Location = new Point(generalFieldX, y), Width = 75,
                 DecimalPlaces = 1, Increment = 0.1m, Minimum = 0.5m, Maximum = 2.0m, Value = 1.0m,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
@@ -1295,8 +1275,8 @@ namespace OpenCompositeConfigurator
             container.Controls.Add(MakeLabel("Controller models:", gc1, y + 3, 120));
             _cmbControllerModels = new ComboBox
             {
-                Location = new Point(gc1 + 120, y),
-                Width = 260,
+                Location = new Point(generalFieldX, y),
+                Width = 240,
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 BackColor = Color.FromArgb(50, 50, 55),
                 ForeColor = Color.White
@@ -1478,25 +1458,37 @@ namespace OpenCompositeConfigurator
             _chkVRIKKnuckles.Width = 300;
             _pnlSkyrimOnly.Controls.Add(_chkVRIKKnuckles);
             _skyrimSettingsTip.SetToolTip(_chkVRIKKnuckles,
-                "Index only: sends trackpad pressure as A-touch for VRIK gestures instead of upper/lower button assignments. Having VRIK installed does not require this. Index grip touch for HIGGS is automatic and independent of this option. Turn off to assign trackpad halves; saved assignments are retained.");
+                "Index only: sends trackpad pressure as A-touch for VRIK gestures instead of upper/lower button assignments. Having VRIK installed does not require this. " +
+                "For Spell Wheel versions with the VRIK Index Touchpad Press option, enable this and select that exact Button in MCM > Spell Wheel > General for each desired hand; set Button Combination to -Empty- unless you want a modifier. This requires pressing the pad, not merely touching it. " +
+                "Index grip touch for HIGGS is automatic and independent of this option. Turn off to assign trackpad halves; saved assignments are retained.");
+            var indexSpellWheelHelp = MakeButton("Help", sc3 + 310, sy2 - 1, 60, 24);
+            indexSpellWheelHelp.AccessibleName = "Spell Wheel / Index setup help";
+            indexSpellWheelHelp.AccessibleDescription = "Shows the matching Spell Wheel MCM settings for a physical Index trackpad press. Changes no settings.";
+            indexSpellWheelHelp.Click += (_, _) =>
+            {
+                using var help = new IndexSpellWheelHelpDialog();
+                help.ShowDialog(this);
+            };
+            _skyrimSettingsTip.SetToolTip(indexSpellWheelHelp, "Spell Wheel / Index setup: matching MCM button and trackpad-press guidance.");
+            _pnlSkyrimOnly.Controls.Add(indexSpellWheelHelp);
             _chkVRIKKnuckles.CheckedChanged += (_, _) => RefreshSelectedControllerBinding(updateStatus: true);
             _chkDisableTrackpad.CheckedChanged += (_, _) => RefreshSelectedControllerBinding(updateStatus: true);
             sy2 += 26;
 
-            _pnlSkyrimOnly.Controls.Add(MakeLabel("L dead zone:", sc3, sy2 + 3, 90));
+            _pnlSkyrimOnly.Controls.Add(MakeLabel("L dead zone:", sc3, sy2 + 3, 100));
             _nudLeftDeadZone = new NumericUpDown
             {
-                Location = new Point(sc3 + 90, sy2), Width = 65,
+                Location = new Point(sc3 + 112, sy2), Width = 65,
                 DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.0m, Maximum = 1.0m, Value = 0.0m,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
             _pnlSkyrimOnly.Controls.Add(_nudLeftDeadZone);
             _skyrimSettingsTip.SetToolTip(_nudLeftDeadZone,
                 "Ignores small X/Y movement from the physical left stick. Raise only until left-stick drift stops.");
-            _pnlSkyrimOnly.Controls.Add(MakeLabel("R:", sc3 + 165, sy2 + 3, 20));
+            _pnlSkyrimOnly.Controls.Add(MakeLabel("R:", sc3 + 191, sy2 + 3, 20));
             _nudRightDeadZone = new NumericUpDown
             {
-                Location = new Point(sc3 + 185, sy2), Width = 65,
+                Location = new Point(sc3 + 220, sy2), Width = 65,
                 DecimalPlaces = 2, Increment = 0.05m, Minimum = 0.0m, Maximum = 1.0m, Value = 0.0m,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
             };
@@ -1510,6 +1502,11 @@ namespace OpenCompositeConfigurator
             _skyrimSettingsTip.SetToolTip(_chkSwapThumbsticks,
                 "Swaps only stick axes and their touch state. Stick clicks and all other buttons remain on their physical hands.");
             sy2 += 24;
+
+            _indexGrip = new IndexGripControl { Location = new Point(sc3, sy2) };
+            _indexGrip.SetIndexSelected(_controllerModelKey == "knuckles");
+            _pnlSkyrimOnly.Controls.Add(_indexGrip);
+            sy2 += _indexGrip.Height + 6;
 
             // Combat haptics moved to the dedicated Haptics tab (BuildHapticsTab)
 
@@ -1555,6 +1552,8 @@ namespace OpenCompositeConfigurator
                 int ay = 0;
                 int ax1 = 0;        // left group start
                 int ax2 = 620;      // right group start
+                // Shared columns keep tilt, rotation, position and laser rows aligned.
+                const int axisLabelX = 140, axisFieldX = 175, axisStride = 115;
 
                 var lblAxisSection = MakeSectionLabel("Controller Axis Adjustments", ax1, ay);
                 _pnlAxisAdjust.Controls.Add(lblAxisSection);
@@ -1569,29 +1568,29 @@ namespace OpenCompositeConfigurator
                 lblAxisWarn.ForeColor = Color.FromArgb(160, 160, 160);
                 lblAxisWarn.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
                 _pnlAxisAdjust.Controls.Add(lblAxisWarn);
-                ay += 24;
+                ay += 28;
 
                 // Row 1: Tilt
                 _chkAdjustTilt = MakeCheckBox("Adjust tilt", ax1, ay);
                 _pnlAxisAdjust.Controls.Add(_chkAdjustTilt);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Tilt:", ax1 + 140, ay + 3, 35));
-                _nudTiltDeg = MakeAxisNud(ax1 + 175, ay, -90m, 90m, 0.5m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Tilt:", ax1 + axisLabelX, ay + 3, 26));
+                _nudTiltDeg = MakeAxisNud(ax1 + axisFieldX, ay, -90m, 90m, 0.5m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudTiltDeg);
                 _pnlAxisAdjust.Controls.Add(MakeLabel("\u00B0 (degrees)", ax1 + 245, ay + 3, 80));
                 _chkAdjustTilt.CheckedChanged += (s, e) => _nudTiltDeg.Enabled = _chkAdjustTilt.Checked;
-                ay += 24;
+                ay += 28;
 
                 // Row 2: Left rotation + Left position
                 _chkLeftRotation = MakeCheckBox("Left rotation", ax1, ay);
                 _pnlAxisAdjust.Controls.Add(_chkLeftRotation);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax1 + 140, ay + 3, 16));
-                _nudLeftRotX = MakeAxisNud(ax1 + 158, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax1 + axisLabelX, ay + 3, 26));
+                _nudLeftRotX = MakeAxisNud(ax1 + axisFieldX, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudLeftRotX);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax1 + 230, ay + 3, 16));
-                _nudLeftRotY = MakeAxisNud(ax1 + 248, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax1 + axisLabelX + axisStride, ay + 3, 26));
+                _nudLeftRotY = MakeAxisNud(ax1 + axisFieldX + axisStride, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudLeftRotY);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax1 + 320, ay + 3, 16));
-                _nudLeftRotZ = MakeAxisNud(ax1 + 338, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax1 + axisLabelX + 2 * axisStride, ay + 3, 26));
+                _nudLeftRotZ = MakeAxisNud(ax1 + axisFieldX + 2 * axisStride, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudLeftRotZ);
                 _chkLeftRotation.CheckedChanged += (s, e) =>
                 {
@@ -1601,33 +1600,33 @@ namespace OpenCompositeConfigurator
 
                 _chkLeftPosition = MakeCheckBox("Left position", ax2, ay);
                 _pnlAxisAdjust.Controls.Add(_chkLeftPosition);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax2 + 140, ay + 3, 16));
-                _nudLeftPosX = MakeAxisNud(ax2 + 158, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax2 + axisLabelX, ay + 3, 26));
+                _nudLeftPosX = MakeAxisNud(ax2 + axisFieldX, ay, -0.50m, 0.50m, 0.005m, 3);
                 _pnlAxisAdjust.Controls.Add(_nudLeftPosX);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax2 + 230, ay + 3, 16));
-                _nudLeftPosY = MakeAxisNud(ax2 + 248, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax2 + axisLabelX + axisStride, ay + 3, 26));
+                _nudLeftPosY = MakeAxisNud(ax2 + axisFieldX + axisStride, ay, -0.50m, 0.50m, 0.005m, 3);
                 _pnlAxisAdjust.Controls.Add(_nudLeftPosY);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax2 + 320, ay + 3, 16));
-                _nudLeftPosZ = MakeAxisNud(ax2 + 338, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax2 + axisLabelX + 2 * axisStride, ay + 3, 26));
+                _nudLeftPosZ = MakeAxisNud(ax2 + axisFieldX + 2 * axisStride, ay, -0.50m, 0.50m, 0.005m, 3);
                 _pnlAxisAdjust.Controls.Add(_nudLeftPosZ);
                 _chkLeftPosition.CheckedChanged += (s, e) =>
                 {
                     bool en = _chkLeftPosition.Checked;
                     _nudLeftPosX.Enabled = en; _nudLeftPosY.Enabled = en; _nudLeftPosZ.Enabled = en;
                 };
-                ay += 24;
+                ay += 28;
 
                 // Row 3: Right rotation + Right position
                 _chkRightRotation = MakeCheckBox("Right rotation", ax1, ay);
                 _pnlAxisAdjust.Controls.Add(_chkRightRotation);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax1 + 140, ay + 3, 16));
-                _nudRightRotX = MakeAxisNud(ax1 + 158, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax1 + axisLabelX, ay + 3, 26));
+                _nudRightRotX = MakeAxisNud(ax1 + axisFieldX, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudRightRotX);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax1 + 230, ay + 3, 16));
-                _nudRightRotY = MakeAxisNud(ax1 + 248, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax1 + axisLabelX + axisStride, ay + 3, 26));
+                _nudRightRotY = MakeAxisNud(ax1 + axisFieldX + axisStride, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudRightRotY);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax1 + 320, ay + 3, 16));
-                _nudRightRotZ = MakeAxisNud(ax1 + 338, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax1 + axisLabelX + 2 * axisStride, ay + 3, 26));
+                _nudRightRotZ = MakeAxisNud(ax1 + axisFieldX + 2 * axisStride, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudRightRotZ);
                 _chkRightRotation.CheckedChanged += (s, e) =>
                 {
@@ -1637,21 +1636,21 @@ namespace OpenCompositeConfigurator
 
                 _chkRightPosition = MakeCheckBox("Right position", ax2, ay);
                 _pnlAxisAdjust.Controls.Add(_chkRightPosition);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax2 + 140, ay + 3, 16));
-                _nudRightPosX = MakeAxisNud(ax2 + 158, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax2 + axisLabelX, ay + 3, 26));
+                _nudRightPosX = MakeAxisNud(ax2 + axisFieldX, ay, -0.50m, 0.50m, 0.005m, 3);
                 _pnlAxisAdjust.Controls.Add(_nudRightPosX);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax2 + 230, ay + 3, 16));
-                _nudRightPosY = MakeAxisNud(ax2 + 248, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax2 + axisLabelX + axisStride, ay + 3, 26));
+                _nudRightPosY = MakeAxisNud(ax2 + axisFieldX + axisStride, ay, -0.50m, 0.50m, 0.005m, 3);
                 _pnlAxisAdjust.Controls.Add(_nudRightPosY);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax2 + 320, ay + 3, 16));
-                _nudRightPosZ = MakeAxisNud(ax2 + 338, ay, -0.50m, 0.50m, 0.005m, 3);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax2 + axisLabelX + 2 * axisStride, ay + 3, 26));
+                _nudRightPosZ = MakeAxisNud(ax2 + axisFieldX + 2 * axisStride, ay, -0.50m, 0.50m, 0.005m, 3);
                 _pnlAxisAdjust.Controls.Add(_nudRightPosZ);
                 _chkRightPosition.CheckedChanged += (s, e) =>
                 {
                     bool en = _chkRightPosition.Checked;
                     _nudRightPosX.Enabled = en; _nudRightPosY.Enabled = en; _nudRightPosZ.Enabled = en;
                 };
-                ay += 24;
+                ay += 28;
 
                 var lblLaserSection = MakeSectionLabel("Laser Aim Calibration", ax1, ay);
                 _pnlAxisAdjust.Controls.Add(lblLaserSection);
@@ -1660,36 +1659,36 @@ namespace OpenCompositeConfigurator
                 lblLaserWarn.ForeColor = Color.FromArgb(255, 185, 70);
                 lblLaserWarn.Font = new Font("Segoe UI", 8.5f, FontStyle.Italic);
                 _pnlAxisAdjust.Controls.Add(lblLaserWarn);
-                ay += 24;
+                ay += 28;
 
                 _chkMenuLaserEnabled = MakeCheckBox(
                     "Enable menu lasers (uncheck for classic controller-only menus; Save + game restart required)", ax1, ay);
                 _chkMenuLaserEnabled.Checked = true;
                 _pnlAxisAdjust.Controls.Add(_chkMenuLaserEnabled);
-                ay += 24;
+                ay += 28;
 
                 _chkLaserSmoothing = MakeCheckBox("Smooth laser aim", ax1, ay);
                 _chkLaserSmoothing.Checked = true;
                 _pnlAxisAdjust.Controls.Add(_chkLaserSmoothing);
-                var lblLaserPosHz = MakeLabel("Pos Hz:", ax1 + 190, ay + 3, 52);
+                var lblLaserPosHz = MakeLabel("Pos Hz:", ax1 + 190, ay + 3, 55);
                 _pnlAxisAdjust.Controls.Add(lblLaserPosHz);
-                _nudLaserPosSmoothMinCutoff = MakeAxisNud(ax1 + 242, ay, 0.01m, 20m, 0.25m, 2);
+                _nudLaserPosSmoothMinCutoff = MakeAxisNud(ax1 + 255, ay, 0.01m, 20m, 0.25m, 2);
                 _nudLaserPosSmoothMinCutoff.Value = 6m;
                 _pnlAxisAdjust.Controls.Add(_nudLaserPosSmoothMinCutoff);
-                var lblLaserPosResponse = MakeLabel("Pos response:", ax1 + 320, ay + 3, 88);
+                var lblLaserPosResponse = MakeLabel("Pos response:", ax1 + 340, ay + 3, 100);
                 _pnlAxisAdjust.Controls.Add(lblLaserPosResponse);
-                _nudLaserPosSmoothBeta = MakeAxisNud(ax1 + 408, ay, 0m, 100m, 0.5m, 2);
+                _nudLaserPosSmoothBeta = MakeAxisNud(ax1 + 455, ay, 0m, 100m, 0.5m, 2);
                 _nudLaserPosSmoothBeta.Value = 12m;
                 _pnlAxisAdjust.Controls.Add(_nudLaserPosSmoothBeta);
 
-                var lblLaserAimHz = MakeLabel("Aim Hz:", ax2, ay + 3, 55);
+                var lblLaserAimHz = MakeLabel("Aim Hz:", ax2 + 190, ay + 3, 55);
                 _pnlAxisAdjust.Controls.Add(lblLaserAimHz);
-                _nudLaserRotSmoothMinCutoff = MakeAxisNud(ax2 + 55, ay, 0.01m, 20m, 0.25m, 2);
+                _nudLaserRotSmoothMinCutoff = MakeAxisNud(ax2 + 255, ay, 0.01m, 20m, 0.25m, 2);
                 _nudLaserRotSmoothMinCutoff.Value = 4m;
                 _pnlAxisAdjust.Controls.Add(_nudLaserRotSmoothMinCutoff);
-                var lblLaserAimResponse = MakeLabel("Aim response:", ax2 + 135, ay + 3, 92);
+                var lblLaserAimResponse = MakeLabel("Aim response:", ax2 + 340, ay + 3, 100);
                 _pnlAxisAdjust.Controls.Add(lblLaserAimResponse);
-                _nudLaserRotSmoothBeta = MakeAxisNud(ax2 + 227, ay, 0m, 10m, 0.05m, 2);
+                _nudLaserRotSmoothBeta = MakeAxisNud(ax2 + 455, ay, 0m, 10m, 0.05m, 2);
                 _nudLaserRotSmoothBeta.Value = 0.35m;
                 _pnlAxisAdjust.Controls.Add(_nudLaserRotSmoothBeta);
                 _chkLaserSmoothing.CheckedChanged += (_, _) =>
@@ -1708,18 +1707,18 @@ namespace OpenCompositeConfigurator
                 _nudLaserPosSmoothBeta.Enabled = true;
                 _nudLaserRotSmoothMinCutoff.Enabled = true;
                 _nudLaserRotSmoothBeta.Enabled = true;
-                ay += 26;
+                ay += 30;
 
                 _chkLeftLaserRotation = MakeCheckBox("Left laser", ax1, ay);
                 _pnlAxisAdjust.Controls.Add(_chkLeftLaserRotation);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax1 + 140, ay + 3, 16));
-                _nudLeftLaserRotX = MakeAxisNud(ax1 + 158, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax1 + axisLabelX, ay + 3, 26));
+                _nudLeftLaserRotX = MakeAxisNud(ax1 + axisFieldX, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudLeftLaserRotX);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax1 + 230, ay + 3, 16));
-                _nudLeftLaserRotY = MakeAxisNud(ax1 + 248, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax1 + axisLabelX + axisStride, ay + 3, 26));
+                _nudLeftLaserRotY = MakeAxisNud(ax1 + axisFieldX + axisStride, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudLeftLaserRotY);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax1 + 320, ay + 3, 16));
-                _nudLeftLaserRotZ = MakeAxisNud(ax1 + 338, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax1 + axisLabelX + 2 * axisStride, ay + 3, 26));
+                _nudLeftLaserRotZ = MakeAxisNud(ax1 + axisFieldX + 2 * axisStride, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudLeftLaserRotZ);
                 _chkLeftLaserRotation.CheckedChanged += (s, e) =>
                 {
@@ -1729,14 +1728,14 @@ namespace OpenCompositeConfigurator
 
                 _chkRightLaserRotation = MakeCheckBox("Right laser", ax2, ay);
                 _pnlAxisAdjust.Controls.Add(_chkRightLaserRotation);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax2 + 140, ay + 3, 16));
-                _nudRightLaserRotX = MakeAxisNud(ax2 + 158, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("X:", ax2 + axisLabelX, ay + 3, 26));
+                _nudRightLaserRotX = MakeAxisNud(ax2 + axisFieldX, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudRightLaserRotX);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax2 + 230, ay + 3, 16));
-                _nudRightLaserRotY = MakeAxisNud(ax2 + 248, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Y:", ax2 + axisLabelX + axisStride, ay + 3, 26));
+                _nudRightLaserRotY = MakeAxisNud(ax2 + axisFieldX + axisStride, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudRightLaserRotY);
-                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax2 + 320, ay + 3, 16));
-                _nudRightLaserRotZ = MakeAxisNud(ax2 + 338, ay, -90m, 90m, 1m, 1);
+                _pnlAxisAdjust.Controls.Add(MakeLabel("Z:", ax2 + axisLabelX + 2 * axisStride, ay + 3, 26));
+                _nudRightLaserRotZ = MakeAxisNud(ax2 + axisFieldX + 2 * axisStride, ay, -90m, 90m, 1m, 1);
                 _pnlAxisAdjust.Controls.Add(_nudRightLaserRotZ);
                 _chkRightLaserRotation.CheckedChanged += (s, e) =>
                 {
@@ -2898,7 +2897,7 @@ namespace OpenCompositeConfigurator
                     {
                         foreach (int f in rightVrFields)
                         {
-                            fields[f] = trackpad ? AppendTrackpadHex(fields[f], hex.hexRight) : hex.hexRight;
+                            fields[f] = (trackpad || _selectedCtrlButton.StartsWith("frame_")) ? AppendTrackpadHex(fields[f], hex.hexRight) : hex.hexRight;
                             RecordControllerChange(ctx, newAction, f, fields[f]);
                         }
                     }
@@ -2906,7 +2905,7 @@ namespace OpenCompositeConfigurator
                     {
                         foreach (int f in leftVrFields)
                         {
-                            fields[f] = trackpad ? AppendTrackpadHex(fields[f], hex.hexLeft) : hex.hexLeft;
+                            fields[f] = (trackpad || _selectedCtrlButton.StartsWith("frame_")) ? AppendTrackpadHex(fields[f], hex.hexLeft) : hex.hexLeft;
                             RecordControllerChange(ctx, newAction, f, fields[f]);
                         }
                     }
@@ -2960,6 +2959,7 @@ namespace OpenCompositeConfigurator
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             var (drawW, drawH, offX, offY) = GetBindingsImageBounds();
+            PaintFrameRearLabels(g, drawW, drawH, offX, offY);
 
             foreach (var kvp in _activeControllerButtons)
             {
@@ -3029,8 +3029,11 @@ namespace OpenCompositeConfigurator
                         g.DrawEllipse(pen, cx - r, cy - r, r * 2, r * 2);
                     }
 
+                    // Rear Frame callouts already have permanent labels below their dots.
+                    bool frameRearLabel = _controllerModelKey == "frame" &&
+                        kvp.Key is "frame_l_bumper" or "l_trigger" or "frame_r_bumper" or "r_trigger";
                     // Draw button label on hover/select (circles only)
-                    if (isHovered || isSelected)
+                    if ((isHovered || isSelected) && !frameRearLabel)
                     {
                         using var font = new Font("Segoe UI", 7f, FontStyle.Bold);
                         using var textBrush = new SolidBrush(Color.White);
@@ -3538,11 +3541,11 @@ namespace OpenCompositeConfigurator
 
             if (_selectedCtrlButton != null)
             {
-                _lblKbStatus.Text += $" — {presetName} preview only. Click Apply Preset to save changes.";
+                _lblKbStatus.Text += $" — {BindingPresetDisplayName(presetName)} preview only. Click Use Preset to save changes.";
             }
             else
             {
-                _lblKbStatus.Text = $"{presetName} preview selected. Click Apply Preset to save changes.";
+                _lblKbStatus.Text = $"{BindingPresetDisplayName(presetName)} preview selected. Click Use Preset to save changes.";
             }
             _lblKbStatus.ForeColor = Color.FromArgb(121, 215, 137);
         }
@@ -3562,6 +3565,7 @@ namespace OpenCompositeConfigurator
                     return false;
                 }
                 presetText = new StreamReader(stream).ReadToEnd();
+                if (_controllerModelKey == "frame") presetText = AdaptBuiltinPresetForFrame(presetText);
                 return true;
             }
 
@@ -3652,6 +3656,11 @@ namespace OpenCompositeConfigurator
                     return false;
                 }
                 presetText = new StreamReader(presetStream).ReadToEnd();
+                if (_controllerModelKey == "frame")
+                {
+                    try { presetText = AdaptBuiltinPresetForFrame(presetText); }
+                    catch (InvalidOperationException ex) { error = ex.Message; return false; }
+                }
             }
 
             var output = new StringBuilder();
@@ -3744,7 +3753,7 @@ namespace OpenCompositeConfigurator
             }
 
             var result = MessageBox.Show(
-                $"Use '{presetName}'? This replaces your controller layout and unsaved controller edits.\n\nKeyboard, mouse, gamepad and combos stay unchanged.",
+                $"Use '{BindingPresetDisplayName(presetName)}'? This replaces your controller layout and unsaved controller edits.\n\nKeyboard, mouse, gamepad and combos stay unchanged.",
                 $"Apply {presetName} Preset",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question);
@@ -3774,7 +3783,7 @@ namespace OpenCompositeConfigurator
             PersistTrackpadRouting();
 
             string repairMsg = bindingRepairs > 0 ? $" + {bindingRepairs} validation repair(s)" : "";
-            _lblKbStatus.Text = $"{presetName} controller bindings applied{repairMsg} (keyboard preserved). Restart the game to apply.";
+            _lblKbStatus.Text = $"{BindingPresetDisplayName(presetName)} controller bindings applied{repairMsg} (keyboard preserved). Restart the game to apply.";
             _lblKbStatus.ForeColor = Color.FromArgb(100, 200, 100);
             if (_selectedCtrlButton != null)
             {
@@ -3807,179 +3816,15 @@ namespace OpenCompositeConfigurator
         // stay intact (Skyrim's parser uses blank lines to delimit input contexts).
         private bool ApplyControllerPresetMergingKeyboard(string? presetResourceName, string? externalPresetPath, out string error)
         {
-            error = "";
-
-            static string BindingKey(string context, string eventName) => $"{context}\u001f{eventName}";
-
-            static bool TryReadContextHeader(string line, out string context)
-            {
-                context = "";
-                if (!line.TrimStart().StartsWith("//") || line.TrimStart().StartsWith(TrackpadMetadata, StringComparison.Ordinal))
-                    return false;
-
-                string comment = line.TrimStart().TrimStart('/').Trim();
-                int tabIdx = comment.IndexOf('\t');
-                if (tabIdx >= 0) comment = comment[..tabIdx].Trim();
-
-                bool isContext = comment.Length > 0 && !comment.StartsWith("1st") && !comment.StartsWith("2nd") &&
-                                 !comment.StartsWith("3rd") && !comment.StartsWith("4th") && !comment.StartsWith("5th") &&
-                                 !comment.StartsWith("6th") && !comment.StartsWith("7th") && !comment.StartsWith("8th") &&
-                                 !comment.StartsWith("9th") && !comment.StartsWith("10th") && !comment.StartsWith("11th") &&
-                                 !comment.StartsWith("12th") && !comment.StartsWith("13th") && !comment.StartsWith("14th") &&
-                                 !comment.StartsWith("15th") && !comment.StartsWith("16th") && !comment.StartsWith("17th") &&
-                                 !comment.StartsWith("18th") && !comment.StartsWith("19th") && !comment.StartsWith("20th") &&
-                                 !comment.StartsWith("Blank") && !comment.StartsWith("See") &&
-                                 !comment.StartsWith("(Vive") && !comment.StartsWith("(Oculus") && !comment.StartsWith("(Windows") &&
-                                 !comment.StartsWith("\"") && !comment.StartsWith("If ");
-                if (!isContext)
-                    return false;
-
-                context = comment;
-                return true;
-            }
-
-            // Step 1: harvest user's current keyboard / mouse / gamepad / their remap flags,
-            // keyed by context + event from the live controlmapvr.txt. If the live file doesn't
-            // exist we fall through with an empty dictionary, and the preset's own
-            // keyboard fields end up applied (no merge target).
+            if (!TryBuildControllerPresetMergedText(presetResourceName, externalPresetPath, out var outputText, out error))
+                return false;
             string savePath = GetControlmapSavePath();
-            var userBindings = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
-            if (File.Exists(savePath))
-            {
-                string currentContext = "";
-                foreach (string rawLine in File.ReadAllLines(savePath))
-                {
-                    string line = rawLine.TrimEnd('\r').TrimEnd();
-                    if (string.IsNullOrWhiteSpace(line)) { currentContext = ""; continue; }
-                    if (TryReadContextHeader(line, out var parsedContext))
-                    {
-                        currentContext = parsedContext;
-                        continue;
-                    }
-                    if (line.TrimStart().StartsWith("//")) continue;
-
-                    var fields = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
-                    for (int i = 0; i < fields.Length; i++) fields[i] = fields[i].Trim();
-                    if (fields.Length < 4) continue;
-
-                    userBindings[BindingKey(currentContext, fields[0])] = fields;
-                }
-            }
-
-            // Step 2: read the preset — embedded resource for built-ins, or external file
-            // for user-saved presets stored under %AppData%\OpenCompositeConfigurator\Presets\.
-            string presetText;
-            if (!string.IsNullOrEmpty(externalPresetPath))
-            {
-                if (!File.Exists(externalPresetPath))
-                {
-                    error = $"User preset file not found: {externalPresetPath}";
-                    return false;
-                }
-                presetText = File.ReadAllText(externalPresetPath);
-            }
-            else
-            {
-                if (string.IsNullOrEmpty(presetResourceName))
-                {
-                    error = "No preset source provided";
-                    return false;
-                }
-                var asm = Assembly.GetExecutingAssembly();
-                using var presetStream = asm.GetManifestResourceStream(presetResourceName);
-                if (presetStream == null)
-                {
-                    error = $"Embedded preset '{presetResourceName}' not found";
-                    return false;
-                }
-                presetText = new StreamReader(presetStream).ReadToEnd();
-            }
-
-            // Step 3: walk preset, merge keyboard fields where context + event match,
-            // emit. Keep blank lines and comments verbatim.
-            var output = new StringBuilder();
-            string presetContext = "";
-            foreach (string rawLine in presetText.Split('\n'))
-            {
-                string line = rawLine.TrimEnd('\r');
-                if (string.IsNullOrWhiteSpace(line))
-                {
-                    presetContext = "";
-                    output.Append(line);
-                    output.Append('\n');
-                    continue;
-                }
-
-                if (TryReadContextHeader(line, out var parsedContext))
-                {
-                    presetContext = parsedContext;
-                    output.Append(line);
-                    output.Append('\n');
-                    continue;
-                }
-
-                if (line.TrimStart().StartsWith("//"))
-                {
-                    output.Append(line);
-                    output.Append('\n');
-                    continue;
-                }
-
-                var presetFields = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
-                for (int i = 0; i < presetFields.Length; i++) presetFields[i] = presetFields[i].Trim();
-                if (presetFields.Length < 4)
-                {
-                    output.Append(line);
-                    output.Append('\n');
-                    continue;
-                }
-
-                string eventName = presetFields[0];
-
-                // The Favor context in Skyrim VR does not accept an Activate row.
-                // Some experimental presets included one, and that can make the
-                // engine reject the controlmap before SKSE/SkyUI ask for mappings.
-                if (presetContext == "Favor" && eventName == "Activate")
-                    continue;
-
-                if (userBindings.TryGetValue(BindingKey(presetContext, eventName), out var userFields))
-                {
-                    // Keyboard / mouse / gamepad
-                    if (userFields.Length > 1) presetFields[1] = userFields[1];
-                    if (userFields.Length > 2) presetFields[2] = userFields[2];
-                    if (userFields.Length > 3) presetFields[3] = userFields[3];
-
-                    // Their respective remap flags (11th-13th, 0-indexed [10..12])
-                    if (presetFields.Length > 10 && userFields.Length > 10) presetFields[10] = userFields[10];
-                    if (presetFields.Length > 11 && userFields.Length > 11) presetFields[11] = userFields[11];
-                    if (presetFields.Length > 12 && userFields.Length > 12) presetFields[12] = userFields[12];
-                }
-
-                // Skyrim VR's mouse column expects direct mouse IDs. Symbolic aliases
-                // such as !0,Tween Menu can break menu-context initialization and
-                // crash SKSE's GetMappedKey when SkyUI resolves controls.
-                if (presetFields.Length > 2 && presetFields[2].Contains('!'))
-                    presetFields[2] = "0xff";
-
-                output.Append(string.Join('\t', presetFields));
-                output.Append('\n');
-            }
-
-            try
-            {
-                string outputText = output.ToString()
-                    .Replace("\r\n", "\n")
-                    .Replace('\r', '\n')
-                    .TrimEnd('\n')
-                    .Replace("\n", "\r\n") + "\r\n";
-                File.WriteAllText(savePath, outputText);
-            }
+            try { File.WriteAllText(savePath, outputText); }
             catch (Exception ex)
             {
                 error = $"Could not write {savePath}: {ex.Message}";
                 return false;
             }
-
             return true;
         }
 
@@ -4147,6 +3992,7 @@ namespace OpenCompositeConfigurator
             f.Controls.Add(lbl); f.Controls.Add(tb); f.Controls.Add(ok); f.Controls.Add(cancel);
             f.AcceptButton = ok; f.CancelButton = cancel;
             ModernUiTheme.Apply(f);
+            DpiLayout.Popup(f);
             return f.ShowDialog() == DialogResult.OK ? tb.Text.Trim() : "";
         }
 
@@ -4177,6 +4023,7 @@ namespace OpenCompositeConfigurator
         {
             _ini.Set("", "disableTrackPad", _chkDisableTrackpad.Checked ? "true" : "false");
             _ini.Set("", "enableVRIKKnucklesTrackPadSupport", _chkVRIKKnuckles.Checked ? "true" : "false");
+            _indexGrip.SaveSettings(_ini);
             SaveControlmapVR();
             var (bindingRepairs, _, _) = ValidateAndRepairControlmap();
             if (_combos.Count > 0 || _ini.GetAllInSection("combos").Count > 0)
@@ -5392,11 +5239,11 @@ namespace OpenCompositeConfigurator
                 // Motion Vectors checkbox
                 _chkMotionVectorsEnabled = MakeCheckBox("Enable Motion Vectors", 20, ap);
                 fsrAdv.Controls.Add(_chkMotionVectorsEnabled);
-                _chkActorMV = MakeCheckBox("Actor MV", 205, ap);
+                _chkActorMV = MakeCheckBox("Actor MV", 260, ap);
                 fsrAdv.Controls.Add(_chkActorMV);
-                _chkFsr3CameraMV = MakeCheckBox("Camera MV", 300, ap);
+                _chkFsr3CameraMV = MakeCheckBox("Camera MV", 425, ap);
                 fsrAdv.Controls.Add(_chkFsr3CameraMV);
-                var lblMvDesc = MakeLabel("SKSE/game, actor, and camera motion vectors feed temporal upscalers. Standard DAPA uses depth and positional changes instead.", 395, ap + 3, advW - 411);
+                var lblMvDesc = MakeLabel("Motion vectors feed temporal upscalers; DAPA uses depth and pose.", 610, ap + 3, advW - 626);
                 lblMvDesc.ForeColor = Color.FromArgb(130, 130, 130);
                 lblMvDesc.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
                 fsrAdv.Controls.Add(lblMvDesc);
@@ -5590,7 +5437,7 @@ namespace OpenCompositeConfigurator
             _chkAswEnabled.CheckedChanged += (s, e) => { };
             container.Controls.Add(_chkAswEnabled);
 
-            var lblSwDesc = MakeLabel("Experimental depth-aware positional approximation. Uses the previous color frame, depth, and positional changes; it does not use per-pixel motion vectors. Expect artifacts on moving objects, walls, foliage, and overlays. Never combine DAPA with SSW or runtime motion smoothing.", leftMargin + 230, y + 3, rightEdge - leftMargin - 250);
+            var lblSwDesc = MakeLabel("Experimental depth-aware positional approximation. Depth-based world reprojection with native-motion correction inside supported player and held-item masks. Moving edges can still ghost. Never combine DAPA with SSW or runtime motion smoothing.", leftMargin + 230, y + 3, rightEdge - leftMargin - 250);
             lblSwDesc.ForeColor = Color.FromArgb(130, 130, 130);
             lblSwDesc.Font = new Font("Segoe UI", 8f, FontStyle.Italic);
             lblSwDesc.Height = 60;
@@ -5899,7 +5746,7 @@ namespace OpenCompositeConfigurator
             container.Controls.Add(MakeLabel("Fixed:", leftMargin + 385, y + 3, 45));
             _nudMipBiasFixed = new NumericUpDown
             {
-                Location = new Point(leftMargin + 430, y), Width = 70,
+                Location = new Point(leftMargin + 440, y), Width = 70,
                 DecimalPlaces = 3, Increment = 0.05m, Minimum = -4.00m, Maximum = 4.00m, Value = -0.766m,
                 BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White,
                 Enabled = false
@@ -6237,27 +6084,6 @@ namespace OpenCompositeConfigurator
 
             container.Controls.Add(MakeSeparator(leftMargin, y, rightEdge - leftMargin));
             y += 10;
-
-            // ── VR KEYBOARD ──
-            container.Controls.Add(MakeSectionLabel("VR Keyboard", c1, y));
-            y += 26;
-
-            container.Controls.Add(MakeLabel("Key click strength:", c1, y + 3, 120));
-            _nudKbHapticStrength = new NumericUpDown
-            {
-                Location = new Point(c1 + 120, y), Width = 55,
-                Minimum = 0, Maximum = 100, Increment = 5, Value = 50,
-                BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White
-            };
-            container.Controls.Add(_nudKbHapticStrength);
-            container.Controls.Add(MakeLabel("%", c1 + 178, y + 3, 20));
-            y += 26;
-
-            var lblKbHint = MakeLabel("Tick felt when the laser presses a key on the in-game VR keyboard.", c1, y, rightEdge - c1);
-            lblKbHint.ForeColor = Color.FromArgb(140, 140, 140);
-            lblKbHint.Font = new Font("Segoe UI", 8.5f);
-            container.Controls.Add(lblKbHint);
-            y += 34;
 
             container.Size = new Size(container.Width, y + 10);
         }
@@ -6635,6 +6461,9 @@ namespace OpenCompositeConfigurator
             };
             for (int i = 0; i < tabs.Length; i++)
                 ModernUiTheme.StyleNavigationButton(tabs[i], i == index);
+            // Showing a tab creates its native input handles for the first time.
+            // Reapply logical bounds after that initialization at the current DPI.
+            DpiLayout.Refresh(this);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -7073,6 +6902,10 @@ namespace OpenCompositeConfigurator
                 foreach (string path in savePaths)
                     _ini.Save(path);
 
+                if (!SaveUiModelChoice())
+                    throw new IOException("Controller selection could not be saved. Your INI settings were saved; retry to retain the controller selection.");
+                AcceptTrackedControlAsSaved(_cmbControllerModel);
+
                 string time = DateTime.Now.ToString("h:mm:ss tt");
                 string locationMsg = $"Settings reset and saved to {DescribeIniSaveLocations(savePaths)} at {time}";
                 _lblStatus.Text = $"{locationMsg} - restart game for changes";
@@ -7105,7 +6938,6 @@ namespace OpenCompositeConfigurator
                 _nudDisplayOpacity.Value = 30m;
                 _nudDisplayScale.Value = 100m;
                 _chkSoundsEnabled.Checked = true;
-                _nudHoverVolume.Value = 50m;
                 _nudPressVolume.Value = 50m;
                 _nudKbHapticStrength.Value = 50m;
 
@@ -7126,6 +6958,7 @@ namespace OpenCompositeConfigurator
                 _txtAudioDevice.Text = "quest";
 
                 _chkInputSmoothing.Checked = false;
+                _indexGrip.ResetSettings();
                 _nudInputWindow.Value = 5m;
                 _chkControllerSmoothing.Checked = true;
                 _nudPosSmoothMinCutoff.Value = 1.25m;
@@ -7234,8 +7067,8 @@ namespace OpenCompositeConfigurator
 
         private void ClearDirty()
         {
-            // Settings save also commits explicit controller edits. Controller
-            // picture and preset previews still have their own apply operations.
+            // Settings save commits controller edits and the controller picture.
+            // Binding preset previews still require their own Apply operation.
             CaptureSavedState(includeIndependentlySaved: false);
             MarkDirty();
         }
@@ -7550,9 +7383,6 @@ namespace OpenCompositeConfigurator
             RefreshKeyboardDesignChoices(keyboardDesign);
 
             _chkSoundsEnabled.Checked = ParseBool(_ini.Get("keyboard", "soundsEnabled", "true"));
-            if (int.TryParse(_ini.Get("keyboard", "hoverVolume",
-                    _ini.Get("keyboard", "soundVolume", "50")), out int hvol))
-                _nudHoverVolume.Value = Math.Clamp(hvol, 0, 100);
             if (int.TryParse(_ini.Get("keyboard", "pressVolume", "50"), out int pvol))
                 _nudPressVolume.Value = Math.Clamp(pvol, 0, 100);
             if (int.TryParse(_ini.Get("keyboard", "hapticStrength", "50"), out int kbhap))
@@ -7602,6 +7432,7 @@ namespace OpenCompositeConfigurator
             _chkDisableThumbrestTouch.Checked = ParseBool(_ini.Get("", "disableThumbrestTouch", "true"));
             _chkDisableTrackpad.Checked = ParseBool(_ini.Get("", "disableTrackPad", "false"));
             _chkVRIKKnuckles.Checked = ParseBool(_ini.Get("", "enableVRIKKnucklesTrackPadSupport", "false"));
+            _indexGrip.LoadSettings(_ini);
             _chkSwapThumbsticks.Checked = ParseBool(_ini.Get("", "swapThumbsticks", "false"));
 
             // Load any user-saved presets from %AppData% before we try to restore
@@ -7900,7 +7731,6 @@ namespace OpenCompositeConfigurator
             _ini.Set("keyboard", "layout", parchmentDesign ? "embedded" : "auto");
             _ini.Set("keyboard", "design", parchmentDesign ? "parchment" : keyboardDesign!.Id);
             _ini.Set("keyboard", "soundsEnabled", _chkSoundsEnabled.Checked ? "true" : "false");
-            _ini.Set("keyboard", "hoverVolume", ((int)_nudHoverVolume.Value).ToString());
             _ini.Set("keyboard", "pressVolume", ((int)_nudPressVolume.Value).ToString());
             _ini.Set("keyboard", "hapticStrength", ((int)_nudKbHapticStrength.Value).ToString());
 
@@ -7946,6 +7776,7 @@ namespace OpenCompositeConfigurator
                 _ini.Set("", "disableThumbrestTouch", _chkDisableThumbrestTouch.Checked ? "true" : "false");
                 _ini.Set("", "disableTrackPad", _chkDisableTrackpad.Checked ? "true" : "false");
                 _ini.Set("", "enableVRIKKnucklesTrackPadSupport", _chkVRIKKnuckles.Checked ? "true" : "false");
+            _indexGrip.SaveSettings(_ini);
                 // The old D3D timestamp-query path caused micro-stutter and was
                 // removed. Strip its obsolete setting from older INIs.
                 _ini.Remove("", "enableGpuTiming");
@@ -8169,7 +8000,7 @@ namespace OpenCompositeConfigurator
                 out parsed);
         }
 
-        private static Label MakeLabel(string text, int x, int y, int width) => new()
+        private static Label MakeLabel(string text, int x, int y, int width) => new ModernLabel()
         {
             Text = text, Location = new Point(x, y),
             Size = new Size(width, 20), ForeColor = Color.FromArgb(200, 200, 200), AutoSize = false

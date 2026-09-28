@@ -1,0 +1,13 @@
+OpenComposite Unleashed 5.0.1 for Skyrim VR
+
+1. DAPA player motion: Added native-motion-vector correction inside the existing player, hands, equipped-weapon and held-item masks. Camera motion is removed before prediction; the original world warp is preserved. Motion is prepared at render resolution, and output regions without usable motion are skipped.
+2. Automatic recovery: Extra player correction pauses after three consecutive complete stereo samples above 1.5 ms, then retries with fresh history. Repeated failures increase the retry delay from 2 seconds up to 30 seconds; sustained recovery restores the short delay. Original masked DAPA continues during cooldown.
+3. Steam Frame controls: Added controller artwork, calibrated binding circles, presets and extension-gated native bindings for the D-pad, ABXY, bumpers, triggers, grips, sticks and View/Menu buttons. Gaze uses the existing OpenXR eye-gaze path. Physical Steam Frame validation remains pending.
+4. Index grip holding: Added short touch-release confirmation and recovery for custom grip thresholds, with cleanup when focus, controller or interaction profile changes.
+5. Menu interaction: Improved MCM option targeting and laser/thumbstick handoff. Removed the unsafe Crafting-menu hit test and hardened Journal focus handling across menu transitions.
+6. Configurator: Included DPI/layout corrections, restored keyboard haptic controls, clearer disabled text and working setup-guide access.
+7. VR keyboard and cable tracking: Added console clipboard paste with Ctrl+V, corrected modifier handling, and an optional physical-turn counter with an unwind overlay and assignable shortcuts.
+
+Player-motion correction remains experimental. It preserves the original mask outline; thin and rotating objects can still ghost. It pauses during locomotion, stick turns, menus, and invalid history. The GPU guard is sampled, and an FPS improvement is not guaranteed. AMD RDM remains experimental.
+
+Install the complete package, including root/openvr_api.dll and SKSE/Plugins/OpenCompositeInput.dll. Preserve your existing settings when updating. No CSX/Open Shaders shader-cache deletion is required. Fixed VRS and verbose logging are off in the shipped configuration.

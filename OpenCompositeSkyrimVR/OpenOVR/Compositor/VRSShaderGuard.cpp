@@ -1,6 +1,7 @@
 #ifdef _WIN32
 #include "VRSShaderGuard.h"
 #include "ExactPixelShader.h"
+#include "MenuShaderMetadata.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
@@ -32,6 +33,8 @@ std::atomic<std::uint64_t> rasterDepthTextureLoadCount{0};
 std::atomic<ID3D11DeviceContext*> watched{nullptr};
 StateChanged changed = nullptr;
 BeforeContextMutation beforeMutation = nullptr;
+std::atomic<ID3D11DeviceContext*> commandBarrierContext{nullptr};
+BeforeContextMutation beforeCommandList = nullptr;
 std::uint32_t shaderReasons = NoPixelShader, blendReasons = 0;
 std::uint32_t coarseHazards = CoarseUnclassified;
 int singleSampledTexture2D = -1;
@@ -96,6 +99,7 @@ template<class Visit> void Registers(std::string_view line, char kind, Visit vis
 struct Classification {
     std::uint32_t reasons = Unclassified, coarse = CoarseUnclassified;
     SampledTexture2DSlots sampledTexture2DSlots;
+    bool scalableMenu = false;
 };
 
 int SingleSlot(const SampledTexture2DSlots& slots) noexcept
@@ -122,8 +126,11 @@ Classification ClassifyAssembly(std::string_view text) noexcept
 {
     bool pixelProgram = false, readsRasterDepth = false, loadsTexture2D = false;
     std::array<bool, D3D11_PS_INPUT_REGISTER_COUNT> positionInputs{};
+    std::array<unsigned, D3D11_PS_INPUT_REGISTER_COUNT> menuPositionMasks{};
     std::array<bool, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> textures2D{};
     std::array<bool, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> sampledTextures2D{};
+    bool menuUnsafe = false, menuHasSample = false;
+    unsigned menuOutputs = 0;
     std::uint32_t reasons = Compatible;
     Instructions(text, [&](std::string_view instruction, std::string_view line) {
         if (Starts(instruction, "ps_")) pixelProgram = true;
@@ -133,14 +140,31 @@ Classification ClassifyAssembly(std::string_view text) noexcept
             reasons |= DepthOrCoverage;
         if (Starts(instruction, "dcl_uav_")) reasons |= UnorderedAccess;
         if (Starts(instruction, "dcl_interface")) reasons |= ClassLinkage;
-        if (instruction == "dcl_input_ps_siv") {
+        if (Starts(instruction, "dcl_output")) {
+            // In pixel assembly ordinary oN outputs correspond to SV_TargetN.
+            // Depth/coverage/system outputs have different declarations.
+            if (instruction != "dcl_output") menuUnsafe = true;
+            bool found = false;
+            Registers(line, 'o', [&](unsigned reg, unsigned) {
+                found = true;
+                if (reg < 8) menuOutputs |= 1u << reg;
+                else menuUnsafe = true;
+            });
+            if (!found) menuUnsafe = true;
+        }
+        if (Starts(instruction, "dcl_function_") || Starts(instruction, "dcl_interface"))
+            menuUnsafe = true;
+        if (instruction == "dcl_input_ps_siv" || instruction == "dcl_input_ps_sgv") {
             const auto comma = line.rfind(',');
             auto semantic = comma == std::string_view::npos ? std::string_view{} : line.substr(comma + 1);
             const auto first = semantic.find_first_not_of(" \t");
             if (first != std::string_view::npos) semantic.remove_prefix(first);
             semantic = semantic.substr(0, semantic.find_first_of(" \t\r\0", 0, 4));
             if (semantic == "position") Registers(line, 'v', [&](unsigned reg, unsigned mask) {
-                if (reg < positionInputs.size() && (mask & 4)) positionInputs[reg] = true;
+                if (reg < menuPositionMasks.size()) menuPositionMasks[reg] |= mask;
+                else menuUnsafe = true;
+                if (instruction == "dcl_input_ps_siv" && reg < positionInputs.size() && (mask & 4))
+                    positionInputs[reg] = true;
             });
         }
         if (instruction == "dcl_resource_texture2d") Registers(line, 't', [&](unsigned reg, unsigned) {
@@ -152,6 +176,7 @@ Classification ClassifyAssembly(std::string_view text) noexcept
         if (Starts(instruction, "dcl_") || Starts(instruction, "ps_")) return;
         Registers(line, 'v', [&](unsigned reg, unsigned mask) {
             if (reg < positionInputs.size() && positionInputs[reg] && (mask & 4)) readsRasterDepth = true;
+            if (reg < menuPositionMasks.size() && (menuPositionMasks[reg] & mask)) menuUnsafe = true;
         });
         if (instruction == "ld" || Starts(instruction, "ld_indexable(texture2d)"))
             Registers(line, 't', [&](unsigned reg, unsigned) {
@@ -167,6 +192,26 @@ Classification ClassifyAssembly(std::string_view text) noexcept
             Registers(line, 't', [&](unsigned reg, unsigned) {
                 if (reg < textures2D.size() && textures2D[reg]) sampledTextures2D[reg] = true;
             });
+        // Only normalized-coordinate ordinary samples from the actual t0
+        // Texture2D are admitted. Resource declarations alone grant nothing.
+        // Loads, gathers, LOD/query operations and derivatives tie execution to
+        // raster scale even when the sampled material identity is unchanged.
+        if (Starts(instruction, "ld") || Starts(instruction, "resinfo") ||
+            Starts(instruction, "bufinfo") || Starts(instruction, "sampleinfo") ||
+            Starts(instruction, "samplepos") || Starts(instruction, "lod") ||
+            Starts(instruction, "deriv_") || Starts(instruction, "eval_") ||
+            Starts(instruction, "gather") || Starts(instruction, "interface_call"))
+            menuUnsafe = true;
+        if (Starts(sampleOpcode, "sample") && sampleOpcode != "sample") menuUnsafe = true;
+        unsigned resourceOperands = 0;
+        Registers(line, 't', [&](unsigned reg, unsigned) {
+            ++resourceOperands;
+            if (sampleOpcode != "sample" || reg != 0 || !textures2D[0]) menuUnsafe = true;
+        });
+        if (sampleOpcode == "sample") {
+            if (resourceOperands != 1) menuUnsafe = true;
+            else menuHasSample = true;
+        }
     });
     SampledTexture2DSlots materialSlots;
     for (unsigned slot = 0; slot < sampledTextures2D.size(); ++slot) {
@@ -176,7 +221,11 @@ Classification ClassifyAssembly(std::string_view text) noexcept
     // This conservative conjunction does not infer a dependency between the
     // depth input and load. It protects terrain equality/blend operations
     // without treating every screen-space load or position declaration as unsafe.
-    return {reasons, readsRasterDepth && loadsTexture2D ? RasterDepthTextureLoad : CoarseCompatible, materialSlots};
+    const bool scalableMenu = !menuUnsafe && menuHasSample && menuOutputs == 1 &&
+        !(reasons & (Unclassified | DepthOrCoverage | UnorderedAccess | ClassLinkage)) &&
+        SingleSlot(materialSlots) == 0;
+    return {reasons, readsRasterDepth && loadsTexture2D ? RasterDepthTextureLoad : CoarseCompatible,
+        materialSlots, scalableMenu};
 }
 
 Classification Classify(const void* bytecode, SIZE_T size) noexcept
@@ -280,6 +329,7 @@ struct CreateHandler {
         if (SUCCEEDED(result) && shader && *shader) {
             Metadata metadata;
             const auto classification = Classify(bytes, size);
+            ocu_menu::detail::StoreShaderScalePermission(*shader, classification.scalableMenu && !linkage);
             metadata.reasons = classification.reasons | (linkage ? ClassLinkage : Compatible);
             CoarseMetadata coarseMetadata;
             coarseMetadata.hazards = classification.coarse;
@@ -369,6 +419,8 @@ using Execute = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11CommandList
 struct ExecuteHandler {
     static void Call(Execute original, ID3D11DeviceContext* context, ID3D11CommandList* list, BOOL restore)
     {
+        if (context == commandBarrierContext.load(std::memory_order_acquire) && beforeCommandList)
+            beforeCommandList(context);
         if (context != watched.load(std::memory_order_acquire)) {
             original(context, list, restore);
             return;
@@ -465,6 +517,20 @@ bool InstallShaderCapture(ID3D11Device* device)
     if (!device || !InitializeHooks()) return false;
     auto table = *reinterpret_cast<void***>(device);
     return MethodHook<CreatePS, CreateHandler>::Install(table[15]);
+}
+
+bool SetCommandListBarrier(ID3D11DeviceContext* context, BeforeContextMutation callback)
+{
+    if ((context == nullptr) != (callback == nullptr)) return false;
+    if (context) {
+        if (context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE || !InitializeHooks()) return false;
+        const auto table = *reinterpret_cast<void***>(context);
+        if (!MethodHook<Execute, ExecuteHandler>::Install(table[58])) return false;
+    }
+    commandBarrierContext.store(nullptr, std::memory_order_release);
+    beforeCommandList = callback;
+    commandBarrierContext.store(context, std::memory_order_release);
+    return true;
 }
 
 bool WatchContext(ID3D11DeviceContext* context, StateChanged callback,

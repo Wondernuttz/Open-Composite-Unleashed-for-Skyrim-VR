@@ -8,6 +8,7 @@ namespace OpenCompositeConfigurator
 {
     internal sealed class ModernCheckBox : CheckBox
     {
+        internal float LayoutScale = 1f;
         private bool _hovered;
         private float _glowIntensity = 0.65f;
 
@@ -44,7 +45,8 @@ namespace OpenCompositeConfigurator
             // WinForms' stock CheckBox reserves more glyph/padding space than
             // its reported text width suggests. Keep a little breathing room so
             // AutoSize labels never end in an unnecessary ellipsis.
-            return new Size(text.Width + 45, Math.Max(20, text.Height + 3));
+            return new Size(text.Width + (int)Math.Ceiling(45 * LayoutScale),
+                Math.Max((int)Math.Ceiling(20 * LayoutScale), text.Height + (int)Math.Ceiling(3 * LayoutScale)));
         }
 
         protected override void OnMouseEnter(EventArgs e)
@@ -77,9 +79,11 @@ namespace OpenCompositeConfigurator
         {
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.Clear(ResolveBackground());
+            var drawingState = e.Graphics.Save();
+            e.Graphics.ScaleTransform(LayoutScale, LayoutScale);
 
             const int box = 15;
-            int top = Math.Max(1, (Height - box) / 2);
+            int top = Math.Max(1, ((int)(Height / LayoutScale) - box) / 2);
             var rect = new Rectangle(4, top, box, box);
             float pulse = Checked
                 ? Math.Min(1f, _glowIntensity + (_hovered ? 0.12f : 0f))
@@ -149,11 +153,13 @@ namespace OpenCompositeConfigurator
                 e.Graphics.DrawLines(check, checkPoints);
             }
 
+            e.Graphics.Restore(drawingState);
             Color textColor = Enabled ? ForeColor : ModernUiTheme.TextMuted;
-            var textRect = new Rectangle(26, 0, Math.Max(0, Width - 26), Height);
+            int textStart = (int)Math.Round(26 * LayoutScale);
+            var textRect = new Rectangle(textStart, 0, Math.Max(0, Width - textStart), Height);
             TextRenderer.DrawText(e.Graphics, Text, Font, textRect, textColor,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter
-                | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+                | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
 
             if (Focused && ShowFocusCues)
             {
@@ -195,6 +201,7 @@ namespace OpenCompositeConfigurator
 
     internal sealed class ModernRadioButton : RadioButton
     {
+        internal float LayoutScale = 1f;
         private bool _hovered;
 
         internal ModernRadioButton()
@@ -210,7 +217,8 @@ namespace OpenCompositeConfigurator
         {
             Size text = TextRenderer.MeasureText(Text, Font, Size.Empty,
                 TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
-            return new Size(text.Width + 42, Math.Max(20, text.Height + 3));
+            return new Size(text.Width + (int)Math.Ceiling(42 * LayoutScale),
+                Math.Max((int)Math.Ceiling(20 * LayoutScale), text.Height + (int)Math.Ceiling(3 * LayoutScale)));
         }
 
         protected override void OnMouseEnter(EventArgs e)
@@ -246,9 +254,11 @@ namespace OpenCompositeConfigurator
                 ? BackColor
                 : Parent?.BackColor ?? ModernUiTheme.Window;
             e.Graphics.Clear(background);
+            var drawingState = e.Graphics.Save();
+            e.Graphics.ScaleTransform(LayoutScale, LayoutScale);
 
             const int diameter = 15;
-            int top = Math.Max(1, (Height - diameter) / 2);
+            int top = Math.Max(1, ((int)(Height / LayoutScale) - diameter) / 2);
             var rect = new Rectangle(1, top, diameter, diameter);
             Color ring = Checked ? ModernUiTheme.AccentHover : ModernUiTheme.Border;
             Color fill = _hovered ? ModernUiTheme.SurfaceHover : ModernUiTheme.Input;
@@ -271,11 +281,13 @@ namespace OpenCompositeConfigurator
                 e.Graphics.FillEllipse(dotBrush, dot);
             }
 
+            e.Graphics.Restore(drawingState);
             Color textColor = Enabled ? ForeColor : ModernUiTheme.TextMuted;
-            var textRect = new Rectangle(23, 0, Math.Max(0, Width - 23), Height);
+            int textStart = (int)Math.Round(23 * LayoutScale);
+            var textRect = new Rectangle(textStart, 0, Math.Max(0, Width - textStart), Height);
             TextRenderer.DrawText(e.Graphics, Text, Font, textRect, textColor,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter
-                | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+                | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
         }
     }
 }

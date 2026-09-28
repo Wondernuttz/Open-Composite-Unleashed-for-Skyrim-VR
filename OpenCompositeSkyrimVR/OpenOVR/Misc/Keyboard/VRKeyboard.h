@@ -153,12 +153,16 @@ private:
 	};
 	HeldPCKey heldPCKeys[2];
 	bool ctrlLatched = false;
+	bool ctrlSentToPC = false;
 	int ctrlLatchSide = -1;
 	bool releaseCtrlAfterHeldPCKey[2] = { false, false };
 	void PressHeldPCKey(int side, int keyId, uint16_t vk, bool shift, bool scanOnly);
+	void PressControlKey(int side, int keyId, uint16_t vk);
 	void ReleaseHeldPCKey(int side);
 	void ToggleCtrlLatch(int side);
 	void ReleaseCtrlLatch();
+	void PasteConsoleClipboard();
+	bool HandleConsoleShortcut(wchar_t ch);
 	void ReleaseAllHeldPCKeys();
 
 	// Grab bar — trigger on the top strip to grab and reposition the keyboard
@@ -213,6 +217,7 @@ private:
 	// Console INPUT overlay — floating panel above keyboard showing typed text
 	bool consoleActive = false;
 	bool consoleDirty = true;
+	std::wstring consoleStatus;
 	XrSwapchain consoleChain = XR_NULL_HANDLE;
 	std::vector<XrSwapchainImageD3D11KHR> consoleSwapImages;
 	static constexpr uint32_t consoleTexWidth = 1024;

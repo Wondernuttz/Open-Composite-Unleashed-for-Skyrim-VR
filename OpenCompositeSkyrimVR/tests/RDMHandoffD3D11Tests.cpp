@@ -22,6 +22,28 @@ void oovr_log_raw_format(const char*, long, const char*, const char* fmt, ...) {
     va_list args; va_start(args,fmt); std::vprintf(fmt,args); va_end(args); std::puts("");
 }
 static void Require(bool ok,const char* message) { if(!ok) throw std::runtime_error(message); }
+// Simulate a menu flag changing without any D3D state setter. The callback
+// must retire itself before EndFrame's internal reconstruction draws.
+struct PopupDrawBoundary {
+    static inline PopupDrawBoundary* active=nullptr;
+    RDMRenderScope& scope;
+    ID3D11Query* nativeDrawQuery=nullptr;
+    unsigned calls=0;
+    bool menuOpen=false,cleared=false,queryStarted=false;
+    explicit PopupDrawBoundary(RDMRenderScope& owner,ID3D11DeviceContext* context):scope(owner) {
+        active=this;
+        Require(RDMRenderScope::SetDrawBoundaryCallback(context,&BeforeDraw),"popup draw boundary registration failed");
+    }
+    static void BeforeDraw(ID3D11DeviceContext* context) {
+        auto& self=*active;++self.calls;
+        if(!self.menuOpen)return;
+        self.cleared=RDMRenderScope::SetDrawBoundaryCallback(nullptr,nullptr);
+        self.scope.EndFrame();
+        // Exclude the pending batch's resolve from the menu draw measurement.
+        if(self.nativeDrawQuery){context->Begin(self.nativeDrawQuery);self.queryStarted=true;}
+    }
+    ~PopupDrawBoundary(){RDMRenderScope::SetDrawBoundaryCallback(nullptr,nullptr);active=nullptr;}
+};
 // Manual scene-only timing fixtures bypass the draw detour while busy. Supply
 // the same current-geometry coverage proof the production detour requires.
 static bool PrepareCoveredDraw(RDMRenderScope& scope, ID3D11DeviceContext* context) {
@@ -214,6 +236,9 @@ Outputs Seed(float4 p:SV_POSITION) {
     o.color=float4((q.x%4+1)/8.0,(q.y%4+1)/8.0,((q.x+q.y)%4+1)/8.0,((q.x+2*q.y)%4+1)/8.0);
     o.motion=float4(((q.x+1)%4+1)/8.0,((q.y+1)%4+1)/8.0,((q.x+3*q.y)%4+1)/8.0,((2*q.x+q.y)%4+1)/8.0);
     return o;
+}
+Outputs MenuPattern(float4 p:SV_POSITION) {
+    Outputs o=Seed(p);o.color.r=frac(p.x*0.25);return o;
 }
 Outputs Partial(float4 p:SV_POSITION) {
     Outputs o;o.color=float4(.75,.625,.875,1);o.motion=float4(.625,.75,.875,1);return o;
@@ -822,6 +847,75 @@ static void Run(IDXGIAdapter* adapter,D3D_DRIVER_TYPE driver,UINT width,UINT hei
         acceptedAfter.startRejectedDraws==acceptedBefore.startRejectedDraws,
         "accepted batch telemetry reported a failure or lost a masked draw");
     CheckColor();rdm.EndFrame();
+    // A popup can open between two identical native draws. A state-hook-only
+    // gate misses this transition and keeps private depth/coverage active.
+    // Per-pixel output makes a skipped/full-rate menu draw visible in readback.
+    {
+        auto code=Compile(shader,"MenuPattern","ps_5_0");ComPtr<ID3D11PixelShader> menuPattern;
+        HR(dev->CreatePixelShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&menuPattern));
+        D3D11_QUERY_DESC description{D3D11_QUERY_PIPELINE_STATISTICS,0};ComPtr<ID3D11Query> menuQuery;
+        HR(dev->CreateQuery(&description,&menuQuery));
+        auto CompleteMenuQuery=[&] {
+            D3D11_QUERY_DATA_PIPELINE_STATISTICS measured{};HRESULT ready=S_FALSE;
+            for(unsigned i=0;i<1000 && ready==S_FALSE;++i){ready=ctx->GetData(menuQuery.Get(),&measured,sizeof(measured),0);if(ready==S_FALSE)Sleep(1);}
+            Require(ready==S_OK,"menu pipeline statistics did not complete");return measured;
+        };
+        Prepare();ctx->PSSetShader(menuPattern.Get(),nullptr,0);
+        ctx->Begin(menuQuery.Get());ctx->Draw(3,0);ctx->End(menuQuery.Get());
+        const auto nativeMenuStats=CompleteMenuQuery();
+        Require(nativeMenuStats.PSInvocations>=UINT64(width)*height,"full-rate menu reference did not cover the viewport");
+        const auto menuColor=Read(dev.Get(),ctx.Get(),color.Get());
+        const auto menuMotion=Read(dev.Get(),ctx.Get(),motion.Get());
+        const auto menuDepth=Read(dev.Get(),ctx.Get(),depth.Get());
+        Prepare(true);ctx->PSSetShader(menuPattern.Get(),nullptr,0);
+        PopupDrawBoundary popup(rdm,ctx.Get());popup.nativeDrawQuery=menuQuery.Get();
+        ctx->Draw(3,0);
+        const auto pending=rdm.Stats();
+        Require(popup.calls==1 && pending.maskedDraws==1 && pending.batches==1 &&
+            pending.resolves==0 && pending.originalDepthRestores==0,
+            "popup fixture did not retain a pending masked draw, or internal rendering ran the boundary callback");
+        popup.menuOpen=true;
+        ctx->Draw(3,0); // Deliberately no setter/getter/readback since the prior draw.
+        Require(popup.queryStarted,"popup callback did not run before native menu draw");
+        ctx->End(menuQuery.Get());
+        const auto stopped=rdm.Stats();
+        Require(popup.cleared && popup.calls==2 && !RDMRenderScope::Active(ctx.Get()),
+            "popup failed to remove itself and disarm RDM on the next same-state draw");
+        Require(stopped.draws==pending.draws && stopped.maskedDraws==pending.maskedDraws &&
+            stopped.guideDraws==pending.guideDraws && stopped.guideInvalidationDraws==pending.guideInvalidationDraws &&
+            stopped.colorCoverageDraws==pending.colorCoverageDraws && stopped.colorCoverageReuses==pending.colorCoverageReuses,
+            "menu draw still ran RDM admission, guide, or color coverage after disarming");
+        Require(stopped.resolves==pending.resolves+2 && stopped.originalDepthRestores==pending.originalDepthRestores+1,
+            "popup boundary failed to flush both pending MRTs and restore native depth");
+        const auto menuStats=CompleteMenuQuery();
+        // WARP counts helper invocations around the fullscreen triangle. Use
+        // the same device's native reference instead of assuming one per pixel.
+        Require(menuStats.PSInvocations==nativeMenuStats.PSInvocations,
+            "native menu draw did not run exactly once at full pixel rate");
+        Require(Read(dev.Get(),ctx.Get(),color.Get())==menuColor &&
+            Read(dev.Get(),ctx.Get(),motion.Get())==menuMotion && Read(dev.Get(),ctx.Get(),depth.Get())==menuDepth,
+            "popup native draw differs from full-rate color/MRT/depth reference");
+        ctx->Draw(3,0);
+        Require(popup.calls==2 && rdm.Stats().draws==stopped.draws && rdm.Stats().resolves==stopped.resolves,
+            "removed popup callback or RDM scope ran again while the menu stayed open");
+        popup.menuOpen=false;popup.nativeDrawQuery=nullptr;
+        Prepare(true);ctx->PSSetShader(menuPattern.Get(),nullptr,0);
+        Require(RDMRenderScope::SetDrawBoundaryCallback(ctx.Get(),&PopupDrawBoundary::BeforeDraw),"popup boundary rearm failed");
+        ctx->Draw(3,0);
+        Require(popup.calls==3 && rdm.Stats().maskedDraws==1 && rdm.Stats().colorCoverageDraws==1,
+            "fresh frame did not resume RDM after popup closed");
+        Require(RDMRenderScope::SetDrawBoundaryCallback(nullptr,nullptr),"popup callback cleanup failed");
+        rdm.EndFrame();
+        // Also disarm a same-state depth producer before it can replay a guide.
+        Prepare(true);Bind(false);ctx->PSSetShader(nullptr,nullptr,0);ctx->Draw(3,0);
+        const auto guide=rdm.Stats();popup.menuOpen=true;
+        Require(RDMRenderScope::SetDrawBoundaryCallback(ctx.Get(),&PopupDrawBoundary::BeforeDraw),"depth popup boundary rearm failed");
+        ctx->Draw(3,0);
+        Require(rdm.Stats().draws==guide.draws && rdm.Stats().guideDraws==guide.guideDraws &&
+            rdm.Stats().guideInvalidationDraws==guide.guideInvalidationDraws && !RDMRenderScope::Active(ctx.Get()),
+            "popup depth producer replayed a guide after its scope was retired");
+        std::printf("RDM POPUP PASS: same-state disarm, pending MRT flush, native menu PS=%llu, exact pixels/depth, no guide/coverage, rearm\n",menuStats.PSInvocations);
+    }
     // Repeated null-PS prepass draws keep the same game state after guide
     // restoration. Neither guide admission nor color rejection needs querying again.
     Prepare(true);Bind(false);ctx->PSSetShader(nullptr,nullptr,0);

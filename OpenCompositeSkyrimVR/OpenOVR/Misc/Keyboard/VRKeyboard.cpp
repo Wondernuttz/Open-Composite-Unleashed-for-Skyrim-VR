@@ -1,6 +1,7 @@
 #include "stdafx.h"
 
 #include "VRKeyboard.h"
+#include "ConsoleClipboard.h"
 
 #include <d3d11.h>
 
@@ -821,7 +822,7 @@ static bool ShouldSuppressSkyrimInput()
 // single-channel emit pattern below ensures one logical press == one
 // OnKeyDown in Papyrus, killing the 30Hz dual-fire bug that previously
 // caused MCM remap to bind to the wrong key.
-static void SendSingleVK(WORD vk, bool pcMode = false)
+static void SendSingleVK(WORD vk, bool pcMode = false, bool shift = false)
 {
 	// PC MODE always passes through to Skyrim. The user explicitly toggled
 	// the VR keyboard to PC mode (sendInputOnly), which is the "I'm sending
@@ -844,30 +845,30 @@ static void SendSingleVK(WORD vk, bool pcMode = false)
 	    pcMode ? " (PC mode)" : "",
 	    isFKey ? " (F-key bypass)" : "");
 
-	WORD scan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 	DWORD flags = (IsExtendedKey(vk) ? KEYEVENTF_EXTENDEDKEY : 0);
 
-	INPUT inputs[2] = {};
-	// VK-based down — Windows posts WM_KEYDOWN AND injects scancode
-	// into the raw input stream that DirectInput observes.
-	inputs[0].type = INPUT_KEYBOARD;
-	inputs[0].ki.wVk = vk;
-	inputs[0].ki.wScan = scan;
-	inputs[0].ki.dwFlags = flags;
-	// VK-based up
-	inputs[1].type = INPUT_KEYBOARD;
-	inputs[1].ki.wVk = vk;
-	inputs[1].ki.wScan = scan;
-	inputs[1].ki.dwFlags = flags | KEYEVENTF_KEYUP;
+	INPUT inputs[4] = {};
+	UINT count = 0;
+	auto append = [&](WORD code, DWORD keyFlags) {
+		auto& event = inputs[count++];
+		event.type = INPUT_KEYBOARD;
+		event.ki.wVk = code;
+		event.ki.wScan = static_cast<WORD>(MapVirtualKeyW(code, MAPVK_VK_TO_VSC));
+		event.ki.dwFlags = keyFlags;
+	};
+	if (shift) append(VK_SHIFT, 0);
+	append(vk, flags);
+	append(vk, flags | KEYEVENTF_KEYUP);
+	if (shift) append(VK_SHIFT, KEYEVENTF_KEYUP);
 
 	EnsureGameForeground();
-	::SendInput(2, inputs, sizeof(INPUT));
+	::SendInput(count, inputs, sizeof(INPUT));
 }
 
 // Send one half of a real PC MODE key hold. Printable keys use the same
 // scancode-only DirectInput path as SendVirtualKey; control/F-keys use VK
 // events so Windows also supplies WM_KEYDOWN/WM_KEYUP to menu consumers.
-// Shift is kept down for the full lifetime of a shifted printable key.
+// Shift is kept down for the full lifetime of the key, including function keys.
 static void SendPCVirtualKeyState(WORD vk, bool shift, bool scanOnly, bool down)
 {
 	WORD scan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
@@ -1536,7 +1537,32 @@ void VRKeyboard::PressHeldPCKey(int side, int keyId, uint16_t vk, bool shift, bo
 	ReleaseHeldPCKey(side);
 	heldPCKeys[side] = { vk, keyId, shift, scanOnly };
 #ifdef _WIN32
-	SendPCVirtualKeyState((WORD)vk, shift, scanOnly, true);
+	// A second hand can share Shift without the first hand releasing it early.
+	const bool otherShift = heldPCKeys[1-side].vk != 0 && heldPCKeys[1-side].shift;
+	SendPCVirtualKeyState((WORD)vk, shift && !otherShift, scanOnly, true);
+#endif
+}
+
+void VRKeyboard::PressControlKey(int side, int keyId, uint16_t vk)
+{
+	if (side < 0 || side >= 2 || vk == 0) return;
+#ifdef _WIN32
+	// Caps controls text casing. Only the explicit, one-shot Shift selection
+	// adds a Shift modifier to F-keys, arrows, Tab and other control keys.
+	const bool shift = caseMode == ECaseMode::SHIFT;
+	if (sendInputOnly && !consoleActive) {
+		const bool consumeCtrl = ctrlLatched;
+		PressHeldPCKey(side, keyId, vk, shift, false);
+		if (consumeCtrl) releaseCtrlAfterHeldPCKey[side] = true;
+	} else {
+		if (consoleActive) {
+			ReleaseCtrlLatch();
+			consoleStatus.clear();
+			consoleDirty = true;
+		}
+		SendSingleVK(vk, sendInputOnly || consoleActive, shift);
+	}
+	if (shift) { caseMode = ECaseMode::LOWER; dirty = true; }
 #endif
 }
 
@@ -1552,9 +1578,10 @@ void VRKeyboard::ReleaseHeldPCKey(int side)
 	s_pressedKey[side] = -1;
 #ifdef _WIN32
 	if (held.vk != 0)
-		SendPCVirtualKeyState((WORD)held.vk, held.shift, held.scanOnly, false);
+		SendPCVirtualKeyState((WORD)held.vk, held.shift &&
+		    !(heldPCKeys[1-side].vk != 0 && heldPCKeys[1-side].shift), held.scanOnly, false);
 #endif
-	if (releaseCtrl)
+	if (releaseCtrl && !releaseCtrlAfterHeldPCKey[0] && !releaseCtrlAfterHeldPCKey[1])
 		ReleaseCtrlLatch();
 }
 
@@ -1570,7 +1597,9 @@ void VRKeyboard::ToggleCtrlLatch(int side)
 	ctrlLatched = true;
 	ctrlLatchSide = side;
 #ifdef _WIN32
-	SendPCVirtualKeyState(VK_CONTROL, false, false, true);
+	// Console shortcuts are handled locally; do not hold desktop Ctrl.
+	ctrlSentToPC = !consoleActive;
+	if (ctrlSentToPC) SendPCVirtualKeyState(VK_CONTROL, false, false, true);
 #endif
 	dirty = true;
 }
@@ -1585,7 +1614,8 @@ void VRKeyboard::ReleaseCtrlLatch()
 	releaseCtrlAfterHeldPCKey[0] = false;
 	releaseCtrlAfterHeldPCKey[1] = false;
 #ifdef _WIN32
-	SendPCVirtualKeyState(VK_CONTROL, false, false, false);
+	if (ctrlSentToPC) SendPCVirtualKeyState(VK_CONTROL, false, false, false);
+	ctrlSentToPC = false;
 #endif
 	dirty = true;
 }
@@ -1595,6 +1625,44 @@ void VRKeyboard::ReleaseAllHeldPCKeys()
 	ReleaseHeldPCKey(0);
 	ReleaseHeldPCKey(1);
 	ReleaseCtrlLatch();
+}
+
+bool VRKeyboard::HandleConsoleShortcut(wchar_t ch)
+{
+    if (!consoleActive || !ctrlLatched) return false;
+    ReleaseAllHeldPCKeys();
+    if (caseMode == ECaseMode::SHIFT) caseMode = ECaseMode::LOWER;
+    if (ch == L'v' || ch == L'V') PasteConsoleClipboard();
+    else { consoleStatus = L"Use Ctrl+V to paste"; consoleDirty = true; }
+    return true;
+}
+
+void VRKeyboard::PasteConsoleClipboard()
+{
+#ifdef _WIN32
+    extern int OCBridge_ConsoleState();
+    HWND hwnd = GetGameWindow();
+    consoleDirty = true;
+    if (!consoleActive || !hwnd || OCBridge_ConsoleState() != 1 || IsPrismaTextFocused()) {
+        consoleStatus = L"Open Skyrim console first";
+        return;
+    }
+    const size_t limit = maxLength ? (std::min)(size_t(maxLength), size_t(256)) : 256;
+    std::wstring pasted;
+    const wchar_t* error = ConsoleClipboard::Read(hwnd, limit - (std::min)(limit, text.size()), pasted);
+    if (error) { consoleStatus = error; return; }
+    cursorPos = (std::clamp)(cursorPos, 0, int(text.size()));
+    // Use the existing SKSE character bridge, never SendInput or Return.
+    // Explicit console routing avoids a focused third-party web text field.
+    for (wchar_t ch : pasted) {
+        if (!PostMessageW(hwnd, WM_OC_CHAR, WPARAM(ch), 0)) {
+            consoleStatus = L"Paste interrupted - check command";
+            return;
+        }
+        text.insert(size_t(cursorPos++), 1, ch);
+    }
+    consoleStatus = L"Pasted - Enter to run";
+#endif
 }
 
 wstring VRKeyboard::contents()
@@ -2369,6 +2437,8 @@ const std::vector<XrCompositionLayerBaseHeader*>& VRKeyboard::Update()
 			OOVR_DEBUG_LOGF("Console sync: first bridge probe = %d", gameConsole);
 		}
 		if (gameConsole >= 0 && (gameConsole != 0) != consoleActive) {
+			ReleaseAllHeldPCKeys();
+			consoleStatus.clear();
 			consoleActive = (gameConsole != 0);
 			if (consoleActive) {
 				text.clear();
@@ -2907,14 +2977,7 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 			// ── SendInput mode: inject Windows keystrokes + buffer text for GetKeyboardText ──
 #ifdef _WIN32
 			auto sendHoldableControl = [&](WORD vk) {
-				if (sendInputOnly && !consoleActive) {
-					const bool consumeCtrl = ctrlLatched;
-					PressHeldPCKey((int)side, key.id, vk, false, false);
-					if (consumeCtrl)
-						releaseCtrlAfterHeldPCKey[(int)side] = true;
-				} else {
-					SendSingleVK(vk, sendInputOnly || consoleActive);
-				}
+				PressControlKey((int)side, key.id, vk);
 			};
 
 			if (ch == '\x01' || ch == '\x02') {
@@ -3002,7 +3065,7 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 			} else if (ch == '\x1D') {
 				sendHoldableControl(VK_END);
 			} else if (ch == '\x1E') {
-				if (sendInputOnly && !consoleActive)
+				if (sendInputOnly || consoleActive)
 					ToggleCtrlLatch((int)side);
 				else
 					SendSingleVK(VK_CONTROL, sendInputOnly || consoleActive);
@@ -3016,8 +3079,11 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 				// ESC — send to SkyUI/menus to cancel text input (does NOT close keyboard)
 				sendHoldableControl(VK_ESCAPE);
 			} else {
+				if (HandleConsoleShortcut(ch)) { dirty = true; return; }
+				consoleStatus.clear();
 				// Tilde/backtick toggles console INPUT overlay
 				if (ch == L'`' || ch == L'~') {
+					ReleaseAllHeldPCKeys();
 					consoleActive = !consoleActive;
 					s_consoleToggleGraceUntil = GetTickCount64() + 700;
 					if (consoleActive) {
@@ -3050,7 +3116,7 @@ void VRKeyboard::HandleOverlayInput(vr::EVREye side, vr::VRControllerState_t sta
 					// ch != 0 suppresses VK events (no double WM_CHAR from VK path).
 					// WM_CHAR from scancodes is blocked by SKSE WndProc hook
 					// (OC_KB_ACTIVE property) to prevent double entry.
-					VkMapping mapping = CharToVK(ch);
+					VkMapping mapping = CharToVK(ctrlLatched && caseMode == ECaseMode::LOCK ? key.ch : ch);
 					if (mapping.vk != 0) {
 						const bool consumeCtrl = ctrlLatched;
 						PressHeldPCKey((int)side, key.id, mapping.vk, mapping.needsShift, true);
@@ -4943,13 +5009,14 @@ void VRKeyboard::RefreshConsole()
 	}
 
 	pix_t titleColour = tp(effectiveConsoleInk);
-	int titleTextW = font->Width(L"INPUT");
+	const std::wstring title = consoleStatus.empty() ? L"INPUT" : consoleStatus;
+	int titleTextW = font->Width(title);
 	int fontH = (int)font->GetLineHeight();
 	int titleTextX = (int)desc.Width / 2 - titleTextW / 2
 	    + int(std::round(VS.inputTitleOffsetX));
 	int titleTextY = consoleBorderWidth + (titleH - fontH) / 2
 	    + int(std::round(VS.inputTitleOffsetY));
-	printLine(titleTextX, titleTextY, titleColour, L"INPUT");
+	printLine(titleTextX, titleTextY, titleColour, title);
 
 	// Input text with blinking cursor — centered vertically in remaining space
 	int contentTop = consoleBorderWidth + titleH + consoleBorderWidth;

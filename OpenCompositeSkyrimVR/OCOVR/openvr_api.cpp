@@ -373,46 +373,20 @@ success:
 	running = true;
 
 	// TODO seperate this from the rest of dllmain
-	BackendManager::Create(DrvOpenXR::CreateOpenXRBackend());
+	auto* backend = DrvOpenXR::CreateOpenXRBackend();
+	if (!backend) {
+		running = false;
+		*peError = VRInitError_Init_Internal;
+		return 0;
+	}
+	BackendManager::Create(backend);
 
 	return current_init_token;
 }
 
 VR_INTERFACE bool VR_CALLTYPE VR_IsHmdPresent()
 {
-	// If we're already running, then Oculus's implementation fails with XR_ERROR_RUNTIME_FAILURE
-	if (running)
-		return true;
-
-	// At this point, we should NOT be running OpenXR, so setup a new session just for this
-	OOVR_FALSE_ABORT(xr_instance == XR_NULL_HANDLE);
-
-	// FIXME copied from DrvOpenXR
-	XrApplicationInfo appInfo{};
-	DrvOpenXR::GetXRAppName(appInfo.applicationName);
-	appInfo.applicationVersion = 1;
-	appInfo.apiVersion = XR_CURRENT_API_VERSION;
-	XrInstanceCreateInfo createInfo{ XR_TYPE_INSTANCE_CREATE_INFO };
-	createInfo.applicationInfo = appInfo;
-	XrInstance tmp_instance;
-	OOVR_FAILED_XR_ABORT(xrCreateInstance(&createInfo, &tmp_instance));
-
-	XrSystemGetInfo systemInfo{};
-	systemInfo.type = XR_TYPE_SYSTEM_GET_INFO;
-	systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-	XrSystemId id;
-	XrResult res = xrGetSystem(tmp_instance, &systemInfo, &id);
-
-	OOVR_FAILED_XR_ABORT(xrDestroyInstance(tmp_instance));
-
-	if (res == XR_SUCCESS)
-		return true;
-
-	if (res == XR_ERROR_FORM_FACTOR_UNAVAILABLE || res == XR_ERROR_FORM_FACTOR_UNSUPPORTED)
-		return false;
-
-	// Something else went wrong
-	OOVR_ABORTF("Failed to probe for OpenXR systems: return status %d", res);
+	return DrvOpenXR::IsHmdPresent();
 }
 
 // Necessary for Proton games on Linux: https://github.com/ValveSoftware/Proton/blob/22f40122788d5f65389f59144705309ce9d6d403/vrclient_x64/vrclient_x64/vrclient_main.c#L267
@@ -473,11 +447,18 @@ static unsigned long ShutdownInternalGuarded()
 
 VR_INTERFACE void VR_CALLTYPE VR_ShutdownInternal()
 {
+	// Keep this scope outside ShutdownInternalGuarded: its SEH recovery can
+	// bypass destructors inside foreign teardown calls compiled with /EHsc.
+	HmdPresenceState::RuntimeCall presenceCall(DrvOpenXR::PresenceState());
+	DrvOpenXR::PresenceState().Publish(false);
 	OOVR_LOG("OpenComposite shutdown");
 
 #ifdef _WIN32
 	unsigned long ec = ShutdownInternalGuarded();
 	if (ec != 0) {
+		// Teardown may have invalidated handles or loader trampolines before
+		// faulting. Later presence queries must not enter that runtime again.
+		DrvOpenXR::PresenceState().Quarantine();
 		OOVR_LOGF("VR_ShutdownInternal: swallowed exception 0x%08lX during XR teardown "
 		          "(likely a foreign OpenXR API layer unloading early); exit continues cleanly.", ec);
 	}

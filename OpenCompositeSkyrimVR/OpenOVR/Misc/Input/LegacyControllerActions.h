@@ -2,6 +2,7 @@
 
 #include <openxr/openxr.h>
 #include <string>
+#include <array>
 
 #include "Drivers/Backend.h"
 
@@ -24,6 +25,11 @@ struct LegacyControllerActions {
 	// than we do) and generally gives more flexibility on exotic hardware, as the user can rebind them separately.
 	XrAction trigger, triggerClick, triggerTouch; // Axis1
 	XrAction grip, gripClick, gripTouch; // Axis2; touch is independent of squeeze force
+
+	// Frame-only extra face, bumper and View/Menu buttons. These IDs are also
+	// used by the Configurator controlmap writer; no other profile binds them.
+	static constexpr std::array<int, 4> FrameButtonIds = { 5, 6, 3, 35 };
+	std::array<XrAction, 4> frameExtra{}, frameExtraTouch{};
 
 	XrAction thumbrestTouch; // Capacitive thumbrest sensor (Quest Touch)
 

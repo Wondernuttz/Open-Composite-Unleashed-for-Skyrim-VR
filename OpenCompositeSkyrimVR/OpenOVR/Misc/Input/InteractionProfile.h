@@ -219,6 +219,7 @@ protected:
 		const char* gripClick = nullptr;
 		const char* gripTouch = nullptr;
 		const char* thumbrestTouch = nullptr;
+		std::array<const char*, 4> frameExtra{}, frameExtraTouch{};
 
 		const char* haptic = nullptr;
 

@@ -531,7 +531,7 @@ static class Program
                 using var screenshot = new Bitmap(video.Width, video.Height);
                 video.DrawToBitmap(screenshot, new Rectangle(Point.Empty, screenshot.Size));
                 int top = Math.Max(0, openButton.Top - 7);
-                int bottom = Math.Min(video.Height, video.Controls.OfType<Button>().Where(b => b.Text == "Save opencomposite.ini").Max(b => b.Bottom) + 8);
+                int bottom = Math.Min(video.Height, video.Controls.OfType<Button>().Where(b => b.Text == "Save settings").Max(b => b.Bottom) + 8);
                 using var crop = screenshot.Clone(new Rectangle(0, top, screenshot.Width, bottom - top), screenshot.PixelFormat);
                 crop.Save(Path.Combine(output, "video-foveation-clean.png"));
                 Check(Field<Control>(main, "_nudVrsInnerRadius").Visible && !Field<Control>(main, "_nudVrsEyeInnerRadius").Visible,

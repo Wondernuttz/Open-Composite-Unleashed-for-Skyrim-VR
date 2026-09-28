@@ -170,6 +170,7 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 	InvalidateCachedFrame();
 	OOVR_LOGF("ASW: Initialized — %ux%u per eye, compute shader ready", eyeWidth, eyeHeight);
 	OOVR_LOG("DAPA: compute-state-restore-v1 / depth-read-hazard-v1");
+    OOVR_LOG("DAPA CHARACTER MOTION 5.0.1: original world shader / mask-only indirect character pass / 1.50ms complete-pair budget; three consecutive over-budget samples / automatic recovery");
 	return true;
 }
 
@@ -267,15 +268,8 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 		hr = device->CreateShaderResourceView(m_cachedColor[eye], &srvDesc, &m_srvColor[eye]);
 		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateSRV color[%d] failed", eye); return false; }
 
-		// Cached MV (R16G16_FLOAT)
-		desc.Format = DXGI_FORMAT_R16G16_FLOAT;
-		hr = device->CreateTexture2D(&desc, nullptr, &m_cachedMV[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateTexture2D MV[%d] failed", eye); return false; }
-
-		srvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
-		hr = device->CreateShaderResourceView(m_cachedMV[eye], &srvDesc, &m_srvMV[eye]);
-		if (FAILED(hr)) { OOVR_LOGF("ASW: CreateSRV MV[%d] failed", eye); return false; }
-
+		// DAPA reprojects from scene/player depth; no motion-vector texture is
+		// sampled by the warp shader. Keep only resources used by that path.
 		// Cached depth (R32_FLOAT)
 		desc.Format = DXGI_FORMAT_R32_FLOAT;
 		hr = device->CreateTexture2D(&desc, nullptr, &m_cachedDepth[eye]);
@@ -301,7 +295,7 @@ bool ASWProvider::CreateStagingTextures(ID3D11Device* device)
 	m_depthWidth = m_eyeWidth;
 	m_depthHeight = m_eyeHeight;
 	m_depthLayerValid = true;
-	OOVR_LOG("ASW: Staging textures created (2 eyes × 4 textures)");
+	OOVR_LOG("ASW: Staging textures created (2 eyes × 3 textures; no unused motion-vector cache)");
 	return true;
 }
 
@@ -311,10 +305,8 @@ void ASWProvider::ReleaseStagingTextures()
 		if (m_uavOutput[i]) { m_uavOutput[i]->Release(); m_uavOutput[i] = nullptr; }
 		if (m_warpedOutput[i]) { m_warpedOutput[i]->Release(); m_warpedOutput[i] = nullptr; }
 		if (m_srvDepth[i]) { m_srvDepth[i]->Release(); m_srvDepth[i] = nullptr; }
-		if (m_srvMV[i]) { m_srvMV[i]->Release(); m_srvMV[i] = nullptr; }
 		if (m_srvColor[i]) { m_srvColor[i]->Release(); m_srvColor[i] = nullptr; }
 		if (m_cachedDepth[i]) { m_cachedDepth[i]->Release(); m_cachedDepth[i] = nullptr; }
-		if (m_cachedMV[i]) { m_cachedMV[i]->Release(); m_cachedMV[i] = nullptr; }
 		if (m_cachedColor[i]) { m_cachedColor[i]->Release(); m_cachedColor[i] = nullptr; }
 	}
 }
@@ -561,6 +553,7 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 	// stereo cache, so the previously published pair must stop being visible
 	// before either eye is overwritten.
 	if (eye == 0) {
+        m_nativePlayer.BeginPair();
 		// Normal pair turnover preserves REAL-frame motion history. Error / pause /
 		// resize invalidation still resets it through InvalidateCachedFrame().
 		m_hasCachedFrame = false;
@@ -679,6 +672,12 @@ bool ASWProvider::CacheFrame(int eye, ID3D11DeviceContext* ctx,
 		if (!m_bodyValid[eye])
 			return failGeneration(); // A required player mask must never disappear silently.
 	}
+    // Extra character work is not admitted during locomotion, turns, or capture.
+    if(m_bodyValid[eye] && !blackout.Active() && !m_capture.Busy() &&
+       m_motion.haveVelocity && DapaMotion::Length(m_motion.velocity)<.1f && !m_turn.turning &&
+       oovr_global_configuration.ASWDebugMode()==0)
+        m_nativePlayer.Capture(eye,ctx,mvTex,mvRegion,m_depthWidth,m_depthHeight,
+            m_bodySrv[eye].Get(),m_srvDepth[eye],m_eyeWidth,m_eyeHeight,sourceFlipV);
 	m_cachedPose[eye] = eyePose;
 	m_cachedFov[eye] = eyeFov;
 	m_cachedSourceFlipV[eye] = sourceFlipV;
@@ -908,6 +907,19 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
 	ctx->CSSetShader(nullptr, nullptr, 0);
 	if (captureShader) m_capture.EndEye(eye, ctx);
 
+    // Original world dispatch above is unchanged. This separate pass can write
+    // only current, depth-validated player-mask pixels, from a GPU tile list.
+    const bool characterAllowed=m_bodyValid[0] && m_bodyValid[1] &&
+        m_motionGeometryValid[0] && m_motionGeometryValid[1] && m_motion.haveVelocity &&
+        DapaMotion::Length(m_motion.velocity)<.1f && !m_turn.turning &&
+        !m_cachedBlackout[0].Active() && !m_cachedBlackout[1].Active() && !m_capture.Busy() &&
+        oovr_global_configuration.ASWDebugMode()==0;
+    bool characterApplied=false;
+    if(characterAllowed)characterApplied=m_nativePlayer.Apply(eye,ctx,m_warpDisplayTime,
+        m_srvColor[eye],m_bodySrv[eye].Get(),m_srvDepth[eye],m_uavOutput[eye]);
+    if(eye==1)OOVR_LOG_LIMITEDF(5000,"DAPA CHARACTER MOTION 5.0.1: allowed=%d history=%d queued=%d budgetOff=%d extraSampledGpu=%.3fms capture=%.3fms correction=%.3fms overSamples=%u trip=%.3fms retryMs=%llu retries=%u; world shader unchanged; queued is not pixel coverage",
+        characterAllowed,m_nativePlayer.Ready(m_warpDisplayTime),characterApplied,m_nativePlayer.BudgetExceeded(),m_nativePlayer.CostMs(),m_nativePlayer.CaptureCostMs(),m_nativePlayer.CorrectionCostMs(),m_nativePlayer.OverBudgetSamples(),m_nativePlayer.TripCostMs(),static_cast<unsigned long long>(m_nativePlayer.RetryRemainingMs()),m_nativePlayer.RecoveryAttempts());
+
 	return true;
 }
 
@@ -999,6 +1011,7 @@ bool ASWProvider::SubmitWarpedOutput(ID3D11DeviceContext* ctx, double displayPer
 
 void ASWProvider::Shutdown()
 {
+    m_nativePlayer.Shutdown();
 	m_gpuTiming.Reset();
 	m_depthTransfer.Reset();
 	m_outputLease = {};
@@ -1023,10 +1036,8 @@ void ASWProvider::Shutdown()
 		if (m_uavOutput[i]) { m_uavOutput[i]->Release(); m_uavOutput[i] = nullptr; }
 		if (m_warpedOutput[i]) { m_warpedOutput[i]->Release(); m_warpedOutput[i] = nullptr; }
 		if (m_srvDepth[i]) { m_srvDepth[i]->Release(); m_srvDepth[i] = nullptr; }
-		if (m_srvMV[i]) { m_srvMV[i]->Release(); m_srvMV[i] = nullptr; }
 		if (m_srvColor[i]) { m_srvColor[i]->Release(); m_srvColor[i] = nullptr; }
 		if (m_cachedDepth[i]) { m_cachedDepth[i]->Release(); m_cachedDepth[i] = nullptr; }
-		if (m_cachedMV[i]) { m_cachedMV[i]->Release(); m_cachedMV[i] = nullptr; }
 		if (m_cachedColor[i]) { m_cachedColor[i]->Release(); m_cachedColor[i] = nullptr; }
 	}
 

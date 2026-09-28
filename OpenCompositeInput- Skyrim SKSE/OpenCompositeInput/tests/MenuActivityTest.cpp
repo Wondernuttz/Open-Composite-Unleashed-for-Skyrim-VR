@@ -1,18 +1,29 @@
-// Executes the exact Main.cpp helper. Fixtures replace only the UI singleton,
-// bridge storage and Win32 property output; the production policy is unchanged.
+// Executes the exact Main.cpp watcher, tracked-menu list and publication helper.
+// Fixtures replace engine services and unrelated laser/camera side effects.
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
 
 using HWND = void*;
 using HANDLE = void*;
 using std::intptr_t;
 namespace SKSE::log {
 template <class... Args> void debug(const char*, Args...) {}
+template <class... Args> void info(const char*, Args...) {}
 }
 namespace RE {
+inline bool dispatchingMenuEvent = false;
+enum class BSEventNotifyControl { kContinue };
+template<class T> struct BSTEventSource {};
+template<class T> struct BSTEventSink {
+    virtual BSEventNotifyControl ProcessEvent(const T*, BSTEventSource<T>*) = 0;
+};
+struct MenuOpenCloseEvent { std::string menuName; bool opening; };
 struct UI {
     static UI* current;
     bool paused = false;
@@ -20,7 +31,11 @@ struct UI {
     unsigned menuQueries = 0;
     static UI* GetSingleton() { return current; }
     bool GameIsPaused() const { return paused; }
-    bool IsMenuOpen(const char* name) { ++menuQueries; return mainMenu && std::string(name) == "Main Menu"; }
+    bool IsMenuOpen(const char* name) {
+        if (dispatchingMenuEvent) throw std::runtime_error("Locked menu query during event dispatch");
+        ++menuQueries;
+        return mainMenu && std::string(name) == "Main Menu";
+    }
 };
 UI* UI::current = nullptr;
 }
@@ -30,11 +45,20 @@ struct ObservedByte {
     operator int() const { return value; }
     ObservedByte& operator=(int next) { value = next; ++writes; return *this; }
 };
-struct Bridge { ObservedByte isMenuOpen; uint8_t isMainMenu = 0, isLoadingScreen = 0, isConsoleOpen = 0; };
+struct Bridge {
+    ObservedByte isMenuOpen;
+    uint8_t isMainMenu = 0, isLoadingScreen = 0, isConsoleOpen = 0;
+    std::uint64_t playerFirstPersonRootPtr = 0;
+};
 Bridge* g_pBridge = nullptr;
 bool g_bridgeMenuStateObserved = false;
 HWND g_gameHwnd = nullptr;
 std::set<std::string> g_activeTrackedMenus;
+std::vector<std::string> g_trackedMenuOpenOrder;
+bool g_mapMenuOpen = false, g_statsMenuOpen = false, g_consoleOpen = false;
+bool g_niCameraFound = false;
+void UpdateMenuTransform() {}
+void FindAndStoreNiCamera() { g_niCameraFound = true; }
 unsigned propertyWrites = 0;
 int propertyValue = -1;
 HWND propertyWindow = nullptr;
@@ -52,6 +76,17 @@ bool SetPropW(HWND window, const wchar_t* name, HANDLE value)
 }
 
 #include "MenuActivityProduction.inl"
+
+void MenuEvent(const char* name, bool opening)
+{
+    struct DispatchScope {
+        DispatchScope() { RE::dispatchingMenuEvent = true; }
+        ~DispatchScope() { RE::dispatchingMenuEvent = false; }
+    } scope;
+    const RE::MenuOpenCloseEvent event{ name, opening };
+    MenuWatcher watcher;
+    watcher.ProcessEvent(&event, nullptr);
+}
 
 unsigned checks = 0;
 void Check(bool condition, const char* message)
@@ -168,6 +203,64 @@ int main()
         RefreshMenuActivityFromGameState();
         Check(propertyWrites == writesAfterNewWindow, "Unchanged new HWND must not be rewritten");
         Check(secondBridge.isMenuOpen.writes == 1, "Unchanged new bridge must not be rewritten");
+
+        // Exercise the actual event path: tracked popups must protect immediately,
+        // before Bethesda increments the pause counter and without maintenance.
+        const auto queriesBeforeEvents = ui.menuQueries;
+        MenuEvent("MessageBoxMenu", true);
+        CheckActive(true, "Popup opening event protects before the pause count changes");
+        Check(g_activeTrackedMenus.contains("MessageBoxMenu"), "Production tracked list includes popups");
+        ui.paused = true;
+        MenuEvent("MessageBoxMenu", false);
+        CheckActive(true, "Popup closing event preserves an outstanding pause");
+        ui.paused = false;
+        RefreshMenuActivityFromGameState();
+        CheckActive(false, "Maintenance resumes after the popup pause is released");
+
+        MenuEvent("MessageBoxMenu", true);
+        CheckActive(true, "Transient popup is protected in its opening event");
+        MenuEvent("MessageBoxMenu", false);
+        CheckActive(false, "Transient popup close without a pause does not remain stuck");
+
+        MenuEvent("Journal Menu", true);
+        MenuEvent("MessageBoxMenu", true);
+        MenuEvent("MessageBoxMenu", false);
+        CheckActive(true, "Closing a popup preserves its underlying journal menu");
+        MenuEvent("Journal Menu", false);
+        CheckActive(false, "Closing the last tracked menu restores gameplay");
+
+        // Map has no special bypass. A popup on top must remain protected even
+        // after it closes while the map's pause is still active.
+        ui.paused = true;
+        MenuEvent("MapMenu", true);
+        Check(g_mapMenuOpen, "Production watcher records native map lifecycle");
+        CheckActive(true, "Paused map remains conservatively protected");
+        MenuEvent("MessageBoxMenu", true);
+        CheckActive(true, "Popup on map remains protected");
+        MenuEvent("MessageBoxMenu", false);
+        CheckActive(true, "Closing a popup cannot bypass the remaining map pause");
+        MenuEvent("MapMenu", false);
+        Check(!g_mapMenuOpen, "Production watcher records map closure");
+        CheckActive(true, "Map close waits for the outstanding pause to release");
+        ui.paused = false;
+        RefreshMenuActivityFromGameState();
+        CheckActive(false, "Gameplay resumes after map pause release");
+
+        ui.paused = true;
+        MenuEvent("Untracked Mod Popup", true);
+        CheckActive(true, "An untracked popup that pauses is protected");
+        MenuEvent("Untracked Mod Popup", false);
+        ui.paused = false;
+        RefreshMenuActivityFromGameState();
+        CheckActive(false, "Untracked paused popup recovers without another event");
+        Check(ui.menuQueries == queriesBeforeEvents, "Event reconciliation never queries locked menus");
+
+        g_gameHwnd = nullptr;
+        MenuEvent("MessageBoxMenu", true);
+        Check(secondBridge.isMenuOpen == 1, "Popup event protects the bridge before a window exists");
+        g_gameHwnd = reinterpret_cast<HWND>(2);
+        MenuEvent("MessageBoxMenu", false);
+        CheckActive(false, "Popup closes normally after the window appears");
 
         // A failed SetPropW must not poison the cache and suppress retries.
         g_gameHwnd = reinterpret_cast<HWND>(3);

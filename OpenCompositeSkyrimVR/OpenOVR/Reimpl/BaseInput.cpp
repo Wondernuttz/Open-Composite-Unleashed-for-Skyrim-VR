@@ -827,6 +827,55 @@ EVRInputError BaseInput::SetActionManifestPath(const char* pchActionManifestPath
 	return vr::VRInputError_None;
 }
 
+XrResult BaseInput::SuggestBindingsWithIndexGrip(const std::string& profile, const XrInteractionProfileSuggestedBinding& suggestion)
+{
+    if (profile != "/interaction_profiles/valve/index_controller")
+        return xrSuggestInteractionProfileBindings(xr_instance, &suggestion);
+    indexGripRuntimeThresholds = false;
+    for (auto& hold : indexGripHolds) hold.Reset();
+    const auto thresholds = oovr_global_configuration.IndexGripThresholds();
+    if (oovr_global_configuration.IndexGripCustom() && xr_valveAnalogThresholds) {
+        XrInteractionProfileAnalogThresholdVALVE values[2]{};
+        const XrBindingModificationBaseHeaderKHR* pointers[2]{};
+        uint32_t count = 0;
+        for (const auto& controller : legacyControllers) {
+            XrPath path = XR_NULL_PATH;
+            const auto result = xrStringToPath(xr_instance, (controller.handPath + "/input/squeeze/value").c_str(), &path);
+            if (XR_FAILED(result)) return result;
+            for (uint32_t i = 0; i < suggestion.countSuggestedBindings; ++i) {
+                const auto& binding = suggestion.suggestedBindings[i];
+                if (binding.action != controller.gripTouch || binding.binding != path) continue;
+                auto& value = values[count];
+                value.type = XR_TYPE_INTERACTION_PROFILE_ANALOG_THRESHOLD_VALVE;
+                value.action = binding.action;
+                value.binding = binding.binding;
+                value.onThreshold = thresholds.grab;
+                value.offThreshold = thresholds.release;
+                pointers[count] = reinterpret_cast<const XrBindingModificationBaseHeaderKHR*>(&value);
+                ++count;
+                break;
+            }
+        }
+        if (count == 2) {
+            XrBindingModificationsKHR modifications{ XR_TYPE_BINDING_MODIFICATIONS_KHR };
+            modifications.next = suggestion.next;
+            modifications.bindingModificationCount = count;
+            modifications.bindingModifications = pointers;
+            auto custom = suggestion;
+            custom.next = &modifications;
+            const auto result = xrSuggestInteractionProfileBindings(xr_instance, &custom);
+            if (XR_SUCCEEDED(result)) indexGripRuntimeThresholds = true;
+            else OOVR_LOGF("Index grip: runtime threshold suggestion rejected (%d); retrying with OCU analog thresholds", (int)result);
+            if (indexGripRuntimeThresholds) {
+                OOVR_LOGF("Index grip: custom grab=%.2f release=%.2f, Valve binding thresholds accepted; OCU hold continuity (both hands)", thresholds.grab, thresholds.release);
+                return result;
+            }
+        }
+    }
+    OOVR_LOGF("Index grip: %s grab=%.2f release=%.2f", oovr_global_configuration.IndexGripCustom() ? "OCU analog thresholds" : "runtime default (custom thresholds inactive)", thresholds.grab, thresholds.release);
+    return xrSuggestInteractionProfileBindings(xr_instance, &suggestion);
+}
+
 void BaseInput::LoadEmptyManifestIfRequired(bool allowSessionRestart)
 {
 	if (hasLoadedActions)
@@ -859,7 +908,7 @@ void BaseInput::LoadEmptyManifestIfRequired(bool allowSessionRestart)
 		suggestedBindings.interactionProfile = interactionProfilePath;
 		suggestedBindings.suggestedBindings = bindings.data();
 		suggestedBindings.countSuggestedBindings = bindings.size();
-		OOVR_FAILED_XR_ABORT(xrSuggestInteractionProfileBindings(xr_instance, &suggestedBindings));
+		OOVR_FAILED_XR_ABORT(SuggestBindingsWithIndexGrip(profile->GetPath(), suggestedBindings));
 	}
 
 	// Attach everything to the current session
@@ -916,6 +965,7 @@ void BaseInput::PrepareForSessionShutdown()
 	OOVR_DEBUG_LOGF("[INPUT-TRACE] Detach session=%p: clearing controller action spaces", (void*)attachedSession);
 	attachedSession = XR_NULL_HANDLE;
 	runtimeSyncFocus.Reset();
+    for (auto& hold : indexGripHolds) hold.Reset();
 	// XrAction and XrActionSet belong to the instance and remain valid across
 	// xrDestroySession. XrSpace belongs to the session, so destroy it while the
 	// old session is still alive and force BindInputsForSession to recreate it.
@@ -1200,7 +1250,7 @@ void BaseInput::LoadBindingsSet(const struct InteractionProfile& profile, const 
 	suggestedBindings.interactionProfile = interactionProfilePath;
 	suggestedBindings.suggestedBindings = bindings.data();
 	suggestedBindings.countSuggestedBindings = bindings.size();
-	OOVR_FAILED_XR_ABORT(xrSuggestInteractionProfileBindings(xr_instance, &suggestedBindings));
+	OOVR_FAILED_XR_ABORT(SuggestBindingsWithIndexGrip(profile.GetPath(), suggestedBindings));
 }
 
 void BaseInput::LoadDpadAction(const InteractionProfile& profile, const std::string& importBasePath, const std::string& inputName, const std::string& subMode, Action* action, std::vector<XrActionSuggestedBinding>& bindings)
@@ -1356,6 +1406,12 @@ void BaseInput::CreateLegacyActions()
 		create(&ctrl.triggerTouch, "trigger-touch", "Trigger (Touch)", XR_ACTION_TYPE_BOOLEAN_INPUT);
 		create(&ctrl.triggerClick, "trigger-click", "Trigger (Digital)", XR_ACTION_TYPE_BOOLEAN_INPUT);
 
+		if (xr_valveFrameController) {
+			for (size_t j = 0; j < ctrl.frameExtra.size(); ++j) {
+				create(&ctrl.frameExtra[j], "frame-extra-" + std::to_string(j), "Frame extra " + std::to_string(j), XR_ACTION_TYPE_BOOLEAN_INPUT);
+				create(&ctrl.frameExtraTouch[j], "frame-extra-touch-" + std::to_string(j), "Frame extra touch " + std::to_string(j), XR_ACTION_TYPE_BOOLEAN_INPUT);
+			}
+		}
 		create(&ctrl.thumbrestTouch, "thumbrest-touch", "Thumbrest (Touch)", XR_ACTION_TYPE_BOOLEAN_INPUT);
 
 		create(&ctrl.haptic, "haptic", "Vibration Haptics", XR_ACTION_TYPE_VIBRATION_OUTPUT);
@@ -1748,6 +1804,8 @@ void BaseInput::TraceActionSync(XrSession syncedSession, XrResult result, bool l
 	runtimeSyncFocus.Observe(syncedSession == xr_session.get() && AreActionsAttachedToSession(syncedSession)
 	        ? syncedSession : XR_NULL_HANDLE,
 	    result, InputNowMs());
+    if (result != XR_SUCCESS || syncedSession != xr_session.get())
+        for (auto& hold : indexGripHolds) hold.Reset();
 	const bool debug = oovr_debug_logging_enabled();
 	// Failure reporting is never gated by the checkbox. Existing abort/soft-abort
 	// handling remains in the caller; this adds the session and input-path context.
@@ -3210,8 +3268,13 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 	// TODO for performance reasons, is it worth grabbing the results once and reusing them until xrSyncActions is called?
 
 	int hand = DeviceIndexToHandId(controllerDeviceIndex);
-	if (hand == -1)
+	if (hand == -1) {
+		// These are the backend's fixed physical controller slots. A confirmed
+		// missing device must not regain its old hold when it reconnects.
+		if (controllerDeviceIndex >= 1 && controllerDeviceIndex <= 2)
+			indexGripHolds[controllerDeviceIndex-1].Reset();
 		return false;
+	}
 	LegacyControllerActions& ctrl = legacyControllers[hand];
 
 	auto bindButton = [state](XrAction action, XrAction touch, int shift, int hand, bool inputSmoothingEnabled) {
@@ -3319,6 +3382,10 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 
 	auto* physicalDevice = BackendManager::Instance().GetDevice(controllerDeviceIndex);
 	const auto* physicalProfile = physicalDevice ? physicalDevice->GetInteractionProfile() : nullptr;
+	if (physicalProfile && physicalProfile->GetPath() == "/interaction_profiles/valve/frame_controller_valve") {
+		for (size_t j = 0; j < ctrl.frameExtra.size(); ++j)
+			bindButton(ctrl.frameExtra[j], ctrl.frameExtraTouch[j], LegacyControllerActions::FrameButtonIds[j], hand, false);
+	}
 	const bool isIndexController = physicalProfile && physicalProfile->GetPath() == "/interaction_profiles/valve/index_controller";
 	bool enableVRIKKnucklesTrackPadSupport = isIndexController && oovr_global_configuration.EnableVRIKKnucklesTrackPadSupport();
 	if (enableVRIKKnucklesTrackPadSupport) {
@@ -3359,12 +3426,44 @@ bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDevi
 		return as.isActive ? as.currentState : false;
 	};
 
-	// HIGGS GripInputMethod=0 (Index Auto) or 2 consumes the legacy Grip touched bit.
-	// Keep runtime-thresholded capacitive touch separate from force/click and from
-	// peak-hold input smoothing, so opening the hand releases it immediately.
-	// Gate on the physical profile, independent of the selected controller picture,
-	// swapped sticks and VRIK trackpad routing. Other profiles leave this unbound.
-	if (isIndexController && readBool(ctrl.gripTouch))
+    // Only Index HIGGS touch gets bounded release confirmation. Squeeze presses,
+    // other controllers, pose tracking and frame-count smoothing are independent.
+    bool gripTouched = false;
+    if (isIndexController) {
+        const auto gripSession = xr_session.get();
+        const auto generation = indexGripHolds[hand].Generation();
+        const bool custom = oovr_global_configuration.IndexGripCustom();
+        XrActionStateGetInfo info{ XR_TYPE_ACTION_STATE_GET_INFO };
+        bool active = false, digital = false;
+        float value = 0;
+        if (custom) {
+            info.action = ctrl.grip;
+            XrActionStateFloat sample{ XR_TYPE_ACTION_STATE_FLOAT };
+            OOVR_FAILED_XR_ABORT(xrGetActionStateFloat(gripSession, &info, &sample));
+            active = sample.isActive == XR_TRUE;
+            value = sample.currentState;
+        } else {
+            info.action = ctrl.gripTouch;
+            XrActionStateBoolean sample{ XR_TYPE_ACTION_STATE_BOOLEAN };
+            OOVR_FAILED_XR_ABORT(xrGetActionStateBoolean(gripSession, &info, &sample));
+            active = sample.isActive == XR_TRUE;
+            digital = sample.currentState == XR_TRUE;
+        }
+        const auto decision = indexGripHolds[hand].Update(
+            gripSession == xr_session.get() && HasFocusedActionSync(gripSession),
+            active, value, digital, custom, oovr_global_configuration.IndexGripThresholds(),
+            InputNowMs(), generation);
+        gripTouched = decision.held;
+        if (decision.report && oovr_debug_logging_enabled())
+            OOVR_LOGF("[INDEX-GRIP] hand=%s mode=%s active=%d value=%.4f digital=%d held=%d reason=%s",
+                hand == 0 ? "left" : "right", custom ? "custom" : "runtime",
+                active, value, digital, gripTouched, decision.reason);
+    } else {
+        indexGripHolds[hand].Reset();
+        if (physicalProfile && physicalProfile->GetPath() == "/interaction_profiles/valve/frame_controller_valve")
+            gripTouched = readBool(ctrl.gripTouch);
+    }
+    if (gripTouched)
 		state->ulButtonTouched |= ButtonMaskFromId(k_EButton_Grip) | ButtonMaskFromId(k_EButton_Axis2);
 
 	// Trackpad state exported for the VR keyboard swipe shortcut and gesture
