@@ -1,0 +1,2487 @@
+//
+// Created by ZNix on 25/10/2020.
+//
+
+#include "XrBackend.h"
+#include "../OpenOVR/InputTrace.h"
+#include "DapaTiming.h"
+#include "FoveationDebugOverlay.h"
+#include "CableTrackingOverlay.h"
+#include "../OpenOVR/Misc/EffectFoveationState.h"
+#include "generated/interfaces/vrtypes.h"
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#include <cstdio>
+#endif
+
+#if defined(SUPPORT_GL) && !defined(_WIN32)
+#include <GL/glx.h>
+#endif
+
+#include <openxr/openxr_platform.h>
+
+// On Android, the app has to pass the OpenGLES setup data through
+#ifdef ANDROID
+#include "../OpenOVR/Misc/android_api.h"
+#endif
+
+// FIXME find a better way to send the OnPostFrame call?
+#include "../OpenOVR/Misc/xrmoreutils.h"
+#include "../OpenOVR/Reimpl/BaseInput.h"
+#include "../OpenOVR/Reimpl/BaseOverlay.h"
+#include "../OpenOVR/Reimpl/BaseSystem.h"
+#include "../OpenOVR/convert.h"
+#include "generated/static_bases.gen.h"
+
+#include "../OpenOVR/Misc/NetworkTrackers.h"
+#include "../OpenOVR/Misc/Input/OscLocomotion.h"
+#include "../OpenOVR/Misc/Input/LocomotionHeading.h"
+#include "../OpenOVR/Misc/OVRPerfHook.h"
+#include "../OpenOVR/Misc/WalkInPlace.h"
+#include "generated/interfaces/IVRCompositor_018.h"
+
+
+#include "tmp_gfx/TemporaryGraphics.h"
+
+#if defined(SUPPORT_VK)
+#include "tmp_gfx/TemporaryVk.h"
+#endif
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+#include "tmp_gfx/TemporaryD3D11.h"
+#endif
+
+#include "../OpenOVR/Misc/Config.h"
+#include "../OpenOVR/Misc/LaserCalibration.h"
+#include "ASWProvider.h"
+#include "DapaCaptureControl.h"
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+#include <d3d11.h>
+#endif
+
+#include <chrono>
+#include <cinttypes>
+#include <mutex>
+#include <ranges>
+#include <type_traits>
+
+using namespace vr;
+
+// ── Aim pose data shared with PrismaVR via window property ──
+// PrismaVR reads OC_AIM_POSES to get controller pointing direction
+// without per-controller calibration constants.
+// Also used by ASW to project controller positions for hand detection.
+struct OCAimPoseData {
+	vr::HmdMatrix34_t matrix[2]; // [0]=left, [1]=right
+	bool valid[2];
+};
+OCAimPoseData g_aimPoses = {}; // non-static: accessed from dx11compositor for ASW hand detection
+static HWND g_aimPoseHwnd = nullptr;
+
+static BOOL CALLBACK FindGameWindowCB(HWND hwnd, LPARAM lParam)
+{
+	DWORD pid;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd)) {
+		*reinterpret_cast<HWND*>(lParam) = hwnd;
+		return FALSE;
+	}
+	return TRUE;
+}
+
+std::mutex inputRestartMutex;
+
+std::unique_ptr<TemporaryGraphics> XrBackend::temporaryGraphics = nullptr;
+XrBackend::XrBackend(bool useVulkanTmpGfx, bool useD3D11TmpGfx)
+{
+	memset(projectionViews, 0, sizeof(projectionViews));
+
+	// setup temporaryGraphics
+
+#if defined(SUPPORT_VK)
+	if (useVulkanTmpGfx) {
+		temporaryGraphics = std::make_unique<TemporaryVk>();
+	}
+#endif
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	// To prevent error code XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING with Unity games
+	if (temporaryGraphics) {
+		XrGraphicsRequirementsD3D11KHR graphicsRequirements{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
+		OOVR_FAILED_XR_ABORT(xr_ext->xrGetD3D11GraphicsRequirementsKHR(xr_instance, xr_system, &graphicsRequirements));
+	}
+
+	if (!temporaryGraphics && useD3D11TmpGfx) {
+		temporaryGraphics = std::make_unique<TemporaryD3D11>();
+	}
+#endif
+
+	OOVR_FALSE_ABORT(temporaryGraphics);
+
+	// setup the device indexes
+	for (vr::TrackedDeviceIndex_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
+		ITrackedDevice* dev = GetDevice(i);
+
+		if (dev)
+			dev->InitialiseDevice(i);
+	}
+}
+
+XrBackend::~XrBackend()
+{
+	OcuLocomotionHeading::Instance().Reset();
+	OscLocomotion::Instance().Stop();
+	// Stop the OSC listener before anything it could touch goes away
+	NetworkTrackerReceiver::Instance().Stop();
+
+	ShutdownOVRPerfHook();
+
+	// First clear out the compositors, since they might try and access the OpenXR instance
+	// in their destructor.
+	PrepareForSessionShutdown();
+
+	DrvOpenXR::FullShutdown();
+
+	graphicsBinding = nullptr;
+
+	// This must happen after session destruction (which occurs in FullShutdown), as runtimes (namely Monado)
+	// may try to access these resources while destroying the session.
+	temporaryGraphics.reset();
+}
+
+XrSessionState XrBackend::GetSessionState()
+{
+	return sessionState;
+}
+
+IHMD* XrBackend::GetPrimaryHMD()
+{
+	return hmd.get();
+}
+
+ITrackedDevice* XrBackend::GetDevice(
+    vr::TrackedDeviceIndex_t index)
+{
+	switch (index) {
+	case vr::k_unTrackedDeviceIndex_Hmd:
+		return GetPrimaryHMD();
+	case 1:
+		return hand_left.get();
+	case 2:
+		return hand_right.get();
+	default: {
+		if (index < 3)
+			return nullptr;
+		// Late tracker discovery may append native roles after existing NET
+		// devices. Resolve assigned indices instead of renumbering those devices.
+		return OcuFindPublishedTracker<ITrackedDevice>(index, bodyTrackers, networkTrackers);
+	}
+	}
+}
+
+ITrackedDevice* XrBackend::GetDeviceByHand(
+    ITrackedDevice::HandType hand)
+{
+	switch (hand) {
+	case ITrackedDevice::HAND_LEFT:
+		return hand_left.get();
+	case ITrackedDevice::HAND_RIGHT:
+		return hand_right.get();
+	default:
+		OOVR_SOFT_ABORTF("Cannot get hand by type '%d'", (int)hand);
+		return nullptr;
+	}
+}
+
+void XrBackend::GetDeviceToAbsoluteTrackingPose(
+    vr::ETrackingUniverseOrigin toOrigin,
+    float predictedSecondsToPhotonsFromNow,
+    vr::TrackedDevicePose_t* poseArray,
+    uint32_t poseArrayCount)
+{
+	for (uint32_t i = 0; i < poseArrayCount; ++i) {
+		ITrackedDevice* dev = GetDevice(i);
+		if (dev) {
+			dev->GetPose(toOrigin, &poseArray[i], ETrackingStateType::TrackingStateType_Rendering);
+		} else {
+			poseArray[i] = BackendManager::InvalidPose();
+		}
+	}
+
+	// Controller pose caching for PrismaVR lasers.
+	// Read from poseArray (populated above for ALL games via legacy or action API).
+	// Device indices: 1 = left controller, 2 = right controller.
+	{
+		static int s_ctrlDbg = 0;
+		for (int h = 0; h < 2; h++) {
+			uint32_t devIdx = (h == 0) ? 1 : 2; // left=1, right=2
+			if (devIdx < poseArrayCount && poseArray[devIdx].bPoseIsValid) {
+				g_aimPoses.valid[h] = true;
+				g_aimPoses.matrix[h] = poseArray[devIdx].mDeviceToAbsoluteTracking;
+				oovr_laser_calibration::ApplyToPoseMatrix(h, g_aimPoses.matrix[h]);
+			} else {
+				g_aimPoses.valid[h] = false;
+			}
+		}
+		if (s_ctrlDbg++ < 3) {
+			OOVR_LOGF("CtrlPose: count=%u asw=%p L_valid=%d R_valid=%d L=(%.3f,%.3f,%.3f)",
+			    poseArrayCount, (void*)g_aswProvider,
+			    (int)g_aimPoses.valid[0], (int)g_aimPoses.valid[1],
+			    g_aimPoses.matrix[0].m[0][3], g_aimPoses.matrix[0].m[1][3], g_aimPoses.matrix[0].m[2][3]);
+		}
+	}
+
+	// Action-based aim poses (PrismaVR laser pointing) — only when actions are loaded.
+	BaseInput* input = GetUnsafeBaseInput();
+	if (input && input->AreActionsLoaded()) {
+		for (int h = 0; h < 2; h++) {
+			XrSpace aimSpace = XR_NULL_HANDLE;
+			input->GetHandSpace((ITrackedDevice::HandType)h, aimSpace, true);
+			if (aimSpace) {
+				vr::TrackedDevicePose_t aimPose = {};
+				xr_utils::PoseFromSpace(&aimPose, aimSpace, toOrigin);
+				g_aimPoses.valid[h] = aimPose.bPoseIsValid;
+				if (aimPose.bPoseIsValid) {
+					g_aimPoses.matrix[h] = aimPose.mDeviceToAbsoluteTracking;
+					oovr_laser_calibration::ApplyToPoseMatrix(h, g_aimPoses.matrix[h]);
+				}
+			} else {
+				g_aimPoses.valid[h] = false;
+			}
+		}
+
+		// Expose aim pose data pointer via window property (set once)
+		if (!g_aimPoseHwnd) {
+			EnumWindows(FindGameWindowCB, reinterpret_cast<LPARAM>(&g_aimPoseHwnd));
+			if (g_aimPoseHwnd) {
+				SetPropW(g_aimPoseHwnd, L"OC_AIM_POSES", (HANDLE)&g_aimPoses);
+			}
+		}
+	}
+}
+
+static void find_queue_family_and_queue_idx(VkDevice dev, VkPhysicalDevice pdev, VkQueue desired_queue, uint32_t& out_queueFamilyIndex, uint32_t& out_queueIndex)
+{
+	uint32_t queue_family_count;
+	vkGetPhysicalDeviceQueueFamilyProperties(pdev, &queue_family_count, NULL);
+
+	std::vector<VkQueueFamilyProperties> hi(queue_family_count);
+	vkGetPhysicalDeviceQueueFamilyProperties(pdev, &queue_family_count, hi.data());
+	OOVR_LOGF("number of queue families is %d", queue_family_count);
+
+	for (int i = 0; i < queue_family_count; i++) {
+		OOVR_LOGF("queue family %d has %d queues", i, hi[i].queueCount);
+		for (int j = 0; j < hi[i].queueCount; j++) {
+			VkQueue tmp;
+			vkGetDeviceQueue(dev, i, j, &tmp);
+			if (tmp == desired_queue) {
+				OOVR_LOGF("Got desired queue: %d %d", i, j);
+				out_queueFamilyIndex = i;
+				out_queueIndex = j;
+				return;
+			}
+		}
+	}
+	OOVR_ABORT("Couldn't find the queue family index/queue index of the queue that the OpenVR app gave us!"
+	           "This is really odd and really shouldn't ever happen");
+}
+
+/* Submitting Frames */
+void XrBackend::CheckOrInitCompositors(const vr::Texture_t* tex)
+{
+	// Check we're using the session with the application's device
+	if (!usingApplicationGraphicsAPI) {
+		usingApplicationGraphicsAPI = true;
+
+		OOVR_LOG("Recreating OpenXR session for application graphics API");
+
+		// Shutdown old session - apparently Varjo doesn't like the session being destroyed
+		// after querying for graphics requirements.
+		DrvOpenXR::ShutdownSession();
+
+		switch (tex->eType) {
+		case vr::TextureType_DirectX: {
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+			// The spec requires that we call this before starting a session using D3D. Unfortunately we
+			// can't actually do anything with this information, since the game has already created the device.
+			XrGraphicsRequirementsD3D11KHR graphicsRequirements{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
+			OOVR_FAILED_XR_ABORT(xr_ext->xrGetD3D11GraphicsRequirementsKHR(xr_instance, xr_system, &graphicsRequirements));
+
+			auto* d3dTex = (ID3D11Texture2D*)tex->handle;
+			ID3D11Device* dev = nullptr;
+			d3dTex->GetDevice(&dev);
+
+			XrGraphicsBindingD3D11KHR d3dInfo{};
+			d3dInfo.type = XR_TYPE_GRAPHICS_BINDING_D3D11_KHR;
+			d3dInfo.device = dev;
+			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingD3D11KHR>>(d3dInfo);
+			DrvOpenXR::SetupSession();
+
+			dev->Release();
+#else
+			OOVR_ABORT("Application is trying to submit a D3D11 texture, which OpenComposite supports but is disabled in this build");
+#endif
+			break;
+		}
+		case vr::TextureType_DirectX12: {
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX12)
+			// The spec requires that we call this before starting a session using D3D. Unfortunately we
+			// can't actually do anything with this information, since the game has already created the device.
+			XrGraphicsRequirementsD3D12KHR graphicsRequirements{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR };
+			OOVR_FAILED_XR_ABORT(xr_ext->xrGetD3D12GraphicsRequirementsKHR(xr_instance, xr_system, &graphicsRequirements));
+
+			D3D12TextureData_t* d3dTexData = (D3D12TextureData_t*)tex->handle;
+			ComPtr<ID3D12Device> device;
+			d3dTexData->m_pResource->GetDevice(IID_PPV_ARGS(&device));
+
+			XrGraphicsBindingD3D12KHR d3dInfo{};
+			d3dInfo.type = XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
+			d3dInfo.device = device.Get();
+			d3dInfo.queue = d3dTexData->m_pCommandQueue;
+			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingD3D12KHR>>(d3dInfo);
+			DrvOpenXR::SetupSession();
+
+#ifdef _DEBUG
+			ComPtr<ID3D12Debug> debugController;
+			D3D12GetDebugInterface(IID_PPV_ARGS(&debugController));
+			debugController->EnableDebugLayer();
+#endif
+
+			device->Release();
+#else
+			OOVR_ABORT("Application is trying to submit a D3D12 texture, which OpenComposite supports but is disabled in this build");
+#endif
+			break;
+		}
+		case vr::TextureType_Vulkan: {
+			const vr::VRVulkanTextureData_t* vktex = (vr::VRVulkanTextureData_t*)tex->handle;
+
+			VkPhysicalDevice xr_desire;
+			// Regardless of error checking, we have to call this or we get crazy validation errors.
+			xr_ext->xrGetVulkanGraphicsDeviceKHR(xr_instance, xr_system, vktex->m_pInstance, &xr_desire);
+
+			if (xr_desire != vktex->m_pPhysicalDevice) {
+				OOVR_ABORTF("The VkPhysicalDevice that the OpenVR app (%p) used is different from the one that the OpenXR runtime used (%p)!\n"
+				            "This should never happen, except for on multi-gpu, in which case DRI_PRIME=1 should fix things on Linux.",
+				    vktex->m_pPhysicalDevice, xr_desire);
+			}
+
+			XrGraphicsBindingVulkanKHR binding;
+			binding.type = XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR;
+			binding.next = nullptr;
+			binding.instance = vktex->m_pInstance;
+			binding.physicalDevice = vktex->m_pPhysicalDevice;
+			binding.device = vktex->m_pDevice;
+
+			find_queue_family_and_queue_idx( //
+			    binding.device, //
+			    binding.physicalDevice, //
+			    vktex->m_pQueue, //
+			    binding.queueFamilyIndex, //
+			    binding.queueIndex //
+			);
+
+			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingVulkanKHR>>(binding);
+			DrvOpenXR::SetupSession();
+			break;
+		}
+		case vr::TextureType_OpenGL: {
+#ifdef SUPPORT_GL
+			// The spec requires that we call this before starting a session using OpenGL. Unfortunately we
+			// can't actually do anything with this information, since the game has already created the context.
+			XrGraphicsRequirementsOpenGLKHR graphicsRequirements{ XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR };
+			OOVR_FAILED_XR_ABORT(xr_ext->xrGetOpenGLGraphicsRequirementsKHR(xr_instance, xr_system, &graphicsRequirements));
+
+			// Platform-specific OpenGL context stuff:
+#ifdef _WIN32
+			XrGraphicsBindingOpenGLWin32KHR binding = { XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR };
+			binding.hGLRC = wglGetCurrentContext();
+			binding.hDC = wglGetCurrentDC();
+
+			if (!binding.hGLRC || !binding.hDC) {
+				OOVR_ABORTF("Null OpenGL GLRC or DC: %p,%p", (void*)binding.hGLRC, (void*)binding.hDC);
+			}
+
+			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingOpenGLWin32KHR>>(binding);
+			DrvOpenXR::SetupSession();
+#else
+			// Only support xlib for now (same as Monado)
+			// TODO wayland
+			// TODO xcb
+
+			// Unfortunately we're in a bit of a sticky situation here. We can't (as far as I can tell) get
+			// the GLXFBConfig from the context or drawable, and the display might give us multiple, so
+			// we can't pass it onto the runtime. If we have it we can use it to find the visual info, but
+			// otherwise we can't find that either.
+			//    GLXFBConfig config = some_magic_function();
+			//    XVisualInfo* vi = glXGetVisualFromFBConfig(glXGetCurrentDisplay(), config);
+			//    uint32_t visualid = vi->visualid;
+			// So... FIXME FIXME FIXME HAAAAACK! Just pass in invalid values and hope the runtime doesn't notice!
+			// Monado doesn't (and hopefully in the future, won't) use these values, so it ought to work for now.
+			//
+			// Note: on re-reading the spec it does appear there's no requirement that the config is the one used
+			//  to create the context. That seems a bit odd so we could be technically compliant by just grabbing
+			//  the first one, but it's probably better (IMO) to pass null and make the potential future issue
+			//  obvious rather than wasting lots of time of the poor person who has to track it down.
+			GLXFBConfig config = nullptr;
+			uint32_t visualid = 0xffffffff;
+
+			XrGraphicsBindingOpenGLXlibKHR binding = { XR_TYPE_GRAPHICS_BINDING_OPENGL_XLIB_KHR };
+			binding.xDisplay = glXGetCurrentDisplay();
+			binding.visualid = visualid;
+			binding.glxFBConfig = config;
+			binding.glxDrawable = glXGetCurrentDrawable();
+			binding.glxContext = glXGetCurrentContext();
+
+			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingOpenGLXlibKHR>>(binding);
+			DrvOpenXR::SetupSession();
+#endif
+			// End of platform-specific code
+
+#elif defined(SUPPORT_GLES)
+			// The spec requires that we call this before starting a session using OpenGL. We could actually handle this properly
+			// on android since the app has to be modified to work with us, but for now don't bother.
+			XrGraphicsRequirementsOpenGLESKHR graphicsRequirements{ XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_ES_KHR };
+			OOVR_FAILED_XR_ABORT(xr_ext->xrGetOpenGLESGraphicsRequirementsKHR(xr_instance, xr_system, &graphicsRequirements));
+
+			if (!OpenComposite_Android_GLES_Binding_Info)
+				OOVR_ABORT("App is trying to use GLES, but OpenComposite_Android_GLES_Binding_Info global is not set.\n"
+				           "Please ensure this is set by the application.");
+
+			XrGraphicsBindingOpenGLESAndroidKHR binding = *OpenComposite_Android_GLES_Binding_Info;
+			OOVR_FALSE_ABORT(binding.type == XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR);
+			binding.next = nullptr;
+
+			graphicsBinding = std::make_unique<BindingWrapper<XrGraphicsBindingOpenGLESAndroidKHR>>(binding);
+			DrvOpenXR::SetupSession();
+
+#else
+			OOVR_ABORT("Application is trying to submit an OpenGL texture, which OpenComposite supports but is disabled in this build");
+#endif
+			break;
+		}
+		default:
+			OOVR_ABORTF("Invalid/unknown texture type %d", tex->eType);
+		}
+
+		// Real graphics binding should be setup now - get rid of temporary graphics
+		temporaryGraphics.reset();
+	}
+
+	for (std::unique_ptr<Compositor>& compositor : compositors) {
+		// Skip a compositor if it's already set up
+		if (compositor)
+			continue;
+
+		compositor.reset(BaseCompositor::CreateCompositorAPI(tex));
+	}
+}
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+
+void XrBackend::LatchViewsForDisplayTime(XrTime displayTime)
+{
+	xr_gbl->nextPredictedFrameTime = displayTime;
+
+	XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	locateInfo.displayTime = displayTime;
+	locateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+	XrViewState viewState = { XR_TYPE_VIEW_STATE };
+	uint32_t viewCount = 0;
+	XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+	OOVR_FAILED_XR_SOFT_ABORT(xrLocateViews(xr_session.get(), &locateInfo, &viewState, XruEyeCount, &viewCount, views));
+
+	for (int eye = 0; eye < XruEyeCount; eye++) {
+		projectionViews[eye].fov = views[eye].fov;
+
+		XrPosef pose = views[eye].pose;
+		if ((viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
+			pose.orientation = XrQuaternionf{ 0, 0, 0, 1 };
+		}
+		if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0) {
+			pose.position = XrVector3f{ 0, 1.75, 0 };
+		}
+
+		projectionViews[eye].pose = pose;
+	}
+
+	xr_gbl->latchedViews[0] = views[0];
+	xr_gbl->latchedViews[1] = views[1];
+	xr_gbl->latchedViewStateFlags = viewState.viewStateFlags;
+	xr_gbl->viewSpaceViewsLatched = false;
+	xr_gbl->viewsLatched = true;
+	{
+		static bool s = false;
+		if (!s && oovr_debug_logging_enabled()) {
+			s = true;
+			OOVR_LOGF("[diag] WaitForTrackingData: views LATCHED (viewsLatched=true)");
+#ifdef _WIN32
+			DWORD jiggleVal = 0;
+			DWORD jiggleSize = sizeof(jiggleVal);
+			LONG jiggleResult = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Virtual Desktop, Inc.\\OpenXR",
+			    L"jiggle_view_rotations", RRF_RT_REG_DWORD, nullptr, &jiggleVal, &jiggleSize);
+			if (jiggleResult == ERROR_SUCCESS)
+				OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations = %lu", jiggleVal);
+			else if (jiggleResult == ERROR_FILE_NOT_FOUND)
+				OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations NOT SET (key absent)");
+			else
+				OOVR_LOGF("[diag] VDXR registry: jiggle_view_rotations read failed (error %ld)", jiggleResult);
+#endif
+		}
+	}
+}
+
+#endif
+
+void XrBackend::WaitForTrackingData()
+{
+	// Make sure the OpenXR session is active before doing anything else, and if not then skip
+	if (!sessionActive) {
+		renderingFrame = false;
+		realFrameShouldRender = false;
+		return;
+	}
+
+	XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+	XrFrameState state{ XR_TYPE_FRAME_STATE };
+
+	// Initialize QPC frequency once
+	if (!qpcInitialized) {
+		QueryPerformanceFrequency(&qpcFrequency);
+		qpcInitialized = true;
+	}
+
+
+	{
+		auto lock = xr_session.lock_shared();
+
+
+		QueryPerformanceCounter(&waitFrameStart);
+		OOVR_FAILED_XR_ABORT(xrWaitFrame(xr_session.get(), &waitInfo, &state));
+		QueryPerformanceCounter(&waitFrameEnd);
+		measuredWaitFrameMs = (float)(waitFrameEnd.QuadPart - waitFrameStart.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+		if (measuredWaitFrameMs > 1000.0f) {
+			OOVR_LOGF("ASW FREEZE: xrWaitFrame blocked %.1fms — possible TDR or runtime stall", measuredWaitFrameMs);
+		}
+
+		xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
+		realFrameShouldRender = state.shouldRender == XR_TRUE;
+
+		// Store the runtime's actual display period (nanoseconds → milliseconds)
+		if (state.predictedDisplayPeriod > 0) {
+			predictedDisplayPeriodMs = (float)(state.predictedDisplayPeriod / 1000000.0);
+			dapaPeriodBaseline.Observe(predictedDisplayPeriodMs);
+			xr_gbl->nextPredictedFramePeriod.store(state.predictedDisplayPeriod, std::memory_order_release);
+		}
+
+		// xrBeginFrame stays adjacent to xrWaitFrame for consistent frame pacing.
+		// Deferring it introduced variable latency from xrLocateViews that caused
+		// VDXR's prediction model to see inconsistent timing → periodic micro-stutters.
+		XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+		OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
+		QueryPerformanceCounter(&beginFrameQpc);
+	}
+
+	LatchViewsForDisplayTime(xr_gbl->nextPredictedFrameTime);
+
+	// If we're not on the game's graphics API yet, don't actually mark us as having started the frame.
+	// Instead, set a different flag so we'll call this method again when it's available.
+	if (!usingApplicationGraphicsAPI) {
+		deferredRenderingStart = true;
+	} else {
+		renderingFrame = true;
+	}
+
+	// Mark CPU frame start — game gets control back now
+	QueryPerformanceCounter(&cpuFrameStart);
+}
+
+void XrBackend::StoreEyeTexture(
+    vr::EVREye eye,
+    const vr::Texture_t* texture,
+    const vr::VRTextureBounds_t* bounds,
+    vr::EVRSubmitFlags submitFlags,
+    bool isFirstEye)
+{
+	CheckOrInitCompositors(texture);
+
+	// WaitGetPoses may have begun a frame on the temporary graphics session.
+	// CheckOrInitCompositors replaces that session and clears renderingFrame.
+	// Begin the replacement frame before copying either eye, otherwise the
+	// first submitted eye is dropped and the first projection is incomplete.
+	if (deferredRenderingStart && usingApplicationGraphicsAPI) {
+		deferredRenderingStart = false;
+		WaitForTrackingData();
+	}
+
+	XrCompositionLayerProjectionView& layer = projectionViews[eye];
+	layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+
+	std::unique_ptr<Compositor>& compPtr = compositors[eye];
+	OOVR_FALSE_ABORT(compPtr.get() != nullptr);
+	Compositor& comp = *compPtr;
+
+	bool eyeStored = false;
+
+	// If the session is inactive, we may be unable to write to the surface
+	if (sessionActive && renderingFrame) {
+		comp.Invoke((XruEye)eye, texture, bounds, submitFlags, layer);
+		eyeStored = true;
+	}
+
+
+	if (eyeStored && renderingFrame)
+		submittedEyeTextures = true;
+
+	// TODO store view somewhere and use it for submitting our frame
+
+}
+
+void XrBackend::SubmitFrames(bool showSkybox, bool postPresent)
+{
+	if (g_aswProvider) g_aswProvider->CaptureTick();
+	static std::mutex submitMutex;
+	std::lock_guard<std::mutex> lock(submitMutex);
+
+	// Always pump events, even if the session isn't active - this is what makes the session active
+	// in the first place.
+	PumpEvents();
+
+	// If we are getting calls from PostPresentHandOff then skip the calls from other functions as
+	//  there will be other data such as GUI layers to be added before ending the frame.
+	bool skipRender = postPresentStatus && !postPresent;
+	postPresentStatus = postPresent;
+
+	if (!renderingFrame || skipRender)
+		return;
+
+	// All data submitted, rendering has finished, frame can be ended.
+	renderingFrame = false;
+
+	// Make sure the OpenXR session is active before doing anything else
+	// Note that if the session becomes ready after WaitGetTrackingPoses was called, then
+	// renderingFrame will still be false so this won't be a problem in that case.
+	if (!sessionActive) {
+		return;
+	}
+
+	XrFrameEndInfo info{ XR_TYPE_FRAME_END_INFO };
+	info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+	info.displayTime = xr_gbl->nextPredictedFrameTime;
+
+	XrCompositionLayerBaseHeader const* const* headers = nullptr;
+	XrCompositionLayerBaseHeader* app_layer = nullptr;
+
+	int layer_count = 0;
+
+	// Apps can use layers to provide GUIs and loading screens where a 3D environment is not being rendered.
+	// Only create the projection layer if we have a 3D environment to submit.
+	XrCompositionLayerProjection mainLayer{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+	if (submittedEyeTextures) {
+		// We have eye textures so setup a projection layer
+		mainLayer.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+		mainLayer.views = projectionViews;
+		mainLayer.viewCount = 2;
+
+		app_layer = (XrCompositionLayerBaseHeader*)&mainLayer;
+		for (int i = 0; i < mainLayer.viewCount; ++i) {
+			XrCompositionLayerProjectionView& layer = projectionViews[i];
+			layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+			if (layer.subImage.swapchain == XR_NULL_HANDLE)
+				app_layer = nullptr;
+		}
+
+
+		submittedEyeTextures = false;
+	}
+
+	// Ensure the BaseOverlay singleton exists so the keyboard shortcut
+	// detection in _BuildLayers runs every frame. Without this, the overlay
+	// is only created when the game explicitly requests IVROverlay, which
+	// some games do late (or not at all until a cell transition).
+	static std::shared_ptr<BaseOverlay> overlayHolder;
+	if (!GetUnsafeBaseOverlay()) {
+		overlayHolder = GetCreateBaseOverlay();
+	}
+
+	// If we have an overlay then add
+	BaseOverlay* overlay = GetUnsafeBaseOverlay();
+	if (overlay) {
+		layer_count = overlay->_BuildLayers(app_layer, headers);
+	} else if (app_layer) {
+		layer_count = 1;
+		headers = &app_layer;
+	}
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	std::vector<const XrCompositionLayerBaseHeader*> debugLayers;
+	const XrCompositionLayerBaseHeader* debugHeaders[FoveationDebugOverlay::LayerCount]{};
+	const bool sceneBlackout = ocu_effect_foveation::GetState().ReadBlackout().Active();
+	if ((oovr_global_configuration.FoveationDebugRings() ||
+	        (!sceneBlackout && oovr_global_configuration.VrsEyeTracked() && oovr_global_configuration.VrsEyeAnyBlackout())) && app_layer) {
+		const auto& limits = xr_gbl->systemProperties.graphicsProperties;
+		const auto* binding = static_cast<const XrBaseInStructure*>(GetCurrentGraphicsBinding());
+		if (binding && binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR &&
+		    uint32_t(layer_count) <= limits.maxLayerCount &&
+		    limits.maxLayerCount - uint32_t(layer_count) >= FoveationDebugOverlay::LayerCount &&
+		    limits.maxSwapchainImageWidth >= 1024 && limits.maxSwapchainImageHeight >= 512) {
+			if (!foveationDebugOverlay) foveationDebugOverlay = std::make_unique<FoveationDebugOverlay>();
+			const auto profile = ocu_effect_foveation::GetState().ReadForPresentation(ocu_effect_foveation::ClockTicks());
+			const bool tracked = profile.mode == ocu_effect_foveation::Mode::EyeTracked;
+			std::string shapeBackend = oovr_global_configuration.FoveatedBackend();
+			std::transform(shapeBackend.begin(), shapeBackend.end(), shapeBackend.begin(),
+			    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+			const float horizontalScale = tracked && shapeBackend != "effects" ?
+			    oovr_global_configuration.VrsEyeHorizontalScale() : 1.f;
+			const auto* d3d = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(binding);
+			if (foveationDebugOverlay->Update(xr_session.get(), d3d->device, profile, horizontalScale,
+			        oovr_global_configuration.FoveationDebugRings(),
+			        tracked && !sceneBlackout && oovr_global_configuration.VrsEyePeripheralMask(),
+			        oovr_global_configuration.VrsEyePeripheralMaskRadius(profile.midRadius),
+			        tracked && !sceneBlackout && oovr_global_configuration.VrsEyeMiddleBlackout(),
+			        tracked && !sceneBlackout && oovr_global_configuration.VrsEyeOuterBlackout()) &&
+			    foveationDebugOverlay->PositionOverScene(mainLayer)) {
+				for (uint32_t eye = 0; eye < FoveationDebugOverlay::LayerCount; ++eye)
+					debugHeaders[eye] = foveationDebugOverlay->Layer(eye);
+			}
+			OOVR_LOG_LIMITEDF(5000, "Eye-tracking overlay: %s; scene blackout culling=%s",
+			    foveationDebugOverlay->Status(), sceneBlackout ? "armed" : "off (visual masks only)");
+			if (debugHeaders[0] && debugHeaders[1]) {
+				debugLayers.assign(headers, headers + layer_count);
+				for (auto* header : debugHeaders) debugLayers.push_back(header);
+				headers = debugLayers.data();
+				layer_count = static_cast<int>(debugLayers.size());
+			}
+		} else {
+			OOVR_LOG_LIMITEDF(5000, "Eye-tracking overlay unavailable: D3D11 graphics and two spare OpenXR composition layers required");
+		}
+	}
+#endif
+
+#if defined(SUPPORT_DX11)
+	std::vector<const XrCompositionLayerBaseHeader*> cableLayers;
+	if (oovr_global_configuration.CableTracking().enabled) {
+		if (!cableTrackingOverlay) cableTrackingOverlay = std::make_unique<CableTrackingOverlay>();
+		const auto* binding = static_cast<const XrBaseInStructure*>(GetCurrentGraphicsBinding());
+		const auto* d3d = binding && binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR ?
+		    reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(binding) : nullptr;
+		const auto& limits = xr_gbl->systemProperties.graphicsProperties;
+		const bool room = app_layer && d3d && uint32_t(layer_count) < limits.maxLayerCount &&
+		    limits.maxSwapchainImageWidth >= 640 && limits.maxSwapchainImageHeight >= 192;
+		if (auto* layer = cableTrackingOverlay->Update(xr_session.get(), xr_gbl->viewSpace, xr_gbl->GetBestTime(),
+		        sessionState == XR_SESSION_STATE_FOCUSED, room, d3d ? d3d->device : nullptr,
+		        oovr_global_configuration.CableTracking())) {
+			if (layer_count) cableLayers.assign(headers, headers + layer_count);
+			cableLayers.push_back(layer); headers = cableLayers.data(); layer_count = static_cast<int>(cableLayers.size());
+		}
+	} else ocu_cable::requests.exchange(0, std::memory_order_relaxed);
+#endif
+
+	// It's ok if no layers have been added at this point,
+	// it will just cause the display to be blanked
+	info.layers = headers;
+	info.layerCount = layer_count;
+
+	// CPU frame time: game work is done, measure before xrEndFrame
+	if (qpcInitialized && cpuFrameStart.QuadPart > 0) {
+		QueryPerformanceCounter(&cpuFrameEnd);
+		measuredCpuFrameMs = (float)(cpuFrameEnd.QuadPart - cpuFrameStart.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+	}
+
+	// Compositor time: measure xrEndFrame duration
+	QueryPerformanceCounter(&endFrameStart);
+	const XrResult realEndResult = xrEndFrame(xr_session.get(), &info);
+	const auto realEndDone = DapaTiming::Clock::now();
+	OOVR_FAILED_XR_SOFT_ABORT(realEndResult);
+	QueryPerformanceCounter(&endFrameEnd);
+	if (qpcInitialized) {
+		measuredEndFrameMs = (float)(endFrameEnd.QuadPart - endFrameStart.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+
+		// Frame-to-frame interval
+		if (lastFrameSubmitQpc.QuadPart > 0) {
+			measuredFrameIntervalMs = (float)(endFrameEnd.QuadPart - lastFrameSubmitQpc.QuadPart) * 1000.0f / (float)qpcFrequency.QuadPart;
+		}
+		lastFrameSubmitQpc = endFrameEnd;
+
+		// Coarse compositor residual. Direct D3D timestamp queries were removed
+		// because they introduced micro-stutter, so this fallback can include
+		// unmeasured application GPU work. Clamp it to the display period.
+		float frameInterval = predictedDisplayPeriodMs > 0.0f ? predictedDisplayPeriodMs : measuredFrameIntervalMs;
+		if (frameInterval > 0.0f) {
+			float residual = frameInterval - measuredCpuFrameMs - measuredEndFrameMs;
+			float maxClamp = frameInterval;
+			compositorOverheadMs = (residual < 0.0f) ? 0.0f : (residual > maxClamp ? maxClamp : residual);
+		}
+	}
+
+	// ── OCU ASW: Hot-reload settings from ini (1-second file watcher) ──
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	{
+		static ULONGLONG lastAswCheck = 0;
+		static FILETIME lastAswWriteTime = {};
+		ULONGLONG now = GetTickCount64();
+		if (now - lastAswCheck > 1000) {
+			lastAswCheck = now;
+			wchar_t exePath[MAX_PATH];
+			GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+			std::wstring iniPath(exePath);
+			size_t sp = iniPath.find_last_of(L"\\/");
+			if (sp != std::wstring::npos)
+				iniPath = iniPath.substr(0, sp + 1);
+			iniPath += L"opencomposite.ini";
+			WIN32_FILE_ATTRIBUTE_DATA fad = {};
+			if (GetFileAttributesExW(iniPath.c_str(), GetFileExInfoStandard, &fad)) {
+				if (CompareFileTime(&fad.ftLastWriteTime, &lastAswWriteTime) != 0) {
+					lastAswWriteTime = fad.ftLastWriteTime;
+					FILE* f = _wfopen(iniPath.c_str(), L"r");
+					if (f) {
+						char line[512];
+						// Accept keys from the default (pre-section) area AND the [asw] section
+						bool inAswSection = true;
+						while (fgets(line, sizeof(line), f)) {
+							if (line[0] == '[') {
+								inAswSection = (strncmp(line, "[asw]", 5) == 0);
+								continue;
+							}
+							if (!inAswSection)
+								continue;
+							float fval;
+							if (sscanf(line, "aswWarpStrength=%f", &fval) == 1)
+								oovr_global_configuration.aswWarpStrength = fval;
+							else if (sscanf(line, "aswRotationScale=%f", &fval) == 1)
+								oovr_global_configuration.aswRotationScale = fval;
+							else if (sscanf(line, "aswTranslationScale=%f", &fval) == 1)
+								oovr_global_configuration.aswTranslationScale = fval;
+							else if (sscanf(line, "aswDepthScale=%f", &fval) == 1)
+								oovr_global_configuration.aswDepthScale = fval;
+							else if (sscanf(line, "aswLocoScale=%f", &fval) == 1)
+								oovr_global_configuration.aswLocoScale = fval;
+							else if (sscanf(line, "aswEdgeFadeWidth=%f", &fval) == 1)
+								oovr_global_configuration.aswEdgeFadeWidth = fval;
+							else if (sscanf(line, "aswNearFadeDepth=%f", &fval) == 1)
+								oovr_global_configuration.aswNearFadeDepth = fval;
+							else if (sscanf(line, "aswEndSpikeMs=%f", &fval) == 1)
+								oovr_global_configuration.aswEndSpikeMs = fval;
+							else {
+								int ival;
+								if (sscanf(line, "aswDebugMode=%d", &ival) == 1)
+									oovr_global_configuration.aswDebugMode = ival;
+								else if (strncmp(line, "aswAutoNative=", 14) == 0) {
+									const char* v = line + 14;
+									oovr_global_configuration.aswAutoNative =
+									    (strncmp(v, "true", 4) == 0 || strncmp(v, "on", 2) == 0 || v[0] == '1');
+								}
+								else if (sscanf(line, "aswAutoEngageFps=%f", &fval) == 1)
+									oovr_global_configuration.aswAutoEngageFps = fval;
+							}
+						}
+						fclose(f);
+					}
+				}
+			}
+		}
+	}
+#endif
+
+	// ── OCU ASW: Inject warped frame ──
+	// After the real frame is submitted, claim the next display slot and submit
+	// a warped version of the cached frame. One synthetic submission per real
+	// frame is possible; this is not proof of compositor presentation or doubled FPS.
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+	static DapaTiming::Recovery recovery;
+	static DapaTiming::PacingGuard pacing;
+	struct DapaStats {
+		uint64_t real = 0, synthetic = 0, errors = 0, empty = 0, attempts = 0;
+		uint64_t held = 0;
+		double waitMs = 0, endMs = 0, maxEndMs = 0;
+		uint64_t samples = 0, runtimeHidden = 0, syntheticHidden = 0;
+		double appMs = 0, maxAppMs = 0, realWaitMs = 0, maxRealWaitMs = 0;
+		double realEndMs = 0, maxRealEndMs = 0, intervalMs = 0, maxIntervalMs = 0;
+	};
+	static DapaStats dapaStats;
+	static auto statsStart = std::chrono::steady_clock::now();
+	if (DapaTiming::Accepted(realEndResult) && app_layer) ++dapaStats.real;
+	else if (!DapaTiming::Accepted(realEndResult)) ++dapaStats.errors;
+	if (app_layer) {
+		++dapaStats.samples;
+		dapaStats.appMs += measuredCpuFrameMs;
+		dapaStats.maxAppMs = std::max(dapaStats.maxAppMs, double(measuredCpuFrameMs));
+		dapaStats.realWaitMs += measuredWaitFrameMs;
+		dapaStats.maxRealWaitMs = std::max(dapaStats.maxRealWaitMs, double(measuredWaitFrameMs));
+		dapaStats.realEndMs += measuredEndFrameMs;
+		dapaStats.maxRealEndMs = std::max(dapaStats.maxRealEndMs, double(measuredEndFrameMs));
+		dapaStats.intervalMs += measuredFrameIntervalMs;
+		dapaStats.maxIntervalMs = std::max(dapaStats.maxIntervalMs, double(measuredFrameIntervalMs));
+		if (!realFrameShouldRender) ++dapaStats.runtimeHidden;
+	}
+	const auto recoveryNow = std::chrono::steady_clock::now();
+	static auto recoveryLast = recoveryNow;
+	const double recoveryElapsedMs = std::chrono::duration<double, std::milli>(recoveryNow - recoveryLast).count();
+	recoveryLast = recoveryNow;
+	recovery.Advance(recoveryElapsedMs, recoveryNow);
+	pacing.HoldRealFrame(recoveryNow);
+	const float dapaTimingPeriodMs = static_cast<float>(dapaPeriodBaseline.Get());
+	auto aswTrouble = [&](const char* what, float ms) {
+		++dapaStats.errors;
+		recovery.Trouble();
+		OOVR_LOGF("ASW: %s %.1fms — backing off %.0fms (level %d)",
+		    what, ms, recovery.backoffMs, recovery.level);
+	};
+	auto observePacing = [&](float waitMs, float endMs) {
+		if (pacing.Observe(waitMs, endMs, oovr_global_configuration.ASWEndSpikeMs(), dapaTimingPeriodMs)) {
+			static auto lastPacingLog = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+			const auto now = std::chrono::steady_clock::now();
+			if (now - lastPacingLog >= std::chrono::seconds(1)) {
+				lastPacingLog = now;
+				OOVR_LOGF("DAPA PACING: wait=%.1fms end=%.1fms; yielding up to %.1fms / one real frame, then retry (timing guard)",
+				    waitMs, endMs, pacing.backoffMs);
+			}
+		}
+	};
+	// Canary: the real frame's xrEndFrame sees the same compositor backpressure as warp
+	// frames. Only gates re-entry during/after trouble episodes (backoffLevel > 0) —
+	// VD has routine isolated end-spikes even at native 90 that shouldn't park ASW.
+	static constexpr double kAswCanaryMs = 90.0;
+	{
+		// Scale thresholds with the session baseline, not missed-frame multiples.
+		float canaryMs = static_cast<float>(DapaTiming::EndPressureLimitMs(
+		    oovr_global_configuration.ASWEndSpikeMs(), dapaTimingPeriodMs));
+		if (canaryMs > 0.0f && measuredEndFrameMs > canaryMs) {
+			// Canary only acts in auto mode (gates re-entry after trouble). With auto off,
+			// injection policy is purely backoff-driven — inject whenever clean.
+			if (oovr_global_configuration.ASWAutoNative() && recovery.level > 0
+			    && recovery.realCleanMs >= kAswCanaryMs) {
+				static auto s_lastCanaryLog = std::chrono::steady_clock::now() - std::chrono::seconds(20);
+				auto cnow = std::chrono::steady_clock::now();
+				if (cnow - s_lastCanaryLog > std::chrono::seconds(10)) {
+					s_lastCanaryLog = cnow;
+					OOVR_LOGF("ASW: real xrEndFrame %.1fms — holding injection until clean", measuredEndFrameMs);
+				}
+			}
+			recovery.realCleanMs = 0.0;
+		} else {
+			recovery.realCleanMs = std::min(kAswCanaryMs, recovery.realCleanMs + recoveryElapsedMs);
+		}
+	}
+
+	// ── ASW AUTO: native when the game holds refresh, half-rate only where it helps ──
+	// native → engage: frame interval sustained in the band (can't hold ~87% of refresh,
+	//                   but CAN hold half-rate). Below the band ASW can't help — stay native.
+	// engage → native: idle time per pinned cycle (real wait + warp wait) shows the game
+	//                   could comfortably run at refresh, or it can't even hold half-rate.
+	static bool s_aswEngaged = true;
+	static constexpr int s_aswInjectCount = 1; // At most one synthetic slot between real frames.
+	static float s_aswIntervalEma = 0.0f;
+	static float s_aswIdleEma = 0.0f;
+	static float s_aswLastWarpWaitMs = 0.0f; // sum of warp slot waits this frame (injection block below)
+	static bool lastDapaEnabled = false;
+	static bool lastDapaAuto = false;
+	if (dapaResetPending || lastDapaEnabled != oovr_global_configuration.ASWEnabled() ||
+	    lastDapaAuto != oovr_global_configuration.ASWAutoNative()) {
+		recovery = {};
+		pacing = {};
+		s_aswIntervalEma = s_aswIdleEma = s_aswLastWarpWaitMs = 0.0f;
+		s_aswEngaged = true;
+		lastDapaEnabled = oovr_global_configuration.ASWEnabled();
+		lastDapaAuto = oovr_global_configuration.ASWAutoNative();
+		dapaResetPending = false;
+		OOVR_LOGF("DAPA CONFIG: enabled=%d auto=%d runtimePeriod=%.3fms baseline=%.3fms translation=%.3f loco=%.3f; build=render-permission-v4 captureCompiled=%d",
+		    (int)lastDapaEnabled, (int)lastDapaAuto, predictedDisplayPeriodMs, dapaTimingPeriodMs,
+		    oovr_global_configuration.ASWTranslationScale(), oovr_global_configuration.ASWLocoScale(), int(DapaCaptureControl::Enabled));
+	}
+	{
+		float period = dapaTimingPeriodMs;
+		if (measuredFrameIntervalMs > 0.0f && measuredFrameIntervalMs < 200.0f)
+			s_aswIntervalEma = (s_aswIntervalEma <= 0.0f) ? measuredFrameIntervalMs
+			                                              : s_aswIntervalEma * 0.92f + measuredFrameIntervalMs * 0.08f;
+
+		if (!oovr_global_configuration.ASWEnabled()) {
+			s_aswEngaged = false;
+			s_aswIntervalEma = s_aswIdleEma = 0.0f;
+			recovery.forceRelease = false;
+		} else if (!oovr_global_configuration.ASWAutoNative()) {
+			s_aswEngaged = true; // legacy: always pin while enabled
+			recovery.forceRelease = false;
+		} else if (!s_aswEngaged) {
+			// Native mode: engage only when natural fps drops below aswAutoEngageFps (hold escalates per chronic zone)
+			float engageFps = static_cast<float>(DapaTiming::AutoEngageFps(
+			    oovr_global_configuration.ASWAutoEngageFps(), period));
+			float engageIntervalMs = 1000.0f / engageFps;
+			if (engageIntervalMs < period * 1.15f)
+				engageIntervalMs = period * 1.15f;
+			if (recovery.dwellMs > recovery.engageHoldMs && s_aswIntervalEma > engageIntervalMs && s_aswIntervalEma < period * 2.05f) {
+				s_aswEngaged = true;
+				recovery.dwellMs = 0.0;
+				s_aswIdleEma = 0.0f;
+				recovery.engagedCleanMs = 0.0;
+				OOVR_LOGF("ASW AUTO: engaging half-rate (interval %.1fms, period %.1fms)",
+				    s_aswIntervalEma, period);
+			}
+		} else if (recovery.forceRelease) {
+			// Chronic backpressure: go native and stay there longer each time this zone proves hostile
+			recovery.forceRelease = false;
+			s_aswEngaged = false;
+			recovery.dwellMs = 0.0;
+			recovery.Clear();
+			recovery.level = 0;
+			recovery.engageHoldMs = std::min(120000.0, recovery.engageHoldMs * 4.0);
+			OOVR_LOGF("ASW AUTO: chronic backpressure — native, re-engage hold %.0fms", recovery.engageHoldMs);
+		} else {
+			// Sustained clean engagement → zone is fine, reset the escalating hold
+			if (recovery.level == 0) {
+				recovery.engagedCleanMs = std::min(30000.0, recovery.engagedCleanMs + recoveryElapsedMs);
+				if (recovery.engagedCleanMs >= 30000.0) recovery.engageHoldMs = 3000.0;
+			}
+			// Release when estimated game work fits ~10fps above the engage point (hysteresis),
+			// not only at full refresh — otherwise a 65fps-capable town stays pinned forever.
+			float engageFps = static_cast<float>(DapaTiming::AutoEngageFps(
+			    oovr_global_configuration.ASWAutoEngageFps(), period));
+			float releaseWorkMs = 1000.0f / (engageFps + 10.0f);
+			float releaseIdleMs = 2.0f * period - releaseWorkMs - 1.5f; // 1.5ms ≈ injection cpu overhead
+			bool aboveBand = s_aswIdleEma > releaseIdleMs;
+			bool belowHalfRate = s_aswIntervalEma > period * 2.3f; // can't hold the pin — release
+			if (recovery.dwellMs > 6000.0 && (aboveBand || belowHalfRate)) {
+				s_aswEngaged = false;
+				recovery.dwellMs = 0.0;
+				OOVR_LOGF("ASW AUTO: releasing to native (%s: idle %.1fms, interval %.1fms)",
+				    aboveBand ? "above engage band" : "below half-rate",
+				    s_aswIdleEma, s_aswIntervalEma);
+			}
+		}
+
+		// ── Cadence rule: max ONE warp between two real frames (multi-warp field-tested worse).
+		// Engaged = pin refresh/2 at whatever refresh the headset runs; below that, release.
+		if (s_aswEngaged) {
+			float idle = measuredWaitFrameMs + s_aswLastWarpWaitMs;
+			s_aswIdleEma = (s_aswIdleEma <= 0.0f) ? idle : s_aswIdleEma * 0.92f + idle * 0.08f;
+		}
+	}
+	// The next real frame must not inherit a warp wait from a skipped attempt.
+	s_aswLastWarpWaitMs = 0.0f;
+	// VISIBLE sessions may still render: use the real wait's permission, not focus.
+	const bool runtimeAllowsSynthetic = sessionActive && realFrameShouldRender;
+	const bool prepareInjection = oovr_global_configuration.ASWEnabled() && runtimeAllowsSynthetic && s_aswEngaged
+	    && recovery.backoffMs == 0.0
+	    && (!oovr_global_configuration.ASWAutoNative() || recovery.level == 0 || recovery.realCleanMs >= kAswCanaryMs);
+	const bool canInject = prepareInjection && pacing.backoffMs == 0.0;
+	// Re-read the menu signal after the real submit and before claiming a slot.
+	// Once claimed, finish that one in-flight slot normally; canceling its layers
+	// can flash black. The next boundary invalidates the pair and stops DAPA.
+	auto refreshDapaMenuPause = []() {
+		if (!g_aswProvider) return false;
+		const bool paused = OCBridge_DapaMenuPaused();
+		g_aswProvider->SetPaused(paused);
+		return paused;
+	};
+	refreshDapaMenuPause();
+	// A one-frame pacing yield keeps caching REAL frames. Invalidating here would
+	// add a cache warm-up gap and reset motion history every time pressure occurs.
+	if (g_aswProvider)
+		g_aswProvider->SetInjectionWanted(prepareInjection && !g_aswProvider->IsPaused());
+	if (!canInject) ++dapaStats.held;
+
+	if (g_aswProvider && g_aswProvider->IsReady() && g_aswProvider->HasCachedFrame()
+	    && canInject && DapaTiming::Accepted(realEndResult) && app_layer
+	    && !g_aswProvider->IsPaused()) {
+
+		// Get D3D11 context from ASWProvider's device (independent of GPU timing)
+		ID3D11DeviceContext* aswCtx = nullptr;
+		if (g_aswProvider->GetDevice()) {
+			g_aswProvider->GetDevice()->GetImmediateContext(&aswCtx);
+		}
+		if (aswCtx) {
+			auto lock = xr_session.lock_shared();
+
+			s_aswLastWarpWaitMs = 0.0f;
+			// Claim only one slot. No synthetic frame is used as another warp's input.
+			for (int aswInj = 0; aswInj < s_aswInjectCount; aswInj++) {
+			if (refreshDapaMenuPause())
+				break;
+			if (recovery.backoffMs > 0.0)
+				break; // trouble on a previous injection this frame — stop claiming slots
+			if (!OCBridge_DapaMaskCacheValid()) {
+				g_aswProvider->InvalidateCachedFrame();
+				break; // Incomplete player coverage: retry on the next real frame, no cooldown.
+			}
+
+			// 1. Claim next display slot (measure time — xrWaitFrame can block the game)
+			auto t0 = DapaTiming::Clock::now();
+			XrFrameWaitInfo aswWaitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+			XrFrameState aswState{ XR_TYPE_FRAME_STATE };
+			++dapaStats.attempts;
+			XrResult res = xrWaitFrame(xr_session.get(), &aswWaitInfo, &aswState);
+			auto t1 = DapaTiming::Clock::now();
+			float waitMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+			s_aswLastWarpWaitMs += waitMs; // feeds the auto-native idle estimate
+			dapaStats.waitMs += waitMs;
+
+			if (XR_SUCCEEDED(res)) {
+				// A synthetic wait may expose the base cadence while real frames run
+				// at a multiple. Learn it for subsequent decisions, without a reset.
+				dapaPeriodBaseline.Observe(double(aswState.predictedDisplayPeriod) * 1e-6);
+				// Preserve the 90Hz tolerance in display intervals at every refresh rate.
+				if (waitMs > DapaTiming::StallLimitMs(dapaTimingPeriodMs)
+				    || aswState.shouldRender != XR_TRUE || res != XR_SUCCESS) {
+					if (aswState.shouldRender != XR_TRUE) ++dapaStats.syntheticHidden;
+					// Submit empty frame to keep runtime in sync, then back off
+					XrFrameBeginInfo aswBeginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+					const XrResult beginResult = xrBeginFrame(xr_session.get(), &aswBeginInfo);
+					XrFrameEndInfo aswEndInfo{ XR_TYPE_FRAME_END_INFO };
+					aswEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+					aswEndInfo.displayTime = aswState.predictedDisplayTime;
+					aswEndInfo.layers = nullptr;
+					aswEndInfo.layerCount = 0;
+					if (XR_SUCCEEDED(beginResult)) {
+						const auto emptyEndStart = DapaTiming::Clock::now();
+						const XrResult emptyResult = xrEndFrame(xr_session.get(), &aswEndInfo);
+						const float emptyEndMs = std::chrono::duration<float, std::milli>(DapaTiming::Clock::now() - emptyEndStart).count();
+						dapaStats.endMs += emptyEndMs;
+						dapaStats.maxEndMs = std::max(dapaStats.maxEndMs, double(emptyEndMs));
+						++dapaStats.empty;
+						if (!DapaTiming::Accepted(emptyResult)) aswTrouble("empty xrEndFrame error/status", emptyEndMs);
+					} else aswTrouble("xrBeginFrame error", 0);
+					if (res != XR_SUCCESS) aswTrouble("xrWaitFrame status", waitMs);
+					else if (waitMs > DapaTiming::StallLimitMs(dapaTimingPeriodMs)) observePacing(waitMs, 0);
+					aswCtx->Release();
+					goto asw_done;
+				}
+
+				// 2. Begin frame
+				XrFrameBeginInfo aswBeginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+				res = xrBeginFrame(xr_session.get(), &aswBeginInfo);
+				const auto tBeginDone = DapaTiming::Clock::now();
+
+				if (XR_SUCCEEDED(res)) {
+					// 3. Get new head pose at the new predicted display time
+					XrViewLocateInfo locateInfo = { XR_TYPE_VIEW_LOCATE_INFO };
+					locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+					locateInfo.displayTime = aswState.predictedDisplayTime;
+					locateInfo.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+					XrViewState viewState = { XR_TYPE_VIEW_STATE };
+					uint32_t viewCount = 0;
+					XrView views[XruEyeCount] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+					XrResult locateRes = xrLocateViews(xr_session.get(), &locateInfo, &viewState, XruEyeCount, &viewCount, views);
+					const auto tLocateDone = DapaTiming::Clock::now();
+
+					// 4. Warp cached frame with actor translation and stick yaw; tracked head rotation belongs to ATW.
+					bool warpOk = true;
+					bool poseValid = XR_SUCCEEDED(locateRes)
+					    && viewCount == XruEyeCount
+					    && (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0
+					    && (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+					if (!poseValid) {
+						static int s_poseInvalidLog = 0;
+						if (s_poseInvalidLog++ < 5) {
+							OOVR_LOGF("ASW: skipping warped frame because pose is invalid result=%d flags=0x%X views=%u",
+							    (int)locateRes, viewState.viewStateFlags, viewCount);
+						}
+						warpOk = false;
+					} else {
+						g_aswProvider->SetWarpDisplayTime(aswState.predictedDisplayTime);
+						for (int eye = 0; eye < 2; eye++) {
+							if (!g_aswProvider->WarpFrame(eye, aswCtx, views[eye].pose)) {
+								warpOk = false;
+								break;
+							}
+						}
+					}
+
+					// 5. Submit warped frame to XR swapchain
+					auto tWarpDone = DapaTiming::Clock::now();
+					bool submitOk = warpOk && g_aswProvider->SubmitWarpedOutput(aswCtx, dapaTimingPeriodMs);
+					auto tSubmitDone = DapaTiming::Clock::now();
+					if (submitOk) {
+						// 6. Build projection layer — use CACHED pose so runtime ATW corrects to current
+						XrCompositionLayerProjectionView warpedViews[2] = {};
+
+						// Attach depth info if depth swapchain is available
+						XrCompositionLayerDepthInfoKHR depthInfo[2] = {};
+						bool hasDepth = (g_aswProvider->GetDepthSwapchain() != XR_NULL_HANDLE) && g_aswProvider->HasSubmittedDepth();
+
+						for (int eye = 0; eye < 2; eye++) {
+							warpedViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+							warpedViews[eye].pose = g_aswProvider->GetCachedPose(eye);
+							warpedViews[eye].fov = g_aswProvider->GetCachedFov(eye);
+							warpedViews[eye].subImage.swapchain = g_aswProvider->GetOutputSwapchain();
+							warpedViews[eye].subImage.imageArrayIndex = 0;
+							warpedViews[eye].subImage.imageRect = g_aswProvider->GetOutputRect(eye);
+
+							if (hasDepth) {
+								depthInfo[eye].type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR;
+								depthInfo[eye].next = nullptr;
+								depthInfo[eye].subImage.swapchain = g_aswProvider->GetDepthSwapchain();
+								depthInfo[eye].subImage.imageArrayIndex = 0;
+								depthInfo[eye].subImage.imageRect = g_aswProvider->GetOutputRect(eye);
+								depthInfo[eye].minDepth = 0.0f;
+								depthInfo[eye].maxDepth = 1.0f;
+								depthInfo[eye].nearZ = g_aswProvider->GetCachedNear();
+								depthInfo[eye].farZ = g_aswProvider->GetCachedFar();
+								warpedViews[eye].next = &depthInfo[eye];
+							}
+						}
+
+						XrCompositionLayerProjection warpedLayer{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+						warpedLayer.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+						warpedLayer.views = warpedViews;
+						warpedLayer.viewCount = 2;
+						const bool syntheticDebug = debugHeaders[0] && foveationDebugOverlay &&
+							foveationDebugOverlay->PositionOverScene(warpedLayer);
+
+						// Build ASW layer array: warped projection + overlay layers from real frame
+						// (overlay layers = keyboard quad, laser beams, etc. at index 1+ of headers)
+						std::vector<XrCompositionLayerBaseHeader const*> aswLayers;
+						aswLayers.push_back((XrCompositionLayerBaseHeader*)&warpedLayer);
+						for (int i = 1; i < layer_count; i++) {
+							if (!syntheticDebug && (headers[i] == debugHeaders[0] || headers[i] == debugHeaders[1])) continue;
+							aswLayers.push_back(headers[i]);
+						}
+
+						XrFrameEndInfo aswEndInfo{ XR_TYPE_FRAME_END_INFO };
+						aswEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+						aswEndInfo.displayTime = aswState.predictedDisplayTime;
+						aswEndInfo.layers = aswLayers.data();
+						aswEndInfo.layerCount = (uint32_t)aswLayers.size();
+
+						auto tEndStart = DapaTiming::Clock::now();
+						XrResult endRes = xrEndFrame(xr_session.get(), &aswEndInfo);
+						auto tEndDone = DapaTiming::Clock::now();
+						g_aswProvider->CaptureSubmission(aswState.predictedDisplayTime, endRes);
+						{
+							static int s = 0;
+							if (s++ < 5)
+								OOVR_LOGF("ASW: Warped frame submission accepted=%d (result=%d)", (int)DapaTiming::Accepted(endRes), (int)endRes);
+						}
+						{
+							auto waitUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+							auto warpUs = std::chrono::duration_cast<std::chrono::microseconds>(tWarpDone - t1).count();
+							auto submitUs = std::chrono::duration_cast<std::chrono::microseconds>(tSubmitDone - tWarpDone).count();
+							auto endUs = std::chrono::duration_cast<std::chrono::microseconds>(tEndDone - tEndStart).count();
+							auto totalUs = waitUs + warpUs + submitUs + endUs;
+							static auto s_lastAswLatencyLog = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+							auto now = std::chrono::steady_clock::now();
+							const bool stageStall=warpUs>2000 || submitUs>2000
+							    || double(waitUs)/1000>DapaTiming::StallLimitMs(dapaTimingPeriodMs)
+							    || double(endUs)/1000>DapaTiming::EndPressureLimitMs(12.0,dapaTimingPeriodMs);
+							if (oovr_global_configuration.DebugLogging() && (stageStall || totalUs>8000)
+							    && now-s_lastAswLatencyLog>std::chrono::seconds(1)) {
+								s_lastAswLatencyLog = now;
+								OOVR_LOGF("DAPA CPU LATENCY: wait=%lldus warpDispatch=%lldus swapchainCopy=%lldus end=%lldus total=%lldus result=%d realEnd=%.2fms captureBusy=%d recording=%d (CPU call times, not GPU execution or encoder latency)",
+								    (long long)waitUs, (long long)warpUs, (long long)submitUs,
+								    (long long)endUs, (long long)totalUs, (int)endRes,measuredEndFrameMs,
+								    int(g_aswProvider->CaptureBusy()),int(g_aswProvider->CaptureRecording()));
+								OOVR_LOGF("DAPA FRAME TIMING: realPeriod=%.3fms syntheticPeriod=%.3fms baseline=%.3fms targetStep=%.3fms sinceRealEnd=%.3fms begin=%.3fms locate=%.3fms layerBuild=%.3fms",
+								    predictedDisplayPeriodMs, double(aswState.predictedDisplayPeriod) * 1e-6, dapaTimingPeriodMs,
+								    double(aswState.predictedDisplayTime - info.displayTime) * 1e-6,
+								    std::chrono::duration<double, std::milli>(tEndStart - realEndDone).count(),
+								    std::chrono::duration<double, std::milli>(tBeginDone - t1).count(),
+								    std::chrono::duration<double, std::milli>(tLocateDone - tBeginDone).count(),
+								    std::chrono::duration<double, std::milli>(tEndStart - tSubmitDone).count());
+							}
+
+							const float endMs = (float)endUs / 1000.0f;
+							dapaStats.endMs += endMs;
+							dapaStats.maxEndMs = std::max(dapaStats.maxEndMs, (double)endMs);
+							if (DapaTiming::Accepted(endRes)) {
+								++dapaStats.synthetic;
+								observePacing(waitMs, endMs);
+								// A cooldown cannot count as successful injection time.
+								recovery.CleanInjection(std::min(recoveryElapsedMs, 2.0 * dapaTimingPeriodMs));
+							} else aswTrouble("synthetic xrEndFrame error/status", endMs);
+						}
+					} else {
+						aswTrouble("warp output unavailable", std::chrono::duration<float, std::milli>(tSubmitDone - tWarpDone).count());
+						// Warp failed — submit empty frame to keep runtime in sync
+						XrFrameEndInfo aswEndInfo{ XR_TYPE_FRAME_END_INFO };
+						aswEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+						aswEndInfo.displayTime = aswState.predictedDisplayTime;
+						aswEndInfo.layers = nullptr;
+						aswEndInfo.layerCount = 0;
+						const auto emptyEndStart = DapaTiming::Clock::now();
+						const XrResult emptyResult = xrEndFrame(xr_session.get(), &aswEndInfo);
+						const float emptyEndMs = std::chrono::duration<float, std::milli>(DapaTiming::Clock::now() - emptyEndStart).count();
+						dapaStats.endMs += emptyEndMs;
+						dapaStats.maxEndMs = std::max(dapaStats.maxEndMs, double(emptyEndMs));
+						++dapaStats.empty;
+						if (!DapaTiming::Accepted(emptyResult))
+							OOVR_LOGF("DAPA: failed warp cleanup xrEndFrame result=%d duration=%.2fms (already in error recovery)", int(emptyResult), emptyEndMs);
+					}
+				} else aswTrouble("xrBeginFrame error", 0);
+			} else {
+				aswTrouble("xrWaitFrame error", waitMs);
+				static int s = 0;
+				if (s++ < 3)
+					OOVR_LOGF("ASW: xrWaitFrame for warped slot failed result=%d", (int)res);
+				break; // wait failed — don't try further slots this frame
+			}
+			} // end per-frame injection loop
+			aswCtx->Release(); // GetImmediateContext adds a ref
+		}
+	}
+asw_done:
+	// API-error recovery stops cache work; short pacing yields preserve history.
+	if (g_aswProvider && recovery.backoffMs > 0)
+		g_aswProvider->SetInjectionWanted(false);
+	{
+		const auto now = std::chrono::steady_clock::now();
+		const double seconds = std::chrono::duration<double>(now - statsStart).count();
+		if (seconds >= 5.0) {
+			if (oovr_global_configuration.ASWEnabled() && oovr_global_configuration.DebugLogging()) {
+				const char* state = !sessionActive ? "inactive" : !runtimeAllowsSynthetic ? "runtime-not-rendering"
+				    : !g_aswProvider ? "no-provider"
+				    : !g_aswProvider->IsReady() ? "not-ready" : g_aswProvider->IsPaused() ? "paused"
+				    : recovery.backoffMs > 0 ? "error-backoff" : pacing.backoffMs > 0 ? "pacing-yield"
+				    : !s_aswEngaged ? "auto-native" : !canInject ? "waiting-clean-real-frame"
+				    : !g_aswProvider->HasCachedFrame() ? "waiting-cache"
+				    : dapaStats.synthetic == 0 && dapaStats.syntheticHidden > 0 ? "runtime-declined-synthetic" : "injecting";
+				OOVR_LOGF("DAPA STATUS: %s runtime=%.2fHz period=%.3fms window=%.2fs realAccepted=%.1f/s syntheticAccepted=%.1f/s attempts=%llu errors=%llu empty=%llu held=%llu errorHold=%.0fms pacingHold=%.0fms waitCpuTotal=%.1fms endCpuTotal=%.1fms maxEndCpu=%.1fms (submitted, NOT presented FPS)",
+				    state, 1000.0 / DapaTiming::PeriodMs(predictedDisplayPeriodMs), predictedDisplayPeriodMs, seconds,
+				    dapaStats.real / seconds, dapaStats.synthetic / seconds,
+				    (unsigned long long)dapaStats.attempts, (unsigned long long)dapaStats.errors,
+				    (unsigned long long)dapaStats.empty, (unsigned long long)dapaStats.held,
+				    recovery.backoffMs, pacing.backoffMs, dapaStats.waitMs, dapaStats.endMs, dapaStats.maxEndMs);
+				OOVR_LOGF("DAPA TIMING POLICY: baseline=%.3fms (fastest observed this session, not panel Hz) pacingMax=25ms/one real frame captureCompiled=%d",
+				    dapaTimingPeriodMs, int(DapaCaptureControl::Enabled));
+				const double samples = double(std::max<uint64_t>(1, dapaStats.samples));
+				OOVR_LOGF("DAPA REAL TIMING: appToSubmit=%.2f/%.2fms realWait=%.2f/%.2fms realEnd=%.2f/%.2fms interval=%.2f/%.2fms (mean/max CPU wall times; appToSubmit includes game work and eye copies, NOT GPU timings) realNoRender=%llu syntheticNoRender=%llu sessionState=%d",
+				    dapaStats.appMs / samples, dapaStats.maxAppMs,
+				    dapaStats.realWaitMs / samples, dapaStats.maxRealWaitMs,
+				    dapaStats.realEndMs / samples, dapaStats.maxRealEndMs,
+				    dapaStats.intervalMs / samples, dapaStats.maxIntervalMs,
+				    (unsigned long long)dapaStats.runtimeHidden, (unsigned long long)dapaStats.syntheticHidden,
+				    int(sessionState));
+			}
+			dapaStats = {};
+			statsStart = now;
+		}
+	}
+#endif
+
+	BaseSystem* sys = GetUnsafeBaseSystem();
+	if (sys) {
+		sys->_OnPostFrame();
+	}
+
+	auto now = std::chrono::system_clock::now().time_since_epoch();
+	frameSubmitTimeUs = (double)std::chrono::duration_cast<std::chrono::microseconds>(now).count() / 1000000.0;
+
+	nFrameIndex++;
+
+	// Release pose latch so next frame gets fresh xrLocateViews data
+	xr_gbl->viewsLatched = false;
+	xr_gbl->viewSpaceViewsLatched = false;
+}
+
+IBackend::openvr_enum_t XrBackend::SetSkyboxOverride(const vr::Texture_t* pTextures, uint32_t unTextureCount)
+{
+	// Needed for rFactor2 loading screens
+	if (unTextureCount && pTextures) {
+		CheckOrInitCompositors(pTextures);
+
+		if (!sessionActive || !usingApplicationGraphicsAPI)
+			return 0;
+
+		// Make sure any unfinished frames don't call xrEndFrame after this call
+		renderingFrame = false;
+
+		XrFrameWaitInfo waitInfo{ XR_TYPE_FRAME_WAIT_INFO };
+		XrFrameState state{ XR_TYPE_FRAME_STATE };
+
+		OOVR_FAILED_XR_ABORT(xrWaitFrame(xr_session.get(), &waitInfo, &state));
+		xr_gbl->nextPredictedFrameTime = state.predictedDisplayTime;
+
+		// This submits a frame when a skybox override is set. This is designed around rFactor2 where the skybox is used as
+		// a loading screen and is frequently updated, and most other games probably behave in a similar manner. It'd be
+		// ideal to run a separate thread while the skybox override is set to submit frames if IVRCompositor->Submit is not
+		// being called frequently enough, and that'd need to be carefully synchronised with the main submit thread. That's
+		// not yet implemented since it's not currently worth the hassle, but if someone in the future wants to do it:
+		// TODO submit skybox frames in their own thread.
+		XrFrameBeginInfo beginInfo{ XR_TYPE_FRAME_BEGIN_INFO };
+		OOVR_FAILED_XR_ABORT(xrBeginFrame(xr_session.get(), &beginInfo));
+
+		static std::unique_ptr<Compositor> compositor = nullptr;
+
+		if (compositor == nullptr)
+			compositor.reset(BaseCompositor::CreateCompositorAPI(pTextures));
+
+		vr::VRTextureBounds_t bounds;
+		bounds.uMin = 0.0;
+		bounds.uMax = 1.0;
+		bounds.vMin = 1.0;
+		bounds.vMax = 0.0;
+
+		compositor->Invoke(pTextures, &bounds);
+		XrCompositionLayerQuad layerQuad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+		layerQuad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+		layerQuad.next = NULL;
+		layerQuad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+		layerQuad.space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+		layerQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+		layerQuad.pose = { { 0.f, 0.f, 0.f, 1.f },
+			{ 0.0f, 0.0f, -0.65f } };
+		layerQuad.size = { 1.0f, 1.0f / 1.333f };
+		layerQuad.subImage = {
+			compositor->GetSwapChain(),
+			{ { 0, 0 },
+			    { (int32_t)compositor->GetSrcSize().width,
+			        (int32_t)compositor->GetSrcSize().height } },
+			0
+		};
+
+		XrCompositionLayerBaseHeader* layers[1];
+		layers[0] = (XrCompositionLayerBaseHeader*)&layerQuad;
+		XrFrameEndInfo info{ XR_TYPE_FRAME_END_INFO };
+		info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		info.displayTime = xr_gbl->nextPredictedFrameTime;
+		info.layers = layers;
+		info.layerCount = 1;
+
+		OOVR_FAILED_XR_SOFT_ABORT(xrEndFrame(xr_session.get(), &info));
+
+	} else {
+		OOVR_SOFT_ABORT("Unsupported texture count");
+	}
+
+	return 0;
+}
+
+void XrBackend::ClearSkyboxOverride()
+{
+	OOVR_SOFT_ABORT("No implementation");
+}
+
+/* Misc compositor */
+
+/**
+ * Get frame timing information to be passed to the application
+ *
+ * Returns true if successful
+ */
+bool XrBackend::GetFrameTiming(OOVR_Compositor_FrameTiming* pTiming, uint32_t unFramesAgo)
+{
+	// Zero everything except the size field
+	memset(reinterpret_cast<unsigned char*>(pTiming) + sizeof(pTiming->m_nSize), 0, pTiming->m_nSize - sizeof(pTiming->m_nSize));
+
+	if (pTiming->m_nSize >= sizeof(IVRCompositor_018::Compositor_FrameTiming)) {
+		pTiming->m_flSystemTimeInSeconds = frameSubmitTimeUs;
+		pTiming->m_nFrameIndex = nFrameIndex;
+
+		pTiming->m_nNumFramePresents = 1;
+		pTiming->m_nNumMisPresented = 0;
+
+		// --- OVR perf hook: real compositor data when available ---
+		OVRPerfData ovrPerf = GetOVRPerfData();
+
+		if (ovrPerf.available && ovrPerf.aswActive) {
+			pTiming->m_nReprojectionFlags = VRCompositor_ReprojectionAsync;
+		} else {
+			pTiming->m_nReprojectionFlags = 0;
+		}
+
+		pTiming->m_nNumDroppedFrames = ovrPerf.available
+		    ? (ovrPerf.appDroppedFrames + ovrPerf.compositorDroppedFrames)
+		    : 0;
+
+		// --- GPU timing ---
+		float displayPeriod = predictedDisplayPeriodMs > 0.0f ? predictedDisplayPeriodMs : 11.1f;
+
+		if (ovrPerf.available && ovrPerf.appGpuMs > 0.0f) {
+			// Real app GPU time from OVR compositor
+			pTiming->m_flPreSubmitGpuMs = ovrPerf.appGpuMs;
+			pTiming->m_flPostSubmitGpuMs = measuredEndFrameMs;
+			pTiming->m_flTotalRenderGpuMs = ovrPerf.appGpuMs + measuredEndFrameMs;
+		} else {
+			pTiming->m_flPreSubmitGpuMs = displayPeriod * 0.7f;
+			pTiming->m_flPostSubmitGpuMs = displayPeriod * 0.1f;
+			pTiming->m_flTotalRenderGpuMs = displayPeriod * 0.8f;
+		}
+
+		// --- Compositor timing ---
+		if (ovrPerf.available && ovrPerf.compositorGpuMs > 0.0f) {
+			// Real compositor timing from OVR hook
+			pTiming->m_flCompositorRenderGpuMs = ovrPerf.compositorGpuMs;
+			pTiming->m_flCompositorRenderCpuMs = ovrPerf.compositorCpuMs;
+		} else {
+			// Fallback: residual estimate
+			pTiming->m_flCompositorRenderGpuMs = compositorOverheadMs > 0.0f ? compositorOverheadMs : displayPeriod * 0.1f;
+			pTiming->m_flCompositorRenderCpuMs = measuredEndFrameMs > 0.0f ? measuredEndFrameMs : displayPeriod * 0.05f;
+		}
+
+		pTiming->m_flCompositorIdleCpuMs = measuredWaitFrameMs > 0.0f ? measuredWaitFrameMs : 0.1f;
+
+		// --- Measured intervals ---
+		// Frame interval: prefer measured, fall back to runtime's display period
+		pTiming->m_flClientFrameIntervalMs = measuredFrameIntervalMs > 0.0f ? measuredFrameIntervalMs : displayPeriod;
+		pTiming->m_flPresentCallCpuMs = measuredEndFrameMs;
+		pTiming->m_flWaitForPresentCpuMs = measuredWaitFrameMs;
+		pTiming->m_flSubmitFrameMs = measuredCpuFrameMs > 0.0f ? measuredCpuFrameMs : 0.0f;
+
+		// --- Relative timestamps (ms offsets from frame reference point) ---
+		// Reference point: waitFrameStart (beginning of the frame cycle).
+		// Convert QPC deltas to milliseconds relative to that reference.
+		float qpcToMs = (qpcInitialized && qpcFrequency.QuadPart > 0)
+		    ? (1000.0f / (float)qpcFrequency.QuadPart)
+		    : 0.0f;
+
+		if (qpcToMs > 0.0f && waitFrameStart.QuadPart > 0) {
+			// WaitGetPoses was called at the frame reference point (offset = 0)
+			pTiming->m_flWaitGetPosesCalledMs = 0.0f;
+
+			// Poses became ready when xrWaitFrame returned
+			pTiming->m_flNewPosesReadyMs = (float)(waitFrameEnd.QuadPart - waitFrameStart.QuadPart) * qpcToMs;
+
+			// New frame ready = when Submit/xrEndFrame completed
+			if (endFrameEnd.QuadPart > 0) {
+				pTiming->m_flNewFrameReadyMs = (float)(endFrameEnd.QuadPart - waitFrameStart.QuadPart) * qpcToMs;
+			}
+
+			// Compositor update start = when xrEndFrame was called
+			if (endFrameStart.QuadPart > 0) {
+				pTiming->m_flCompositorUpdateStartMs = (float)(endFrameStart.QuadPart - waitFrameStart.QuadPart) * qpcToMs;
+			}
+
+			// Compositor update end = when xrEndFrame returned
+			if (endFrameEnd.QuadPart > 0) {
+				pTiming->m_flCompositorUpdateEndMs = (float)(endFrameEnd.QuadPart - waitFrameStart.QuadPart) * qpcToMs;
+			}
+
+			// Compositor render start = when xrBeginFrame was called (deferred)
+			if (beginFrameQpc.QuadPart > 0) {
+				pTiming->m_flCompositorRenderStartMs = (float)(beginFrameQpc.QuadPart - waitFrameStart.QuadPart) * qpcToMs;
+			}
+		}
+
+		GetPrimaryHMD()->GetPose(vr::ETrackingUniverseOrigin::TrackingUniverseSeated, &pTiming->m_HmdPose, ETrackingStateType::TrackingStateType_Rendering);
+
+		return true;
+	}
+
+	return false;
+}
+
+/* D3D Mirror textures */
+/* #if defined(SUPPORT_DX) */
+IBackend::openvr_enum_t XrBackend::GetMirrorTextureD3D11(vr::EVREye eEye, void* pD3D11DeviceOrResource, void** ppD3D11ShaderResourceView)
+{
+	OOVR_SOFT_ABORT("No implementation");
+	return 0;
+}
+void XrBackend::ReleaseMirrorTextureD3D11(void* pD3D11ShaderResourceView)
+{
+	OOVR_SOFT_ABORT("No implementation");
+}
+/* #endif */
+/** Returns the points of the Play Area. */
+bool XrBackend::GetPlayAreaPoints(vr::HmdVector3_t* points, int* count)
+{
+	if (count)
+		*count = 0;
+
+	XrExtent2Df bounds;
+	XrResult res = xrGetReferenceSpaceBoundsRect(xr_session.get(), XR_REFERENCE_SPACE_TYPE_STAGE, &bounds);
+
+	if (res == XR_SPACE_BOUNDS_UNAVAILABLE)
+		return false;
+
+	OOVR_FAILED_XR_ABORT(res);
+
+	if (count)
+		*count = 4;
+
+	// The origin of the free space is centred around the player
+	// TODO if we're using the Oculus runtime, grab it's native handle and get the full polygon
+	if (points) {
+		points[0] = vr::HmdVector3_t{ -bounds.width / 2, 0, -bounds.height / 2 };
+		points[1] = vr::HmdVector3_t{ bounds.width / 2, 0, -bounds.height / 2 };
+		points[2] = vr::HmdVector3_t{ bounds.width / 2, 0, bounds.height / 2 };
+		points[3] = vr::HmdVector3_t{ -bounds.width / 2, 0, bounds.height / 2 };
+	}
+
+	return true;
+}
+/** Determine whether the bounds are showing right now **/
+bool XrBackend::AreBoundsVisible()
+{
+	OOVR_SOFT_ABORT("No implementation");
+	return false;
+}
+/** Set the boundaries to be visible or not (although setting this to false shouldn't affect
+ * what happens if the player moves their hands too close and shows it that way) **/
+void XrBackend::ForceBoundsVisible(bool status)
+{
+	OOVR_SOFT_ABORT("No implementation");
+}
+
+bool XrBackend::IsInputAvailable()
+{
+	if (sessionState == XR_SESSION_STATE_FOCUSED) return true;
+	// Bridge recovery can begin a real session without receiving its state events.
+	// Use fresh successful action sync as proof, not a guessed FOCUSED state.
+	const auto* input = GetUnsafeBaseInput();
+	return sessionActive && OcuInputSession::CanQueryProfiles(sessionState, sessionActive)
+	    && input && input->HasFocusedActionSync(xr_session.get());
+}
+
+void XrBackend::PumpEvents()
+{
+	if (oovr_global_configuration.TreadmillEnabled()) {
+		if (!treadmillAttempted) {
+			treadmillAttempted = true;
+			OscLocomotion::Instance().Start(oovr_global_configuration.TreadmillPort(),
+			    oovr_global_configuration.TreadmillFullSpeed());
+		}
+	}
+	BaseInput* input = GetUnsafeBaseInput();
+
+	// Build raw HTCX role readers after actions are attached. These never become
+	// public devices themselves: the publication pass below gives each physical
+	// pose exactly one stable identity and keeps OCU-NET1/2/3 compatible with
+	// existing SkyrimVR-FBT serial pins in both physical and camera modes.
+	const bool trackerInputsReady = input && IsInputAvailable() && input->AreActionsLoaded()
+	    && input->AreActionsAttachedToSession(xr_session.get());
+	if (trackerInputsReady && bodyTrackerDiscovery.Claim(input->GetTrackerSpaceGeneration())) {
+		if (xr_htcxViveTrackers && oovr_global_configuration.BodyTrackersEnabled()) {
+			const auto previousSources = htcxTrackerSources.size();
+			for (int i = 0; i < OCU_TRACKER_ROLE_COUNT; i++) {
+				XrSpace space = XR_NULL_HANDLE;
+				input->GetTrackerSpace(i, space);
+				if (space == XR_NULL_HANDLE)
+					continue;
+				const bool known = std::any_of(htcxTrackerSources.begin(), htcxTrackerSources.end(),
+				    [i](const auto& source) { return source->GetRoleIndex() == i; });
+				if (known)
+					continue;
+
+				htcxTrackerSources.push_back(std::make_unique<XrGenericTracker>(i));
+			}
+			if (htcxTrackerSources.size() != previousSources) {
+				networkTrackersAttempted = false;
+				OOVR_LOGF("Body trackers: discovered %d private HTCX role sources",
+				    (int)htcxTrackerSources.size());
+			}
+		}
+	}
+
+	// Publish one device per pose source. OCU-NET1/2/3 are the canonical waist,
+	// left-foot and right-foot identities even when OSC is disabled, preserving
+	// existing FBT calibration pins. With OSC active, the remaining camera slots
+	// also mux matching HTCX chest/knee/elbow roles. Physical roles without a
+	// network slot retain their native OCU-* identity. No pose is exposed twice.
+	if (trackerInputsReady && !networkTrackersAttempted) {
+		networkTrackersAttempted = true;
+		const bool wantOsc = oovr_global_configuration.NetworkTrackersEnabled();
+		bool oscReady = false;
+		const int port = oovr_global_configuration.NetworkTrackerPort();
+		if (wantOsc)
+			oscReady = NetworkTrackerReceiver::Instance().Start(port);
+
+		// OSC slots: waist, feet, knees, elbows, chest. HTCX uses a different
+		// role ordering, so keep the relationship explicit and reviewable.
+		static constexpr int htcxRoleForNetworkSlot[NetworkTrackerReceiver::MAX_TRACKERS] = {
+			0, 1, 2, 4, 5, 6, 7, 3
+		};
+		auto findHtcxRole = [&](int role) -> XrGenericTracker* {
+			for (auto& tracker : htcxTrackerSources) {
+				if (tracker->GetRoleIndex() == role)
+					return tracker.get();
+			}
+			return nullptr;
+		};
+
+		const bool hasCanonicalHtcx = findHtcxRole(0) || findHtcxRole(1) || findHtcxRole(2);
+		const int trackerCount = std::max(static_cast<int>(networkTrackers.size()),
+		    oscReady ? NetworkTrackerReceiver::MAX_TRACKERS : (hasCanonicalHtcx ? 3 : 0));
+		auto roleUsesNetworkIdentity = [&](int role) {
+			for (int slot = 0; slot < trackerCount; slot++) {
+				if (htcxRoleForNetworkSlot[slot] == role)
+					return true;
+			}
+			return false;
+		};
+
+		// Allocate only missing identities. Existing devices keep their assigned
+		// indices when a new action set recovers previously rejected HTCX roles.
+		vr::TrackedDeviceIndex_t nextIndex = 3 + static_cast<vr::TrackedDeviceIndex_t>(
+		    bodyTrackers.size() + networkTrackers.size());
+		auto hasPublicNativeRole = [&](int role) {
+			return std::any_of(bodyTrackers.begin(), bodyTrackers.end(),
+			    [role](const auto& tracker) { return tracker->GetRoleIndex() == role; });
+		};
+		for (auto& source : htcxTrackerSources) {
+			const int role = source->GetRoleIndex();
+			if (roleUsesNetworkIdentity(role) || hasPublicNativeRole(role))
+				continue;
+			bodyTrackers.push_back(std::make_unique<XrGenericTracker>(role, nextIndex));
+			input->RegisterBodyTrackerDevice(nextIndex, role);
+			OOVR_LOGF("Body trackers: device %u = %s (%s)", nextIndex,
+			    OCU_TRACKER_ROLES[role].iniName, OCU_TRACKER_ROLES[role].serial);
+			nextIndex++;
+		}
+
+		if (trackerCount > 0) {
+			for (int i = 0; i < trackerCount; i++) {
+				const int htcxRole = htcxRoleForNetworkSlot[i];
+				ITrackedDevice* htcxRoleSource = hasPublicNativeRole(htcxRole) ? nullptr : findHtcxRole(htcxRole);
+				if (i < static_cast<int>(networkTrackers.size()))
+					networkTrackers[i]->SetHtcxRoleSource(htcxRoleSource);
+				else
+					networkTrackers.push_back(std::make_unique<XrNetworkTracker>(i, nextIndex++, htcxRoleSource));
+				if (htcxRoleSource)
+					input->RegisterBodyTrackerDevice(networkTrackers[i]->DeviceIndex(), htcxRole);
+			}
+			const auto networkFirstIndex = networkTrackers.front()->DeviceIndex();
+			const auto networkLastIndex = networkTrackers.back()->DeviceIndex();
+			if (oscReady) {
+				OOVR_LOGF("Network trackers: listening on UDP %d, exposing %d fused trackers (devices %u-%u)",
+				    port, trackerCount, (unsigned)networkFirstIndex, (unsigned)networkLastIndex);
+			} else {
+				OOVR_LOGF("Body trackers: OSC disabled/unavailable; exposing canonical HTCX-backed OCU-NET1-3 (devices %u-%u)",
+				    (unsigned)networkFirstIndex, (unsigned)networkLastIndex);
+			}
+		} else if (wantOsc && !oscReady) {
+			OOVR_LOGF("Network trackers: could not open UDP port %d and no HTCX roles are available", port);
+		}
+	}
+
+	// Keep the sender->playspace alignment fresh. The HMD/head pair owns root
+	// translation; controller/wrist samples remain available for diagnostics
+	// but must not drag the lower body around while the arms swing.
+	if (!networkTrackers.empty() && hmd) {
+		vr::TrackedDevicePose_t hp;
+		hmd->GetPose(vr::TrackingUniverseStanding, &hp, ETrackingStateType::TrackingStateType_Now);
+		if (hp.bPoseIsValid) {
+			float p[3] = {
+				hp.mDeviceToAbsoluteTracking.m[0][3],
+				hp.mDeviceToAbsoluteTracking.m[1][3],
+				hp.mDeviceToAbsoluteTracking.m[2][3],
+			};
+			float forward[2] = {
+				-hp.mDeviceToAbsoluteTracking.m[0][2],
+				-hp.mDeviceToAbsoluteTracking.m[2][2],
+			};
+			float lp[3], rp[3];
+			float* lPtr = nullptr;
+			float* rPtr = nullptr;
+			vr::TrackedDevicePose_t cp;
+			if (hand_left) {
+				hand_left->GetPose(vr::TrackingUniverseStanding, &cp, ETrackingStateType::TrackingStateType_Now);
+				if (cp.bPoseIsValid) {
+					lp[0] = cp.mDeviceToAbsoluteTracking.m[0][3];
+					lp[1] = cp.mDeviceToAbsoluteTracking.m[1][3];
+					lp[2] = cp.mDeviceToAbsoluteTracking.m[2][3];
+					lPtr = lp;
+				}
+			}
+			if (hand_right) {
+				hand_right->GetPose(vr::TrackingUniverseStanding, &cp, ETrackingStateType::TrackingStateType_Now);
+				if (cp.bPoseIsValid) {
+					rp[0] = cp.mDeviceToAbsoluteTracking.m[0][3];
+					rp[1] = cp.mDeviceToAbsoluteTracking.m[1][3];
+					rp[2] = cp.mDeviceToAbsoluteTracking.m[2][3];
+					rPtr = rp;
+				}
+			}
+			NetworkTrackerReceiver::Instance().UpdateAlignment(p, forward, lPtr, rPtr);
+		}
+	}
+
+	// Walk-in-place locomotion: feed the detector with foot/waist/HMD poses
+	// from whichever tracker source currently has them (network or HTCX).
+	if (oovr_global_configuration.WalkInPlaceEnabled() && hmd && input
+	    && (!networkTrackers.empty() || !bodyTrackers.empty())) {
+		auto poseOf = [](ITrackedDevice* d, float o[3]) {
+			if (!d)
+				return false;
+			vr::TrackedDevicePose_t tp;
+			d->GetPose(vr::TrackingUniverseStanding, &tp, ETrackingStateType::TrackingStateType_Now);
+			if (!tp.bPoseIsValid)
+				return false;
+			o[0] = tp.mDeviceToAbsoluteTracking.m[0][3];
+			o[1] = tp.mDeviceToAbsoluteTracking.m[1][3];
+			o[2] = tp.mDeviceToAbsoluteTracking.m[2][3];
+			return true;
+		};
+		auto controllerSteerPoseOf = [&](ITrackedDevice::HandType hand, float controllerHead[2],
+		    float palmFront[2], float& controllerY) {
+			XrSpace aimSpace = XR_NULL_HANDLE;
+			XrSpace gripSpace = XR_NULL_HANDLE;
+			input->GetHandSpace(hand, aimSpace, true);
+			input->GetHandSpace(hand, gripSpace, false);
+			if (aimSpace == XR_NULL_HANDLE || gripSpace == XR_NULL_HANDLE)
+				return false;
+			vr::TrackedDevicePose_t aimPose{};
+			vr::TrackedDevicePose_t gripPose{};
+			// OpenXR standardizes the aim pose's local -Z as the controller's
+			// pointing ray. That is the physical controller-head direction the
+			// steering gesture asks the user to point outward. Grip +Y is merely
+			// orthogonal to the palm axes and is not the controller head; using it
+			// made Meta Touch outward tilts score negative forever.
+			xr_utils::PoseFromSpace(&aimPose, aimSpace, vr::TrackingUniverseStanding);
+			xr_utils::PoseFromSpace(&gripPose, gripSpace, vr::TrackingUniverseStanding);
+			if (!aimPose.bPoseIsValid || !gripPose.bPoseIsValid)
+				return false;
+			controllerY = gripPose.mDeviceToAbsoluteTracking.m[1][3];
+			controllerHead[0] = -aimPose.mDeviceToAbsoluteTracking.m[0][2];
+			controllerHead[1] = -aimPose.mDeviceToAbsoluteTracking.m[2][2];
+			// OpenXR grip +X is away from the left palm but into the right palm.
+			// Mirror the right axis so both vectors point out through the palm.
+			float palmSign = hand == ITrackedDevice::HAND_LEFT ? 1.0f : -1.0f;
+			palmFront[0] = palmSign * gripPose.mDeviceToAbsoluteTracking.m[0][0];
+			palmFront[1] = palmSign * gripPose.mDeviceToAbsoluteTracking.m[2][0];
+			return true;
+		};
+
+		// Feet: network slots (1=left ankle, 2=right ankle), falling back to
+		// HTCX roles (1=left foot, 2=right foot).
+		XrNetworkTracker* nLFoot = networkTrackers.size() > 1 ? networkTrackers[1].get() : nullptr;
+		XrNetworkTracker* nRFoot = networkTrackers.size() > 2 ? networkTrackers[2].get() : nullptr;
+		ITrackedDevice* nLKnee = networkTrackers.size() > 3 ? networkTrackers[3].get() : nullptr;
+		ITrackedDevice* nRKnee = networkTrackers.size() > 4 ? networkTrackers[4].get() : nullptr;
+		ITrackedDevice* hLFoot = nullptr;
+		ITrackedDevice* hRFoot = nullptr;
+		for (auto& bt : htcxTrackerSources) {
+			switch (bt->GetRoleIndex()) {
+			case 1: hLFoot = bt.get(); break;
+			case 2: hRFoot = bt.get(); break;
+			}
+		}
+
+		float lPos[3] = {}, rPos[3] = {}, lkPos[3] = {}, rkPos[3] = {};
+		float hLPos[3] = {}, hRPos[3] = {};
+		float lcHead[2] = {}, rcHead[2] = {};
+		float lcPalm[2] = {}, rcPalm[2] = {};
+		float lcY = 0.0f, rcY = 0.0f;
+		auto networkFootPoseOf = [](XrNetworkTracker* d, float o[3]) {
+			if (!d)
+				return false;
+			vr::TrackedDevicePose_t tp;
+			d->GetPoseForLocomotion(vr::TrackingUniverseStanding, &tp, ETrackingStateType::TrackingStateType_Now);
+			if (!tp.bPoseIsValid)
+				return false;
+			o[0] = tp.mDeviceToAbsoluteTracking.m[0][3];
+			o[1] = tp.mDeviceToAbsoluteTracking.m[1][3];
+			o[2] = tp.mDeviceToAbsoluteTracking.m[2][3];
+			return true;
+		};
+		// True HTCX feet are precise 6DoF inputs, so prefer them. Camera OSC
+		// remains the automatic fallback and continues supplying knees/arms.
+		bool hLV = poseOf(hLFoot, hLPos);
+		bool hRV = poseOf(hRFoot, hRPos);
+		bool lV = hLV;
+		bool rV = hRV;
+		if (hLV)
+			std::copy(hLPos, hLPos + 3, lPos);
+		else
+			lV = networkFootPoseOf(nLFoot, lPos);
+		if (hRV)
+			std::copy(hRPos, hRPos + 3, rPos);
+		else
+			rV = networkFootPoseOf(nRFoot, rPos);
+		bool trustedHardwareFeet = hLV && hRV;
+		bool lkV = poseOf(nLKnee, lkPos);
+		bool rkV = poseOf(nRKnee, rkPos);
+		NetTrackerFrameSample activeTrackerFrame;
+		bool continuous3DGait = NetworkTrackerReceiver::Instance().GetTrackerFrame(
+		    activeTrackerFrame, 1500)
+		    && (activeTrackerFrame.flags & NetTrackerFrame_Continuous3D) != 0;
+		NetCameraLegSample cameraLegs[2] = {};
+		bool cameraLegV[2] = {
+			NetworkTrackerReceiver::Instance().GetCameraLeg(0, cameraLegs[0], 500),
+			NetworkTrackerReceiver::Instance().GetCameraLeg(1, cameraLegs[1], 500),
+		};
+		for (int side = 0; side < 2; ++side) {
+			cameraLegV[side] = cameraLegV[side]
+			    && (!activeTrackerFrame.everSeen
+			        || (cameraLegs[side].sourceEpoch == activeTrackerFrame.sourceEpoch
+			            && cameraLegs[side].frameGeneration == activeTrackerFrame.generation));
+			// Keep a coherent Invalid packet visible so WIP can time out a
+			// prior kick latch, but never promote a zero-confidence state into
+			// walking or action intent.
+			if (cameraLegV[side]
+			    && cameraLegs[side].state != NetCameraLegState::Invalid
+			    && cameraLegs[side].confidence < 0.08f)
+				cameraLegs[side].state = NetCameraLegState::Invalid;
+		}
+		// World3D geometry alone cannot distinguish a deliberate kick from a
+		// gait half-cycle. Its fresh semantic leg stream is therefore part of the
+		// camera gait contract. A complete HTCX/Vive foot pair remains its own
+		// trusted source and deliberately bypasses all camera-only arbitration.
+		bool cameraSemanticGait = continuous3DGait && !trustedHardwareFeet;
+
+		// Arm cadence comes from the same camera skeleton as feet/knees. The
+		// Configurator sends a shoulder+elbow+wrist phase plus both hand heights;
+		// Quest controller position is intentionally not part of the walking gate.
+		NetSkeletonArmsSample skeletonArms;
+		bool skeletonArmsV = NetworkTrackerReceiver::Instance().GetSkeletonArms(skeletonArms)
+		    && NetworkTrackerReceiver::NowMs() - skeletonArms.lastUpdateMs <= 1500
+		    && (!activeTrackerFrame.everSeen
+		        || (skeletonArms.sourceEpoch == activeTrackerFrame.sourceEpoch
+		            && skeletonArms.frameGeneration == activeTrackerFrame.generation));
+		float skeletonArmPhase = 0.0f;
+		float skeletonHandY[2] = {};
+		if (skeletonArmsV) {
+			float alignScale = NetworkTrackerReceiver::Instance().GetAlignmentScale();
+			float alignOffset[3] = {};
+			NetworkTrackerReceiver::Instance().GetAlignmentOffset(alignOffset);
+			skeletonArmPhase = skeletonArms.armPhase * alignScale;
+			skeletonHandY[0] = skeletonArms.handY[0] * alignScale + alignOffset[1];
+			skeletonHandY[1] = skeletonArms.handY[1] * alignScale + alignOffset[1];
+		}
+
+		// HMD direction plus controller ORIENTATION for the optional palm-turn
+		// gesture. Controller position no longer participates in walking cadence.
+		vr::TrackedDevicePose_t hp2;
+		hmd->GetPose(vr::TrackingUniverseStanding, &hp2, ETrackingStateType::TrackingStateType_Now);
+		bool hV = hp2.bPoseIsValid;
+		float hmdY = hV ? hp2.mDeviceToAbsoluteTracking.m[1][3] : 0.0f;
+		float hmdForwardX = hV ? -hp2.mDeviceToAbsoluteTracking.m[0][2] : 0.0f;
+		float hmdForwardZ = hV ? -hp2.mDeviceToAbsoluteTracking.m[2][2] : 0.0f;
+		bool lcV = controllerSteerPoseOf(ITrackedDevice::HAND_LEFT, lcHead, lcPalm, lcY);
+		bool rcV = controllerSteerPoseOf(ITrackedDevice::HAND_RIGHT, rcHead, rcPalm, rcY);
+		bool quickStartArmed = input->HasWalkInPlaceActivationButton() &&
+		    input->IsWalkInPlaceActivationHeld();
+
+		WalkInPlace::Instance().Update(lV, lV ? lPos[1] : 0, rV, rV ? rPos[1] : 0,
+		    lkV, lkPos[1], rkV, rkPos[1],
+		    hLV, hRV,
+		    cameraSemanticGait,
+		    cameraLegV[0], cameraLegs[0].state,
+		    cameraLegV[1], cameraLegs[1].state,
+		    hV, hmdY, hmdForwardX, hmdForwardZ,
+		    skeletonArmsV, skeletonArmPhase, skeletonHandY[0], skeletonHandY[1],
+		    lcV, lcHead[0], lcHead[1], lcPalm[0], lcPalm[1], lcY,
+		    rcV, rcHead[0], rcHead[1], rcPalm[0], rcPalm[1], rcY,
+		    quickStartArmed);
+	}
+	// Poll for OpenXR events
+	// Drain the queue before querying profiles. A profile change may precede a
+	// visibility/focus event, and old-session events must not affect its replacement.
+	while (true) {
+		XrEventDataBuffer ev = { XR_TYPE_EVENT_DATA_BUFFER };
+		XrResult res;
+		OOVR_FAILED_XR_ABORT(res = xrPollEvent(xr_instance, &ev));
+
+		if (res == XR_EVENT_UNAVAILABLE) {
+			break;
+		}
+
+		if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+			auto* changed = (XrEventDataSessionStateChanged*)&ev;
+			if (!OcuInputSession::Matches(xr_session.get(), changed->session)) {
+				if (oovr_debug_logging_enabled()) {
+					OOVR_LOG_LIMITEDF(1000, "[INPUT-TRACE] Ignored stale state event: eventSession=%p currentSession=%p state=%s",
+					    (void*)changed->session, (void*)xr_session.get(), OcuInputTrace::State(changed->state));
+				}
+				continue;
+			}
+			if (sessionState != changed->state
+			    && (changed->state == XR_SESSION_STATE_READY || changed->state == XR_SESSION_STATE_FOCUSED))
+				interactionProfileRetry.Request();
+			sessionState = changed->state;
+			if (oovr_global_configuration.TreadmillEnabled())
+				OcuLocomotionHeading::Instance().SetFocused(IsInputAvailable());
+
+			// Monado bug: it returns 0 for this value (at least for the first two states)
+			// Make sure this is actually greater than 0, otherwise this will mess up xr_gbl->GetBestTime()
+			if (changed->time > 0 && xr_gbl)
+				xr_gbl->latestTime = changed->time;
+
+			OOVR_LOGF("Switch to OpenXR state %d", sessionState);
+			OOVR_DEBUG_LOGF("[INPUT-TRACE] State session=%p state=%s eventTime=%lld attached=%d leftResolved=%d rightResolved=%d",
+			    (void*)xr_session.get(), OcuInputTrace::State(sessionState), (long long)changed->time,
+			    input && input->AreActionsAttachedToSession(xr_session.get()), !!hand_left, !!hand_right);
+
+			switch (sessionState) {
+			case XR_SESSION_STATE_READY: {
+				// A delayed READY can follow a successful bridge-startup recovery.
+				if (sessionActive) break;
+				OOVR_LOG("Hit ready state, begin session...");
+				// Start the session running - this means we're supposed to start submitting frames
+				XrSessionBeginInfo beginInfo{ XR_TYPE_SESSION_BEGIN_INFO };
+				beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+				OOVR_FAILED_XR_ABORT(xrBeginSession(xr_session.get(), &beginInfo));
+				sessionActive = true;
+				break;
+			}
+			case XR_SESSION_STATE_STOPPING: {
+				// End the session. The session is still valid and we can still query some information
+				// from it, but we're not allowed to submit frames anymore. This is done when the engagement
+				// sensor detects the user has taken off the headset, for example.
+				if (sessionActive)
+					OOVR_FAILED_XR_ABORT(xrEndSession(xr_session.get()));
+				sessionActive = false;
+				renderingFrame = false;
+				break;
+			}
+			case XR_SESSION_STATE_EXITING: {
+				OOVR_LOGF("Exiting");
+				break;
+			}
+			case XR_SESSION_STATE_LOSS_PENDING: {
+				// If the headset is unplugged or the user decides to exit the app
+				// TODO just kill the app after awhile, unless it sends a message to stop that - read the OpenVR wiki docs for more info
+				VREvent_t quit = { VREvent_Quit };
+				auto system = GetBaseSystem();
+				if (system)
+					system->_EnqueueEvent(quit);
+				break;
+			}
+			default:
+				// suppress clion warning about missing branches
+				break;
+			}
+		} else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+			const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&ev);
+#if defined(SUPPORT_DX11)
+			if (cableTrackingOverlay && changed->session == xr_session.get() &&
+			    changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL)
+				cableTrackingOverlay->ReferenceChange(changed->changeTime);
+#endif
+			if (oovr_global_configuration.TreadmillEnabled() && OcuInputSession::Matches(xr_session.get(), changed->session)) {
+				if (changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE) {
+					const auto q = changed->poseValid ? changed->poseInPreviousSpace.orientation : XrQuaternionf{};
+					const bool preserve = OcuLocomotionHeading::Instance().QueueStageChange(changed->changeTime,
+					    changed->poseValid != XR_FALSE, q.x, q.y, q.z, q.w);
+					OscLocomotion::Instance().SuspendHeading();
+					OOVR_LOG_LIMITEDF(1000, "Locomotion: STAGE recenter queued time=%lld poseValid=%d preserveHeading=%d",
+					    (long long)changed->changeTime, (int)changed->poseValid, preserve);
+				} else {
+					OOVR_LOG_LIMITEDF(1000, "Locomotion: reference change type=%d leaves STAGE heading unchanged",
+					    (int)changed->referenceSpaceType);
+				}
+			}
+		} else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+			const auto* changed = reinterpret_cast<const XrEventDataInteractionProfileChanged*>(&ev);
+			if (OcuInputSession::Matches(xr_session.get(), changed->session))
+				interactionProfileRetry.Request();
+			else if (oovr_debug_logging_enabled()) {
+				OOVR_LOG_LIMITEDF(1000, "[INPUT-TRACE] Ignored stale profile event: eventSession=%p currentSession=%p",
+				    (void*)changed->session, (void*)xr_session.get());
+			}
+		}
+
+	} // while loop
+	// Observe suppression even when Skyrim temporarily stops querying movement
+	// actions, so a menu or focus transition cannot replay a cached command.
+	if (input && oovr_global_configuration.TreadmillEnabled()) {
+		OcuLocomotionHeading::Instance().SetFocused(IsInputAvailable());
+		input->ReadExternalMovement(0, 0);
+	}
+
+	// xrGetCurrentInteractionProfile requires attached actions, NOT input focus.
+	// Resolve hands independently even if no change event arrives during startup
+	// or session recreation. xrSyncActions still enforces focus for actual input.
+	// Retry at most once/second when unresolved; events/wake request an immediate check.
+	const auto now = std::chrono::steady_clock::now();
+	if (input && interactionProfileRetry.Due(now, sessionState,
+	        input->AreActionsAttachedToSession(xr_session.get()), !!hand_left, !!hand_right, sessionActive)) {
+		interactionProfileRetry.Complete(now, UpdateInteractionProfile());
+	}
+	if (oovr_debug_logging_enabled()) {
+		const bool attached = input && input->AreActionsAttachedToSession(xr_session.get());
+		const bool running = OcuInputSession::CanQueryProfiles(sessionState, sessionActive);
+		const char* reason = !input ? "waiting-for-input-system" : !attached ? "waiting-for-current-session-attachment"
+		    : !running ? "waiting-for-running-session" : (!hand_left || !hand_right) ? "retrying-unresolved-profiles"
+		    : !IsInputAvailable() ? "profiles-resolved-waiting-for-runtime-focus" : "profiles-resolved-input-focused";
+		thread_local OcuInputTrace::ChangeGate recoveryTrace;
+		if (recoveryTrace.Allow(true, { OcuInputTrace::Handle(xr_session.get()), (uint64_t)sessionState,
+		        attached ? 1u : 0u, (hand_left ? 1u : 0u) | (hand_right ? 2u : 0u), input ? 1u : 0u }, OcuLogging::NowMs())) {
+			OOVR_LOGF("[INPUT-TRACE] Recovery v5 session=%p state=%s begun=%d attached=%d leftResolved=%d rightResolved=%d reason=%s",
+			    (void*)xr_session.get(), OcuInputTrace::State(sessionState), sessionActive, attached, !!hand_left, !!hand_right, reason);
+		}
+	}
+}
+
+void XrBackend::OnSessionCreated()
+{
+	OcuLocomotionHeading::Instance().Reset();
+	dapaPeriodBaseline = {};
+	dapaResetPending = true;
+	realFrameShouldRender = false;
+	predictedDisplayPeriodMs = 0.0f;
+	OOVR_DEBUG_LOGF("[INPUT-TRACE] Session created/reset session=%p graphics=%s",
+	    (void*)xr_session.get(), usingApplicationGraphicsAPI ? "application" : "temporary");
+	sessionState = XR_SESSION_STATE_UNKNOWN;
+	sessionActive = false;
+	renderingFrame = false;
+	interactionProfileRetry.Request();
+	interactionProfileStateReported[0] = false;
+	interactionProfileStateReported[1] = false;
+	lastReportedInteractionProfiles[0] = XR_NULL_PATH;
+	lastReportedInteractionProfiles[1] = XR_NULL_PATH;
+
+	PumpEvents();
+
+	// Bound missing IDLE/READY delivery, including IDLE followed by a lost READY.
+	// Normal runtimes begin through PumpEvents. No synthetic focus/pose state.
+	OcuInputSession::StartupWait startup(std::chrono::steady_clock::now());
+	while (startup.Waiting(std::chrono::steady_clock::now(), sessionState, sessionActive)) {
+		const int durationMs = 250;
+
+		OOVR_LOG_LIMITEDF(1000, "OpenXR startup: waiting for READY (state=%d)", sessionState);
+
+#ifdef _WIN32
+		Sleep(durationMs);
+#else
+		struct timespec ts = { 0, durationMs * 1000000 };
+		nanosleep(&ts, &ts);
+#endif
+
+		PumpEvents();
+	}
+	if (!sessionActive && (sessionState == XR_SESSION_STATE_UNKNOWN || sessionState == XR_SESSION_STATE_IDLE)) {
+		bool compatibilityPlatform = true;
+#ifdef _WIN32
+		const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+		compatibilityPlatform = ntdll && GetProcAddress(ntdll, "wine_get_version");
+#endif
+		XrInstanceProperties properties{ XR_TYPE_INSTANCE_PROPERTIES };
+		const bool compatible = xrGetInstanceProperties(xr_instance, &properties) == XR_SUCCESS &&
+		    OcuInputSession::NeedsBridgeStartupRecovery(compatibilityPlatform, properties.runtimeName);
+		if (startup.ClaimRecovery(std::chrono::steady_clock::now(), sessionState, sessionActive, compatible)) {
+			// The runtime may already be READY even though its bridge lost the event.
+			// Ask once; a rejection leaves the session inactive for ordinary events.
+			XrSessionBeginInfo beginInfo{ XR_TYPE_SESSION_BEGIN_INFO };
+			beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+			const auto result = xrBeginSession(xr_session.get(), &beginInfo);
+			sessionActive = result == XR_SUCCESS || result == XR_ERROR_SESSION_RUNNING;
+			OOVR_LOGF("OpenXR bridge startup recovery v1: runtime=%s session=%p result=%d active=%d; focus remains event-driven",
+			    properties.runtimeName, (void*)xr_session.get(), int(result), int(sessionActive));
+		}
+		if (!sessionActive)
+			OOVR_LOG("OpenXR startup wait expired; session inactive, continuing to poll for its READY event");
+	}
+
+	// OVR perf hook disabled: MinHook + mutex per-frame overhead causes micro stutter.
+	// if (InitOVRPerfHook()) {
+	// 	OOVR_LOG("OVR compositor timing hook active — real perf data available");
+	// }
+}
+
+void XrBackend::PrepareForSessionShutdown()
+{
+	OcuLocomotionHeading::Instance().Reset();
+	OscLocomotion::Instance().Invalidate();
+#if defined(SUPPORT_DX11)
+	foveationDebugOverlay.reset();
+	cableTrackingOverlay.reset();
+	ocu_cable::requests.exchange(0, std::memory_order_relaxed);
+#endif
+	// Body-tracker actions live in the instance-owned legacy action set, while
+	// their XrSpaces belong to this session. Destroy only the spaces here;
+	// published device objects and device->role haptic routing remain stable and
+	// will resolve the replacement spaces dynamically after the next bind.
+	if (BaseInput* input = GetUnsafeBaseInput())
+		input->PrepareForSessionShutdown();
+
+	for (std::unique_ptr<Compositor>& c : compositors) {
+		c.reset();
+	}
+	if (infoSet != XR_NULL_HANDLE) {
+		OOVR_FAILED_XR_ABORT(xrDestroyActionSet(infoSet));
+		infoSet = XR_NULL_HANDLE;
+		infoAction = XR_NULL_HANDLE;
+	}
+}
+
+// On Android, add an event poll function for use while sleeping
+#ifdef ANDROID
+void OpenComposite_Android_EventPoll()
+{
+	BackendManager::Instance().PumpEvents();
+}
+#endif
+
+bool XrBackend::IsGraphicsConfigured()
+{
+	return usingApplicationGraphicsAPI;
+}
+
+void XrBackend::OnOverlayTexture(const vr::Texture_t* texture)
+{
+	if (!usingApplicationGraphicsAPI)
+		CheckOrInitCompositors(texture);
+}
+
+bool XrBackend::UpdateInteractionProfile()
+{
+	struct hand_info {
+		const char* pathstr;
+		std::unique_ptr<XrController>& controller;
+		const XrController::XrControllerType hand;
+		const size_t index;
+	};
+
+	hand_info hands[] = {
+		{ .pathstr = "/user/hand/left", .controller = hand_left, .hand = XrController::XCT_LEFT, .index = 0 },
+		{ .pathstr = "/user/hand/right", .controller = hand_right, .hand = XrController::XCT_RIGHT, .index = 1 }
+	};
+	bool allHandsResolved = true;
+
+	auto deactivateController = [](hand_info& info) {
+		if (!info.controller)
+			return;
+		info.controller.reset();
+		if (BaseSystem* system = GetUnsafeBaseSystem()) {
+			VREvent_t event = {
+				.eventType = VREvent_TrackedDeviceDeactivated,
+				.trackedDeviceIndex = (TrackedDeviceIndex_t)info.hand + 1
+			};
+			system->_EnqueueEvent(event);
+		}
+	};
+
+	for (hand_info& info : hands) {
+		XrInteractionProfileState state{ XR_TYPE_INTERACTION_PROFILE_STATE };
+		XrPath path;
+		OOVR_FAILED_XR_ABORT(xrStringToPath(xr_instance, info.pathstr, &path));
+		const XrResult profileResult = xrGetCurrentInteractionProfile(xr_session.get(), path, &state);
+		if (oovr_debug_logging_enabled() || XR_FAILED(profileResult)) {
+			thread_local OcuInputTrace::ChangeGate profileTrace[2];
+			if (profileTrace[info.index].Allow(true, { OcuInputTrace::Handle(xr_session.get()), state.interactionProfile,
+			        OcuInputTrace::Code(profileResult), 0, 0 }, OcuLogging::NowMs())) {
+				OOVR_LOGF("[INPUT-TRACE] Profile session=%p hand=%s profilePathId=%llu result=%s(%d)",
+				    (void*)xr_session.get(), info.pathstr, (unsigned long long)state.interactionProfile,
+				    OcuInputTrace::Result(profileResult), (int)profileResult);
+			}
+		}
+		OOVR_FAILED_XR_ABORT(profileResult);
+
+		// Resolve each hand independently. Previously an already-created controller
+		// on one hand masked an unsupported/missing profile on the other hand, which
+		// left stale input until a later session or game launch happened to refresh it.
+		if (state.interactionProfile != XR_NULL_PATH) {
+			uint32_t tmp;
+			char path_name[XR_MAX_PATH_LENGTH];
+			OOVR_FAILED_XR_ABORT(xrPathToString(xr_instance, state.interactionProfile, XR_MAX_PATH_LENGTH, &tmp, path_name));
+
+			const InteractionProfile* matchedProfile = nullptr;
+			for (const std::unique_ptr<InteractionProfile>& profile : InteractionProfile::GetProfileList()) {
+				if (profile->GetPath() == path_name) {
+					matchedProfile = profile.get();
+					break;
+				}
+			}
+
+			if (!matchedProfile) {
+				allHandsResolved = false;
+				if (!interactionProfileStateReported[info.index]
+				    || lastReportedInteractionProfiles[info.index] != state.interactionProfile) {
+					OOVR_LOGF("%s - Unsupported interaction profile: %s. SteamVR must map this controller to an OpenXR profile supported by OCU.",
+					    info.pathstr, path_name);
+				}
+				deactivateController(info);
+				lastReportedInteractionProfiles[info.index] = state.interactionProfile;
+				interactionProfileStateReported[info.index] = true;
+				continue;
+			}
+
+			// SteamVR can temporarily report the generic Vive controller profile while
+			// a sleeping controller is disappearing or waking. Rebuilding an already
+			// valid Quest/Index/PSVR controller from that transient report changes its
+			// bindings and render model into Vive wands. Keep the last valid identity
+			// and retry until the runtime restores the real interaction profile.
+			const InteractionProfile* currentProfile =
+			    info.controller ? info.controller->GetInteractionProfile() : nullptr;
+			const bool temporaryViveFallback = currentProfile
+			    && currentProfile->GetPath() != "/interaction_profiles/htc/vive_controller"
+			    && matchedProfile->GetPath() == "/interaction_profiles/htc/vive_controller";
+			if (oovr_global_configuration.PreserveControllerProfileOnSleep() && temporaryViveFallback) {
+				allHandsResolved = false;
+				if (!interactionProfileStateReported[info.index]
+				    || lastReportedInteractionProfiles[info.index] != state.interactionProfile) {
+					OOVR_LOGF("%s - Ignoring temporary Vive interaction profile while the controller sleeps; preserving %s",
+					    info.pathstr, currentProfile->GetPath().c_str());
+				}
+				lastReportedInteractionProfiles[info.index] = state.interactionProfile;
+				interactionProfileStateReported[info.index] = true;
+				continue;
+			}
+
+			const bool profileChanged = !info.controller
+			    || info.controller->GetInteractionProfile() != matchedProfile;
+			if (profileChanged) {
+				OOVR_LOGF("%s - Using interaction profile: %s", info.pathstr, path_name);
+				info.controller = std::make_unique<XrController>(info.hand, *matchedProfile);
+				hmd->SetInteractionProfile(matchedProfile);
+				if (BaseSystem* system = GetUnsafeBaseSystem()) {
+					VREvent_t event = {
+						.eventType = VREvent_TrackedDeviceActivated,
+						.trackedDeviceIndex = (TrackedDeviceIndex_t)info.hand + 1
+					};
+					system->_EnqueueEvent(event);
+					event = {
+						.eventType = VREvent_TrackedDeviceUpdated,
+						.trackedDeviceIndex = 0
+					};
+					system->_EnqueueEvent(event);
+				}
+			}
+			lastReportedInteractionProfiles[info.index] = state.interactionProfile;
+			interactionProfileStateReported[info.index] = true;
+		} else {
+			allHandsResolved = false;
+			if (oovr_global_configuration.PreserveControllerProfileOnSleep() && info.controller) {
+				if (!interactionProfileStateReported[info.index]
+				    || lastReportedInteractionProfiles[info.index] != XR_NULL_PATH) {
+					OOVR_LOGF("%s - Controller interaction profile temporarily unavailable; preserving %s while OCU retries",
+					    info.pathstr, info.controller->GetInteractionProfile()->GetPath().c_str());
+				}
+				lastReportedInteractionProfiles[info.index] = XR_NULL_PATH;
+				interactionProfileStateReported[info.index] = true;
+				continue;
+			}
+			if (!interactionProfileStateReported[info.index]
+			    || lastReportedInteractionProfiles[info.index] != XR_NULL_PATH) {
+				OOVR_LOGF("%s - No interaction profile detected; OCU will retry while the session runs (state=%d)", info.pathstr, sessionState);
+			}
+			deactivateController(info);
+			lastReportedInteractionProfiles[info.index] = XR_NULL_PATH;
+			interactionProfileStateReported[info.index] = true;
+		}
+	}
+
+	return allHandsResolved;
+}
+
+void XrBackend::MaybeRestartForInputs()
+{
+	// if we haven't attached any actions to the session (infoSet or game actions), no need to restart
+	BaseInput* input = GetUnsafeBaseInput();
+	// if (infoSet == XR_NULL_HANDLE && (!input || !input->AreActionsLoaded()))
+	// return;
+
+	OOVR_LOG("Restarting session for inputs...");
+	DrvOpenXR::SetupSession();
+	OOVR_LOG("Session restart successful!");
+}
+
+void XrBackend::QueryForInteractionProfile()
+{
+	// Note that we want to avoid using BaseInput here because it would allow for games to call GetControllerState before rendering
+	// and then we'd have to recreate the session twice, once for the input state and once for when the game submits a frame
+	if (subactionPaths[0] == XR_NULL_PATH) {
+		OOVR_FAILED_XR_ABORT(xrStringToPath(xr_instance, "/user/hand/left", &subactionPaths[0]));
+		OOVR_FAILED_XR_ABORT(xrStringToPath(xr_instance, "/user/hand/right", &subactionPaths[1]));
+	}
+
+	if (infoSet == XR_NULL_HANDLE) {
+		OOVR_LOG("Creating infoset");
+		CreateInfoSet();
+		BindInfoSet();
+	}
+
+	// Interaction profiles are updated after xrSyncActions, so we'll try to make the runtime give us one by calling xrSyncActions.
+	XrActiveActionSet active[2] = {
+		{ .actionSet = infoSet, .subactionPath = subactionPaths[0] },
+		{ .actionSet = infoSet, .subactionPath = subactionPaths[1] },
+	};
+
+	XrActionsSyncInfo info{ XR_TYPE_ACTIONS_SYNC_INFO };
+	info.countActiveActionSets = 2;
+	info.activeActionSets = active;
+
+	OOVR_FAILED_XR_ABORT(xrSyncActions(xr_session.get(), &info));
+}
+
+void XrBackend::CreateInfoSet()
+{
+	XrActionSetCreateInfo set_info{ XR_TYPE_ACTION_SET_CREATE_INFO };
+	strcpy_s(set_info.actionSetName, XR_MAX_ACTION_SET_NAME_SIZE, "opencomposite-internal-info-set");
+	strcpy_s(set_info.localizedActionSetName, XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE, "OpenComposite internal info set");
+	OOVR_FAILED_XR_ABORT(xrCreateActionSet(xr_instance, &set_info, &infoSet));
+
+	XrActionCreateInfo act_info{ XR_TYPE_ACTION_CREATE_INFO };
+	strcpy_s(act_info.actionName, XR_MAX_ACTION_NAME_SIZE, "opencomposite-internal-info-act");
+	strcpy_s(act_info.localizedActionName, XR_MAX_LOCALIZED_ACTION_NAME_SIZE, "OpenComposite internal info action");
+	act_info.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+	act_info.countSubactionPaths = std::size(subactionPaths);
+	act_info.subactionPaths = subactionPaths;
+	OOVR_FAILED_XR_ABORT(xrCreateAction(infoSet, &act_info, &infoAction));
+}
+
+void XrBackend::BindInfoSet()
+{
+	for (const std::unique_ptr<InteractionProfile>& profile : InteractionProfile::GetProfileList()) {
+		XrPath interactionProfilePath;
+		OOVR_FAILED_XR_ABORT(xrStringToPath(xr_instance, profile->GetPath().c_str(), &interactionProfilePath));
+		XrInteractionProfileSuggestedBinding suggestedBindings{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+
+		std::vector<XrActionSuggestedBinding> bindings;
+		// grabs the first found paths ending in /click for each subaction path
+		for (const std::string& path_name : { "/user/hand/left", "/user/hand/right" }) {
+			auto click_path = std::ranges::find_if(profile->GetValidInputPaths(),
+			    [&path_name](std::string s) -> bool {
+				    return s.find("/click") != s.npos && s.find(path_name) != s.npos;
+			    });
+			if (click_path == profile->GetValidInputPaths().end()) {
+				continue;
+			}
+			XrPath path;
+			OOVR_FAILED_XR_ABORT(xrStringToPath(xr_instance, click_path->c_str(), &path));
+			bindings.push_back({ .action = infoAction, .binding = path });
+
+			suggestedBindings.interactionProfile = interactionProfilePath;
+			suggestedBindings.suggestedBindings = bindings.data();
+			suggestedBindings.countSuggestedBindings = bindings.size();
+
+			OOVR_FAILED_XR_ABORT(xrSuggestInteractionProfileBindings(xr_instance, &suggestedBindings));
+		}
+	}
+
+	// Attach the info set by itself. We will have to restart the session once the game attaches its real inputs.
+	XrSessionActionSetsAttachInfo info{ XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
+	info.countActionSets = 1;
+	info.actionSets = &infoSet;
+	OOVR_FAILED_XR_ABORT(xrAttachSessionActionSets(xr_session.get(), &info));
+}
+
+const void* XrBackend::GetCurrentGraphicsBinding()
+{
+	if (graphicsBinding) {
+		return graphicsBinding->asVoid();
+	}
+	OOVR_FALSE_ABORT(temporaryGraphics);
+	return temporaryGraphics->GetGraphicsBinding();
+}
+
+#ifdef SUPPORT_VK
+void XrBackend::VkGetPhysicalDevice(VkInstance instance, VkPhysicalDevice* out)
+{
+	*out = VK_NULL_HANDLE;
+
+	TemporaryVk* vk = temporaryGraphics->GetAsVk();
+	if (vk == nullptr)
+		OOVR_ABORT("Not using temporary Vulkan instance");
+
+	// Find the UUID of the physical device the temporary instance is running on
+	VkPhysicalDeviceIDProperties idProps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+	VkPhysicalDeviceProperties2 props = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &idProps };
+	vkGetPhysicalDeviceProperties2(vk->physicalDevice, &props);
+
+	// Look through all the physical devices on the target instance and find the matching one
+	uint32_t devCount;
+	OOVR_FAILED_VK_ABORT(vkEnumeratePhysicalDevices(instance, &devCount, nullptr));
+	std::vector<VkPhysicalDevice> physicalDevices(devCount);
+	OOVR_FAILED_VK_ABORT(vkEnumeratePhysicalDevices(instance, &devCount, physicalDevices.data()));
+
+	for (VkPhysicalDevice phy : physicalDevices) {
+		VkPhysicalDeviceIDProperties devIdProps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+		VkPhysicalDeviceProperties2 devProps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &devIdProps };
+		vkGetPhysicalDeviceProperties2(phy, &devProps);
+
+		if (memcmp(devIdProps.deviceUUID, idProps.deviceUUID, sizeof(devIdProps.deviceUUID)) != 0)
+			continue;
+
+		// Found it
+		*out = phy;
+		return;
+	}
+
+	OOVR_ABORT("Could not find matching Vulkan physical device for instance");
+}
+
+#endif

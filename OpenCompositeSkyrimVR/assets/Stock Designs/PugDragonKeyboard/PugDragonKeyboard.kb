@@ -1,0 +1,342 @@
+# OCU Keyboard Studio custom keyboard
+# Label offsets are pixels in OCU's 1024x560 keyboard texture.
+
+width 15
+base_theme parchment
+font medieval
+key_plates true
+top_button_plates true
+input_bar_plate true
+parchment_ribbon false
+
+style custom
+font_color #EDF0F5FF
+font_outline_color #080B0FDC
+font_glow_color #84F29EFF
+font_glow_enabled false
+font_glow_strength 45
+font_glow_radius 3
+font_breathe false 35 2 0
+key_color #70BBBECC
+plate_fill_color #161A211F
+plate_outline_width 2
+glow_color #84F29EFF
+hover_color #84F29EFF
+glow_enabled true
+glow_strength 45
+glow_radius 4
+hover_enabled true
+hover_strength 55
+label_outline true
+key_roundness 14
+key_breathe false 35 2 0
+
+background OCUKeyboardBackground.png
+background_rect 1 -1 1024 560 100 16 0 false 35 2 0 100
+
+control_offset size 0 0
+control_offset opacity -15 126
+control_offset tilt -14 65
+top_offset textbar 0 0
+top_offset mode 0 0
+top_offset lock 0 0
+top_design textbar 0 0 0
+top_design mode 0 0 0
+top_design lock 0 0 0
+control_box size 92 98
+control_part size up 0 0 24 20
+control_part size down 0 0 24 20
+control_text size label 0 0 0.58
+control_text size value 0 0 0.58
+control_box opacity 92 98
+control_part opacity up 0 0 24 20
+control_part opacity down 0 0 24 20
+control_text opacity label 0 0 0.58
+control_text opacity value 0 0 0.58
+control_box tilt 92 98
+control_part tilt up 0 0 24 20
+control_part tilt down 0 0 24 20
+control_text tilt label 0 0 0.58
+control_text tilt value 0 0 0.58
+
+key \e \e 0 0 1.5 1
+.label "ESC"
+
+key \f1 \f1 1.5 0 1.05 1
+.label "F1"
+
+key \f2 \f2 2.55 0 1.05 1
+.label "F2"
+
+key \f3 \f3 3.6 0 1.05 1
+.label "F3"
+
+key \f4 \f4 4.65 0 1.05 1
+.label "F4"
+
+key \f5 \f5 5.7 0 1.05 1
+.label "F5"
+
+key \f6 \f6 6.75 0 1.05 1
+.label "F6"
+
+key \f7 \f7 7.8 0 1.05 1
+.label "F7"
+
+key \f8 \f8 8.85 0 1.05 1
+.label "F8"
+
+key \f9 \f9 9.9 0 1.05 1
+.label "F9"
+
+key \f10 \f10 10.95 0 1.15 1
+.label "F10"
+
+key \f11 \f11 12.1 0 1.15 1
+.label "F11"
+
+key \f12 \f12 13.25 0 1.05 1
+.label "F12"
+
+key ` ¬ 0 1 1 1
+.label "`"
+.label_shift "¬"
+
+key 1 ! 1 1 1 1
+.label "1"
+.label_shift "!"
+
+key 2 \o 2 1 1 1
+.label "2"
+.label_shift "\""
+
+key 3 £ 3 1 1 1
+.label "3"
+.label_shift "£"
+
+key 4 $ 4 1 1 1
+.label "4"
+.label_shift "$"
+
+key 5 % 5 1 1 1
+.label "5"
+.label_shift "%"
+
+key 6 ^ 6 1 1 1
+.label "6"
+.label_shift "^"
+
+key 7 & 7 1 1 1
+.label "7"
+.label_shift "&"
+
+key 8 * 8 1 1 1
+.label "8"
+.label_shift "*"
+
+key 9 ( 9 1 1 1
+.label "9"
+.label_shift "("
+
+key 0 ) 10 1 1 1
+.label "0"
+.label_shift ")"
+
+key - _ 11 1 1 1
+.label "-"
+.label_shift "_"
+
+key = + 12 1 1 1
+.label "="
+.label_shift "+"
+
+key \b \b 13 1 1 1
+.label "back"
+.spans_to_right true
+
+key \t \t 0 2 1.5 1
+.label "tab"
+
+key q Q 1.5 2 1 1
+.label "q"
+.label_shift "Q"
+
+key w W 2.5 2 1 1
+.label "w"
+.label_shift "W"
+
+key e E 3.5 2 1 1
+.label "e"
+.label_shift "E"
+
+key r R 4.5 2 1 1
+.label "r"
+.label_shift "R"
+
+key t T 5.5 2 1 1
+.label "t"
+.label_shift "T"
+
+key y Y 6.5 2 1 1
+.label "y"
+.label_shift "Y"
+
+key u U 7.5 2 1 1
+.label "u"
+.label_shift "U"
+
+key i I 8.5 2 1 1
+.label "i"
+.label_shift "I"
+
+key o O 9.5 2 1 1
+.label "o"
+.label_shift "O"
+
+key p P 10.5 2 1 1
+.label "p"
+.label_shift "P"
+
+key [ { 11.5 2 1 1
+.label "["
+.label_shift "{"
+
+key ] } 12.5 2 1 1
+.label "]"
+.label_shift "}"
+
+key \c \c 0 3 1.83 1
+.label "caps"
+
+key a A 1.83 3 1 1
+.label "a"
+.label_shift "A"
+
+key s S 2.83 3 1 1
+.label "s"
+.label_shift "S"
+
+key d D 3.83 3 1 1
+.label "d"
+.label_shift "D"
+
+key f F 4.83 3 1 1
+.label "f"
+.label_shift "F"
+
+key g G 5.83 3 1 1
+.label "g"
+.label_shift "G"
+
+key h H 6.83 3 1 1
+.label "h"
+.label_shift "H"
+
+key j J 7.83 3 1 1
+.label "j"
+.label_shift "J"
+
+key k K 8.83 3 1 1
+.label "k"
+.label_shift "K"
+
+key l L 9.83 3 1 1
+.label "l"
+.label_shift "L"
+
+key ; : 10.83 3 1 1
+.label ";"
+.label_shift ":"
+
+key ' @ 11.83 3 1 1
+.label "'"
+.label_shift "@"
+
+key # ~ 12.83 3 1 1
+.label "#"
+.label_shift "~"
+
+key \n \n 13.5 2 1 1
+.label "Enter"
+.spans_to_right true
+
+key \v \v 13.83 3 1 1
+.label "[T]"
+.spans_to_right true
+
+key \z \z 0 4 1.5 1
+.label "shift"
+
+key \\ | 1.5 4 1 1
+.label "\\"
+.label_shift "|"
+
+key z Z 2.5 4 1 1
+.label "z"
+.label_shift "Z"
+
+key x X 3.5 4 1 1
+.label "x"
+.label_shift "X"
+
+key c C 4.5 4 1 1
+.label "c"
+.label_shift "C"
+
+key v V 5.5 4 1 1
+.label "v"
+.label_shift "V"
+
+key b B 6.5 4 1 1
+.label "b"
+.label_shift "B"
+
+key n N 7.5 4 1 1
+.label "n"
+.label_shift "N"
+
+key m M 8.5 4 1 1
+.label "m"
+.label_shift "M"
+
+key , < 9.5 4 1 1
+.label ","
+.label_shift "<"
+
+key . > 10.5 4 1 1
+.label "."
+.label_shift ">"
+
+key / ? 11.5 4 1 1
+.label "/"
+.label_shift "?"
+
+key \z \z 12.5 4 1.5 1
+.label "shift"
+
+key \E \E 14 4 1 1
+.label "End"
+
+key \s \z 0 5 8.796 1
+.label ""
+.label_offset -46 0
+.label_scale 0.7
+
+key \L \L 8 5 1 1
+.label "LT"
+
+key \D \D 9 5 1 1
+.label "DN"
+
+key \U \U 10 5 1 1
+.label "UP"
+
+key \R \R 11 5 1 1
+.label "RT"
+
+key \C \C 12 5 1.5 1
+.label "Ctrl"
+
+key \P \P 13.5 5 1.5 1
+.label "PrtSc"
+.spans_to_right true

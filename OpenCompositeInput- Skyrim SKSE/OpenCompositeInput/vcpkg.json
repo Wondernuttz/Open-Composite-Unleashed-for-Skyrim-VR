@@ -1,0 +1,12 @@
+{
+  "name": "opencompositeinput",
+  "version-semver": "1.0.0",
+  "description": "SKSE VR plugin for OpenComposite - bridges keyboard input to Scaleform menus",
+  "dependencies": [
+    "spdlog",
+    "fmt",
+    "rapidcsv",
+    "directxtk",
+    "directxmath"
+  ]
+}

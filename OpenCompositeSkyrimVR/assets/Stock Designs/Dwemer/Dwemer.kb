@@ -1,0 +1,345 @@
+# OCU Keyboard Studio custom keyboard
+# Label offsets are pixels in OCU's 1024x560 keyboard texture.
+
+width 15
+base_theme dwemer
+font parchment
+key_plates true
+top_button_plates true
+input_bar_plate true
+parchment_ribbon true
+
+style custom
+font_color #65F8FFFF
+font_outline_color #080B0FDC
+font_glow_color #BEFAFFFF
+font_glow_enabled true
+font_glow_strength 10
+font_glow_radius 6
+font_breathe true 0 1.5 0
+key_color #BE8C465A
+plate_fill_color #FFFFFF00
+plate_outline_width 0
+glow_color #EFFFB4FF
+hover_color #FFFFFFFF
+glow_enabled true
+glow_strength 65
+glow_radius 8
+hover_enabled true
+hover_strength 45
+label_outline true
+key_roundness 2
+key_breathe true 35 2 90
+
+control_offset size -1 28
+control_offset opacity 5.071 27.894
+control_offset tilt 4 55
+top_offset textbar 0 0
+top_offset mode -1 -9
+top_offset lock 18 -3
+top_design textbar 616.267 45 0
+top_design mode 134.063 32 0
+top_design lock 117.658 32 0
+control_box size 92 98
+control_part size up 0 0 24 20
+control_part size down 0 0 24 20
+control_text size label 0 0 0.58
+control_text size value 0 4.142 0.58
+control_box opacity 89.929 101.106
+control_part opacity up 0 -15.531 24 20
+control_part opacity down 0 0 24 20
+control_text opacity label 1.035 -4.142 0.58
+control_text opacity value 1.035 4.142 0.58
+control_box tilt 92 98
+control_part tilt up 0 0 24 20
+control_part tilt down 0 0 24 20
+control_text tilt label 0 0 0.58
+control_text tilt value 0 7.248 0.58
+
+key \e \e 0 0.046 1.605 0.948
+.label "ESC"
+
+key \f1 \f1 1.546 0.058 0.998 0.935
+.label "F1"
+
+key \f2 \f2 2.585 0.058 1.011 0.935
+.label "F2"
+
+key \f3 \f3 3.635 0.058 1.011 0.935
+.label "F3"
+
+key \f4 \f4 4.704 0.058 0.985 0.935
+.label "F4"
+
+key \f5 \f5 5.735 0.046 1.011 0.948
+.label "F5"
+
+key \f6 \f6 6.781 0.058 0.958 0.935
+.label "F6"
+
+key \f7 \f7 7.823 0.069 1.024 0.922
+.label "F7"
+
+key \f8 \f8 8.85 0.058 1.05 0.935
+.label "F8"
+
+key \f9 \f9 9.9 0.081 1.05 0.908
+.label "F9"
+
+key \f10 \f10 10.946 0.046 1.202 0.948
+.label "F10"
+
+key \f11 \f11 12.181 0.058 1.045 0.935
+.label "F11"
+
+key \f12 \f12 13.2 0.1 1.194 0.922
+.label "F12"
+
+key ` ~ 0 1 1 1
+.label "`"
+.label_shift "~"
+
+key 1 ! 1 1 1 1
+.label "1"
+.label_shift "!"
+
+key 2 @ 2 1 1 1
+.label "2"
+.label_shift "@"
+
+key 3 # 3 1 1 1
+.label "3"
+.label_shift "#"
+
+key 4 $ 4 1 1 1
+.label "4"
+.label_shift "$"
+
+key 5 % 5.069 1.023 0.922 0.974
+.label "5"
+.label_shift "%"
+
+key 6 ^ 6.046 1.012 0.948 0.987
+.label "6"
+.label_shift "^"
+
+key 7 & 7.058 1.023 0.935 0.974
+.label "7"
+.label_shift "&"
+
+key 8 * 8.081 1.012 0.908 0.987
+.label "8"
+.label_shift "*"
+
+key 9 ( 9.058 1.012 0.935 0.987
+.label "9"
+.label_shift "("
+
+key 0 ) 10.046 1.012 0.948 0.987
+.label "0"
+.label_shift ")"
+
+key - _ 11.046 1.023 0.948 0.974
+.label "-"
+.label_shift "_"
+
+key = + 12.035 1.046 0.961 0.948
+.label "="
+.label_shift "+"
+
+key \b \b 13.127 1.035 2.427 0.961
+.label "back"
+.label_scale 0.85
+
+key \t \t 0 2.068 1.602 0.923
+.label "tab"
+.label_offset 3 1
+
+key q Q 1.534 2.068 0.962 0.923
+.label "q"
+.label_shift "Q"
+.label_offset 1 5
+
+key w W 2.534 2.056 0.962 0.936
+.label "w"
+.label_shift "W"
+
+key e E 3.523 2.056 0.974 0.884
+.label "e"
+.label_shift "E"
+
+key r R 4.558 2.035 0.935 0.961
+.label "r"
+.label_shift "R"
+
+key t T 5.535 2.046 0.961 0.948
+.label "t"
+.label_shift "T"
+
+key y Y 6.546 2.069 0.948 0.922
+.label "y"
+.label_shift "Y"
+
+key u U 7.523 2.046 0.974 0.948
+.label "u"
+.label_shift "U"
+
+key i I 8.5 2.045 1 0.91
+.label "i"
+.label_shift "I"
+
+key o O 9.5 2.058 1 0.935
+.label "o"
+.label_shift "O"
+
+key p P 10.5 2.058 1 0.935
+.label "p"
+.label_shift "P"
+
+key [ { 11.5 2.045 1 0.948
+.label "["
+.label_shift "{"
+.label_offset -0 2
+
+key ] } 12.5 2.035 1 0.961
+.label "]"
+.label_shift "}"
+
+key \c \c 0.09 3.079 1.843 0.911
+.label "caps"
+.label_offset 1 6
+
+key a A 1.934 3.056 0.962 0.936
+.label "a"
+.label_shift "A"
+
+key s S 2.956 3.1 0.936 0.911
+.label "s"
+.label_shift "S"
+
+key d D 3.9 3.1 1.039 0.897
+.label "d"
+.label_shift "D"
+
+key f F 4.969 3.1 0.922 0.869
+.label "f"
+.label_shift "F"
+
+key g G 5.966 3.1 0.947 0.908
+.label "g"
+.label_shift "G"
+
+key h H 6.935 3.1 0.935 0.908
+.label "h"
+.label_shift "H"
+
+key j J 7.911 3.056 0.987 0.932
+.label "j"
+.label_shift "J"
+.label_scale 0.7
+
+key k K 8.9 3.1 1 0.94
+.label "k"
+.label_shift "K"
+.label_offset 2 1
+
+key l L 9.9 3.1 0.969 0.908
+.label "l"
+.label_shift "L"
+
+key ; : 10.902 3.054 0.919 0.939
+.label ";"
+.label_shift ":"
+
+key ' @ 11.881 3.063 0.908 0.929
+.label "'"
+.label_shift "@"
+
+key # ~ 12.89 3.056 0.898 0.936
+.label "#"
+.label_shift "~"
+
+key \n \n 13.6 2.1 1.885 0.935
+.label "Enter"
+.label_scale 0.9
+
+key \v \v 13.9 3.1 1.527 0.936
+.label "[T]"
+.label_offset 1 3
+
+key \z \z 0.1 4.068 1.577 0.923
+.label "shift"
+.label_offset 1 2
+
+key \\ | 1.6 4.034 0.987 0.962
+.label "\\"
+.label_shift "|"
+
+key z Z 2.6 4.034 0.923 0.962
+.label "z"
+.label_shift "Z"
+
+key x X 3.6 4.045 0.923 0.949
+.label "x"
+.label_shift "X"
+
+key c C 4.602 4.045 0.885 0.949
+.label "c"
+.label_shift "C"
+
+key v V 5.568 4.011 0.923 0.987
+.label "v"
+.label_shift "V"
+
+key b B 6.623 4.011 0.911 0.962
+.label "b"
+.label_shift "B"
+
+key n N 7.6 4.034 0.911 0.936
+.label "n"
+.label_shift "N"
+
+key m M 8.579 4.034 0.911 0.962
+.label "m"
+.label_shift "M"
+
+key , < 9.579 4.023 0.911 0.974
+.label ","
+.label_shift "<"
+
+key . > 10.579 4.045 0.911 0.949
+.label "."
+.label_shift ">"
+
+key / ? 11.534 4.034 0.962 0.962
+.label "/"
+.label_shift "?"
+
+key \z \z 12.5 4 1.5 0.949
+.label "shift"
+
+key \E \E 14 4.023 1.511 0.936
+.label "End"
+
+key \s \z 1.6 4.953 7.024 2.457
+.label ""
+
+key \L \L 8.079 5 0.911 0.987
+.label "LT"
+
+key \D \D 9.045 5 0.949 0.974
+.label "DN"
+
+key \U \U 10.068 5 0.923 0.974
+.label "UP"
+
+key \R \R 11.034 5 0.962 0.936
+.label "RT"
+
+key \C \C 12 5.045 1.449 0.911
+.label "Ctrl"
+.label_offset -1 2
+
+key \P \P 13.4 5.048 2.071 0.97
+.label "PrtSc"
+.label_offset -1 3

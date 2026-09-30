@@ -1,0 +1,47 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "release-vr",
+      "displayName": "Release VR (MSVC, Vcpkg)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL",
+        "VCPKG_HOST_TRIPLET": "x64-windows-static-md",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md"
+      },
+      "environment": {
+        "PROJECT_PLATFORM_FLAGS": "-DWIN32_LEAN_AND_MEAN -DNOMINMAX -DUNICODE -D_UNICODE"
+      }
+    },
+    {
+      "name": "debug-vr",
+      "displayName": "Debug VR (MSVC, Vcpkg)",
+      "inherits": "release-vr",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release-vr",
+      "displayName": "Release VR",
+      "configurePreset": "release-vr"
+    },
+    {
+      "name": "debug-vr",
+      "displayName": "Debug VR",
+      "configurePreset": "debug-vr"
+    }
+  ]
+}

@@ -1,0 +1,710 @@
+#include "stdafx.h"
+
+#include "Config.h"
+#include "ExternalUpscalerConfig.h"
+#include "ExternalUpscalerState.h"
+#include "ini.h"
+
+#include <algorithm>
+#include <codecvt>
+#include <locale>
+#include <string>
+
+#ifdef WIN32
+#include <direct.h>
+#define GetCurrentDir _getcwd
+#else
+#include <unistd.h>
+#define GetCurrentDir getcwd
+#endif
+
+using vr::HmdColor_t;
+
+Config oovr_global_configuration;
+
+// OOVR_ABORT doesn't work here for some reason
+// TODO Turtle1331 use OOVR_ABORT from logging.h
+#ifdef WIN32
+#define ABORT(msg)                                                                        \
+	{                                                                                     \
+		MessageBoxA(NULL, string(msg).c_str(), "OpenComposite Config File Error", MB_OK); \
+		exit(1);                                                                          \
+	}
+#else
+#define ABORT(msg) \
+	{              \
+		exit(42);  \
+	}
+#endif
+
+static string str_tolower(std::string val)
+{
+	transform(val.begin(), val.end(), val.begin(), ::tolower);
+	return val;
+}
+
+unsigned char hexval(unsigned char c)
+{
+	if ('0' <= c && c <= '9')
+		return c - '0';
+	else if ('a' <= c && c <= 'f')
+		return c - 'a' + 10;
+	else
+		return 0;
+}
+
+static bool parse_bool(string orig, string name, int line)
+{
+	string val = str_tolower(orig);
+
+	if (val == "true" || val == "on" || val == "enabled") {
+		return true;
+	}
+	if (val == "false" || val == "off" || val == "disabled") {
+		return false;
+	}
+
+	string err = "Value " + orig + " for in config file for " + name + " on line "
+	    + to_string(line) + " is not a boolean - true/on/enabled/false/off/disabled";
+	ABORT(err);
+}
+
+static HmdColor_t parse_HmdColor_t(string orig, string name, int line)
+{
+	string val = str_tolower(orig);
+
+	if (val.length() != 7 || val[0] != '#') {
+		goto invalid;
+	}
+
+	for (int i = 1; i < val.length(); i++) {
+		char c = val[i];
+		if ((c < '0' || c > '9') && (c < 'a' || c > 'f'))
+			goto invalid;
+	}
+
+	HmdColor_t c;
+	c.a = 255; // Full alpha
+
+	c.r = ((hexval(val[1]) << 4) + hexval(val[2])) / 255.0f;
+	c.g = ((hexval(val[3]) << 4) + hexval(val[4])) / 255.0f;
+	c.b = ((hexval(val[5]) << 4) + hexval(val[6])) / 255.0f;
+
+	return c;
+
+invalid:
+
+	string err = "Value " + orig + " for in config file for " + name + " on line "
+	    + to_string(line) + " is not a hex (CSS) colour code";
+	ABORT(err);
+}
+
+static float parse_float(string orig, string name, int line)
+{
+	// Replace comma with dot for locale independence (German/French use 1,0 not 1.0)
+	string fixed = orig;
+	std::replace(fixed.begin(), fixed.end(), ',', '.');
+
+	const char* str = fixed.c_str();
+	char* end = NULL;
+	float result = strtof(str, &end);
+
+	if (end != str + fixed.length()) {
+		OOVR_LOGF("Warning: config param %s value '%s' is not a decimal number on line %d, using default",
+		    name.c_str(), orig.c_str(), line);
+		return 0.0f;
+	}
+
+	return result;
+}
+
+static int parse_int(string orig, string name, int line)
+{
+	const char* str = orig.c_str();
+	char* end = NULL;
+	long result = strtol(str, &end, 10);
+
+	if (end != str + orig.length()) {
+		string err = "Value " + orig + " for in config file for " + name + " on line "
+		    + to_string(line) + " is not an integer (eg 5)";
+		ABORT(err);
+	}
+
+	return static_cast<int>(result);
+}
+
+static string parse_string(string orig, string name, int line)
+{
+	string result = orig;
+	if (name != "keyboardText") {
+		result = str_tolower(orig);
+	}
+
+	return result;
+}
+
+static int parse_dlss_model(string model)
+{
+	if (model.empty() || model == "default" || model == "auto" || model == "0" || model == "off") {
+		return 0;
+	}
+	if (model == "j" || model == "10") {
+		return 10;
+	}
+	if (model == "k" || model == "11") {
+		return 11;
+	}
+	if (model == "l" || model == "12") {
+		return 12;
+	}
+	if (model == "m" || model == "13") {
+		return 13;
+	}
+
+	string err = "Value " + model + " for dlssModel is invalid. Use default/auto/0 or J/K/L/M";
+	ABORT(err);
+	return 0;
+}
+
+static const char* dlss_model_name(int model)
+{
+	switch (model) {
+	case 0: return "Default";
+	case 10: return "J";
+	case 11: return "K";
+	case 12: return "L";
+	case 13: return "M";
+	default: return "Invalid";
+	}
+}
+
+int Config::ini_handler(void* user, const char* pSection,
+    const char* pName, const char* pValue,
+    int lineno)
+{
+
+	string section = pSection;
+	string name = pName;
+	string value = pValue;
+
+	Config* cfg = (Config*)user;
+
+#define CFGOPT(type, vname)                             \
+	if (name == #vname) {                               \
+		cfg->vname = parse_##type(value, name, lineno); \
+		return true;                                    \
+	}
+
+	if (section == "" || section == "default"
+	    || section == "general"
+	    || section == "audio"
+	    || section == "input"
+	    || section == "controller_pose"
+	    || section == "laser_aim"
+	    || section == "upscaling"
+	    || section == "fsr"
+	    || section == "fsr3"
+	    || section == "dlss"
+	    || section == "motion_vectors"
+	    || section == "asw"
+	    || section == "cas"
+	    || section == "mip_bias"
+	    || section == "vrs"
+	    || section == "debug") {
+		if (name == "vrsInnerRadius" || name == "vrsMidRadius" ||
+		    name == "vrsEyeInnerRadius" || name == "vrsEyeMidRadius" ||
+		    name == "vrsCompatibilityMode" || name == "vrsEyeCompatibilityMode" ||
+		    name == "vrsFavorHorizontal" || name == "vrsEyeInnerRate" ||
+		    name == "vrsEyeMidRate" || name == "vrsEyeOuterRate" || name == "vrsEyeCustomRates")
+			cfg->vrsEyeLegacyProfile = true;
+		CFGOPT(bool, renderCustomHands);
+		CFGOPT(bool, useLegacyGreyHands);
+		CFGOPT(HmdColor_t, handColour);
+		CFGOPT(float, supersampleRatio);
+		CFGOPT(bool, haptics);
+		CFGOPT(bool, admitUnknownProps);
+		CFGOPT(bool, useViewportStencil);
+		CFGOPT(bool, forceConnectedTouch);
+		CFGOPT(bool, logGetTrackedProperty);
+		CFGOPT(bool, stopOnSoftAbort);
+		CFGOPT(string, logLevel);
+		CFGOPT(bool, enableLayers);
+		CFGOPT(bool, dx10Mode);
+		CFGOPT(bool, preserveControllerProfileOnSleep);
+		CFGOPT(bool, enableAppRequestedCubemap);
+		CFGOPT(bool, enableHiddenMeshFix);
+		CFGOPT(bool, invertUsingShaders);
+		CFGOPT(bool, initUsingVulkan);
+		CFGOPT(float, hiddenMeshVerticalScale);
+		CFGOPT(bool, logAllOpenVRCalls);
+		CFGOPT(bool, enableAudioSwitch);
+		CFGOPT(string, audioDeviceName);
+		CFGOPT(bool, enableInputSmoothing);
+		CFGOPT(int, inputWindowSize);
+		CFGOPT(bool, adjustTilt);
+		CFGOPT(bool, adjustLeftRotation);
+		CFGOPT(bool, adjustRightRotation);
+		CFGOPT(bool, adjustLeftPosition);
+		CFGOPT(bool, adjustRightPosition);
+		CFGOPT(bool, adjustLeftLaserRotation);
+		CFGOPT(bool, adjustRightLaserRotation);
+		CFGOPT(float, tilt);
+		CFGOPT(float, leftXRotation);
+		CFGOPT(float, leftYRotation);
+		CFGOPT(float, leftZRotation);
+		CFGOPT(float, rightXRotation);
+		CFGOPT(float, rightYRotation);
+		CFGOPT(float, rightZRotation);
+		CFGOPT(float, leftLaserXRotation);
+		CFGOPT(float, leftLaserYRotation);
+		CFGOPT(float, leftLaserZRotation);
+		CFGOPT(float, rightLaserXRotation);
+		CFGOPT(float, rightLaserYRotation);
+		CFGOPT(float, rightLaserZRotation);
+		CFGOPT(float, leftLaserOriginDown);
+		CFGOPT(float, rightLaserOriginDown);
+		CFGOPT(float, leftXPosition);
+		CFGOPT(float, leftYPosition);
+		CFGOPT(float, leftZPosition);
+		CFGOPT(float, rightXPosition);
+		CFGOPT(float, rightYPosition);
+		CFGOPT(float, rightZPosition);
+		CFGOPT(float, renderModelRotX);
+		CFGOPT(float, renderModelRotY);
+		CFGOPT(float, renderModelRotZ);
+		CFGOPT(float, renderModelOffX);
+		CFGOPT(float, renderModelOffY);
+		CFGOPT(float, renderModelOffZ);
+		CFGOPT(float, renderModelScale);
+		CFGOPT(float, indexRenderModelRotX);
+		CFGOPT(float, indexRenderModelRotY);
+		CFGOPT(float, indexRenderModelRotZ);
+		CFGOPT(float, indexRenderModelOffX);
+		CFGOPT(float, indexRenderModelOffY);
+		CFGOPT(float, indexRenderModelOffZ);
+		CFGOPT(float, indexRenderModelScale);
+		CFGOPT(bool, renderModelAdjust);
+		CFGOPT(float, leftDeadZoneSize);
+		CFGOPT(float, leftDeadZoneXSize);
+		CFGOPT(float, leftDeadZoneYSize);
+		CFGOPT(float, rightDeadZoneSize);
+		CFGOPT(float, rightDeadZoneXSize);
+		CFGOPT(float, rightDeadZoneYSize);
+		CFGOPT(bool, disableTriggerTouch);
+		CFGOPT(bool, disableThumbrestTouch);
+		CFGOPT(float, triggerDeadzone);
+		CFGOPT(float, triggerMax);
+		CFGOPT(float, hapticStrength);
+		CFGOPT(bool, disableTrackPad);
+		CFGOPT(int, indexTrackpadCustomRegions);
+		CFGOPT(bool, enableControllerSmoothing);
+		CFGOPT(bool, enableVRIKKnucklesTrackPadSupport);
+        CFGOPT(bool, indexGripCustom);
+        CFGOPT(float, indexGripGrabThreshold);
+        CFGOPT(float, indexGripReleaseThreshold);
+		CFGOPT(bool, swapThumbsticks);
+		CFGOPT(string, keyboardText);
+		CFGOPT(string, controllerModel);
+		CFGOPT(float, posSmoothMinCutoff);
+		CFGOPT(float, rotSmoothMinCutoff);
+		CFGOPT(float, posSmoothBeta);
+		CFGOPT(float, rotSmoothBeta);
+		CFGOPT(bool, dlaaEnabled);
+		CFGOPT(float, dlaaLambda);
+		CFGOPT(float, dlaaEpsilon);
+		CFGOPT(bool, fsrEnabled);
+		CFGOPT(bool, fsrNativeAA);
+		CFGOPT(float, fsrRenderScale);
+		CFGOPT(float, fsr3Sharpness);
+		CFGOPT(float, fsr3JitterScale);
+		CFGOPT(bool, fsr3JitterCancellation);
+		CFGOPT(float, fsr3ShadingChangeScale);
+		CFGOPT(float, fsr3ReactivenessScale);
+		CFGOPT(float, fsr3AccumulationPerFrame);
+		CFGOPT(float, fsr3MinDisocclusionAccumulation);
+		CFGOPT(float, fsr3VelocityFactor);
+		CFGOPT(float, fsr3ReactiveBase);
+		CFGOPT(float, fsr3ReactiveEdgeBoost);
+		CFGOPT(float, fsr3ReactiveColorBoost);
+		CFGOPT(float, fsr3ReactiveColorThreshold);
+		CFGOPT(float, fsr3ReactiveColorScale);
+		CFGOPT(float, fsr3ReactiveDepthFalloffStart);
+		CFGOPT(float, fsr3ReactiveDepthFalloffEnd);
+		CFGOPT(bool, fsr3CameraMV);
+		CFGOPT(bool, fsr3LocoInjection);
+		CFGOPT(float, fsr3ViewToMeters);
+		CFGOPT(int, fsr3DebugMode);
+		CFGOPT(bool, fsr3PostAAEnabled);
+		CFGOPT(float, fsr3PostAALambda);
+		CFGOPT(float, fsr3PostAAEpsilon);
+		CFGOPT(bool, blueSkyDefenderEnabled);
+		CFGOPT(float, blueSkyDefenderLambda);
+		CFGOPT(float, blueSkyDefenderEpsilon);
+		CFGOPT(bool, motionVectorsEnabled);
+		CFGOPT(bool, bodyTrackersEnabled);
+		CFGOPT(string, bodyTrackerRoles);
+		CFGOPT(bool, networkTrackersEnabled);
+		CFGOPT(int, networkTrackerPort);
+		CFGOPT(bool, treadmillEnabled);
+		CFGOPT(bool, treadmillControllerCalibration);
+		CFGOPT(int, treadmillPort);
+		CFGOPT(float, treadmillFullSpeed);
+		CFGOPT(bool, cameraLegCalibrationEnabled);
+		CFGOPT(bool, menuLaserEnabled);
+		CFGOPT(bool, enableLaserSmoothing);
+		CFGOPT(float, laserPosSmoothMinCutoff);
+		CFGOPT(float, laserPosSmoothBeta);
+		CFGOPT(float, laserRotSmoothMinCutoff);
+		CFGOPT(float, laserRotSmoothBeta);
+		CFGOPT(bool, walkInPlaceEnabled);
+		CFGOPT(float, walkInPlaceSpeed);
+		CFGOPT(string, walkInPlaceActivation);
+		CFGOPT(bool, combatHapticShield);
+		CFGOPT(bool, combatHapticWeapon);
+		CFGOPT(bool, combatHapticBow);
+		CFGOPT(bool, combatHapticMagic);
+		CFGOPT(int, combatHapticStrength);
+		CFGOPT(float, motionVectorScale);
+		CFGOPT(bool, actorMV);
+		CFGOPT(bool, aswEnabled);
+		CFGOPT(float, aswWarpStrength);
+		CFGOPT(float, aswRotationScale);
+		CFGOPT(float, aswTranslationScale);
+		CFGOPT(float, aswLocoScale);
+		CFGOPT(float, aswDepthScale);
+		CFGOPT(float, aswEdgeFadeWidth);
+		CFGOPT(float, aswNearFadeDepth);
+		CFGOPT(float, aswEndSpikeMs);
+		CFGOPT(bool, aswAutoNative);
+		CFGOPT(float, aswAutoEngageFps);
+		CFGOPT(int, aswDebugMode);
+		CFGOPT(bool, casEnabled);
+		CFGOPT(float, casSharpness);
+		CFGOPT(float, fsrSharpness);
+		CFGOPT(bool, fsrRadiusEnabled);
+		CFGOPT(float, fsrRadius);
+		CFGOPT(bool, mipBiasEnabled);
+		CFGOPT(string, mipBias);
+		CFGOPT(float, mipBiasOffset);
+		CFGOPT(float, dlssMipBiasOffset);
+		CFGOPT(float, fsr3MipBiasOffset);
+		CFGOPT(bool, vrsEnabled);
+		CFGOPT(bool, vrsEyeTracked);
+		CFGOPT(bool, foveationDebugRings);
+		CFGOPT(string, foveatedBackend);
+		CFGOPT(float, vrsInnerRadius);
+		CFGOPT(float, vrsMidRadius);
+		CFGOPT(float, vrsFixedInnerRadius);
+		CFGOPT(float, vrsFixedMidRadius);
+		CFGOPT(float, vrsEyeInnerRadius);
+		CFGOPT(float, vrsEyeHorizontalScale);
+		CFGOPT(float, vrsEyeHorizontalOffset);
+		CFGOPT(float, vrsEyeVerticalOffset);
+		CFGOPT(bool, vrsEyePeripheralMask);
+		CFGOPT(bool, vrsEyeMiddleBlackout);
+		CFGOPT(bool, vrsEyeOuterBlackout);
+		CFGOPT(bool, vrsEyeBlackoutCull);
+		CFGOPT(float, vrsEyePeripheralMaskRadius);
+		CFGOPT(float, vrsEyeMidRadius);
+		if (name == "vrsEyeCustomRates") {
+			cfg->vrsEyeCustomRates = parse_bool(value, name, lineno);
+			cfg->vrsEyeCustomRatesExplicit = true;
+			return true;
+		}
+		CFGOPT(string, vrsEyeInnerRate);
+		CFGOPT(string, vrsEyeMidRate);
+		CFGOPT(string, vrsEyeOuterRate);
+		if (name == "vrsCompatibilityMode") {
+			cfg->vrsCompatibilityMode = parse_bool(value, name, lineno);
+			cfg->vrsCompatibilityExplicit = true;
+			return true;
+		}
+		if (name == "vrsEyeCompatibilityMode") {
+			cfg->vrsEyeCompatibilityMode = parse_bool(value, name, lineno);
+			cfg->vrsEyeCompatibilityExplicit = true;
+			return true;
+		}
+		// Legacy no-op accepted so older INIs do not emit an unknown-key warning.
+		// The configurator removes it the next time settings are saved.
+		CFGOPT(float, vrsOuterRadius);
+		CFGOPT(bool, vrsFavorHorizontal);
+		CFGOPT(bool, dlssEnabled);
+		CFGOPT(int, dlssPreset);
+		CFGOPT(float, dlssRenderScaleOverride);
+		CFGOPT(string, dlssModel);
+		CFGOPT(int, dlssRenderPreset);
+		CFGOPT(int, dlssModeOverride);
+		CFGOPT(bool, dlssNgxVerboseLogging);
+		CFGOPT(float, dlssSharpness);
+		CFGOPT(float, dlssMvScale);
+		CFGOPT(float, dlssBiasBase);
+		CFGOPT(float, dlssBiasEdgeBoost);
+		CFGOPT(float, dlssBiasDepthFalloffStart);
+		CFGOPT(float, dlssBiasDepthFalloffEnd);
+		CFGOPT(float, dlssJitterScale);
+	}
+
+	if (section == "cabletracking") {
+		if (name == "enabled") { cfg->cableTracking.enabled = parse_bool(value, name, lineno); return true; }
+		if (name == "showKey") { cfg->cableTracking.showKey = parse_int(value, name, lineno); return true; }
+		if (name == "showModifiers") { cfg->cableTracking.showModifiers = parse_int(value, name, lineno); return true; }
+		if (name == "resetKey") { cfg->cableTracking.resetKey = parse_int(value, name, lineno); return true; }
+		if (name == "resetModifiers") { cfg->cableTracking.resetModifiers = parse_int(value, name, lineno); return true; }
+		if (name == "displaySeconds") { cfg->cableTracking.displaySeconds = parse_int(value, name, lineno); return true; }
+		if (name == "warningTurns") { cfg->cableTracking.warningTurns = parse_float(value, name, lineno); return true; }
+	}
+
+	// Combos are parsed separately by BaseOverlay; just skip them here
+	if (section == "combos") {
+		return true;
+	}
+
+	if (section == "keyboard") {
+		// INI uses shortcutEnabled etc, but members are kbShortcutEnabled etc.
+		// Manual mapping since CFGOPT stringifies the member name.
+		if (name == "shortcutEnabled") { cfg->kbShortcutEnabled = parse_bool(value, name, lineno); return true; }
+		if (name == "shortcutButton") { cfg->kbShortcutButton = parse_string(value, name, lineno); return true; }
+		if (name == "shortcutMode") { cfg->kbShortcutMode = parse_string(value, name, lineno); return true; }
+		if (name == "shortcutTiming") { cfg->kbShortcutTiming = parse_int(value, name, lineno); return true; }
+		if (name == "shortcutTrackpad") { cfg->kbShortcutTrackpad = parse_string(value, name, lineno); return true; }
+		if (name == "gesturesEnabled") { cfg->kbGesturesEnabled = parse_bool(value, name, lineno); return true; }
+		if (name == "gestureThreshold") { cfg->kbGestureThreshold = parse_float(value, name, lineno); return true; }
+		if (name == "gestureSounds") { cfg->kbGestureSounds = parse_bool(value, name, lineno); return true; }
+		if (name == "gestureFinishSound") { cfg->kbGestureFinishSound = parse_string(value, name, lineno); return true; }
+		if (name == "gestureArmHeight") { cfg->kbGestureArmHeight = parse_float(value, name, lineno); return true; }
+		if (name == "displayTilt") { cfg->kbDisplayTilt = parse_float(value, name, lineno); return true; }
+		if (name == "displayOpacity") { cfg->kbDisplayOpacity = parse_int(value, name, lineno); return true; }
+		if (name == "displayScale") { cfg->kbDisplayScale = parse_int(value, name, lineno); return true; }
+		if (name == "soundsEnabled") { cfg->kbSoundsEnabled = parse_bool(value, name, lineno); return true; }
+		if (name == "soundVolume") { cfg->kbSoundVolume = parse_int(value, name, lineno); return true; }
+		if (name == "hoverVolume") { cfg->kbHoverVolume = parse_int(value, name, lineno); return true; }
+		if (name == "pressVolume") { cfg->kbPressVolume = parse_int(value, name, lineno); return true; }
+		if (name == "hapticStrength") { cfg->kbHapticStrength = parse_int(value, name, lineno); return true; }
+		if (name == "theme") { cfg->kbTheme = parse_string(value, name, lineno); return true; }
+		if (name == "font") { cfg->kbFont = parse_string(value, name, lineno); return true; }
+		if (name == "layout") { cfg->kbLayout = parse_string(value, name, lineno); return true; }
+	}
+
+	if (section == "configurator") {
+		return true;
+	}
+
+#undef CFGOPT
+
+	// Don't abort on unknown options — just log and ignore
+	OOVR_LOGF("Unknown config option '%s' in section [%s] on line %d", name.c_str(), section.c_str(), lineno);
+	return true;
+}
+
+static float dlss_preset_render_scale(int preset)
+{
+	switch (preset) {
+	case 0:
+		return 0.67f; // Quality
+	case 1:
+		return 0.58f; // Balanced
+	case 2:
+		return 0.50f; // Performance
+	case 3:
+		return 0.33f; // Ultra Performance
+	case 4:
+		return 1.0f; // DLAA / native AA
+	case 5:
+		return 0.77f; // Ultra Quality
+	default:
+		OOVR_LOGF("DLSS: Unknown preset %d, defaulting render scale to Quality", preset);
+		return 0.67f;
+	}
+}
+
+static void publish_external_upscaler_config(const Config& cfg)
+{
+	ExternalUpscalerConfig::Input input{};
+#ifdef OC_HAS_FSR3
+	input.fsr3Available = true;
+#endif
+#ifdef OC_HAS_DLSS
+	input.dlssAvailable = true;
+#endif
+	input.fsrEnabled = cfg.FsrEnabled();
+	input.fsrNativeAA = cfg.FsrNativeAA();
+	input.dlssEnabled = cfg.DlssEnabled();
+	input.dlaaEnabled = cfg.DlaaEnabled();
+	input.aswEnabled = cfg.ASWEnabled();
+	input.renderScale = cfg.FsrRenderScale();
+	// DLSS scale resolved HERE (override wins, else preset scale) — never
+	// derived from fsrRenderScale (2026-07-16 fix, preserved through the
+	// ExternalUpscalerConfig refactor)
+	input.dlssRenderScale = cfg.DlssRenderScaleOverride() > 0.0f
+	    ? cfg.DlssRenderScaleOverride()
+	    : dlss_preset_render_scale(cfg.DlssPreset());
+	input.dlssPreset = cfg.DlssPreset();
+	input.mipBiasEnabled = cfg.MipBiasEnabled();
+	input.mipBiasMode = cfg.MipBias();
+	input.mipBiasOffset = cfg.MipBiasOffset();
+	input.fsr3MipBiasOffset = cfg.Fsr3MipBiasOffset();
+	input.dlssMipBiasOffset = cfg.DlssMipBiasOffset();
+
+	const auto state = ExternalUpscalerConfig::Resolve(input);
+	PublishExternalUpscalerState(
+	    state.active,
+	    state.method,
+	    state.renderScale,
+	    state.mipBias,
+	    state.mipBiasOffset,
+	    state.dlssPreset,
+	    state.flags);
+}
+
+static int wini_parse(const wchar_t* filename, ini_handler handler, void* user)
+{
+	std::wstring_convert<std::codecvt_utf8<wchar_t>> CHAR_CONV;
+	std::string utf8filename = CHAR_CONV.to_bytes(filename);
+
+	FILE* file = fopen(utf8filename.c_str(), "r");
+	if (!file) {
+		OOVR_LOGF("No config file found at %s", utf8filename.c_str());
+		return -1;
+	}
+
+	OOVR_LOGF("Reading config file at %s", utf8filename.c_str());
+
+	int error = ini_parse_file(file, handler, user);
+	fclose(file);
+	return error;
+}
+
+// The ctor is run before DLLMain, so use this hack for now
+#ifdef _WIN32
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+#define HINST_THISCOMPONENT ((HINSTANCE) & __ImageBase)
+#endif
+
+Config::Config()
+{
+	// Initialise using Vulkan if D3D11 is unavailable
+#if !defined(SUPPORT_DX11)
+	initUsingVulkan = true;
+#endif
+
+	// If we're on Windows, look for a config file next to the DLL
+	// If we're on Linux, skip that and just check the working directory.
+#ifdef _WIN32
+	wchar_t buffer[MAX_PATH];
+	DWORD len = GetModuleFileNameW(HINST_THISCOMPONENT, buffer, sizeof(buffer));
+
+	wstring dir;
+	if (len) {
+		wstring fname = wstring(buffer, len);
+		size_t slash_index = fname.rfind(L'\\');
+
+		if (slash_index != wstring::npos) {
+			dir = fname.substr(0, slash_index + 1);
+		}
+	}
+
+	OOVR_LOG("Checking for global config file...");
+	OOVR_LOG("Version 1.9");
+	wstring file = dir + L"opencomposite.ini";
+	int err = wini_parse(file.c_str(), ini_handler, this);
+#else
+	int err = -1;
+	wstring file;
+#endif
+
+	if (err == -1 || err == 0) {
+		// No such file or it was parsed successfully, check the working directory
+		// for a file that overrides some properties
+		char buff[FILENAME_MAX];
+		GetCurrentDir(buff, FILENAME_MAX);
+		file = wstring(&buff[0], &buff[strlen(buff)]);
+#ifdef _WIN32
+		file += L"\\opencomposite.ini";
+#else
+		file += L"/opencomposite.ini";
+#endif
+		OOVR_LOG("Checking for app specific config file...");
+		err = wini_parse(file.c_str(), ini_handler, this);
+	}
+
+	if (err == -1) {
+		// Couldn't open file, no problem since the config file is optional
+	} else if (err) {
+		string str = "Config error on line " + to_string(err);
+		ABORT(str);
+	}
+
+	if (err == -1 || err == 0) {
+		// No such file or it was parsed successfully, check the working directory
+		// for a file that overrides some properties
+		char buff[FILENAME_MAX];
+		GetCurrentDir(buff, FILENAME_MAX);
+		file = wstring(&buff[0], &buff[strlen(buff)]);
+#ifdef _WIN32
+		file += L"\\opencomposite_ext.ini";
+#else
+		file += L"/opencomposite_ext.ini";
+#endif
+		OOVR_LOG("Checking for app specific extended config file...");
+		err = wini_parse(file.c_str(), ini_handler, this);
+	}
+
+	if (err == -1) {
+		// Couldn't open file, no problem
+	} else if (err) {
+		string str = "Config error on line " + to_string(err);
+		ABORT(str);
+	}
+
+	// Post-processing: apply derived config settings after all INI files parsed
+	logLevel = str_tolower(logLevel);
+	if (logLevel != "normal" && logLevel != "debug") {
+		OOVR_LOGF("Unknown logLevel '%s'; using normal", logLevel.c_str());
+		logLevel = "normal";
+	}
+	debugLogging = (logLevel == "debug");
+	OOVR_LOGF("Logging level: %s", logLevel.c_str());
+
+	if (fsrNativeAA) {
+		fsrEnabled = true;
+		fsrRenderScale = 1.0f;
+		OOVR_LOG("FSR3: Native AA enabled (renderScale=1.00)");
+	}
+
+	if (dlssEnabled && !fsrEnabled) {
+		fsrRenderScale = dlss_preset_render_scale(dlssPreset);
+		if (dlssRenderScaleOverride > 0.0f) {
+			float clampedScale = std::max(0.33f, std::min(1.0f, dlssRenderScaleOverride));
+			OOVR_LOGF("DLSS: render scale override %.2f -> %.2f (preset %d)",
+			    dlssRenderScaleOverride, clampedScale, dlssPreset);
+			fsrRenderScale = clampedScale;
+		} else {
+			OOVR_LOGF("DLSS: overriding render scale from preset %d -> %.2f (FSR disabled)",
+			    dlssPreset, fsrRenderScale);
+		}
+	}
+
+	if (!dlssModel.empty()) {
+		dlssRenderPreset = parse_dlss_model(dlssModel);
+		OOVR_LOGF("DLSS: model override %s -> render preset hint %s(%d)",
+		    dlssModel.c_str(), dlss_model_name(dlssRenderPreset), dlssRenderPreset);
+	}
+
+	// DLAA via NVIDIA DLSS: when dlaaEnabled=true, enable DLSS in DLAA mode (preset 4).
+	// Works standalone (native-res AA) or on top of FSR3 (post-upscale AA).
+	if (dlaaEnabled && !dlssEnabled) {
+		dlssEnabled = true;
+		dlssPreset = 4;
+		if (!fsrEnabled) {
+			fsrRenderScale = 1.0f; // DLAA = native resolution
+		}
+		OOVR_LOGF("DLAA: Enabling DLSS in DLAA mode (preset 4, renderScale=%.2f)", fsrRenderScale);
+	}
+
+	publish_external_upscaler_config(*this);
+}
+
+Config::~Config()
+{
+	ShutdownExternalUpscalerState();
+}

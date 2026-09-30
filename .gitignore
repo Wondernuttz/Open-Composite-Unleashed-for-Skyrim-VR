@@ -13,6 +13,11 @@ Release/
 *.pdb
 *.ilk
 *.exp
+libs/
+scripts/
+!/OpenCompositeSkyrimVR/scripts/
+/OpenCompositeSkyrimVR/scripts/*
+!/OpenCompositeSkyrimVR/scripts/VerifyUserPackage.py
 
 # Published executables
 *.exe
@@ -32,3 +37,29 @@ CMakeCache.txt
 Thumbs.db
 desktop.ini
 .DS_Store
+/OpenCompositeSkyrimVR/build_reorder_main_vs
+/OpenCompositeSkyrimVR/build_clean_vs
+build-deploy-openvr-api.ps1
+/OpenCompositeSkyrimVR/build_codex_check_vs
+/.codex-build-ocsvr/DrvOpenXR.dir/RelWithDebInfo
+/.codex-build-ocsvr
+
+# Configurator publish bundles (build artifacts)
+ConfiguratorPublish-*/
+OpenCompositeSkyrimVR/OC Unleashed Configurator/publish-runtime-recovery/
+
+# Body tracking runtime output
+world3d_diag.csv
+BodyTracking/Captures/
+
+# Local analysis and calibration captures (never publish)
+/.analysis/
+/OpenCompositeSkyrimVR/art/live-*.png
+
+# Local publication helpers and Python bytecode
+/.publish-links/
+__pycache__/
+*.pyc
+
+# Shelved audio recovery deployment backups
+/OCU Audio Recovery- Skyrim SKSE/shelved_deployed_copies/

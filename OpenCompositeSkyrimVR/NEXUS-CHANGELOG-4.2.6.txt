@@ -1,0 +1,71 @@
+Open Composite Unleashed for Skyrim VR 4.2.6
+Changes since Nexus 4.2.5, uploaded 16 Aug 2026 at 3:11 AM
+Current through 22 Aug 2026
+
+CRASH AND COMPATIBILITY FIXES
+
+- Removed OCU's MapMenu integration completely. OCU no longer renders a map beam or dot, reads native pointer depth, exports map geometry, calls MapMenu Scaleform, or masks map input. Skyrim VR's original map laser and controls remain fully native.
+- Both controller lasers now remain visible at matching full strength in flat menus, including MCM and RaceMenu. Skyrim's single cursor follows the last laser meaningfully moved on the menu quad; clicking also transfers it immediately. Tracking jitter is filtered with a movement dead zone, and ownership remains locked through drags until release.
+- Fixed the delayed MapMenu and fast-travel handler-pointer crash reproduced with or without CSX.
+- Prevented severe intermittent barter/main/dialogue/menu stalls by allowing only one pending main-thread laser, console-pick, or render-target-refresh job at a time and running expensive menu work only once per submitted frame or menu transition. Slow frames can no longer create or repeatedly execute stale task work.
+- Fixed RaceMenu VR's final character-name Accept/Cancel laser targets and modal handling.
+- DAPA's expensive render hooks are now installed only when DAPA is enabled, removing that CPU overhead when the feature is off. The shared render bridge remains available to menus and unrelated OCU features.
+- Hardened eye-gaze validation for runtimes that provide a valid pose with an unavailable/zero sample timestamp.
+
+PSVR2 AND CONTROLLER SUPPORT
+
+- Added the standard XR_KHR_generic_controller interaction profile for PSVR2 Sense and other previously unmapped OpenXR motion controllers.
+- Translates primary/secondary buttons, sticks, triggers, grips, poses, and haptics into Skyrim VR's Oculus-compatible input surface.
+- Added PSVR2 Sense artwork and independent PSVR binding markers to the Configurator. Controller artwork changes presentation only; runtime translation is automatic.
+- Added a thumbstick-swap option so the right stick can control movement and the left stick can control turning. Stick clicks and all other buttons stay on their original hands, and dead zones remain attached to the physical sticks.
+- Added adaptive OCU laser smoothing without smoothing the raw aim-pose export used by Prisma UI.
+- Reworked controller-model selection into Automatic SteamVR/Relos models, Legacy Grey Hands, and Off.
+
+FOVEATED RENDERING AND VIDEO
+
+- Added Skyrim Compatibility as the default pattern whenever VRS is active; it does not enable VRS or Fixed by itself. Eye Tracking AUTO defaults on and activates eye-tracked VRS only while a valid gaze stream exists. Fixed defaults off. Compatibility caps peripheral shading at 2x1/1x2 to avoid flat-color terrain and foliage failures; aggressive 2x2 remains opt-in.
+- Removed the non-functional Outer Radius control and fixed VRS presets immediately reverting their label to Custom. Old vrsOuterRadius entries are accepted and migrated away on save.
+- Added eye-tracked VRS through the standard XR_EXT_eye_gaze_interaction path for compatible OpenXR runtimes and headsets, including PSVR2Toolkit and Quest Pro configurations that expose the extension.
+- Separated Eye Tracking AUTO from Fixed VRS. AUTO never silently enables Fixed VRS on a headset without usable gaze data; Fixed remains an explicit option for non-eye-tracking headsets or as a selected fallback.
+- Added rate-limited gaze-state and per-eye UV diagnostics for hardware testing.
+- Corrected gaze projection for canted/asymmetric headsets: the combined OpenXR gaze pose is now converted to a finite fixation point and projected through each eye's complete VIEW-space pose and FOV, including eye orientation, IPD, and gaze origin. This targets the reported Pimax right-eye fovea offset without a headset-specific calibration fudge.
+- Added active OpenXR runtime/version, per-eye VIEW pose, submitted bounds, FOV tangent, and eye-local gaze diagnostics so PimaxXR/Pimax Play and SteamVR OpenXR routes can be distinguished from one log.
+- Eye tracking does not alter CSX render scale, submitted texture bounds, swapchains, DAPA timing, motion vectors, or post-processing resources. CSX and game menus remain full-rate.
+- Renamed the experimental non-motion-vector frame system to DAPA: Depth-Assisted Positional Reprojection. Existing asw* INI keys remain compatible.
+
+CONFIGURATOR AND INSTALLATION
+
+- Rebuilt the Configurator with a modern dark interface, rounded controls, consistent OCU green accents, breathing selected-key/checkmark effects, and clearer Video layout.
+- Unsaved Changes now appears only when the current values actually differ from the saved state, including controller-image and binding-marker edits, and clears if everything is returned to its saved values.
+- Preset previews now clearly state that Apply Preset saves the changes.
+- Added a dedicated SteamVR / Help tab for the SteamVR OCU profile, documentation, recovery tools, and status information without requiring page scrolling.
+- Added Remove OCU Game-Root Files. It moves recognized OCU runtime files into a recoverable local backup, does not touch Data or headset drivers, and tells the user to verify Skyrim VR through Steam when a trusted Valve loader cannot be restored.
+- Added safer SteamVR settings discovery, profile backup/restore behavior, and updated setup/uninstall documentation for MO2 Root Builder, Vortex, and manual installs.
+
+VR KEYBOARD
+
+- Added Ctrl and Print Screen. Ctrl is a visible one-shot toggle that releases after the next shortcut key or when tapped again.
+- Combined Enter and Done contextually: Skyrim-owned naming dialogs receive KeyboardDone, while console and user-opened sessions keep normal Enter behavior.
+- Added smoother antialiased font rendering, rounded/pill key styling, configurable colors, outlines, glow, hover, transparency, and breathing effects.
+- Added licensed Cyrodiil, OCU Nordic, and OCU Unease font options under the SIL Open Font License 1.1.
+- Added custom keyboard loading through OCUKeyboard.kb with an embedded Parchment fallback. The default layout=auto loads an installed custom design when present and otherwise uses Parchment.
+- Added a Keyboard Design selector to the Configurator. Parchment remains permanently available, while Studio designs are registered as they are opened or saved.
+- Fixed word-label and function-key centering, arrow-key content positioning, high-DPI artwork sizing, translucent outline/glow bleed, and jagged scaled/rotated PNG edges.
+
+OCU KEYBOARD STUDIO
+
+- Added a separate visual keyboard-authoring application launched from the Configurator.
+- Supports direct key and glyph selection, dragging, anchored edge/corner resizing, precise numeric positioning, output remapping, Lower/Shift/Caps/pressed previews, and persistent Undo/Redo history.
+- The text/input bar, PC/VR Mode, Lock, Size, Opacity, and Tilt controls can be repositioned. Their authored in-game laser hit zones move with them.
+- Key plates, top-control plates, and the input-bar plate can be hidden independently without removing their native interaction areas.
+- Supports movable/resizable/rotatable backgrounds, multiple layered PNG sprites and ribbons, clipboard cut/copy/paste, layer ordering, edge fading, corner rounding, independent opacity, glow color, and breathing effects.
+- Side-control arrows can be resized, moved, or replaced with transparent PNG artwork.
+- Imports TTF/OTF fonts into OCU's native SFN plus PNG format, audits only characters used by keys in the active layout, reports unsupported labels, and fills missing used glyphs from OCU Nordic.
+- Save and Save As register self-contained keyboard designs. Apply to Game detects the OCU installation it was launched from and installs directly without repeatedly asking for a folder.
+- Exports portable keyboard projects and shareable MO2 Root Builder ZIPs without overwriting another user's opencomposite.ini.
+- Keeps the original Parchment ribbon on the untouched classic keyboard while making it selectable/removable artwork in edited designs.
+
+NOTES FOR TESTERS
+
+- To validate the CSX crash fix, keep bOverrideScaleformAllocator=True, open and close MapMenu repeatedly, remain on the map for several minutes, and perform repeated fast travel.
+- The OpenCompositeInput log should report the MapMenu native bypass. No OCU map beam, geometry, Scaleform, depth bridge, or input ownership should be active.

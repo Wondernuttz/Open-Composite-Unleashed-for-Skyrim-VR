@@ -1,0 +1,1119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenComposite Unleashed 5 Setup Readme</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --window: #0e1116;
+      --surface: #161a21;
+      --surface-raised: #1b2028;
+      --surface-hover: #242a33;
+      --input: #14181f;
+      --border: #303844;
+      --border-soft: #252b35;
+      --accent: #287828;
+      --accent-hover: #339137;
+      --accent-pressed: #1f6022;
+      --accent-soft: #1b4323;
+      --accent-text: #67d376;
+      --key-glow: #3ebe8f;
+      --key-glow-hover: #5fe5b0;
+      --key-glow-bright: #84f29e;
+      --text: #edf0f5;
+      --text-secondary: #b5bcc7;
+      --muted: #7e8896;
+      --warning: #c27e2d;
+      --danger: #a44242;
+    }
+
+    * { box-sizing: border-box; }
+    html {
+      scroll-behavior: smooth;
+      scrollbar-color: var(--accent) var(--window);
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(62, 190, 143, 0.08), transparent 34rem),
+        radial-gradient(circle at 88% 12%, rgba(40, 120, 40, 0.07), transparent 28rem),
+        var(--window);
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+
+    header {
+      position: relative;
+      overflow: hidden;
+      padding: 54px 28px 42px;
+      border-top: 3px solid var(--accent);
+      border-bottom: 1px solid var(--border-soft);
+      background:
+        linear-gradient(110deg, rgba(27, 67, 35, 0.52), transparent 42%),
+        linear-gradient(180deg, var(--surface-raised), var(--surface));
+      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.26);
+    }
+    header::before {
+      content: "";
+      position: absolute;
+      width: 520px;
+      height: 520px;
+      right: -170px;
+      top: -310px;
+      border: 1px solid rgba(132, 242, 158, 0.12);
+      border-radius: 50%;
+      box-shadow:
+        0 0 65px rgba(62, 190, 143, 0.08),
+        inset 0 0 65px rgba(62, 190, 143, 0.05);
+    }
+    header::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--key-glow), transparent);
+      opacity: 0.7;
+    }
+    .header-inner {
+      position: relative;
+      z-index: 1;
+      width: min(1120px, 100%);
+      margin: 0 auto;
+    }
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin: 0 0 12px;
+      color: var(--key-glow-bright);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before {
+      content: "";
+      width: 28px;
+      height: 3px;
+      border-radius: 999px;
+      background: var(--key-glow-bright);
+      box-shadow: 0 0 12px rgba(132, 242, 158, 0.7);
+    }
+
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 34px 28px 60px;
+    }
+
+    h1, h2, h3 { line-height: 1.2; }
+    h1 {
+      max-width: 900px;
+      margin: 0 0 12px;
+      color: var(--text);
+      font-size: clamp(34px, 5vw, 52px);
+      font-weight: 720;
+      letter-spacing: -0.035em;
+      text-shadow: 0 0 28px rgba(132, 242, 158, 0.08);
+    }
+    h2 {
+      position: relative;
+      margin: 44px 0 18px;
+      padding-bottom: 11px;
+      color: var(--accent-text);
+      font-size: 26px;
+      letter-spacing: -0.015em;
+    }
+    h2::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 1px;
+      background: linear-gradient(90deg, var(--key-glow), var(--border-soft) 55%, transparent);
+    }
+    h3 { margin: 28px 0 9px; color: var(--key-glow-hover); }
+    p { margin: 8px 0 12px; }
+    a {
+      color: var(--accent-text);
+      text-decoration-color: rgba(103, 211, 118, 0.45);
+      text-underline-offset: 3px;
+    }
+    a:hover { color: var(--key-glow-bright); }
+    ::selection { color: #08110b; background: var(--key-glow-bright); }
+    code {
+      background: var(--input);
+      border: 1px solid var(--border);
+      padding: 2px 6px;
+      border-radius: 6px;
+      color: #dffbea;
+      font-size: 0.92em;
+    }
+
+    .lead {
+      max-width: 880px;
+      margin: 0;
+      color: var(--text-secondary);
+      font-size: 18px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: linear-gradient(145deg, rgba(27, 32, 40, 0.96), rgba(22, 26, 33, 0.96));
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 22px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+    }
+    .card > h2:first-child { margin-top: 0; }
+    #support {
+      position: relative;
+      overflow: hidden;
+      border-color: rgba(62, 190, 143, 0.45);
+      box-shadow:
+        0 12px 32px rgba(0, 0, 0, 0.2),
+        0 0 24px rgba(62, 190, 143, 0.04);
+    }
+    #support::after {
+      content: "";
+      position: absolute;
+      width: 220px;
+      height: 220px;
+      right: -110px;
+      bottom: -150px;
+      border-radius: 50%;
+      background: rgba(62, 190, 143, 0.09);
+      filter: blur(20px);
+      pointer-events: none;
+    }
+    .warn {
+      border: 1px solid rgba(194, 126, 45, 0.34);
+      border-left: 4px solid var(--warning);
+      border-radius: 10px;
+      background: linear-gradient(90deg, rgba(112, 73, 30, 0.24), rgba(27, 32, 40, 0.76));
+      padding: 13px 16px;
+      margin: 16px 0;
+    }
+    .ok {
+      border: 1px solid rgba(62, 190, 143, 0.3);
+      border-left: 4px solid var(--key-glow);
+      border-radius: 10px;
+      background: linear-gradient(90deg, rgba(27, 67, 35, 0.4), rgba(22, 26, 33, 0.78));
+      padding: 13px 16px;
+      margin: 16px 0;
+    }
+    .muted { color: var(--muted); }
+    .button-row { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+    .button {
+      position: relative;
+      display: inline-block;
+      overflow: hidden;
+      padding: 10px 18px;
+      border: 1px solid var(--key-glow);
+      border-radius: 999px;
+      background: linear-gradient(180deg, #1b4139, #101f20);
+      color: var(--text);
+      text-decoration: none;
+      font-weight: 650;
+      box-shadow:
+        0 0 0 1px rgba(132, 242, 158, 0.03) inset,
+        0 0 14px rgba(62, 190, 143, 0.1);
+      transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+    }
+    .button::after {
+      content: "";
+      position: absolute;
+      inset: -60% auto -60% -45%;
+      width: 24%;
+      transform: rotate(18deg);
+      background: linear-gradient(90deg, transparent, rgba(235, 255, 240, 0.48), transparent);
+      opacity: 0;
+    }
+    .button:hover {
+      color: #f0fff4;
+      border-color: var(--key-glow-bright);
+      background: linear-gradient(180deg, #265c4a, #142a28);
+      box-shadow: 0 0 20px rgba(132, 242, 158, 0.18);
+      transform: translateY(-1px);
+    }
+    .button:hover::after {
+      opacity: 1;
+      animation: button-shine 700ms ease-out both;
+    }
+    .button:focus-visible,
+    .tab-jumps a:focus-visible,
+    .toc > a:focus-visible,
+    summary:focus-visible {
+      outline: 2px solid var(--key-glow-bright);
+      outline-offset: 3px;
+    }
+    figure {
+      margin: 18px 0;
+      padding: 13px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 12px;
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.16);
+    }
+    figure img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      margin-bottom: 10px;
+    }
+    figcaption { color: var(--muted); font-size: 14px; }
+    ul { padding-left: 22px; }
+    ol { padding-left: 24px; }
+    li::marker { color: var(--key-glow); }
+    .toc {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 9px;
+    }
+    .toc h2 { grid-column: 1 / -1; }
+    .toc > a {
+      display: block;
+      padding: 10px 14px;
+      border: 1px solid var(--border-soft);
+      border-radius: 10px;
+      background: rgba(22, 26, 33, 0.75);
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: 140ms ease;
+    }
+    .toc > a:hover {
+      border-color: var(--key-glow);
+      background: rgba(27, 65, 57, 0.55);
+      color: var(--text);
+      transform: translateX(2px);
+    }
+    .tab-jumps {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin: 18px 0;
+    }
+    .tab-jumps a {
+      padding: 7px 13px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface-raised);
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: 140ms ease;
+    }
+    .tab-jumps a:hover {
+      border-color: var(--key-glow-hover);
+      background: rgba(27, 65, 57, 0.75);
+      color: var(--text);
+      box-shadow: 0 0 14px rgba(62, 190, 143, 0.1);
+    }
+    details.tab-reference {
+      margin: 13px 0;
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      background: linear-gradient(145deg, var(--surface-raised), var(--surface));
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+    }
+    details.tab-reference > summary {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 17px;
+      color: var(--accent-text);
+      font-size: 18px;
+      font-weight: 700;
+      cursor: pointer;
+      list-style: none;
+      background: rgba(27, 67, 35, 0.26);
+      transition: color 140ms ease, background 140ms ease;
+    }
+    details.tab-reference > summary::-webkit-details-marker { display: none; }
+    details.tab-reference > summary::after {
+      content: "+";
+      display: grid;
+      flex: 0 0 27px;
+      width: 27px;
+      height: 27px;
+      place-items: center;
+      border: 1px solid var(--key-glow);
+      border-radius: 50%;
+      color: var(--key-glow-bright);
+      font-size: 19px;
+      font-weight: 500;
+      line-height: 1;
+      box-shadow: 0 0 10px rgba(62, 190, 143, 0.09);
+      transition: transform 160ms ease, background 160ms ease;
+    }
+    details.tab-reference > summary:hover {
+      color: var(--key-glow-bright);
+      background: rgba(27, 67, 35, 0.44);
+    }
+    details.tab-reference[open] {
+      border-color: rgba(62, 190, 143, 0.52);
+    }
+    details.tab-reference[open] > summary {
+      color: var(--key-glow-bright);
+      border-bottom: 1px solid rgba(62, 190, 143, 0.22);
+    }
+    details.tab-reference[open] > summary::after {
+      content: "−";
+      transform: rotate(180deg);
+      background: var(--accent-soft);
+    }
+    details.tab-reference > div { padding: 5px 18px 18px; }
+    .setting-list { padding-left: 20px; }
+    .setting-list li { margin: 8px 0; }
+    .setting-list strong { color: var(--key-glow-hover); }
+    .subhead {
+      margin: 20px 0 7px;
+      color: var(--accent-text);
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+    @keyframes button-shine {
+      from { left: -45%; }
+      to { left: 125%; }
+    }
+
+    @media (max-width: 720px) {
+      header { padding: 40px 20px 32px; }
+      main { padding: 24px 18px 46px; }
+      h2 { margin-top: 36px; font-size: 23px; }
+      .toc { grid-template-columns: 1fr; }
+      .card { padding: 18px; }
+      details.tab-reference > summary { font-size: 16px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <p class="eyebrow">OpenXR for Skyrim VR</p>
+      <h1>OpenComposite Unleashed 5 Setup Readme</h1>
+      <p class="lead">
+        Set up OCU, choose the right OpenXR runtime, configure controls and video features,
+        and troubleshoot the full Skyrim VR integration.
+      </p>
+    </div>
+  </header>
+
+  <main>
+    <section id="support" class="card">
+      <h2>Support The Work</h2>
+      <p>
+        OCU is maintained through active development, testing, and debugging. Historically, there have been many
+        mods that have been out of reach for VR. The goal of OCU is to fundamentally change the Skyrim VR experience
+        into a proper VR game that will work with most mods available to players on desktop. OCU developers put a lot
+        of hard work and dedication into creating, maintaining, and troubleshooting this experience. We do this because
+        we love this community. Any support you can offer that helps further this goal is appreciated.
+      </p>
+      <div class="button-row">
+        <a class="button" href="https://buymeacoffee.com/coldbomb1f">Support ColdBomb</a>
+        <a class="button" href="https://ko-fi.com/wondernutts">Support Wondernutts</a>
+      </div>
+    </section>
+
+    <section id="contents" class="toc">
+      <h2>Contents</h2>
+      <a href="#bindings">Critical: Bindings First</a>
+      <a href="#install">Installation And Root Files</a>
+      <a href="#runtime-model">Runtime Model</a>
+      <a href="#meta">Meta / Quest / Virtual Desktop Setup</a>
+      <a href="#steamvr">SteamVR OpenXR Headsets</a>
+      <a href="#uninstall">Clean OCU Removal / Return To SteamVR</a>
+      <a href="#configurator">Configurator Settings</a>
+      <a href="#settings-reference">Complete Tab-By-Tab Settings Reference</a>
+      <a href="#laser-alignment">Controller And Laser Alignment</a>
+      <a href="#community-shaders">Community Shaders And Upscaling</a>
+      <a href="#dapa">DAPA Experimental Notes</a>
+      <a href="#troubleshooting">Troubleshooting</a>
+    </section>
+
+    <section id="bindings">
+      <h2>Critical: Bindings First</h2>
+      <div class="warn">
+        Binding conflicts are the number one reason for crashes, broken controls, and strange input behavior.
+        Do not stack old binding files, old SteamVR binding exports, or unrelated controlmap mods on top of OCU.
+      </div>
+      <p>
+        OCU ships with its own binding presets in the Configurator. Use those presets as the source of truth.
+        If you already have custom Skyrim VR bindings, VRIK controlmap edits, or another <code>controlmapvr.txt</code>
+        being supplied by a mod, remove and disable the conflicting file. OCU must control the bindings because
+        multiple keyboard and controller input paths need to block certain game actions to prevent crashes.
+      </p>
+      <h3>Included Presets</h3>
+      <ul>
+        <li><strong>VRIK V2.1.0:</strong> default recommended starting point. This is what most Skyrim VR players use.</li>
+        <li><strong>VR Safe:</strong> reestablishes original VRIK plus the original keyboard layout. Using the keyboard to walk in-game or activate items can crash the game.</li>
+        <li><strong>VRIK Alternate:</strong> alternate VRIK layout.</li>
+        <li><strong>Kvite:</strong> included community preset.</li>
+        <li><strong>Vanilla:</strong> baseline Skyrim VR layout.</li>
+        <li><strong>Vanilla + Oculus Touch Hotkeys:</strong> vanilla-style layout with Oculus Touch hotkey additions.</li>
+      </ul>
+      <div class="ok">
+        Recommended first test: apply one OCU preset, save bindings, restart the game, then test before adding any custom binding changes.
+      </div>
+      <h3>Controller Combo Bindings</h3>
+      <p>
+        Controller combos are configured on the Bindings page and saved to the <code>[combos]</code> section of
+        <code>opencomposite.ini</code>. A combo does not directly rewrite the game action at runtime. It watches
+        controller input, then sends one keyboard scancode. Skyrim then resolves that key through the active
+        <code>controlmapvr.txt</code>.
+      </p>
+      <ul>
+        <li><strong>Multiple buttons:</strong> every selected button must be pressed together for the combo to count.</li>
+        <li><strong>Press:</strong> fires once when all selected buttons are down, then resets after release.</li>
+        <li><strong>Double / Triple / Quad tap:</strong> counts clean combo presses inside the configured timing window.</li>
+        <li><strong>Long press:</strong> fires after all selected buttons are held for the configured timing window.</li>
+        <li><strong>Fire as keyboard key:</strong> sends the selected key scancode directly.</li>
+        <li><strong>Fire as Skyrim action:</strong> looks up that action's controlmap key and sends the matching scancode.</li>
+      </ul>
+      <p>
+        The runtime supports up to 16 combos. Larger button combos are checked before smaller ones, so a combo like
+        <code>Grip + A + B</code> is not eaten by a simpler <code>Grip + A</code> combo first. Combos are disabled
+        while the OCU keyboard is open so keyboard input does not fight itself.
+      </p>
+      <figure>
+        <img src="images/controller-combo-bindings.png" alt="OCU Configurator edit controller combo window">
+        <figcaption>Bindings -> Add/Edit Combo. Select one or more controller buttons, choose the activation mode, then fire a keyboard key or Skyrim action.</figcaption>
+      </figure>
+    </section>
+
+    <section id="install">
+      <h2>Installation And Root Files</h2>
+      <p>
+        OCU is not only a normal Data-folder mod. It includes root files that must land beside <code>SkyrimVR.exe</code>.
+        The most important root files are <code>openvr_api.dll</code> and <code>opencomposite.ini</code>.
+      </p>
+      <div class="warn">
+        If the root files are not deployed to the Skyrim VR game folder, Skyrim will not actually run through OCU.
+      </div>
+      <p>
+        In the Configurator, the game path must point to the folder that contains <code>SkyrimVR.exe</code>.
+        That folder varies by user and mod manager. A heavily modded Skyrim VR install should not live under
+        <code>Program Files (x86)</code>; Windows protected-folder behavior can block writes or make root-file
+        deployment look broken. Use a dedicated Steam library path such as <code>C:\Games\steamapps\common\SkyrimVR</code>
+        or another non-protected folder.
+      </p>
+      <figure>
+        <img src="images/game-folder-path.png" alt="OCU Configurator game folder path field">
+        <figcaption>The Configurator path should point to the real Skyrim VR game folder containing <code>SkyrimVR.exe</code>. The exact path varies by user.</figcaption>
+      </figure>
+      <h3>Mod Organizer 2</h3>
+      <ol>
+        <li>Install OCU as an MO2 mod.</li>
+        <li>Make sure the archive's <code>root</code> folder is deployed or virtualized into the real Skyrim VR game folder.</li>
+        <li>Put the Configurator EXE in the OCU mod folder. The Configurator is designed to save to both the mod folder and the game location.</li>
+        <li>After saving, verify <code>opencomposite.ini</code> and <code>openvr_api.dll</code> are present beside <code>SkyrimVR.exe</code> at launch.</li>
+      </ol>
+      <h3>MO2 Root Folder: With And Without Root Builder</h3>
+      <p>
+        MO2's virtual file system only covers the <code>Data</code> folder, and only for programs launched through MO2.
+        Even current MO2 versions (2.5.x) have no built-in way to put files beside <code>SkyrimVR.exe</code>.
+        The <code>Root</code> folder inside the OCU mod needs one of the two setups below.
+      </p>
+      <p><strong>Option A: Root Builder plugin (recommended).</strong></p>
+      <p>
+        First check if you already have it: open MO2 and look under <strong>Tools &gt; Tool Plugins</strong>.
+        If a <strong>Root Builder</strong> entry is there (with Build / Clear / Sync), the plugin is already
+        installed. Many Wabbajack lists ship with it. If so, skip straight to launching the game.
+      </p>
+      <ol>
+        <li>Download the Root Builder plugin for MO2 (by Kezyma, on Nexus).</li>
+        <li>Extract the <code>rootbuilder</code> folder into your MO2 <code>plugins</code> folder and restart MO2.</li>
+        <li>Root Builder looks for a folder literally named <code>Root</code> inside each mod and deploys its contents beside <code>SkyrimVR.exe</code> when you launch the game through MO2, then cleans up after (with autobuild on). The OCU package already uses this convention.</li>
+      </ol>
+      <p>
+        Root Builder has several modes. This choice matters for OCU:
+      </p>
+      <ul>
+        <li><strong>Copy mode (the default): use this.</strong> Files are physically copied to the game folder at launch. Most compatible.</li>
+        <li><strong>USVFS + Link mode</strong> also works: it virtualizes most files but hard-links <code>.exe</code> and <code>.dll</code> files so they physically exist at launch.</li>
+        <li><strong>Pure USVFS mode: do NOT use for OCU.</strong> Fully virtual root sounds ideal, but it struggles with files required at process launch. <code>openvr_api.dll</code> and the FidelityFX / DLSS DLLs load when SkyrimVR starts, which is exactly the case that breaks. Symptom: the game launches through SteamVR as if OCU is not installed.</li>
+      </ul>
+      <p><strong>Option B: Manual copy (no Root Builder).</strong></p>
+      <ol>
+        <li>Open the OCU mod folder in MO2 (right click the mod, Open in Explorer).</li>
+        <li>Copy everything inside the <code>Root</code> folder (<code>openvr_api.dll</code>, <code>opencomposite.ini</code>, the FidelityFX and DLSS DLLs) directly into the folder that contains <code>SkyrimVR.exe</code>.</li>
+        <li>Repeat the copy after every OCU update. Manual copies do not update themselves.</li>
+      </ol>
+      <div class="warn">
+        Root Builder is not required, but without it the root files must be copied by hand.
+        Either way the test is the same: if Skyrim launches through SteamVR instead of OCU, the root files were not beside <code>SkyrimVR.exe</code> at launch.
+      </div>
+      <h3>Vortex</h3>
+      <ol>
+        <li>Install and deploy the OCU package.</li>
+        <li>Verify the root files deploy to the same folder as <code>SkyrimVR.exe</code>, not only into <code>Data</code>.</li>
+        <li>Deploy SKSE/plugin files normally through the mod manager.</li>
+        <li>Run the Configurator, save <code>opencomposite.ini</code>, then restart Skyrim VR.</li>
+      </ol>
+    </section>
+
+    <section id="runtime-model">
+      <h2>Runtime Model</h2>
+      <p>
+        OCU replaces the normal OpenVR path with an OpenXR path. Think of it this way:
+      </p>
+      <div class="grid">
+        <div class="card">
+          <h3>Normal Skyrim VR</h3>
+          <p><code>SkyrimVR -> SteamVR</code></p>
+        </div>
+        <div class="card">
+          <h3>OCU</h3>
+          <p><code>SkyrimVR -> OCU -> active OpenXR runtime</code></p>
+        </div>
+      </div>
+      <p>
+        If you only have one headset, your OpenXR runtime is usually already set to that headset's expected runtime.
+        Enabling OCU makes Skyrim VR use that OpenXR runtime instead of the old SteamVR path. If you switch between
+        multiple headsets, consider using XR Picker to choose the active OpenXR runtime.
+      </p>
+    </section>
+
+    <section id="meta">
+      <h2>Meta / Quest / Virtual Desktop Setup</h2>
+      <h3>Quest Link / Air Link</h3>
+      <p>
+        For wired Link or Air Link, use the Oculus/Meta OpenXR runtime. In this path, OCU sends Skyrim VR through
+        Meta's OpenXR runtime.
+      </p>
+      <p><code>SkyrimVR -> OCU -> Oculus OpenXR</code></p>
+
+      <h3>Virtual Desktop On Quest</h3>
+      <p>
+        Virtual Desktop is mainly relevant for wireless headsets. For normal Quest wireless play through Virtual Desktop,
+        use <strong>VDXR</strong> in Virtual Desktop Streamer.
+      </p>
+      <p><code>SkyrimVR -> OCU -> VDXR</code></p>
+      <figure>
+        <img src="images/virtual-desktop-vdxr-runtime.png" alt="Virtual Desktop Streamer OpenXR runtime dropdown set to VDXR">
+        <figcaption>Virtual Desktop Streamer -> Options -> OpenXR Runtime. Quest wireless users should normally select VDXR, not SteamVR.</figcaption>
+      </figure>
+      <div class="warn">
+        Do not enable the Configurator's auto-switch audio option for Virtual Desktop. Virtual Desktop handles its own audio path.
+      </div>
+    </section>
+
+    <section id="steamvr">
+      <h2>SteamVR OpenXR Headsets</h2>
+      <p>
+        Bigscreen Beyond, Valve Index style setups, and other SteamVR/OpenXR headset paths generally use Steam's OpenXR runtime.
+      </p>
+      <p><code>SkyrimVR -> OCU -> SteamVR OpenXR</code></p>
+      <div class="ok">
+        OCU only replaces Skyrim VR's game-local OpenVR loader. It does not install a SteamVR driver.
+        With correct root deployment, clearing the deployed OCU files returns Skyrim VR to Valve's loader.
+      </div>
+      <h3>Wired SteamVR Headsets</h3>
+      <ol>
+        <li>Open SteamVR Settings.</li>
+        <li>Go to <strong>OpenXR</strong>.</li>
+        <li>Click <strong>Set SteamVR as OpenXR Runtime</strong> if SteamVR is not already the active runtime.</li>
+        <li>Open the OCU Configurator and apply the <strong>SteamVR OCU Profile</strong>.</li>
+        <li>Launch Skyrim VR through your mod manager after OCU root files are deployed.</li>
+      </ol>
+      <figure>
+        <img src="images/steamvr-openxr-runtime.png" alt="SteamVR OpenXR runtime settings page">
+        <figcaption>SteamVR Settings -> OpenXR. Wired SteamVR headset users set SteamVR as the active OpenXR runtime here.</figcaption>
+      </figure>
+      <div class="warn">
+        Important: wired SteamVR/OpenXR headset users should apply the SteamVR OCU Profile in the Configurator.
+        This patches SteamVR settings for OCU and backs up the existing <code>steamvr.vrsettings</code> file.
+      </div>
+      <figure>
+        <img src="images/configurator-steamvr-ocu-profile.png" alt="OCU Configurator SteamVR OCU Profile button">
+        <figcaption>OCU Configurator -> Settings -> SteamVR OCU Profile. Apply this profile for wired/native SteamVR OpenXR headset paths.</figcaption>
+      </figure>
+      <div class="warn">
+        Pimax works, but PimaxXR with Index controllers may report controller poses incorrectly.
+        If laser aim is miscalibrated or not aligned, use the laser calibration controls and report working values.
+      </div>
+      <h3>Steam-Native Wireless Note</h3>
+      <p>
+        Future Steam-native wireless headsets or wireless adapters may still use SteamVR as the OpenXR runtime.
+        If the headset's required runtime is SteamVR, use the same SteamVR OpenXR plus SteamVR OCU Profile path.
+        Do not apply this assumption to Quest Virtual Desktop users; those should normally use VDXR.
+      </p>
+      <h3>If SteamVR Still Acts Wrong</h3>
+      <p>
+        Some problems come from global OpenVR/OpenXR changes outside this mod. If you used OpenComposite Switcher before,
+        it may have changed settings that affect other games too. OCU does not automatically undo those global changes
+        because doing so could break another game setup.
+      </p>
+      <p>
+        If disabling the OCU mod does not return Skyrim VR to the normal SteamVR path, check previous OpenComposite
+        Switcher changes, your active OpenXR runtime, and stale files beside <code>SkyrimVR.exe</code>.
+      </p>
+    </section>
+
+    <section id="uninstall">
+      <h2>Clean OCU Removal / Return To SteamVR</h2>
+      <div class="warn">
+        Never delete the Skyrim VR root folder or everything except <code>Data</code>. OCU owns a small, explicit
+        set of root files; the Configurator can move those files into a recoverable backup without touching the game or <code>Data</code>.
+      </div>
+      <h3>MO2 With Root Builder</h3>
+      <ol>
+        <li>Close Skyrim VR and SteamVR.</li>
+        <li>Disable the OCU mod in MO2 so Root Builder cannot deploy it again.</li>
+        <li>Run <strong>Tools &gt; Root Builder &gt; Clear</strong>. Do this before cleanup so Root Builder finishes its own deployment cycle.</li>
+        <li>Close the MO2-launched Configurator, then launch the Configurator EXE directly from the OCU mod folder.</li>
+        <li>Open <strong>SteamVR / Help</strong> and click <strong>Remove OCU Game-Root Files</strong>.</li>
+        <li>Click <strong>Restore SteamVR Defaults</strong> to remove the separate OCU helper overrides from <code>steamvr.vrsettings</code>.</li>
+        <li>If the Configurator reports that no trusted Valve loader backup exists, verify Skyrim VR files in Steam before launching normally.</li>
+      </ol>
+      <p>
+        Root Builder can accidentally record an older OCU <code>openvr_api.dll</code> as its original game file. In that state,
+        disabling the mod or running Clear can restore old OCU instead of Valve OpenVR. The removal button recognizes an
+        OpenComposite loader by its contents, moves it out of the game folder, and requests Steam Verify when no trusted
+        Valve backup is available.
+      </p>
+      <h3>Manual Or Vortex Installation</h3>
+      <ol>
+        <li>Close Skyrim VR and SteamVR, then disable or purge the OCU mod.</li>
+        <li>Launch the Configurator directly and use <strong>Remove OCU Game-Root Files</strong>.</li>
+        <li>Use <strong>Restore SteamVR Defaults</strong>.</li>
+        <li>Run Steam Verify only if the Configurator says the Valve loader could not be restored.</li>
+      </ol>
+      <p>
+        Removed files are moved to <code>%LOCALAPPDATA%\OpenCompositeConfigurator\RuntimeBackups</code>. Customized INI and gesture
+        files are preserved there. Unknown or mismatched binaries are left untouched instead of being guessed at.
+      </p>
+      <div class="warn">
+        If SteamVR crashes or shows a black headset before Skyrim VR is launched, the game-local OCU DLL is not loaded yet.
+        That failure is in SteamVR, the headset driver, or another SteamVR driver wrapper. For PSVR2Toolkit, restore or verify
+        the PlayStation VR2 App driver separately; the OCU removal button intentionally does not touch that installation.
+      </div>
+    </section>
+
+    <section id="configurator">
+      <h2>Configurator Settings</h2>
+      <h3>SteamVR OCU Profile</h3>
+      <p>
+        The SteamVR OCU Profile resolves SteamVR's active <code>steamvr.vrsettings</code> file and patches it with OCU-friendly defaults.
+        It does not change your active OpenXR runtime.
+      </p>
+      <ul>
+        <li><strong>Apply SteamVR OCU Profile:</strong> backs up and patches SteamVR settings.</li>
+        <li><strong>Restore SteamVR Defaults:</strong> backs up and removes the OCU helper overrides.</li>
+        <li><strong>Open SteamVR Settings Folder:</strong> opens the folder containing <code>steamvr.vrsettings</code>.</li>
+        <li><strong>Remove OCU Game-Root Files:</strong> safely moves recognized OCU runtime files into a recovery backup. It does not touch <code>Data</code> or SteamVR's headset drivers.</li>
+      </ul>
+    </section>
+
+    <section id="settings-reference">
+      <h2>Complete Tab-By-Tab Settings Reference</h2>
+      <p>
+        This reference follows the labels in the current OCU Configurator. Settings stored in
+        <code>opencomposite.ini</code> do not affect a game that is already running: click
+        <strong>Save settings</strong>, close Skyrim VR, and start it again. Save settings also saves pending controller
+        bindings and Index trackpad assignments. <strong>Save All Bindings</strong> saves the complete control map;
+        <strong>Save Custom…</strong> also creates a named controller preset.
+        Gesture edits hot-load within a few seconds unless the control itself says otherwise.
+      </p>
+      <div class="tab-jumps">
+        <a href="#tab-settings">Settings</a>
+        <a href="#tab-bindings">Bindings</a>
+        <a href="#tab-gestures">Gestures</a>
+        <a href="#tab-video">Video</a>
+        <a href="#tab-kat">KAT VR / Trackers</a>
+        <a href="#tab-steam-help">SteamVR / Help</a>
+      </div>
+
+      <details id="tab-settings" class="tab-reference" open>
+        <summary>Settings Tab</summary>
+        <div>
+          <p class="subhead">Page controls</p>
+          <ul class="setting-list">
+            <li><strong>Master Reset:</strong> resets and saves only the Settings page. It does not alter keyboard or controller bindings.</li>
+            <li><strong>Save settings:</strong> writes INI-backed settings and pending controller bindings, including Index trackpad assignments, to OCU's installed locations. Restart Skyrim VR afterward.</li>
+            <li><strong>Reload:</strong> discards unsaved INI edits in the window and reloads the currently installed configuration.</li>
+          </ul>
+
+          <p class="subhead">VR Keyboard Shortcut</p>
+          <ul class="setting-list">
+            <li><strong>Enable controller shortcut to open keyboard anywhere:</strong> allows the chosen controller button or combination to open OCU's VR keyboard.</li>
+            <li><strong>Left/Right Stick, X/Y, and A/B selections:</strong> choose the physical buttons in the shortcut. Selecting more than one makes a chord; all selected buttons must be held together.</li>
+            <li><strong>Trackpad:</strong> adds an Index/Knuckles trackpad swipe shortcut. It appears only when the Index controller picture is selected.</li>
+            <li><strong>Tap:</strong> chooses single, double, triple, or quadruple activation. Multi-tap waits for the selected timing window before resolving the final tap count.</li>
+            <li><strong>Timing:</strong> length of the multi-tap window in milliseconds.</li>
+            <li><strong>Tilt / Trans / Size:</strong> keyboard angle, overall opacity, and physical display scale in VR.</li>
+            <li><strong>Keyboard:</strong> selects Parchment or an installed <code>.ocukb</code> design. Studio-installed designs appear here automatically.</li>
+            <li><strong>Open Keyboard Studio:</strong> launches the separate visual editor for keyboard layouts, fonts, artwork, states, and effects.</li>
+            <li><strong>Keyboard feedback:</strong> master switch for keyboard hover and press audio.</li>
+            <li><strong>Hover / Press:</strong> set the volume of hover and keypress feedback sounds.</li>
+          </ul>
+
+          <h4>Paste console commands in VR</h4>
+          <p>Copy one command on your Windows desktop or through Virtual Desktop. Open the Skyrim console using the OCU VR keyboard, tap <strong>Ctrl</strong>, then <strong>V</strong>. The text is inserted without running it; review the game console and press <strong>Enter</strong> when ready. Paste is limited to 256 characters including existing input. Multiline commands are rejected; a trailing line break is removed. Clipboard text is not logged. Other game text fields do not gain clipboard support from this feature.</p>
+
+          <p class="subhead">General Settings</p>
+          <ul class="setting-list">
+            <li><strong>Supersampling:</strong> multiplies OCU's render resolution. Above 1.0 is sharper and substantially more GPU-intensive; below 1.0 improves performance at the cost of clarity. It stacks with runtime supersampling.</li>
+            <li><strong>Controller models:</strong> <em>Automatic</em> prefers the installed SteamVR/Relos model, <em>Legacy grey hands</em> uses OCU's old hand model, and <em>Off</em> leaves controller/hand rendering to another mod such as VRIK.</li>
+            <li><strong>Enable hidden mesh fix:</strong> converts the runtime's hidden-area visibility mask for Skyrim VR. Leave it on unless the headset shows clipped edges or black wedges; it has no effect when the runtime supplies no mask.</li>
+            <li><strong>Invert using shaders:</strong> vertically flips eye textures through a shader. Use it only when the headset image is upside down.</li>
+            <li><strong>Keep player hands when controllers sleep:</strong> preserves the player's current left/right hand profile, bindings, and model while a controller sleeps or wakes instead of letting SteamVR temporarily replace that hand with a Vive wand. It does not keep the physical controller awake.</li>
+          </ul>
+
+          <p class="subhead">Skyrim VR Settings</p>
+          <ul class="setting-list">
+            <li><strong>Input dropout protection:</strong> keeps the strongest recent stick, trigger, grip, button, and touch sample so a one-frame runtime dropout does not cancel the input. It is not averaging and can make releases linger.</li>
+            <li><strong>Hold samples:</strong> number of recent samples retained. Three to five is a practical starting range; higher values survive longer dropouts but add more release latency.</li>
+            <li><strong>Controller smoothing:</strong> applies adaptive One Euro filtering to controller position and rotation. It stabilizes virtual hands, not the HMD, sticks, or buttons.</li>
+            <li><strong>Pos/Rot base Hz:</strong> baseline position or rotation responsiveness. Lower values smooth more at rest; higher values preserve more immediate movement and more jitter.</li>
+            <li><strong>Pos/Rot response:</strong> how quickly fast movement breaks through the corresponding filter. Higher values reduce lag during rapid motion but admit more noise.</li>
+            <li><strong>Disable trigger touch:</strong> ignores capacitive finger contact on the trigger. Pulling and clicking the trigger still work.</li>
+            <li><strong>Disable thumbrest touch:</strong> prevents capacitive thumbrest contact from being exposed as the legacy bindable D-pad Up input.</li>
+            <li><strong>Disable legacy trackpad routing:</strong> disables Skyrim's upper/lower physical-trackpad click translation. It does not disable or emulate thumbsticks.</li>
+            <li><strong>VRIK Knuckles trackpad mode:</strong> routes the Index/Knuckles trackpad in the compatibility mode expected by VRIK gestures. Leave it off for other controllers. The adjacent <strong>Help</strong> button explains the matching Spell Wheel MCM options when you want to open its wheel with a physical trackpad press.</li>
+            <li><strong>Index grip holding:</strong> select the Index controller picture to show these controls. Runtime default preserves the runtime's grip thresholds. Custom sensitivity enables Grab and Release thresholds for HIGGS Auto/Touch holding; Release must remain lower than Grab. Lower Grab makes pickup easier; lower Release makes a relaxed grip easier to maintain. The initial 0.50/0.25 values are tuning starting points, not factory calibration. Both modes confirm grip-touch release for 20 ms to filter brief dropouts; release completes on the next input update at or after that interval. Confirmed device removal or loss of input focus clears the hold immediately. Custom sensitivity retains a relaxed hold when input recovers within that interval. Squeeze-button bindings remain independent. Applies to detected Index controllers with any headset; no headset connection is needed to configure it. Save settings and restart Skyrim.</li>
+            <li><strong>L/R dead zone:</strong> ignores small X/Y movement around the center of each physical stick. Raise only far enough to stop drift.</li>
+            <li><strong>Swap sticks: right moves, left turns:</strong> swaps stick axes and stick-touch state. Stick clicks and other buttons remain on their physical hands.</li>
+          </ul>
+
+          <p class="subhead">Audio</p>
+          <ul class="setting-list">
+            <li><strong>Auto-switch audio to headset:</strong> changes the Windows default audio endpoint when OCU starts. Do not use it with Virtual Desktop, which owns its own audio routing.</li>
+            <li><strong>Device name:</strong> partial text used to match the desired Windows audio device.</li>
+          </ul>
+
+          <p class="subhead">Controller Axis Adjustments</p>
+          <ul class="setting-list">
+            <li><strong>Adjust tilt:</strong> applies a shared forward/backward controller tilt in degrees.</li>
+            <li><strong>Left/Right rotation X/Y/Z:</strong> rotates each controller model around its three local axes.</li>
+            <li><strong>Left/Right position X/Y/Z:</strong> offsets each controller model in meters. These are model/grip-pose adjustments, not laser calibration.</li>
+            <li><strong>Reset All to Defaults:</strong> returns controller and laser calibration values to zero/default filtering values.</li>
+          </ul>
+
+          <p class="subhead">Laser Aim Calibration</p>
+          <ul class="setting-list">
+            <li><strong>Enable menu lasers:</strong> enables OCU lasers in supported Scaleform menus. Disable for classic controller-only menu input. Requires save and restart.</li>
+            <li><strong>Smooth laser aim:</strong> applies adaptive filtering to the beam origin and aim direction.</li>
+            <li><strong>Pos Hz / Pos response:</strong> baseline smoothing and fast-motion response for the beam origin.</li>
+            <li><strong>Aim Hz / Aim response:</strong> baseline smoothing and fast-motion response for the beam direction.</li>
+            <li><strong>Left/Right laser X/Y/Z:</strong> rotates the OpenXR aim pose for each hand. It changes where the laser points; it does not move the controller model or the decorative binding dots.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details id="tab-bindings" class="tab-reference">
+        <summary>Bindings Tab</summary>
+        <div>
+          <div class="warn">After editing controller buttons, click <strong>Save settings</strong> or <strong>Save All Bindings</strong> to keep the changes. Use <strong>Save Custom…</strong> to save them as a named controller preset too. Restart Skyrim VR to use the changes.</div>
+          <ul class="setting-list">
+            <li><strong>Keyboard Type:</strong> selects the Skyrim input context being edited, such as gameplay, menus, or inventory. Each context has independent mappings.</li>
+            <li><strong>Disable Mouse Bindings (VR):</strong> unbinds the mouse column in the VR control map to prevent conflicting desktop-style mouse actions.</li>
+            <li><strong>Key / Action:</strong> click a key in the keyboard diagram, then assign the Skyrim action for the selected input context. Choose the none option to unbind it.</li>
+            <li><strong>Save All Bindings:</strong> writes the entire <code>controlmapvr.txt</code>&mdash;keyboard, mouse, gamepad, controller mappings&mdash;and saves controller combos.</li>
+            <li><strong>Master Reset:</strong> resets the Bindings page to OCU's VR Safe defaults, removes known keyboard conflicts, and unbinds mouse mappings.</li>
+            <li><strong>Reset to Game Defaults:</strong> restores the embedded baseline game control map rather than the VR Safe preset.</li>
+            <li><strong>Validate Bindings:</strong> scans the live control map for known deterministic crash patterns, repairs known-safe cases, and reports ambiguous conflicts.</li>
+            <li><strong>Controller Type:</strong> selects the input context for controller editing, independently of the keyboard Type selector.</li>
+            <li><strong>Button / Action:</strong> click a dot on the controller picture and assign an action available in that input context. Index trackpad halves can have separate assignments when the VRIK trackpad-gesture option is off; their saved assignments are retained when that option is on.</li>
+            <li><strong>Steam Frame:</strong> gameplay bindings and the Add/Edit combo pickers expose all 18 gameplay buttons. Combo circles use the same calibrated positions as the Bindings page. Left D-pad Down/Up and right X/Y are distinct controls. Grip uses analog squeeze; finger touch stays separate. Install the included <code>Interface/controls/pc/oculuscontroller.txt</code> so extra buttons support Skyrim's hold actions. Saving bindings, settings or combos repairs missing definitions while preserving custom entries. In MO2, ensure this OCU file wins conflicts, then restart Skyrim; an overriding file can reintroduce repeated inventory actions or broken holds. The active OpenXR runtime must expose the native Frame controller profile; physical Frame testing remains pending.</li>
+            <li><strong>Drop on left A/X:</strong> adds the left face button to Item Menus / XButton (inventory Drop), preserving existing Drop buttons. Save and restart Skyrim afterward.</li>
+            <li><strong>Preset:</strong> selects a built-in or user-saved controller layout.</li>
+            <li><strong>Use Preset:</strong> applies and saves the selected controller layout. Selecting a preset alone is a preview. Keyboard, mouse, gamepad mappings and combos stay unchanged.</li>
+            <li><strong>Save Custom…:</strong> save the edits currently shown in the editor and store a named preset in one step. No separate save is needed. Presets restore controller mappings; combos remain separate installation settings.</li>
+            <li><strong>Remove:</strong> deletes a user-created preset. Built-in presets are embedded and cannot be removed.</li>
+            <li><strong>Controller Combos:</strong> maps a button chord or one-to-four-tap sequence to a keyboard key. If the same button has multiple tap counts, OCU waits through the configured tap window so it can resolve the intended count.</li>
+            <li><strong>Controller:</strong> changes the Configurator picture and dot layout between Quest Touch, Index Knuckles, and PSVR2 Sense. Click its adjacent Save button to retain the choice.</li>
+            <li><strong>Move dots:</strong> lets mod authors align the clickable binding dots with the controller artwork. It does not calibrate an in-game laser or change OpenXR controller coordinates.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details id="tab-gestures" class="tab-reference">
+        <summary>Gestures Tab</summary>
+        <div>
+          <ul class="setting-list">
+            <li><strong>Left/Right drawing canvases:</strong> define one continuous stroke per hand. Drawing again replaces that hand's stroke; using both boxes creates a two-hand gesture.</li>
+            <li><strong>Gesture Library:</strong> loads, previews, edits, or deletes saved gestures.</li>
+            <li><strong>Clear Left / Clear Right / Clear Both:</strong> remove strokes from the selected canvas or both canvases.</li>
+            <li><strong>Smooth Shapes:</strong> cleans the current stroke once. <strong>Smooth as you draw</strong> applies cleanup continuously while authoring.</li>
+            <li><strong>Name:</strong> the saved gesture's display name.</li>
+            <li><strong>Key:</strong> keyboard key emitted when the Action is Press Key.</li>
+            <li><strong>Hold while gesturing:</strong> physical controller input that arms and records the gesture in game.</li>
+            <li><strong>Save Gesture:</strong> writes the gesture and hot-loads it into the running game within a few seconds.</li>
+            <li><strong>Action:</strong> chooses Press Key, instant spell cast, or equip spell in the left or right hand.</li>
+            <li><strong>Spell / Reload / Only spells I know:</strong> selects a spell from the exported game list, reloads that list, and optionally hides spells the player does not know.</li>
+            <li><strong>Trail / Rune:</strong> choose separate colors for the live tracing ribbon and the successful-completion flash.</li>
+            <li><strong>Width:</strong> controls the rendered trail thickness.</li>
+            <li><strong>Transparent / Smoky / Wispy / Glowing:</strong> combine visual style flags for the trail. Smoky adds billowing puffs; Wispy adds thin tendrils.</li>
+            <li><strong>Cast sounds:</strong> enables the tracing hum and successful-cast sound.</li>
+            <li><strong>Finish sound:</strong> selects the Impact or Dark successful-cast sound.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details id="tab-video" class="tab-reference">
+        <summary>Video Tab</summary>
+        <div>
+          <div class="warn">Do not stack OCU DLSS or FSR 3 with another temporal upscaler. OCU blocks Community Shaders upscaling while either OCU upscaler is active.</div>
+
+          <p class="subhead">NVIDIA DLSS / DLAA</p>
+          <ul class="setting-list">
+            <li><strong>Enable DLSS Super Resolution:</strong> enables NVIDIA NGX temporal upscaling. It is mutually exclusive with OCU FSR 3 and automatically enables the motion-vector path it requires.</li>
+            <li><strong>DLSS Preset:</strong> selects Quality 67%, Balanced 58%, Performance 50%, Ultra Performance 33%, DLAA/native resolution, or Ultra Quality 77%.</li>
+            <li><strong>Quick Presets:</strong> one-click buttons for the common DLSS presets or Off.</li>
+            <li><strong>Advanced &mdash; Model:</strong> selects the NGX model hint. Default uses K unless the installed NGX runtime resolves it differently.</li>
+            <li><strong>Advanced &mdash; Scale override:</strong> replaces the preset render scale; zero means use the chosen preset.</li>
+            <li><strong>Advanced &mdash; MV scale:</strong> scales the motion-vector magnitude sent to DLSS. Keep 1.0 unless diagnosing motion-vector behavior.</li>
+            <li><strong>Advanced &mdash; Jitter:</strong> controls temporal sub-pixel jitter amplitude.</li>
+            <li><strong>Advanced &mdash; NGX verbose logging:</strong> enables detailed NGX diagnostics and should remain off during ordinary play.</li>
+          </ul>
+
+          <p class="subhead">AMD FSR 3 / Native AA</p>
+          <ul class="setting-list">
+            <li><strong>Enable FSR 3:</strong> enables the hardware-agnostic FSR 3 temporal upscaler. It is mutually exclusive with OCU DLSS.</li>
+            <li><strong>Native AA:</strong> runs FSR's temporal antialiasing at a 1.0 render scale instead of upscaling a lower-resolution image.</li>
+            <li><strong>Render Scale:</strong> fraction of each eye's target resolution rendered before FSR reconstruction. Lower values save more GPU time and lose more source detail.</li>
+            <li><strong>Presets:</strong> set Quality 0.67, Balanced 0.59, Performance 0.50, Ultra Performance 0.33, Native AA 1.00, or Off.</li>
+            <li><strong>Advanced &mdash; Enable Motion Vectors / Actor MV / Camera MV:</strong> selects the game, actor, and camera motion-vector sources used by temporal upscalers.</li>
+            <li><strong>Advanced &mdash; MV Scale:</strong> global multiplier for motion-vector magnitude; 1.0 is the unmodified engine value.</li>
+            <li><strong>Advanced &mdash; FSR 3 Sharpness:</strong> FSR's own sharpening pass, separate from CAS.</li>
+            <li><strong>Advanced &mdash; Jitter Scale / MV Jitter Cancellation:</strong> controls temporal jitter and whether FSR compensates for jitter already present in game vectors.</li>
+            <li><strong>Advanced &mdash; View-to-Meters:</strong> converts Skyrim units to meters for FSR motion estimation; the normal Skyrim value is 0.01428.</li>
+            <li><strong>Advanced &mdash; Reactiveness / Shading / Accum per frame:</strong> tune disocclusion response, shading-change response, and temporal-history accumulation.</li>
+            <li><strong>Advanced &mdash; Debug view:</strong> shows FSR inputs and intermediate buffers for diagnosis. Leave Off for normal play.</li>
+          </ul>
+
+          <p class="subhead">DAPA &mdash; Depth Aware Positional Approximation</p>
+          <ul class="setting-list">
+            <li><strong>Enable DAPA:</strong> generates synthetic frames from the previous color frame, depth, and positional change. World reprojection remains depth-based. Where valid native motion vectors are available, a separate pass corrects pixels inside player and held-item masks. Do not combine it with SSW or runtime motion smoothing.</li>
+            <li><strong>Advanced &mdash; Auto mode:</strong> leaves native rendering alone while the game is fast enough and engages DAPA below the FPS threshold.</li>
+            <li><strong>Advanced &mdash; Debug highlight:</strong> tints synthetic frames so cadence and engagement can be verified.</li>
+            <li><strong>Advanced &mdash; Warp Strength:</strong> master correction strength; zero shows the cached frame without pose correction and 1.0 applies full correction.</li>
+            <li><strong>Advanced &mdash; Rotation / Translation / Loco Scale:</strong> control head-turn, positional lean/strafe, and game-locomotion contributions to the warp.</li>
+            <li><strong>Advanced &mdash; Depth Scale:</strong> controls depth-parallax intensity; zero becomes a flat 2D shift and values above 1.0 exaggerate depth.</li>
+            <li><strong>Advanced &mdash; Engage below FPS:</strong> threshold used by Auto mode.</li>
+          </ul>
+
+          <p class="subhead">Post AA and CAS</p>
+          <ul class="setting-list">
+            <li><strong>BlueSkyDefender Post-AA:</strong> hardware-agnostic post-process edge antialiasing. NVIDIA DLAA is instead selected from the DLSS preset list.</li>
+            <li><strong>BlueSky sensitivity / Threshold:</strong> tune edge detection strength and the luminance threshold for BlueSkyDefender.</li>
+            <li><strong>Enable CAS Sharpening:</strong> applies AMD RCAS sharpening, useful at native resolution. FSR 3 already has its own sharpening control.</li>
+            <li><strong>CAS Sharpness:</strong> controls RCAS strength from soft/off to maximum.</li>
+          </ul>
+
+          <p class="subhead">Texture MIP Bias</p>
+          <ul class="setting-list">
+            <li><strong>Correct MIPs for upscaling:</strong> asks texture sampling to retain finer mip levels when the scene is rendered below native resolution. This counteracts the blur that otherwise occurs before DLSS/FSR reconstruction, but values that are too negative can shimmer.</li>
+            <li><strong>Mode:</strong> <em>Auto</em> derives bias from <code>log2(renderScale)</code>, <em>Off</em> applies no correction, and <em>Custom</em> uses the Fixed value.</li>
+            <li><strong>Fixed:</strong> manual mip bias used only in Custom mode. Negative values select sharper/higher-detail mip levels; positive values select softer/lower-detail levels.</li>
+            <li><strong>Shared offset:</strong> adjustment applied to every automatic upscaler calculation.</li>
+            <li><strong>DLSS / FSR3 offset:</strong> per-upscaler correction added after the shared automatic bias.</li>
+          </ul>
+
+          <p class="subhead">Foveated Rendering</p>
+          <ul class="setting-list">
+            <li><strong>Backend:</strong> Auto prefers supported NVIDIA hardware VRS and otherwise selects Radial Density Mask (RDM). <strong>Density Mask (AMD / Intel, experimental)</strong> explicitly selects RDM. AMD/Intel image correctness and performance need hardware validation; successful activation does not guarantee a gain. The scene backends never stack. <strong>Shader effects only (test)</strong> publishes a profile for an enabled compatible renderer effect, without reducing scene shading through VRS or RDM.</li>
+            <li><strong>Eye Tracking AUTO / Enable automatic eye tracking:</strong> enabled by default, but activates only with valid OpenXR gaze. Auto can select RDM on AMD when gaze is available. Without gaze, foveation stays off unless Fixed is explicitly enabled.</li>
+            <li><strong>Fixed ENABLE:</strong> disabled by default. Enables a separate head-centered profile, also used as the fallback when eye tracking is enabled but gaze is unavailable.</li>
+            <li><strong>Edit eye-tracked rings:</strong> opens the moving-eye preview and eye-specific settings. Apply accepts the draft into the Configurator; Save settings and restart Skyrim to use it. Cancel discards the draft.</li>
+            <li><strong>Eye preset:</strong> Quality uses center/middle radii 0.30/0.65 and rates 1x1 / 1x2 / 2x2. Balanced uses 0.22/0.45 and 1x1 / 2x2 / 4x2. Performance uses 0.20/0.40 and 1x1 / 2x2 / 4x2; it is the fresh-profile default. Aggressive uses 0.20/0.40 and 1x1 / 2x2 / 4x4, resets shape/offset adjustments, and enables the optional outer cutoff at 0.82. Custom preserves manual choices. Named eye presets turn off the half-rate cap; existing saved profiles remain authoritative.</li>
+            <li><strong>Center / Middle:</strong> set the inner and middle ring boundaries. The outer rate continues beyond the middle boundary unless an optional blackout hides it. <strong>Choose each ring's rate</strong> exposes separate center, middle and outer rates; the preview shows requested and effective values.</li>
+            <li><strong>Limit eye rings to half rate:</strong> caps coarse eye-profile rates at 2x1/1x2. Fixed foveation has its own compatibility setting. <strong>Favor horizontal half rate</strong> is shared with Fixed and controls automatic half-rate direction and the cap for square coarse rates.</li>
+            <li><strong>Width / Horizontal offset / Vertical offset:</strong> adjust eye-ring shape and alignment. Positive horizontal offset moves both eyes outward; positive vertical offset moves down. <strong>Clear adjustments</strong> restores width to 100% and offsets to zero while retaining ring sizes, rates and blackout choices. Effects-only uses circular rings and disables width adjustment.</li>
+            <li><strong>Blackout / Outer boundary:</strong> hide the selected middle ring, outer ring or area beyond an optional cutoff while live eye tracking is active. By themselves these controls hide pixels after rendering. <strong>Skip rendering behind blackout (experimental)</strong> separately allows omitted scene work; effects and upscalers may still need those pixels. It requires a scene backend and a selected blackout, and does not alter Fixed fallback.</li>
+            <li><strong>Show rings inside the headset (debug):</strong> displays the current profile for alignment checks. Turn this and detailed logging off for normal performance comparisons.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details id="tab-kat" class="tab-reference">
+        <summary>KAT VR / Trackers Tab</summary>
+        <div>
+          <p>KAT treadmill input is experimental. Install and start KAT Gateway with the treadmill connected; the optional reader uses <code>KATNativeSDK.dll</code> from that installation. Gateway, its SDK and its runtime prerequisites are not bundled with OCU.</p>
+          <ol>
+            <li>Enable <strong>KAT treadmill input (experimental)</strong>, click <strong>Save settings</strong>, and restart Skyrim. Select headset-directed movement in Skyrim.</li>
+            <li>Open <strong>Reader setup</strong>, choose your installed Gateway's <code>KATNativeSDK.dll</code>, and start the reader. The SDK choice is remembered; optional automatic startup runs the reader with the Configurator when KAT input is enabled. Keep the Configurator open while playing. Closing Reader setup alone leaves the reader running; closing the Configurator stops it.</li>
+            <li>After gameplay loads, stand still and face forward. Press the direction-sensor button, or enable <strong>Controller calibration (both thumbstick clicks)</strong> and hold both centered thumbstick clicks for two seconds. Release before repeating. Haptics confirm accepted alignment when enabled; the shortcut requires fresh headset, controller and treadmill data with gameplay focused and menus closed.</li>
+          </ol>
+          <ul class="setting-list">
+            <li><strong>Port / Full-stick speed:</strong> reader and OCU ports must match (default 9020). Full-stick speed defaults to 3.0 m/s; raising it reduces movement sensitivity. Run only one reader.</li>
+            <li><strong>Connection status:</strong> green means fresh connected reader data, including while standing still. It does not confirm calibration or delivery to Skyrim. Stale, disconnected or invalid input stops treadmill movement; missing data expires within 250 ms. Physical stick input takes priority, and menus, keyboard use or unavailable game input suppress treadmill movement.</li>
+            <li><strong>Recalibration:</strong> align again after a data dropout, Gateway/reader restart or unknown reference-space change. A runtime recenter can preserve alignment when its transform is supplied. Headset system/recenter buttons are not the OCU controller-calibration shortcut.</li>
+            <li><strong>Body trackers:</strong> waist/foot indicators distinguish tracked poses (green), inferred poses (amber), and invalid or stale poses (gray). Other dots are reference points. Tracker software and the active OpenXR runtime must expose usable poses; KAT MoCap is separate from the walking reader and needs a compatible vendor setup. OCU does not make unavailable tracker poses appear.</li>
+          </ul>
+          <h4>Cable tracking</h4>
+          <p>Enable <strong>Track headset turns</strong> in the Cable tracking panel, save settings and restart Skyrim. No treadmill, body trackers or separate SteamVR overlay app are required.</p>
+          <ul class="setting-list">
+            <li><strong>Show:</strong> F8 displays the accumulated physical turns and which direction to unwind. <strong>Reset zero:</strong> Ctrl+Shift+F8, only after physically untwisting the cable. Both keyboard shortcuts are editable in <strong>Shortcuts &amp; display</strong>.</li>
+            <li><strong>VR keyboard:</strong> in PC mode, tap Ctrl, tap Shift, then press F8 to reset zero. Shift applies to function-key shortcuts; Caps does not add Shift to them. Release the trigger to release the shortcut keys.</li>
+            <li><strong>Controller shortcuts:</strong> on Bindings, add a Button combo and select <strong>Cable tracker: Show</strong> or <strong>Cable tracker: Reset zero</strong> as the target. Use a deliberate chord or long press for reset. Combos keep their normal game actions and are suspended while the VR keyboard is open.</li>
+            <li><strong>Automatic warning:</strong> choose a turn threshold (default 2; zero disables warnings) and display duration. The counter continues while hidden. It measures physical headset rotation, not joystick turns, and requires no Configurator process while playing.</li>
+            <li><strong>Start untwisted:</strong> each runtime session starts at zero. Tracking gaps or long pauses make the estimate incomplete and show an amber message. Untwist and reset to restore a known zero. This estimates cable twists; it cannot sense the cable itself.</li>
+          </ul>
+        </div>
+      </details>
+
+      <details id="tab-steam-help" class="tab-reference">
+        <summary>SteamVR / Help Tab</summary>
+        <div>
+          <ul class="setting-list">
+            <li><strong>Apply SteamVR OCU Profile:</strong> backs up and patches the active <code>steamvr.vrsettings</code> with OCU-compatible helper values. It does not select the active OpenXR runtime.</li>
+            <li><strong>Restore SteamVR Defaults:</strong> creates a backup and removes the OCU-specific SteamVR helper overrides.</li>
+            <li><strong>Open SteamVR Settings Folder:</strong> opens the folder containing the active SteamVR settings file.</li>
+            <li><strong>Remove OCU Game-Root Files:</strong> moves recognized OCU runtime files from the Skyrim VR game root into a recoverable backup. It does not delete <code>Data</code>, headset drivers, or SteamVR itself. Follow the result message and verify Skyrim VR through Steam when Valve's original loader cannot be restored.</li>
+            <li><strong>Open Setup Readme:</strong> opens this Help page from the installed OCU package.</li>
+          </ul>
+        </div>
+      </details>
+
+    </section>
+
+    <section id="laser-alignment">
+      <h2>Controller And Laser Alignment</h2>
+      <p>
+        Controller axis adjustments and laser aim calibration are separate.
+      </p>
+      <div class="grid">
+        <div class="card">
+          <h3>Controller Axis Adjustments</h3>
+          <p>
+            These adjust controller/grip pose behavior. Use them only if controller alignment feels wrong.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Laser Aim Calibration</h3>
+          <p>
+            These rotate the OpenXR aim pose used by the OCU keyboard and OCU menu lasers.
+          </p>
+        </div>
+      </div>
+      <div class="warn">
+        Laser calibration is use-at-your-own-risk. Defaults are zero. If you find good values for a headset,
+        controller, and runtime combination, report them to the OCU devs.
+      </div>
+    </section>
+
+    <section id="community-shaders">
+      <h2>Community Shaders And Upscaling</h2>
+      <p>
+        OCU contains multiple graphics and upscaling options in the Configurator. Community Shaders also contains DLSS
+        upscaling, but not all users are using Community Shaders. Decide which system you want doing your upscaling
+        before compiling shaders.
+      </p>
+      <div class="warn">
+        If Community Shaders is not going to be your upscaling platform, disable its upscaling before shader compilation.
+        Otherwise users can waste time rebuilding shaders.
+      </div>
+    </section>
+
+    <section id="dapa">
+      <h2>DAPA Experimental Notes</h2>
+      <p>
+        OCU DAPA (Depth Aware Positional Approximation) is experimental and currently for future testing. It can create parallax artifacts, ghosting,
+        flickering, or headset/runtime-specific issues.
+      </p>
+      <ul>
+        <li>Do not run DAPA and SSW or runtime motion smoothing at the same time.</li>
+        <li>If SSW is smoother for your setup, keep using SSW.</li>
+        <li>DAPA support tickets are not accepted yet unless the user is intentionally testing experimental DAPA.</li>
+      </ul>
+
+      <h3>How OCU DAPA Works</h3>
+      <p>
+        With DAPA on, the game renders at a throttled rate (for example 45 fps) and OCU generates a synthetic frame
+        between each real frame by re-projecting the last real frame with depth-based parallax. Rotation smoothing is
+        left to the runtime's own reprojection; OCU's warp corrects position, locomotion, and depth parallax. Standard
+        world reprojection does not use per-pixel motion vectors. Version 5.0.1 adds a separate native-motion correction inside the player and held-item mask; NPCs and other moving world objects can still ghost or distort.
+      </p>
+
+      <p>Player correction preserves the mask silhouette and falls back during locomotion, stick turns, menus, or invalid motion history. Thin or rotating objects can still show ghosting. It does not guarantee full-rate body animation or an FPS gain.</p>
+      <p>Capture, preparation, and correction costs are sampled together for the same stereo frame pair. Three consecutive samples above 1.5 ms pause the extra correction. Normal DAPA continues. The correction retries automatically with fresh history after 2 seconds; repeated failures increase the delay up to 30 seconds. Ten under-budget samples restore the initial retry delay. This is a sampled guard, not a strict per-frame time limit.</p>
+
+      <h3>DAPA Advanced Settings Reference</h3>
+      <p>All of these live in <code>opencomposite.ini</code> and most are exposed in the Configurator's DAPA panel. The existing <code>asw*</code> key names are retained for compatibility with older configurations.</p>
+      <ul>
+        <li><code>aswWarpStrength</code>: master strength. 0 shows the cached frame with no correction, 1 is full correction. Default 1.0.</li>
+        <li><code>aswTranslationScale</code>: optional extra headset-position correction (leaning, stepping). Default 0.0. Game locomotion uses its own setting below.</li>
+        <li><code>aswRotationScale</code>: stick-turn correction. Default 1.0. Tracked headset rotation remains with the runtime independently of this setting.</li>
+        <li><code>aswLocoScale</code>: stick locomotion correction so the world does not rubber-band while you run. Default 1.0.</li>
+        <li><code>aswDepthScale</code>: parallax intensity from the depth buffer. Lower it if near geometry wobbles. Default 1.0.</li>
+        <li><code>aswEdgeFadeWidth</code>: fades warp at depth edges to hide stretching artifacts. Higher = wider fade. Default 3.0.</li>
+        <li><code>aswNearFadeDepth</code>: parallax fades out closer than this distance in meters. Useful if your hands or weapon smear. 0 = off.</li>
+        <li><code>aswAutoNative</code> + <code>aswAutoEngageFps</code>: opt-in auto mode. DAPA stays out of the way while your natural fps is above the threshold and engages only when fps falls below it.</li>
+        <li><code>aswDebugMode</code>: 10 tints synthetic frames so you can see the real:synthetic cadence. 0 = off.</li>
+      </ul>
+
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Troubleshooting</h2>
+      <h3>Laser aim is miscalibrated or not aligned</h3>
+      <p>
+        Use Laser Aim Calibration, not controller axis adjustments, if the pointer direction is wrong while the controller model itself feels fine.
+      </p>
+
+      <h3>Crashes on exit, an invisible body, or a log that reports the wrong headset (foreign OpenXR API layers)</h3>
+      <p>
+        Other VR software can register <strong>implicit OpenXR API layers</strong> that silently load into every OpenXR
+        session, including OCU. Common sources are VIVE Business Streaming (VIVE HUB), Virtual Desktop Streamer, Ultraleap
+        Hand Tracking, and the Oculus / Meta runtime. On a machine that carries several of these, the extra layers wrap
+        every call OCU makes and can cause:
+      </p>
+      <ul>
+        <li>A crash log written on quit, even when the play session itself ran fine.</li>
+        <li>An invisible or misplaced VRIK body, or a shifted play space.</li>
+        <li>A crash or diagnostics log that reports a headset you are not actually using (for example a Quest while you are on an Index), because a compatibility layer is impersonating another runtime.</li>
+      </ul>
+      <p>
+        None of this is caused by OCU or by your headset. A Valve Index runs on OCU through the SteamVR OpenXR runtime
+        (lighthouse) and is fully supported. The fix is to remove the stray layers:
+      </p>
+      <ol>
+        <li>Open <code>SteamVR Settings &gt; OpenXR</code>. For an Index or Vive, confirm <code>Current OpenXR Runtime</code> reads <code>SteamVR</code> (if it already does, the "Set SteamVR as OpenXR Runtime" button is correctly absent).</li>
+        <li>Click <code>Manage OpenXR API Layers</code> and turn <strong>Off</strong> every layer you do not actively use. Aim for zero active.</li>
+        <li>Set <code>Meta Plugin Compatibility</code> to <strong>Off</strong> unless you are deliberately using a Meta headset.</li>
+        <li>Fully restart SteamVR, then recenter and re-run the VRIK Calibration power on flat ground.</li>
+      </ol>
+      <div class="warn">
+        <strong>They keep coming back?</strong> The owning app (VIVE Business Streaming, Virtual Desktop Streamer,
+        Ultraleap, Oculus / Meta) re-enables its own layer every time it launches or updates. If you are not using that
+        software, close it or uninstall it so the layer stays off.
+      </div>
+      <p class="muted">
+        Advanced: these layers live in the registry under
+        <code>HKLM\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit</code> and
+        <code>HKCU\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit</code>. Each value is a path to a layer JSON file, and its
+        data is <code>0</code> for enabled or any non-zero value such as <code>1</code> for disabled. OCU records the
+        active implicit layers at startup, so you can also check the <code>OCUnleashedSKSE</code> log for lines that begin
+        <code>Implicit OpenXR layer</code>, which flag foreign-runtime layers for you.
+      </p>
+    </section>
+  </main>
+</body>
+</html>

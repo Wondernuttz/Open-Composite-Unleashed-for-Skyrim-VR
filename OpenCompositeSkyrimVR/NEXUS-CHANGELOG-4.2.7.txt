@@ -1,0 +1,59 @@
+Open Composite Unleashed for Skyrim VR 4.2.7
+Changes since the Nexus build uploaded 22 Aug 2026 at 3:17 PM
+
+PERFORMANCE AND STABILITY
+
+- Eliminated the severe framerate drop while the OCU keyboard is open. Laser movement now uses a lightweight cursor layer instead of rebuilding and uploading the entire keyboard every frame.
+- Optimized animated keyboard glow and breathing while retaining all visual effects.
+- Reduced intermittent menu slowdowns by preventing blocked frames from accumulating repeated laser, render-target, and Scaleform work.
+- Reduced stationary-pointer overhead while keeping moving pointers, clicks, releases, sliders, and drags responsive.
+- Removed OCU's MapMenu rendering and input integration. Skyrim VR now retains complete control over the native map pointer, controls, geometry, and Scaleform handlers.
+- Added protections against delayed MapMenu and fast-travel handler corruption.
+- DAPA's high-frequency rendering hooks now install only when DAPA is enabled.
+- Reduced normal log spam from VRS, gaze tracking, upscaling, and motion-vector diagnostics. Detailed telemetry remains available through debug logging.
+
+LASERS AND RACEMENU
+
+- Added PrismaUI-style faded circular pointer dots with a warm-white resting state and electric-blue click feedback.
+- The new pointers reuse existing OCU layers and do not consume additional SteamVR overlay slots.
+- Both controller lasers remain visible at equal strength in flat menus, MCM, and RaceMenu.
+- Cursor authority follows the controller most recently moved over the menu. Clicking immediately transfers authority.
+- Cursor ownership remains locked during slider, scrollbar, and RaceMenu sculpting operations until the controlling hand releases.
+- Fixed RaceMenu VR's final Accept and Cancel controls.
+- Improved the RaceMenu character-naming flow so laser acceptance properly opens and completes text entry.
+- MapMenu continues using Skyrim VR's original native laser.
+
+EYE-TRACKED VRS
+
+- Corrected right-eye fovea alignment on Pimax and other canted or asymmetric headsets by projecting gaze separately through each eye.
+- Improved compatibility with runtimes that provide valid gaze poses without a timestamp.
+- Skyrim Compatibility mode limits coarse peripheral shading to reduce flat-colored terrain and foliage mipmap artifacts.
+- Added concise per-eye diagnostics for confirming gaze and projection alignment.
+- Eye Tracking AUTO only activates eye-tracked VRS when a valid gaze stream exists. It does not enable Fixed VRS on headsets without eye tracking.
+- Eye tracking remains isolated from CSX render scale, DAPA, motion vectors, swapchains, and post-processing resources.
+
+OCU KEYBOARD STUDIO
+
+- Added portable .ocukb packages containing keyboard layouts, artwork, and imported fonts for sharing through MO2 or Vortex.
+- Added a shared Keyboard Design library used by both Studio and the Configurator.
+- Bundled Parchment, the authored Dwemer keyboard, and Pug Dragon as selectable designs. Parchment remains the default.
+- Added direct hexadecimal color entry alongside the color wheels, including copy and paste support.
+- Added precise canvas zoom, middle-mouse panning, marquee selection, additive multiselect, group movement, and independent edge/corner resizing.
+- Added direct editing of keys, fonts, plates, the input bar, PC/VR Mode, Lock, and the Size, Opacity, and Tilt controls.
+- Added layered PNG artwork, sprites, ribbons, rotation, opacity, edge fading, rounded masking, glow, breathing, and layer ordering.
+- Added TTF/OTF importing with automatic conversion to OCU's native font format and OCU Nordic fallback for missing required characters.
+- Added independent plate fill, outline, outer glow, font outline, font glow, hover, and breathing controls.
+- Keyboard designs opened from an installed OCU package can be saved directly back to that installation for the next game launch.
+- The Dwemer design retains its specifically authored control positions and internal arrow, label, value, and control-box spacing.
+
+CONFIGURATOR AND CONTROLLER BINDINGS
+
+- Added Keyboard Design selection to the Configurator.
+- Added a warning when Press, Double Tap, Triple Tap, or Quad Tap actions share the same controller input, explaining the resulting overlap without introducing delayed button response.
+- Updated the Open Keyboard Studio button to match the Configurator's green visual design and periodic sword-shine effect.
+
+NOTES
+
+- Restart Skyrim VR after installing or changing a keyboard design.
+- Use Apply Preset to commit a controller binding preset; selecting a preset only previews it.
+- After using Remove OCU Game Root, validate Skyrim VR's files in Steam before returning to SteamVR.

@@ -1,0 +1,314 @@
+OpenComposite Unleashed 5.0.1 for Skyrim VR
+
+1. DAPA player motion: Added native-motion-vector correction inside the existing player, hands, equipped-weapon and held-item masks. Camera motion is removed before prediction; the original world warp is preserved. Motion is prepared at render resolution, and output regions without usable motion are skipped.
+2. Automatic recovery: Extra player correction pauses after three consecutive complete stereo samples above 1.5 ms, then retries with fresh history. Repeated failures increase the retry delay from 2 seconds up to 30 seconds; sustained recovery restores the short delay. Original masked DAPA continues during cooldown.
+3. Steam Frame controls: Added controller artwork, calibrated binding circles, presets and extension-gated native bindings for the D-pad, ABXY, bumpers, triggers, grips, sticks and View/Menu buttons. Gaze uses the existing OpenXR eye-gaze path. Physical Steam Frame validation remains pending.
+4. Index grip holding: Added short touch-release confirmation and recovery for custom grip thresholds, with cleanup when focus, controller or interaction profile changes.
+5. Menu interaction: Improved MCM option targeting and laser/thumbstick handoff. Removed the unsafe Crafting-menu hit test and hardened Journal focus handling across menu transitions.
+6. Configurator: Included DPI/layout corrections, restored keyboard haptic controls, clearer disabled text and working setup-guide access.
+7. VR keyboard and cable tracking: Added console clipboard paste with Ctrl+V, corrected modifier handling, and an optional physical-turn counter with an unwind overlay and assignable shortcuts.
+
+Player-motion correction remains experimental. It preserves the original mask outline; thin and rotating objects can still ghost. It pauses during locomotion, stick turns, menus, and invalid history. The GPU guard is sampled, and an FPS improvement is not guaranteed. AMD RDM remains experimental.
+
+Install the complete package, including root/openvr_api.dll and SKSE/Plugins/OpenCompositeInput.dll. Preserve your existing settings when updating. No CSX/Open Shaders shader-cache deletion is required. Fixed VRS and verbose logging are off in the shipped configuration.
+
+
+Steam Frame controller support
+- Added Frame artwork and Quest-sized binding circles for D-pad, ABXY, bumpers, triggers, grips, View/Menu and sticks.
+- Added extension-gated native OpenXR Frame bindings with independent extra buttons and Frame pose offsets. Eye gaze uses the existing EXT eye-gaze path; physical Frame testing is pending.
+
+Index grip: Added bounded 20 ms touch-release confirmation and custom-hysteresis recovery, immediate focus/device/profile reset, and optional transition diagnostics. Local tests passed; headset retest pending.
+
+VR keyboard: Added Windows clipboard paste into Skyrim console via Ctrl+V. Enter remains separate.
+
+VR keyboard: Added Shift to function/control-key shortcuts and repaired shared modifier releases.
+
+Cable tracking: Added optional headset-turn counter, unwind overlay, keyboard/controller shortcuts and turn warnings on KAT VR / Trackers.
+
+5.0.0 (release candidate)
+
+CONFIGURATOR DISPLAY SCALING
+- Restored keyboard haptic strength below press-sound volume on Settings, with aligned percentage fields. This controls both hover and key-press vibration. Removed the inactive hover-audio control; keyboard vibration remains independent of the sound switch.
+- Separated deadzone labels from their fields and spaced the FSR motion-vector controls. Removed the overlapping keyboard hint and labeled both keyboard sound volumes explicitly.
+- Reworked DPI fitting from stable design coordinates. Native numeric inputs retain ownership of their edit/spin controls; actual Windows client bounds prevent clipped fields after oversized window requests. Repeated scale changes no longer accumulate layout drift.
+- Corrected clipped button labels and bottom-of-window content, with additional space for the bottom row and layout checks across simulated display scales.
+- Kept Index grip settings visible for every controller layout, with disabled controls and guidance when Index is not selected. Save settings also remembers the controller picture selection.
+- Fixed the screen-fit exception when maximizing a window. Maximized layouts use the client area and preserve Windows-managed borders and restore bounds.
+- Enabled per-monitor DPI scaling with a 96-DPI design baseline for sharper text on scaled displays. Main pages and dialogs fit the available screen without scrollbars; oversized layouts scale down proportionally. Scrolling is retained only in the foveation editor. The gesture library uses previous/next pages. Saved controller calibration stays in normalized image coordinates.
+
+MENU RENDERING AND UPSCALING
+- Moved Journal System focus repair to the UI task queue, delayed it during menu transitions, and rejected stale movies and unready focus targets. Local lifecycle regression checks passed; the reported in-game crash requires tester confirmation.
+- Added an OCU-owned projected/HUD menu capture path for OCU DLSS/FSR. Compatible menu layers are composited after upscaling, sharpening and blackout processing, keeping captured UI out of world-image reconstruction. Source menu-texture resolution still limits final detail; this does not rerender fonts or replace CSX/Open Shaders' own menu handling.
+- Added stereo crop/alignment handling and restoration before unsupported draws, texture reads, copies, clears and deferred command playback. Unsupported rendering passes retain normal rendering. Menu composition uses an isolated command list to preserve the game's graphics state.
+- Pause temporal camera jitter during protected menu frames and keep DAPA suspended for a frame containing captured UI, including when the menu closes before submission finishes. Resume gameplay using fresh frame state.
+- Local GPU tests passed on WARP and NVIDIA hardware with and without the Direct3D debug layer, alongside VRS/RDM regression checks. In-headset Inventory/MCM validation of the new separation path remains pending.
+
+EYE TRACKING AND FOVEATION
+- Fixed and eye-tracked scene foveation now stop before the next draw when a Skyrim popup or pause menu opens during a frame. Pending RDM work finishes first; full-rate menu rendering stays active until a fresh gameplay frame. Existing map protection remains.
+- Added the PugDragon gaze-preview editor with Quality, Balanced, Performance and Aggressive profiles, independent ring sizes/rates, width and alignment controls, and in-headset diagnostic rings. Performance is the fresh-install default; saved profiles are preserved.
+- Added optional middle/outer blackout, an adjustable peripheral cutoff and a separate experimental option to skip rendering in hidden areas. Blackout alone does not establish a rendering-performance gain.
+- Improved gaze compatibility with runtimes whose timestamps are absent or unsuitable for freshness checks. Valid pose flags determine gaze eligibility; timestamps remain available for diagnostics.
+- Retained separate NVIDIA VRS and Density Mask rendering paths. AMD foveation (RDM) is now explicitly labeled experimental in the Configurator, including beside the Auto selection.
+- Corrected RDM reconstruction writing outside the current color draw when an earlier depth prepass covered a larger area. Current-draw coverage now restricts reconstruction, with incomplete edge clusters kept at full rate. Net AMD gameplay performance still requires matched testing.
+- Added selectable shader-effects-only foveation for compatible shader integrations; this mode requires a matching consumer and does not apply scene shading rates.
+
+KAT VR AND TRACKERS
+- Added KAT Gateway treadmill input through the bundled reader and a themed KAT VR / Trackers setup page. Users select the SDK from their installed Gateway; the reader remembers that location and offers automatic startup.
+- Added fresh connection indicators, speed and port controls, and direction calibration using the sensor button or the optional two-thumbstick controller shortcut after gameplay loads.
+- Added handling for stale/disconnected input, menus, lost focus and recentering. Physical stick input takes priority over treadmill movement. Calibration is required before walking input is delivered.
+- Added tracker-role configuration and connection feedback for compatible runtime-exposed body trackers. Avatar tracking requires a compatible Skyrim body-tracking mod and its dependencies.
+
+STARTUP AND CONTROLLER HELP
+- Added optional Index grip sensitivity: Runtime default or Custom with separate grab/release thresholds. The section stays visible; tuning controls are disabled unless the Index layout and Custom mode are selected. In-game tuning applies only to detected Index controllers. Custom mode uses Valve OpenXR thresholds where available and analog hysteresis otherwise; HIGGS Auto/Touch holding remains separate from squeeze-button bindings. Save settings and restart Skyrim.
+- Corrected HMD-presence queries during initialization, active runtime use and teardown so they do not create a competing OpenXR instance or assert solely because an instance already exists.
+- Added a themed Help button beside the Index trackpad gesture setting, with the paired Spell Wheel MCM options and physical press guidance. Existing bindings remain unchanged.
+
+4.3.7 Hotfix 6 (2026-09-12)
+- Fixed slow resource-identity recovery after CSX/upscaler render-target recreation. Coalesced game-thread maintenance replaces the approximately one-second poll; unchanged resources return before COM/descriptor work. Exact scene ownership and safe resource retirement remain.
+- Reconcile menu activity after events so a later pause-count release can restore foveation/DAPA without another menu event. Tracked menus and real pauses remain protected.
+- Includes the fixed-profile diagnostic timeout correction below. DAPA tuning, ring settings and Configurator are unchanged. See doc/4.3.7-Hotfix-6.md for tests and remaining headset confirmation.
+
+4.3.7 fixed-ring diagnostic follow-up (2026-09-12)
+- Fixed and gaze-loss fallback debug rings no longer turn into an amber X solely because a rendered frame took over 500 milliseconds. The next frame still clears the profile before menu, missing-geometry or other disabled decisions; invalid profiles and clocks remain rejected.
+- Eye-tracked diagnostic gaze still expires after 500 milliseconds. Rendering eligibility, CSX compatibility, DAPA timing, settings and GPU work are unchanged. This removes a misleading indicator, not a demonstrated cause of every reported gameplay dropout.
+- Runtime marker: 4.3.7-foveation-debug-hotfix1 / fixed-ring-no-timeout-v1. The separately packaged Hotfix 5 hashes below identify the earlier drop.
+
+4.3.7 Hotfix 5 (2026-09-12)
+- Full alpha test package combining the current runtime, SKSE plugin and Configurator. See doc/4.3.7-Hotfix-5.md for component identities, validation and remaining headset checks.
+- Fixed and gaze-loss fallback foveation now use the validated scene-depth route for separate submitted eye images. RDM can use valid scene depth without a shared submitted color texture; existing draw and viewport guards remain.
+- Added the moving-eye popup with the PugDragon detail preview. Quality, Balanced, Performance and Aggressive apply complete size/rate profiles; Performance is the fresh-install/reset default. Saved profiles remain authoritative.
+- Accumulated gaze movement now triggers rate-map updates. DAPA suspends for gameplay menus including Favorites and resumes from a fresh real stereo pair.
+- Includes earlier terrain/cutout protection, separate debug-ring overlays, controller/session recovery, Index grip/trackpad routing, RaceMenu keyboard recovery, DAPA mask lifetime/exact-pixel protection and the optional CSX integration contracts.
+- The separate-eye routing adds no GPU pass or full-frame copy. Normal VRS/RDM costs remain; no new Skyrim FPS or AMD/headset validation claim is made.
+
+4.3.4 Test 7 (2026-09-10)
+- RDM color-pass handoff: preserve original depth/stencil; mask a private copy only for eligible depth-equal opaque color passes.
+- Reconstruct affected MRTs before shader, compute, copy and command-list consumers; protect depth edges, blending, alpha/discard and unsupported passes.
+- Restore the original DSV before CSX post-draw callbacks. Resume RDM on the next eligible draw; preserve DAPA tuning and Test 6 VRS protection.
+- Hardware and software GPU probes cover color/MRT reconstruction and byte-identical original depth. Skyrim/AMD headset performance still needs validation.
+
+# Changelog
+
+## 10 September 2026 - 4.3.4 Test 6 VRS color coverage
+
+- Added shader-specific full-rate protection for pixel discard/dither, depth or coverage output, UAV writes, dynamic linkage and alpha-to-coverage. Ordinary opaque shaders retain fixed/eye-tracked NVIDIA VRS; protection releases immediately on the next compatible shader.
+- Capture shader bytecode during early D3D11 initialization and on the game device. Classifications attach to shader objects, support stripped bytecode, and cannot survive object destruction/address reuse. Pre-existing unclassified shaders run full rate individually.
+- Track shader/blend changes, ClearState and context-state swaps before rendering. Deferred command lists run full rate and restore the previous immediate-context decision after playback. No new GPU copies, waits, flushes or shader compilation during state changes.
+- Hardware regression reproduces 7,680 missing expected pixels in each half-rate control; production hooks restore all 16,384 expected pixels. Opaque stereo shading reduction, immediate recovery, state restoration and resize/session tests pass on RTX 5070 Ti.
+- New runtime marker and per-frame throttled diagnostics identify effective coarse/protected/unclassified state transitions. DAPA tuning, gaze geometry, RDM depth handoff, CSX and SKSE binaries are unchanged. Skyrim/headset confirmation of the reported artifacts remains required.
+
+## 6 September 2026 - DAPA and diagnostic logging update
+
+- Added support for the exact CSX AIO VR 1595cffd build and validated all six supported DLLs. Added startup discovery for byte-identical known draw functions relocated within the shader DLL; changed code still requires validation. No new per-frame scanning or GPU work.
+- Added a once-per-session in-game warning after loading when DAPA player/body/held-item mask startup fails. Logs identify the actual draw-hook owner without automatically blaming Community Shaders. ENB binaries and live AMD behavior are not yet qualified.
+- Removed MapMenu from OCU's managed interaction targets, retaining only a native-map exclusion guard. Removed console code that hid Skyrim's shared native pointer without restoring it. Skyrim owns the map laser and clicks; OCU's white console selection remains.
+- Follow-up compatibility update: validated Treatid's published CSX 3.19 PR20/PR21 accepted-draw functions, added a complete five-binary regression mode, and made unsupported-owner startup failures explicitly report inactive body correction and the owner offset. No additional frame work. Deployed to local MO2 and Nexus staging; live AMD/CSX validation remains outstanding.
+- Fixed the DAPA accepted-draw adapter rejecting the verified regular CSX 3.18 and 3.19 binaries. Select the exact validated owner contract at startup, retaining Paintball support and all CSX suppression decisions. No additional per-frame scan, GPU pass or timing change. Other rebuilt/forked binaries are not automatically accepted; see doc/DAPA-CSX-Compatibility-2026-09-06.md.
+- Follow-up: moved routine keyboard/haptic/key-injection, gesture/combo, laser/menu and eye-pose diagnostics behind logging. First failures remain visible with per-call-site throttling on high-frequency failure paths. Starting/completed keyboard text is no longer logged. No input/rendering behavior changes.
+- Added the themed "Turn on logging" checkbox in SteamVR / Help. Detailed runtime and SKSE diagnostics share the resolved logLevel setting; saving requires a Skyrim restart. Basic startup/error logs remain.
+- Gated recurring DAPA body-mask/status/latency diagnostics and removed per-draw diagnostic clock reads when logging is off. Removed config parameter echo spam and per-info-line forced disk flushing. No DAPA motion, timing or mask math changed for this logging update.
+- Integrated tested player/equipped, HIGGS-held and Spell Wheel UI depth ownership. The CSX adapter validates its supported draw signature; transparent materials without usable depth remain a limitation.
+- Production builds disable DAPA capture gestures, hotkey and desktop requests by default. The capture utility is developer-only and excluded from the local Nexus package. MediaPipe World3D and Vive tracker support remain; retired Legacy2D code remains recoverable in Git history.
+
+## v4.2.9 - 28 Aug 2026
+
+Changes since the Nexus build uploaded 22 Aug 2026 at 3:17 PM.
+
+- Removed the unused Meta space-warp provider, XR_FB_space_warp registration, unreachable submission branches, deprecated ASW control/MV settings and orphaned scheduler counters. Removed the disabled ONNX/RTMW Legacy2D body-inference/sender/recorder path and its private buffers and obsolete UI fields. Current MediaPipe World3D output remains unchanged and its pose/gait/recorder self-tests pass.
+- Removed the retired rendering experiment's split-frame scheduler, no-op provider interfaces, unused first-person/stencil capture machinery, and unused synthetic-frame DLSS/FSR histories and resources. Removed nonfunctional experimental controls and migrate their old INI keys out on save. Normal DAPA, gaze/fixed foveation, and game-frame DLSS/FSR remain. See Docs/Rendering-Cleanup-Validation-2026-09-05.md.
+- Hardened DAPA timing: refresh-relative stall detection, wall-time recovery instead of frame-count delays, adaptive engagement thresholds that remain usable at high refresh, and bounded color/depth swapchain waits with timeout-safe ownership. Runtime depth attachments are used only when updated successfully for that submission. The warp shader, normal one-warp cadence, CSX binaries, and saved user settings are unchanged. See Docs/DAPA-Timing-Validation-2026-09-05.md for test evidence and limitations.
+- Fixed Radial Density Mask reconstruction using the wrong vertex shader, inherited blend/sample-mask state, stale frame flags across menu/gaze transitions, incomplete edge clusters at non-aligned eye resolutions, and loss of application output-merger UAV bindings. Added real D3D11 pixel/state regression tests. This does not establish compatibility with Community Shaders' earlier depth-dependent passes or third-party alternate-frame rendering; see Docs/Foveation-Validation-2026-09-05.md.
+- Restored normal player locomotion while repositioning the VR keyboard. Keyboard grab and two-hand pinch still use unmasked controller input for placement, but no longer zero both game-facing thumbsticks or suppress unrelated actions.
+- Added a cross-vendor D3D11 Radial Density Mask foveation backend for AMD and Intel GPUs, with automatic NVIDIA VRS preference, shared fixed/eye-tracked centers, scene-depth scoping, pre-compositor color reconstruction, explicit backend selection in the Configurator, and retained MIT attribution to VRPerfKit_RSF. The two backends are mutually exclusive and menus remain unmasked.
+- Added ABI-correct `IVROverlay_028` support for current OpenVR/ReShade clients while retaining the existing `IVROverlay_027` adapter unchanged for CommonLibVR and older Skyrim VR plugins. The two new 2.12 subview calls return a safe OpenVR `RequestFailed` result because OCU does not render subviews yet; they never abort the process or shift legacy vtable slots. Older ReShade 6 builds that request a SteamVR dashboard now receive one inert hidden compatibility overlay so their effect runtime can initialize without creating another OpenXR swapchain; current ReShade builds retain their own OpenComposite-detection path.
+- Expanded the installed Help webpage with a complete public tab-by-tab Configurator reference covering Settings, Bindings, Gestures, Video and its Advanced panels, and SteamVR / Help. The reference separates saved settings from actions and explains restart requirements, performance/quality tradeoffs, calibration scope, MIP bias, VRS fallback behavior, and unsafe feature combinations. The guide now uses the same graphite surfaces, bright-green interaction glow, rounded pill controls, and softened warning colors as the Configurator.
+- Fixed custom console INPUT artwork being lost when a Studio design passed back through the Configurator. The Configurator now copies artwork declared through portable OCU metadata, including console INPUT and PC/VR/lock state images; direct Studio installs use a collision-proof Installed Custom identity instead of resolving an edited stock-named design back to the bundled original. Studio now verifies every referenced asset beside the installed layout before reporting success, and custom designs that share a stock name receive a clear `(Custom)` label instead of an indistinguishable duplicate.
+- Cleaned up Skyrim VR Settings so the controls describe their real behavior: Input Smoothing is now Input Dropout Protection with a Hold Samples control, One Euro filter tuning uses readable base-frequency/response labels and detailed tooltips, physical trackpad routing is distinguished from thumbstick emulation, and the controller-sleep option now explicitly says it keeps the player's hands instead of allowing a temporary Vive-wand replacement. Removed the non-functional GPU Frame Timing checkbox and its disabled D3D11 timestamp-query code, which had previously been shelved for causing micro-stutter. Older `enableGpuTiming` entries are ignored and removed when the Configurator saves.
+- Fixed AMD and other non-NVIDIA systems repeatedly attempting to initialize the NVIDIA-only VRS backend every compositor frame while Eye Tracking AUTO was enabled. OCU now identifies the D3D adapter before touching NVAPI and permanently latches an unsupported result for that graphics-device session. Generic OpenXR eye-gaze handling, FSR, DAPA, menus, and keyboards are unchanged.
+- Keyboard Studio now treats PC/VR Mode and Lock/Unlock as layered controls. Their interaction box, state PNG, and text can be selected and positioned independently; state PNGs can also be resized and text retains independent font scaling. The native keyboard applies those exact transforms while keeping the authored interaction box as the sole laser hit target. Existing `.kb` and `.ocukb` designs remain centered through zero-offset/inherited-size defaults.
+- Fixed selection authority for those layered controls: choosing a state PNG now selects its matching preview/image immediately, explicit Hit box / State image / Text buttons expose fully overlapped layers, and clicking a painted PC/VR or LOCK glyph takes text authority even while its larger hit box is selected. Moving or resizing a hit box now preserves the state image and text at their absolute visual geometry instead of stretching them; Fit image to box and Fit box to image provide deliberate one-shot alignment in either direction. The mouse wheel resizes selected state images or ordinary sprites around their center as well as resizing selected text. A selected generic sprite can also be dragged when it overlaps a Mode/Lock hit box.
+- Added four optional state-aware top-button images to Keyboard Studio and the native keyboard: VR Mode, PC Mode, world/unlocked, and head-locked. Each PNG follows the authored button rectangle, switches with the actual runtime state, falls back to normal text when absent, and can optionally retain text over the image. The assets travel inside `.ocukb` and MO2 exports and are composited into the existing keyboard texture without adding an OpenXR layer or swapchain.
+- Replaced the keyboard and Scaleform-menu laser endpoints with PrismaUI-style faded circular dots: a warm-white core, soft warm halo, and transparent edge. The texture is now correctly premultiplied, fixing the square quad some runtimes exposed around the cursor. Click feedback retains the electric-blue version of the same shape.
+- Kept the cursor change within the existing keyboard/menu dot layers; it adds no OpenXR composition layers or SteamVR overlays.
+- Removed the keyboard breathing renderer's per-tick D3D texture allocation and extra GPU copy. OCU now reuses its CPU surface, updates the acquired OpenXR swapchain image directly, and samples slow breathing effects at 10 Hz instead of rebuilding the full 1024x560 keyboard at 20 Hz. Glow and breathing remain available.
+- Cached repeated rounded-key glow geometry, collapsed sixteen redundant font-glow layout/resampling passes into one atlas pass, and added a native-size fast path for stock keyboard backgrounds. Breathing, hover, and press effects retain the same keyboard layer while doing substantially less render-thread work. Slow keyboard refreshes are reported at most once every five seconds with CPU and OpenXR wait/upload time separated.
+- Fixed the stock VR keyboard collapsing headset performance while a laser was active. Laser motion now updates a tiny dedicated cursor composition layer instead of forcing a CPU redraw, swapchain wait, and upload of the full 1024x560 keyboard every frame. This path is isolated from the Quest Pro companion-window/mirror fix, DAPA, render scale, and CSX.
+- Kept flat-menu laser pose/rendering at full headset refresh while making Scaleform interaction change-driven. Moving hover is capped at roughly 30 Hz, a stationary pointer performs no Scaleform hit testing or mouse-event injection, and menu transitions, trigger edges, and active drags bypass the limiter immediately. Slow semantic probes over 4 ms are logged at most once every two seconds.
+- Physically removed the obsolete MapMenu depth bridge, cloned companion-beam geometry, shader/material mutation, GPU buffer replacement, map quad profile, and dormant map-specific laser branches. Only a menu-name lifecycle sentinel remains so OCU can clear its own state and leave Skyrim VR's map completely alone.
+- Added directly editable and pasteable hex color fields beside Keyboard Studio's color-wheel swatches. Both `#RRGGBB` and alpha-preserving `#RRGGBBAA` values are accepted.
+- Fixed the Appearance palette retaining stale colors after changing Keyboard Design or Base Theme. The palette now always reflects the loaded design, appearance edits automatically create overrides without a gate checkbox, and a Reset action restores the selected Base Theme. Switching designs explicitly warns before discarding unsaved changes.
+- Restored native cut/copy/paste and undo behavior inside Studio's text and numeric editors. Selecting a key now has a real drag threshold, preserves exact values such as `1.15` with Snap enabled, and no longer lifts the key or glyph as an edit-mode hover preview.
+- Added a Configurator warning when Press, Double Tap, Triple Tap, or Quad Tap actions share the exact same controller input. These modes remain independent by design; OCU explains that exclusive recognition would delay the shorter action for the full tap window instead of silently adding controller latency.
+- Moved high-frequency DLSS, FSR3, motion-vector, and live-gaze telemetry behind the explicit `logLevel=debug` setting. Normal logging retains startup state, failures, first-frame confirmation, and slow-frame warnings without continuously writing render-path diagnostics.
+- Cleaned the packaged `opencomposite.ini` so new installs receive the standard keyboard size, opacity, position, laser-adjustment, and VRIK preset defaults instead of development-machine values.
+- Removed duplicate Keyboard Design entries caused by older managed copies sharing a bundled design name. The current stock design now wins and appears once under its clean name, including `Pug Dragon Keyboard`.
+- Fixed authored settings arrows being visually covered but laser-blocked by invisible keyboard regions. Arrow hit testing now follows the renderer's topmost order, correcting the Dwemer opacity-up triangle that previously responded only when aimed just above it.
+- Fixed Dwemer theme switching in Keyboard Studio so Size, Opacity, and Tilt move into the same authored side-panel slots used by the in-game Dwemer keyboard. The stock design now also preserves Dwemer's distinct arrow, label, value, and control-box spacing. The Controls inspector and preview update immediately, and exact runtime geometry is covered by Studio's self-test.
+- Added a Find Fonts shortcut beside Keyboard Studio's Add TTF action, with a reminder to verify the individual font's redistribution license before sharing it in an `.ocukb` or mod package.
+- Added a dedicated Relos Custom Controllers pill button to Keyboard Studio. Its tooltip identifies the linked mod as SteamVR controller artwork and clarifies that it does not change OCU bindings, dot calibration, or laser alignment.
+- Widened the Configurator's selected-controller-button prompt and moved the adjacent Action field so `(click a button)` remains readable instead of being clipped.
+
+- Matched the Configurator's Open Keyboard Studio action to the exact positive-button green used elsewhere and added a one-second diagonal sword-shine sweep every five seconds.
+- Removed pointer-drag stalls by coalescing full 1024x560 preview rendering and deferring inspector-panel rebuilds until the drag is released.
+- Added visible-item marquee selection from empty canvas space, additive Ctrl/Shift marquee selection, per-item/group outlines, and group movement.
+- Hidden plates are excluded from marquee selection. Full-canvas backgrounds are selected only when completely enclosed so they do not capture every box.
+- Renamed the misleading Grid Width section to Grid Column Count and documents that fewer columns produce larger keys.
+- Removed the zero-position clamp from typing-key numeric fields, pointer movement, multi-selection movement, and edge resizing. Negative grid X/Y positions now work end to end.
+- Preview/input bar, PC/VR Mode, and Lock now have independent plate width, plate height, and font scale. Visible plates resize with canvas handles, the mouse wheel scales their font, and native OCU rendering plus laser hit testing use the authored rectangles.
+- Fixed Base Theme showing the raw `KeyboardTheme` record instead of readable theme names. Added an explicit explanation that custom colors/artwork override most theme visuals while fallback styling and geometry remain.
+- Moved Undo and Redo from the top action row to a dedicated lower-right strip beneath the keyboard preview; the live history count remains in the bottom status bar.
+- Added cursor-anchored 100%-500% canvas zoom: when text is selected the wheel resizes that font anywhere on the canvas; selecting a non-text element makes the wheel zoom the full keyboard, and middle-drag pans for pixel-level work.
+- Fixed Use custom keyboard colors replacing stock-template colors with hidden green defaults. Its first enable now seeds editable colors, outline behavior, roundness, and effects from the currently visible Base Theme; later off/on toggles restore the user's custom values.
+- Replaced the stock Dwemer Keyboard Design with the latest `Dwemer.ocukb` layout under the same Dwemer name. The design now uses OCU's bundled Dwemer Base Theme background and loose layout data, so the Nexus package contains no nested archive.
+- Added Pug Dragon as a second bundled artwork-backed Keyboard Design in both Studio and Configurator while leaving Parchment first and permanently default.
+- Suppressed managed-library duplicates when a saved/imported layout is byte-identical to a bundled stock design.
+- Save now disables once the current project is clean and refuses a redundant second write; Save As remains available for intentionally creating another copy.
+- A selected font now owns the mouse wheel anywhere on the preview instead of requiring the pointer to remain over its painted glyphs.
+- Unlocked procedural color, strength, radius, and breathing controls for the built-in side-control triangles as well as replacement arrow PNGs; the effect is serialized and rendered by native OCU.
+- Replaced the pill-button look inside square inspector tabs with proper rounded-top tab shapes.
+- Replaced the legacy Dwemer Base Theme artwork itself with the new authored Dwemer background, pre-rendered through Studio's exact 1024x560 background transform for both the Studio preview and OCU's embedded runtime resource.
+
+## v4.2.6 - 22 Aug 2026
+
+Changes since Nexus v4.2.5, uploaded 16 Aug 2026 at 3:11 AM.
+
+### Community Shaders / CSX Compatibility
+
+- Removed OCU's MapMenu integration completely. OCU no longer renders a map beam or dot, reads native pointer depth, exports map geometry, calls MapMenu Scaleform, or masks map input. Skyrim VR's original map laser and controls remain fully native.
+- Both controller lasers now remain visible at matching full strength in flat menus, including MCM and RaceMenu. Skyrim's single menu cursor follows the last laser meaningfully moved on the menu quad; clicking also transfers ownership immediately. A motion dead zone prevents tracking jitter from making stationary hands fight, and ownership stays locked through slider, scrollbar, and RaceMenu sculpt drags until the original hand releases.
+- Fixed a delayed MapMenu/fast-travel crash that produced the same poisoned `MapZoomHandler`/`MapLookHandler`/`MapMoveHandler`/`MapClickHandler` pointer signature both with and without Community Shaders.
+- Added single-flight guards to OCU's game-thread laser, console-pick, and render-target refresh jobs, and limited expensive menu work to one pass per submitted frame or menu transition. A blocked menu frame can no longer accumulate or repeatedly execute hundreds of stale pumps and then run at one frame every 5–10 seconds.
+
+### Movable Keyboard Top Bar
+
+- Made the text bar, PC/VR Mode button, and Lock button independently selectable and movable in Keyboard Studio, with exact numeric X/Y offsets.
+- Saved top-bar positions now drive both native rendering and native laser hit-testing, so interactive regions follow the moved controls in game.
+- Added independent plate-visibility switches for ordinary keys, the PC/VR Mode plus Lock buttons, and the input bar. Hidden top plates retain their exact native laser/caret hit areas.
+- Promoted Undo and Redo to the main Studio toolbar, kept the global Ctrl+Z/Ctrl+Y shortcuts, capped snapshots at 150, and added a persistent undo/redo history counter in the status bar.
+- Fixed click-only canvas selections creating identical history entries. Undo/Redo now skip legacy no-op snapshots, preserve the selected object, and repaint the restored keyboard immediately.
+- Added a separate Keyboard Design library in Studio. Built-in and previously opened/saved `.kb` designs appear in its dropdown; Save and Save As register self-contained managed copies automatically so designs saved from the same folder cannot overwrite one another's artwork, while Install to OCU remains an explicit action.
+- Kept Undo and Redo text bright white when their history stacks are empty instead of allowing the WinForms disabled renderer to turn them black.
+- Added the shared Keyboard Design dropdown to the main Configurator with Parchment as the permanent default. Designs opened or saved in Studio automatically populate this list; Save installs the selected `.kb` and referenced artwork into the OCU root, while selecting Parchment switches back to the embedded keyboard without deleting the custom project.
+
+### Keyboard Arrow-Key Editing
+
+- Reworked Keyboard Studio's Key page around a physical-key capture button. Click Assigned key and press a real key; Studio translates normal and Shift output through the active Windows keyboard layout instead of exposing raw OCU escape fields.
+- Corrected the bundled number row to use `Shift+3 = #` instead of the British pound sign, and changed the grave key's shifted symbol to `~`.
+- Renamed label placement to Font X/Y and Font size/scale, replaced the ambiguous Layout block with a documented Grid Width/Columns control, removed the duplicate inspector Undo/Redo buttons, and removed the exposed Stretch-to-right checkbox. Editing an old stretched key's width now converts it to an explicit width without jumping.
+- Renamed Appearance's Key Shape section to Interaction / Selection. Hidden key or top-control plates are now click-through in Studio instead of leaving large invisible draggable regions; visible glyphs remain directly selectable and native in-game assignments remain intact.
+- Matched Studio to the Configurator's exact dark-green palette, glowing anti-aliased pill buttons, green checkboxes, Segoe UI typography, and selected-tab treatment. The inspector now opens wide enough to show Key, Appearance, Artwork, and Controls without a tab-scroll arrow.
+- Fixed the keyboard's Up, Down, Left, and Right key triangles so each one uses its own authored content offset and scale in both Studio and the VR keyboard.
+- Arrow-key content can now be dragged, mouse-wheel scaled, or resized with handles instead of filling the entire key plate.
+- Fixed translucent plate outlines and glows bleeding through the entire key fill. Fill now paints only the interior, outline is a true border ring, and glow is confined to rings outside the plate in both Studio and VR.
+- Made the classic Parchment spacebar ribbon optional and directly selectable as key content. It can be moved, scaled, resized, removed, cut, or copied as PNG artwork in Studio, while the untouched embedded Parchment keyboard keeps the ribbon by default.
+- Removed the unnecessary OCU-folder prompt when Studio is launched from an installed OCU package. Save, Save As, and Apply to Game now detect that package's sibling `root` folder, write the active keyboard there, and set `layout=auto`; the folder picker remains only as a standalone fallback.
+
+### PSVR2 Sense Controller Translation
+
+- Enabled the ratified `XR_KHR_generic_controller` extension when the runtime advertises it.
+- Added a full generic-controller interaction profile for PSVR2 Sense and other unmapped motion controllers: primary/secondary buttons, thumbsticks, triggers, grips, poses, and haptics now translate into Skyrim VR's Oculus-compatible legacy input surface.
+- The new profile is preferred over the input-starved `khr/simple_controller` fallback without inventing Sony-private OpenXR paths.
+- Added PlayStation VR2 Sense artwork to the Configurator controller selector, with PSVR-specific clickable positions, enlarged stick-click targets, and Square/Triangle/Cross/Circle labels. The picture is presentation-only; it does not alter the runtime binding translation.
+
+### Eye-Tracked Foveated Rendering
+
+- Added Skyrim Compatibility as the default pattern whenever VRS is active; it does not enable VRS or Fixed by itself. Eye Tracking AUTO defaults on and activates eye-tracked VRS only while a valid gaze stream exists. Fixed defaults off. Compatibility caps peripheral coarse shading at half-rate (2x1/1x2) to avoid the severe flat-color terrain and foliage failures caused by 2x2 derivative/mip behavior; 2x2 remains available through the opt-in performance presets.
+- Removed the non-functional Outer Radius control. Older `vrsOuterRadius` entries are still accepted silently and are removed the next time the Configurator saves.
+- Fixed choosing a foveated-rendering preset immediately changing the preset display back to Custom while its values were being applied.
+- Hardened the standard `XR_EXT_eye_gaze_interaction` path for PSVR2Toolkit, Quest Pro, and other OpenXR runtimes/headsets.
+- Valid gaze poses are now accepted when a conforming runtime reports sample time `0` (timestamp unavailable); freshness limits still reject stale or implausibly future timestamped samples.
+- Added rate-limited gaze-state diagnostics plus live direction/per-eye UV diagnostics so hardware tests can prove that the VRS fovea is following the user's eyes.
+- Auto eye tracking still never enables Fixed VRS on a headset without usable eye tracking. Fixed remains a separate explicit option.
+- Eye tracking still does not modify CSX render scale, submitted texture bounds, swapchains, DAPA timing, motion vectors, or post-processing resources.
+
+### PSVR / DAPA Performance
+
+- DAPA's shader-accumulator, stencil, depth-clear, and first-person geometry hooks are now installed only when `aswEnabled=true` in the game-root `opencomposite.ini` (OCU's global `[]` section; a hand-written `[asw]` section is also accepted).
+- Kept the shared render-target bridge active for menus and unrelated OCU features while eliminating the million-call first-person geometry hook overhead when DAPA is off.
+
+### RaceMenu VR Laser
+
+- Fixed the final character-name Accept/Cancel buttons by using visible button geometry when RaceMenu VR exposes no reliable AS2 hit area.
+- Character naming is now treated as a true modal regardless of stale RaceMenu mode state, and Accept/Cancel call the TextEntryField's semantic callbacks directly.
+
+### VR Keyboard
+
+- Added dedicated Ctrl and Print Screen keys to the default VR keyboard layout.
+- Ctrl is now a visible one-shot toggle: tap it, tap the shortcut key, and it releases after that key; tap Ctrl again to cancel it.
+- Combined Enter and Done into one context-aware key: it submits Skyrim-owned naming/input dialogs through `KeyboardDone`, while console and player-opened keyboard sessions keep normal Enter behavior.
+- Added five public Configurator-style keyboard themes: OCU Green, White, Blue, Amber, and Purple.
+- Separated keyboard Theme and Font selectors. Font choices now show the font name and author, save independently from color/theme, and hot-reload while the game is running.
+- Added Cyrodiil by Neale Davidson, OCU Nordic derived from Paul James Miller's Balgruf, and OCU Unease derived from AliceElizaDesign's Uncanny. All three are distributed under the SIL Open Font License 1.1.
+- Preserved the font atlas's fractional alpha coverage when tinting glyphs, removing the hard jagged edges caused by the old binary-mask renderer.
+- Added native dark rounded panels, pill-shaped keys, and soft accent glow rendering for the new themes. The styling is generated directly in the existing keyboard RGBA texture and does not touch the compositor, video, DAPA, render-scale, or CSX paths.
+- Added the separate OCU Keyboard Studio desktop authoring tool. It previews the real 1024x560 layout and SudoFont atlases, supports direct label/key dragging, key-box resizing, label scaling, output remapping, Lower/Shift/Caps and pressed-state previews, undo/redo, PNG export, and one-click installation into either the game root or a persistent MO2 Root Builder mod.
+- Added an Open Keyboard Studio button to the Configurator while keeping the authoring surface as its own focused desktop application.
+- Added direct TTF/OTF import to Keyboard Studio. Studio converts the selected font into OCU's native SFN metadata and antialiased PNG atlas, audits only labels belonging to keys in the open layout, and fills only missing used glyphs from OCU Nordic. Editing a key to introduce unsupported text now reports it and rebuilds imported fonts when their stored source is available.
+- Custom converted fonts now install and export with the keyboard as `OCUKeyboardFont.sfn` plus `OCUKeyboardFont.png`; native OCU loads that pair beside `openvr_api.dll` whenever the layout selects a `custom_` font.
+- Added real hue/saturation color wheels for font, key, glow, and hover colors; configurable glow/hover strength, label outline, square-to-pill roundness, and optional key plates for floating-label designs.
+- Added an independent font-outline color plus font glow color, strength, radius, and breathing cycle. Renamed the existing key glow controls to plate-outline glow, added a plate-glow radius, and kept font and plate breathing phases independent in both Studio and native VR rendering.
+- Expanded Keyboard Studio artwork into a true layered designer: movable/resizable/rotatable backgrounds with square-to-pill corner clipping, independent opacity and edge fading, multiple drag/drop or clipboard-pasted PNG sprites, layer ordering, and a reusable Parchment ribbon asset. Studio save/install and MO2 exports carry every layer, and the native renderer reproduces them in game.
+- Replaced edit-mode guessing with direct canvas manipulation: click a glyph to move its content, click empty key plate to move the key, drag corner/edge handles to resize, use the rotation circle on artwork, and right-click sprites for cut/copy/paste/delete/layer actions.
+- Tightened content selection to the SudoFont atlas's actually painted alpha pixels, kept the opposite edge anchored during unsnapped mouse resizing, made background pill transparency proportional to current dimensions, exposed Cut/Copy/Paste on every canvas context menu, and automatically opens Controls when a Size/Opacity/Tilt box is selected so its replacement triangles are immediately available.
+- Added independent key-plate fill color/transparency, outline color/transparency, and outline width.
+- Added the real Size, Opacity, and Tilt side controls to the Studio preview. Each outer group can be moved and resized, while its Up arrow, Down arrow, label, and value are independently selectable and movable. Arrow children resize independently; the matching in-game rendering and laser hit zones follow the authored geometry.
+- Added replaceable side-control arrows: designers may supply any transparent PNG shape, rotate it, and OCU reuses it at 180 degrees for the matching Down control while retaining the built-in triangle fallback.
+- Added procedural breathing for key glow, independently colored sprite/ribbon/overlay glow, and custom control arrows. Sprite artwork itself remains stable while its cached halo breathes. Each effect has minimum intensity, period, and phase controls with a live 20 Hz Studio preview.
+- Native breathing redraws are capped at 20 Hz and only exist while the keyboard overlay is open. Static artwork performs no animation redraws, and a closed keyboard has no animation or artwork-rendering cost.
+- Replaced nearest-neighbor artwork scaling with premultiplied-alpha bilinear filtering, removing dark fringes and reducing jagged rotated/scaled PNG edges. Background and sprite transformations are cached once at keyboard load so smoothing does not multiply hover/laser redraw cost.
+- Fixed high-DPI PNG artwork being physically scaled by its DPI metadata and rendered as a small image in the upper-left. Studio now imports backgrounds, sprites, control art, and font atlases strictly by pixel dimensions, so 300-DPI artwork fills its authored bounds correctly.
+- Kept transparent artwork PNG-only. JPEG can be imported only as a background after an explicit quality/transparency warning and is transcoded to a real PNG for Save, Install, and shareable MO2 exports.
+- Kept the original ribbon spacebar artwork exclusive to the classic Parchment theme; every modern/custom keyboard now uses a clean space key.
+- Removed keyboard theme/font choices from the main Configurator. Parchment is the no-design default, and the Configurator now launches Keyboard Studio for all appearance work.
+- Made Keyboard Studio exports portable between users: each `OCUKeyboard.kb` now carries its exact base theme and font along with colors, geometry, and artwork, while the shareable MO2 ZIP still avoids replacing `opencomposite.ini`.
+- Added custom keyboard loading through `[keyboard] layout=OCUKeyboard.kb`; custom layout files are restricted to the game root beside `openvr_api.dll`, with the embedded English layout retained as the safe fallback.
+- The default `layout=auto` convention now loads `OCUKeyboard.kb` when an independent MO2 Root Builder keyboard mod supplies it, otherwise falling back to the embedded layout without requiring an INI overwrite.
+- Added per-key `.label_offset`, `.label_scale`, and `.label_shift` layout properties plus quoted labels for lossless Keyboard Studio round trips.
+- Unified single-character and word-label centering using visible glyph bounds. OCU Nordic labels such as Shift, F10, Ctrl, and PrtSc now use the same vertical-centering rule as ordinary letter keys.
+- Kept the legacy Done escape code working for custom keyboard layouts.
+
+## v2.0.0
+
+Major overhaul of the VR keyboard input system — thumbstick navigation replaced with laser pointer aiming, and the keyboard is now world-anchored and repositionable.
+
+### New Features
+
+- **Laser pointer beams** — Each controller projects a visible warm-white beam onto the keyboard surface with a cursor dot showing exactly where you're aiming. Point and pull trigger to type.
+- **World-anchored keyboard** — The keyboard now spawns in world space in front of the player (80cm forward, 35cm below eye level) and stays fixed in place. No longer head-locked by default.
+- **Grab bar** — A dedicated strip at the top of the keyboard lets you hold trigger and drag to reposition the keyboard anywhere in your play space. The keyboard follows your laser 1:1 during drag.
+- **MOVE / LOCK buttons** — MOVE (top-left) indicates the keyboard is in world-anchored mode and can be grabbed. LOCK (top-right) toggles head-locked mode where the keyboard follows your head. Both buttons show hover highlights when aimed at.
+- **Clickable text cursor** — Tap anywhere in the text input bar to place the cursor at that character position. A blinking cursor (500ms on/off) shows your insertion point.
+- **Cursor-based editing** — Characters now insert at the cursor position instead of always appending to the end. Backspace deletes the character before the cursor.
+- **Beam billboard orientation** — Laser beams always face the viewer for maximum visibility regardless of viewing angle.
+
+### Changes
+
+- Thumbstick/DPad key navigation removed (laser pointers replace it entirely)
+- Keyboard spawns facing the player based on head orientation at open time
+- Selection highlight is now a unified cream-gold color for both controllers (replaces the old blue-left/green-right scheme)
+- Text bar is now a distinct clickable zone separated from the key area
+- Warm white color scheme for laser beams and cursor dots (RGB 255/240/220)
+
+### Technical
+
+- Laser beams rendered as XrCompositionLayerQuad overlays (one per hand)
+- Ray-plane intersection for keyboard hit testing supports arbitrary keyboard orientation
+- Grab uses ray-plane intersection against the original grab plane to prevent feedback lag
+- Head-lock toggle switches between viewSpace and floorSpace for both keyboard and laser layers
+- Swapchain and D3D11 resources for laser beams properly created and destroyed (no leaks)
+
+## v1.0.0
+
+Initial release of the VR keyboard for Skyrim VR via OpenComposite.
+
+### Features
+
+- Native OpenXR composition layer keyboard
+- Head-locked positioning (keyboard follows head movement)
+- Thumbstick navigation between keys
+- Trigger to press keys, grip to dismiss
+- Dual controller support (blue highlight left, green highlight right)
+- Skyrim-themed dark stone and gold UI
+- Shift, Caps Lock, Backspace, Done keys
+- English (GB) layout
+- Works with character creation, enchanting, and any SteamVR keyboard API call

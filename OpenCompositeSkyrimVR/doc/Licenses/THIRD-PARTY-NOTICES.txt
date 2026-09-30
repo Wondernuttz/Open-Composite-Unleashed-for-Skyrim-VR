@@ -1,0 +1,92 @@
+OpenComposite Unleashed for Skyrim VR - Third-party notices
+===========================================================
+
+OCU itself is licensed under the GNU General Public License v3 (GPLv3),
+because it is a derivative of OpenComposite, which is GPLv3. The full text
+is in OpenComposite-OCU-GPLv3.txt. Source code:
+https://github.com/Wondernuttz/Open-Composite-Unleashed-for-Skyrim-VR
+
+Components redistributed with this package
+------------------------------------------
+
+Third-party components retain their respective copyright notices and licenses.
+Their inclusion does not transfer ownership to OCU. The applicable license
+texts and attributions are identified below.
+
+HIGGS C++ interface declaration prefix (adapted in the SKSE plugin)
+  Author/source: adamhynek / https://github.com/adamhynek/higgs
+  License: GPLv3 (OpenComposite-OCU-GPLv3.txt)
+  Provenance commit: 93bf67b1bc4c4a11a20ccaef0d5012781d0d7eee
+  Modified 2026-09-06: CommonLib type names, interface prefix only.
+  HIGGS itself is an optional, separately installed mod; its DLL is not bundled.
+
+OpenComposite (OpenOVR)
+  License: GPLv3 (OpenComposite-OCU-GPLv3.txt)
+  Source:  https://gitlab.com/znixian/OpenOVR
+
+NVIDIA DLSS (nvngx_dlss.dll)
+  License: NVIDIA RTX SDKs License (NVIDIA-DLSS-LICENSE.txt)
+  Source:  https://github.com/NVIDIA/DLSS
+  This software contains source code provided by NVIDIA Corporation.
+
+NVIDIA NVAPI (statically linked)
+  License: MIT (NVIDIA-NVAPI-LICENSE.txt)
+  Source:  https://developer.nvidia.com/nvapi
+
+AMD FidelityFX / FSR upscaling (amd_fidelityfx_*.dll)
+  License: MIT (AMD-FidelityFX-MIT.txt)
+  Source:  https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+
+VRPerfKit_RSF Radial Density Mask algorithm (modified source)
+  License: MIT (VRPerfKit-RSF-MIT.txt)
+  Source:  https://github.com/RavenSystem/VRPerfKit_RSF
+  Provenance commit: b2150204fc9886ee0b6fb8be81bb9f795118d1bc
+
+OpenCvSharp (managed assembly in the Configurator)
+  License: Apache License 2.0 (OpenCvSharp-Apache2.txt)
+  Source:  https://github.com/shimat/opencvsharp
+  The standard mod does not include the experimental camera feature's
+  MediaPipe models, MediaPipe runtime, or native OpenCV camera libraries.
+
+Valve OpenVR API headers
+  License: BSD 3-Clause (Valve-OpenVR-BSD3.txt)
+  Source:  https://github.com/ValveSoftware/openvr
+
+Khronos OpenXR SDK
+  License: Apache License 2.0 (OpenXR-SDK-Apache2.txt)
+  Source:  https://github.com/KhronosGroup/OpenXR-SDK
+
+Eigen 3.4
+  License: MPL2 (Eigen-MPL2.txt)
+  Source:  https://eigen.tuxfamily.org
+
+GLM (OpenGL Mathematics)
+  License: MIT / Happy Bunny (GLM-LICENSE.txt)
+  Source:  https://github.com/g-truc/glm
+
+MinHook
+  License: BSD 2-Clause (MinHook-BSD2.txt)
+  Source:  https://github.com/TsudaKageyu/minhook
+
+inih (ini parser)
+  License: New BSD (inih-BSD.txt)
+  Source:  https://github.com/benhoyt/inih
+
+build-util / debug-break helpers
+  Licenses: build-util-LICENSE.txt, debug-break-LICENSE.txt
+
+Oculus VR hand/controller models (assets)
+  License: Creative Commons Attribution 4.0 (Oculus-HandModels-CCBY4.txt)
+
+Microsoft .NET runtime (bundled in the self-contained Configurator exe)
+  License: MIT
+  Source:  https://github.com/dotnet/runtime
+
+Fonts (keyboard skins): MedievalSharp (SIL Open Font License),
+Ubuntu font (Ubuntu Font Licence), and the additional fonts documented in
+Keyboard-Fonts-OFL-1.1.txt.
+
+KATReader (when included)
+  Independent optional locomotion data reader. Copyright 2026 Wondernutts.
+  License: MIT (Tools/KATReader/LICENSE.txt).
+  KAT SDK binaries and Gateway are separately installed vendor software.

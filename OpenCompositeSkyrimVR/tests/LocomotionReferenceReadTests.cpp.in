@@ -1,0 +1,78 @@
+#include "OpenOVR/Misc/Input/LocomotionHeading.h"
+#include "OpenOVR/Misc/Input/LocomotionFrame.h"
+#include <iostream>
+#include <stdexcept>
+#define OOVR_LOGF(...) ((void)0)
+std::uint64_t now=100;
+class OscLocomotion {
+public:
+    std::mutex stateMutex;
+    locomotion::Config config{};
+    locomotion::Receiver receiver{config};
+    std::optional<double> latestHmdYaw;
+    std::uint64_t hmdStamp=0,headingReferenceEpoch=0,reportedCalibration=0,latestHeadingToken=0;
+    bool eligible=false,latestCalibrationAllowed=false;
+    locomotion::Status lastStatus=locomotion::Status::Empty;
+    static std::uint64_t NowMs() { return now; }
+    locomotion::Output Read(locomotion::Stick,std::optional<double>,bool,bool,std::uint64_t,std::uint64_t,bool);
+    bool CalibrateFromControllers();
+    bool ControllerCalibrationReady();
+    bool CalibrationHeadingCurrent() const;
+};
+/*PRODUCTION_READ*/
+unsigned checks=0;
+void Check(bool ok,const char* why) { ++checks; if(!ok) throw std::runtime_error(why); }
+bool Near(double a,double b) { return std::abs(a-b)<.00001; }
+int main() {
+    try {
+        auto& h=OcuLocomotionHeading::Instance();
+        h.Reset(); h.SetFocused(true); h.Read(now,false);
+        const auto publish=[&](std::int64_t time,double yaw) {
+            h.Publish(h.CaptureToken(),now,true,0,std::sin(yaw/2),0,std::cos(yaw/2),time);
+            return h.Read(now,false);
+        };
+        OscLocomotion osc;
+        const auto read=[&](const OcuLocomotionHeading::Snapshot& s,locomotion::Stick stick={}) {
+            return osc.Read(stick,s.yaw,s.focused,false,s.referenceEpoch,s.token,s.calibrationAllowed);
+        };
+        locomotion::Frame f; f.flags=locomotion::Connected; f.epoch=1; f.vz=-1;
+        const auto send=[&] {
+            ++f.sequence;
+            const auto yaw=osc.eligible && osc.CalibrationHeadingCurrent() ? osc.latestHmdYaw : std::nullopt;
+            Check(osc.receiver.Ingest(f,now,yaw)==locomotion::Error::None,"sensor packet accepted");
+        };
+        auto old=publish(1000,.2); read(old); send(); send();
+        Check(osc.CalibrateFromControllers(),"initial explicit controller calibration accepted");
+        const auto initial=osc.receiver.CalibrationGeneration();
+        h.QueueStageChange(2000,false,0,0,0,0);
+        Check(!osc.CalibrationHeadingCurrent(),"event instantly blocks cached old-yaw calibration before SuspendHeading or another Read");
+        Check(!osc.ControllerCalibrationReady(),"controller request cannot complete in pending recenter window");
+        ++f.calibrationSerial; send();
+        Check(osc.receiver.CalibrationPending() && osc.receiver.CalibrationGeneration()==initial,"sensor request queues instead of using stale cached coordinate");
+        auto before=publish(1999,.2); read(before); send();
+        Check(!before.calibrationAllowed && osc.receiver.CalibrationPending() && osc.receiver.CalibrationGeneration()==initial,
+            "future unknown event does not consume request on an eligible pre-change pose");
+        auto after=publish(2000,.8);
+        Check(!osc.CalibrationHeadingCurrent(),"new epoch also blocks old cached heading before next Read");
+        read(after); send();
+        Check(after.calibrationAllowed && !osc.receiver.CalibrationPending() && osc.receiver.CalibrationGeneration()==initial+1,
+            "request completes once on matching post-change pose without second press");
+        const auto epoch=osc.headingReferenceEpoch;
+        const auto token=osc.latestHeadingToken;
+        const auto generation=osc.receiver.CalibrationGeneration();
+        Check(read(after).source==locomotion::Source::Locomotion,"new reference remains calibrated");
+        Check(read(before).source==locomotion::Source::None,"delayed older-epoch read suppresses treadmill movement");
+        Check(osc.headingReferenceEpoch==epoch && osc.latestHeadingToken==token && Near(*osc.latestHmdYaw,.8),
+            "delayed read cannot roll back reference or overwrite latest pose");
+        Check(osc.receiver.CalibrationGeneration()==generation && read(after).source==locomotion::Source::Locomotion,
+            "delayed read does not invalidate new alignment");
+        const auto physical=read(before,{.4,-.3});
+        Check(physical.source==locomotion::Source::Physical && Near(physical.stick.x,.4),"physical input passes through stale snapshot rejection");
+        auto sameEpoch=after;
+        h.Invalidate(); auto refreshed=publish(2100,.9); read(refreshed);
+        Check(read(sameEpoch).source==locomotion::Source::None && osc.latestHeadingToken==refreshed.token,
+            "older cache generation cannot overwrite fresh pose within same reference epoch");
+        Check(read(refreshed).source==locomotion::Source::Locomotion,"same-reference invalidation preserves calibration");
+        std::cout<<checks<<" production reordered-reference/calibration checks passed\n";
+    } catch(const std::exception& e) { std::cerr<<"FAIL: "<<e.what()<<'\n'; return 1; }
+}
