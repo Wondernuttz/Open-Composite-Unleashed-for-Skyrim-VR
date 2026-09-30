@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(
     OpenCompositeInput
-    VERSION 1.0.0
+    VERSION 5.0.3
     DESCRIPTION "SKSE VR plugin for OpenComposite - bridges keyboard input to Scaleform"
     LANGUAGES CXX C
 )

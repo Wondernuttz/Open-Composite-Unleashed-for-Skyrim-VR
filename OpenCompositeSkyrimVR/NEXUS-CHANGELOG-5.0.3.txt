@@ -1,4 +1,4 @@
-OpenComposite Unleashed 5.0.1 for Skyrim VR
+OpenComposite Unleashed 5.0.3 for Skyrim VR
 
 1. DAPA player motion: Added native-motion-vector correction inside the existing player, hands, equipped-weapon and held-item masks. Camera motion is removed before prediction; the original world warp is preserved. Motion is prepared at render resolution, and output regions without usable motion are skipped.
 2. Automatic recovery: Extra player correction pauses after three consecutive complete stereo samples above 1.5 ms, then retries with fresh history. Repeated failures increase the retry delay from 2 seconds up to 30 seconds; sustained recovery restores the short delay. Original masked DAPA continues during cooldown.

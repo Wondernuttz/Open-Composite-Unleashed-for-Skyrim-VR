@@ -7400,8 +7400,8 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	SKSE::Init(a_skse);
 	SetupLogging();
 
-	SKSE::log::info("OpenCompositeInput v3.2.0 loaded");
-	SKSE::log::info("OCU SKSE package: 5.0.1 / journal-ui-focus-v2 / menu-targets-v1 / prompt-bridge-refresh-v1 / menu-reconcile-v1 / DAPA exact-mask-v1 / accepted-draw-api-v1 / held-geometry ownership / startup-menu-state-v1 / dapa-mask-lease-v1");
+	SKSE::log::info("OpenCompositeInput v5.0.3 loaded");
+	SKSE::log::info("OCU SKSE package: 5.0.3 / journal-ui-focus-v2 / menu-targets-v1 / prompt-bridge-refresh-v1 / menu-reconcile-v1 / DAPA exact-mask-v1 / accepted-draw-api-v1 / held-geometry ownership / startup-menu-state-v1 / dapa-mask-lease-v1");
 	SKSE::log::info("  VR keyboard bridge + Scaleform char injection + menu state tracking");
 		SKSE::log::info("  RaceMenu keyboard test: confirmed-naming-v4 / VR-button-slot-8");
 	SKSE::log::info("  + Render target bridge (MV + depth) for FSR 2/3 integration");
