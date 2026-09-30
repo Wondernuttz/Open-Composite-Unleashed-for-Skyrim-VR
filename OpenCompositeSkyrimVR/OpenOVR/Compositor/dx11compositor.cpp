@@ -3333,8 +3333,18 @@ static bool OCUMenusUseTemporalUpscaling()
 	     (oovr_global_configuration.FsrRenderScale() < .99f || oovr_global_configuration.DlssPreset() == 4));
 }
 
+static ocu_menu::CanSeparateFn s_canSeparateMenu = nullptr;
+static bool s_menuSeparationBlockedThisFrame = true;
+
 static bool CaptureSeparatedMenuDraw(ID3D11DeviceContext* ctx, void (*draw)(void*), void* token)
 {
+	// A physical menu may open after frame admission. Flush already captured
+	// pixels before allowing its native draw; do not resume capture mid-frame.
+	if (s_menuSeparationBlockedThisFrame || !s_canSeparateMenu || !s_canSeparateMenu()) {
+		s_menuSeparationBlockedThisFrame = true;
+		s_menuLayerRenderer.BeforeClear(ctx, nullptr);
+		return false;
+	}
 	if (!OCBridge_CachedFoveationMenuPaused() && !s_menuLayerRenderer.HasLayer()) return false;
 	const bool captured = s_menuLayerRenderer.Capture(ctx, draw, token);
 	if (captured) {
@@ -3373,7 +3383,11 @@ static void BeginSeparatedMenuFrame(ID3D11Device* device, ID3D11DeviceContext* c
 			    s_menuLayerRenderer.HasLayer(), previousStats.lastRejection);
 		}
 	}
-	s_menuLayerRenderer.ResetFrame(!menuOpen);
+	auto module = menuOpen && OCUMenusUseTemporalUpscaling() ? GetModuleHandleW(L"OpenCompositeInput.dll") : nullptr;
+	s_canSeparateMenu = module ? reinterpret_cast<ocu_menu::CanSeparateFn>(
+		GetProcAddress(module, ocu_menu::CanSeparateExportName)) : nullptr;
+	s_menuSeparationBlockedThisFrame = !s_canSeparateMenu || !s_canSeparateMenu();
+	s_menuLayerRenderer.ResetFrame(!menuOpen || s_menuSeparationBlockedThisFrame);
 	s_menuLayerFrameActive.store(false, std::memory_order_release);
 	// An incompatible target ends this popup's separation, not future menus.
 	if (!menuOpen) s_menuLayerPresentationFailed = false;
@@ -3384,7 +3398,7 @@ static void BeginSeparatedMenuFrame(ID3D11Device* device, ID3D11DeviceContext* c
 	auto left = std::move(s_menuSubmitted[0]);
 	auto right = std::move(s_menuSubmitted[1]);
 	s_menuSubmitted[0] = {}; s_menuSubmitted[1] = {};
-	if (!menuOpen || !OCUMenusUseTemporalUpscaling() || s_menuLayerPresentationFailed) return;
+	if (!menuOpen || s_menuSeparationBlockedThisFrame || !OCUMenusUseTemporalUpscaling() || s_menuLayerPresentationFailed) return;
 	// Main/loading and physical world-space menu geometry keep the native path.
 	if (!s_pBridge || s_pBridge->isMainMenu || s_pBridge->isLoadingScreen) return;
 	if (pair != 3 || !left.texture || left.texture != right.texture ||
@@ -3396,7 +3410,6 @@ static void BeginSeparatedMenuFrame(ID3D11Device* device, ID3D11DeviceContext* c
 	    left.region.bottom != left.desc.Height || right.region.bottom != left.desc.Height ||
 	    !left.outputWidth || !left.outputHeight || left.outputWidth != right.outputWidth ||
 	    left.outputHeight != right.outputHeight) return;
-	auto module = GetModuleHandleW(L"OpenCompositeInput.dll");
 	auto acquire = module ? reinterpret_cast<ocu_menu::AcquireFn>(GetProcAddress(module, ocu_menu::AcquireExportName)) : nullptr;
 	if (!acquire) return;
 	ocu_menu::Targets targets;

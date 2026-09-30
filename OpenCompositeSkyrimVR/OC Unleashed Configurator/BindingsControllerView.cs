@@ -376,6 +376,10 @@ namespace OpenCompositeConfigurator
         private void SyncComboEditorModel()
         {
             ComboEditForm.ControllerModelKey = _controllerModelKey;
+            ComboEditForm.ModelExtraButtons = _controllerModelKey == "frame"
+                ? _activeControllerButtons.Where(kv => kv.Key.StartsWith("frame_", StringComparison.Ordinal))
+                    .ToDictionary(kv => kv.Key, kv => kv.Value)
+                : null;
             if (_controllerModelKey == "touch")
             {
                 ComboEditForm.ModelPositionOverrides = null;

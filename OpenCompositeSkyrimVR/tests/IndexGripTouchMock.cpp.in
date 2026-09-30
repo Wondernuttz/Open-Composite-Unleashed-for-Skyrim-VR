@@ -109,6 +109,9 @@ struct Device : ITrackedDevice { InteractionProfile profile; const InteractionPr
 bool devicePresent[2]={true,true};
 struct BackendManager {
     static BackendManager& Instance() { static BackendManager instance; return instance; }
+    Device* GetDeviceByHand(ITrackedDevice::HandType hand) {
+        return hand == ITrackedDevice::HAND_LEFT ? GetDevice(1) : GetDevice(2);
+    }
     Device* GetDevice(vr::TrackedDeviceIndex_t index) {
         if (index==0) return &hmd;
         if (index>2 || !devicePresent[index-1]) return nullptr;

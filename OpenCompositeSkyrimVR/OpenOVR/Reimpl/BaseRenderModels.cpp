@@ -170,8 +170,7 @@ static OOVR_RenderModel_Vertex_t split_face(
 	return out;
 }
 
-// NOTE: Quest 3 controller code archived to:
-// OpenOVR/Misc/ARCHIVE_Quest3Controllers.cpp.disabled
+// The retired experimental Quest 3 controller renderer is preserved in Git history.
 
 // =========================================================================
 // STEAMVR RENDER MODEL PASSTHROUGH (2026-07-25)
@@ -589,7 +588,7 @@ EVRRenderModelError BaseRenderModels::LoadRenderModel_Async(const char* pchRende
 		OOVR_LOG_ONCE("RenderModels: legacy grey hand meshes selected; SteamVR model passthrough disabled");
 	int rid;
 	float sided;
-	bool isQuest3 = false; // Quest 3 support archived — see ARCHIVE_Quest3Controllers.cpp.disabled
+	bool isQuest3 = false; // Experimental Quest 3 renderer retired; see Git history.
 
 	// todo: start loading correct models, !359 related
 	if (name == "renderLeftHand") {

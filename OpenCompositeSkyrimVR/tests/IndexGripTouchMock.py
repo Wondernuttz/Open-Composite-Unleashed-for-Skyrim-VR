@@ -51,6 +51,20 @@ fixture = fixture.replace('/*PROFILE_ASSIGNMENTS*/', profiles)
 frame = (repo/'OpenOVR/Misc/Input/FrameInteractionProfile.cpp').read_text()
 fixture = fixture.replace('/*FRAME_BINDINGS*/', block(frame, 'const InteractionProfile::LegacyBindings* FrameInteractionProfile::GetLegacyBindings').replace('FrameInteractionProfile::GetLegacyBindings', 'InteractionProfile::GetFrameLegacyBindings'))
 fixture = fixture.replace('/*FRAME_TESTS*/', (repo/'tests/FrameControllerTests.inc').read_text())
+overlay = (repo/'OpenOVR/Reimpl/BaseOverlay.cpp').read_text()
+combo_support = '''
+#define OOVR_DEBUG_LOGF(...) do {} while(0)
+struct BaseSystem {};
+static ULONGLONG comboNow=1000;
+static ULONGLONG ComboNow() { return comboNow; }
+static std::vector<std::pair<int,bool>> comboKeys;
+static void SendComboKey(int key, bool up) { comboKeys.push_back({key,up}); }
+''' + block(overlay, 'struct ComboBinding') + ';\nstatic std::vector<ComboBinding> s_combos;\n'
+for signature in ('static void FireComboTap', 'static bool ParseComboButton', 'static void ProcessCombos'):
+    combo_support += block(overlay, signature).replace('GetTickCount64()', 'ComboNow()') + '\n'
+fixture = fixture.replace('int main(', combo_support + '\nint main(', 1)
+frame_tests = (repo/'tests/FrameControllerTests.inc').read_text()
+fixture = fixture.replace(frame_tests, frame_tests + '\n' + (repo/'tests/FrameComboTests.inc').read_text(), 1)
 fixture = fixture.replace('/*BINDINGS*/', block(profile, 'void InteractionProfile::AddLegacyBindings'))
 fixture = fixture.replace('/*CREATE_ACTIONS*/', block(base, 'void BaseInput::CreateLegacyActions'))
 fixture = fixture.replace('/*CONTROLLER_STATE*/', block(base, 'XrResult BaseInput::SuggestBindingsWithIndexGrip')+'\n'+block(base, 'bool BaseInput::GetLegacyControllerState'))

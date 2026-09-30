@@ -61,7 +61,10 @@ const InteractionProfile::LegacyBindings* FrameInteractionProfile::GetLegacyBind
 			b.stickBtn = "input/thumbstick/click"; b.stickBtnTouch = "input/thumbstick/touch";
 			b.trigger = "input/trigger/value"; b.triggerClick = "input/trigger/click";
 			b.triggerTouch = "input/trigger/touch";
-			b.grip = "input/squeeze/value"; b.gripClick = "input/squeeze/click";
+			// Gameplay grab uses analog squeeze, not Frame's end-stop click.
+			// OpenXR converts the scalar to a boolean with runtime thresholds,
+			// just like our Touch profile. Capacitive finger touch stays separate.
+			b.grip = "input/squeeze/value"; b.gripClick = "input/squeeze/value";
 			b.gripTouch = "input/squeeze/touch";
 			b.btnA = hand == 0 ? "input/dpad_down/click" : "input/a/click";
 			b.btnATouch = hand == 0 ? "input/dpad_down/touch" : "input/a/touch";

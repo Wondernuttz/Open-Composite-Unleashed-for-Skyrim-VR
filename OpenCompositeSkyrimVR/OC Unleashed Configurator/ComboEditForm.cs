@@ -41,9 +41,9 @@ namespace OpenCompositeConfigurator
             };
         }
 
-        public string GetDisplaySummary(Dictionary<string, int> keyScancodes)
+        public string GetDisplaySummary(Dictionary<string, int> keyScancodes, string controllerModel = "touch")
         {
-            string buttons = string.Join(" + ", ButtonString.Split('+').Select(FormatButton));
+            string buttons = string.Join(" + ", ButtonString.Split('+').Select(b => FormatButton(b, controllerModel)));
             string modeStr = Mode switch
             {
                 "press" => "Press",
@@ -58,7 +58,7 @@ namespace OpenCompositeConfigurator
             return $"{buttons}  \u2192  {modeStr}  \u2192  {keyName}";
         }
 
-        private static string FormatButton(string b)
+        private static string FormatButton(string b, string controllerModel)
         {
             return b.Trim() switch
             {
@@ -76,10 +76,18 @@ namespace OpenCompositeConfigurator
                 "right_grip" => "R Grip",
                 "left_trigger" => "L Trigger",
                 "right_trigger" => "R Trigger",
-                "x" => "X",
-                "y" => "Y",
+                "x" => controllerModel == "frame" ? "D-pad Down" : "X",
+                "y" => controllerModel == "frame" ? "D-pad Up" : "Y",
                 "a" => "A",
                 "b" => "B",
+                "frame_dpad_left" => "D-pad Left",
+                "frame_dpad_right" => "D-pad Right",
+                "frame_x" => "R X",
+                "frame_y" => "R Y",
+                "frame_l_bumper" => "L Bumper",
+                "frame_r_bumper" => "R Bumper",
+                "frame_view" => "View",
+                "frame_menu" => "Menu",
                 _ => b.Trim()
             };
         }
@@ -174,6 +182,7 @@ namespace OpenCompositeConfigurator
         // model chosen on the Bindings tab (photo + calibrated dot positions).
         public static string ControllerModelKey = "touch";
         public static Dictionary<string, PointF>? ModelPositionOverrides;
+        public static Dictionary<string, (string display, PointF pos, bool isStickDir)>? ModelExtraButtons;
 
         // Instance copy of the layout, with model overrides applied
         private readonly Dictionary<string, (string display, PointF pos, bool isStickDir)> _buttons;
@@ -188,6 +197,9 @@ namespace OpenCompositeConfigurator
             };
 
             _buttons = ComboButtons.ToDictionary(kv => kv.Key, kv => kv.Value);
+            if (ControllerModelKey == "frame" && ModelExtraButtons != null)
+                foreach (var entry in ModelExtraButtons)
+                    _buttons[entry.Key] = entry.Value;
             if (ModelPositionOverrides != null)
             {
                 foreach (var kv in ModelPositionOverrides)
@@ -698,8 +710,12 @@ namespace OpenCompositeConfigurator
                 "right_grip" => 9, "right_trigger" => 10, "right_stick" => 11,
                 "right_stick_up" => 12, "right_stick_down" => 13, "right_stick_left" => 14, "right_stick_right" => 15,
                 "a" => 16, "b" => 17,
+                "frame_dpad_left" => 7, "frame_dpad_right" => 8,
+                "frame_l_bumper" => 1, "frame_view" => 8,
+                "frame_x" => 16, "frame_y" => 17,
+                "frame_r_bumper" => 10, "frame_menu" => 17,
                 _ => 18
-            });
+            }).ThenBy(b => b, StringComparer.Ordinal);
 
             Result = new ComboEntry
             {

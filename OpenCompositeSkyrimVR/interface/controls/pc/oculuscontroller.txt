@@ -1,0 +1,15 @@
+// Button name and OpenVR button ID. Existing Touch names must stay unchanged.
+grab	0x0002
+OCC_A	0x0007
+OCC_B	0x0001
+thumbstick	0x0020
+trigger	0x0021
+
+// Frame uses Skyrim's Touch input device with additional independent buttons.
+// Register these IDs so Skyrim accumulates held time for composite actions
+// such as Journal Or Wait and Tween Or Ready Weapon. A controlmap entry alone
+// delivers presses but cannot give unregistered buttons a hold duration.
+OCU_Frame_Bumper	0x0003
+OCU_Frame_X_Left	0x0005
+OCU_Frame_Y_Right	0x0006
+OCU_Frame_Menu_View	0x0023

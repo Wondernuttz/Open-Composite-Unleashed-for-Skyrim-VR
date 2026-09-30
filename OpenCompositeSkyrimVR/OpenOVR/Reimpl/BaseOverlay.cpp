@@ -13,6 +13,7 @@
 #include "Misc/Config.h"
 #include "Misc/CableTracking.h"
 #include "Misc/ScopeGuard.h"
+#include "Misc/Input/InteractionProfile.h"
 #include "convert.h"
 #include "generated/static_bases.gen.h"
 #include <algorithm>
@@ -443,6 +444,7 @@ struct ComboBinding {
 		uint64_t mask;        // digital button mask (0 if stick direction)
 		int stickAxis;        // 0=X, 1=Y (only when mask==0)
 		float stickThreshold; // +0.7 or -0.7 (only when mask==0)
+		bool frameOnly = false; // Extra IDs must not fire on another controller profile.
 	};
 
 	std::vector<BtnReq> buttons;
@@ -517,6 +519,24 @@ static bool ParseComboButton(const std::string& token, ComboBinding::BtnReq& out
 	out.mask = 0;
 	out.stickAxis = 0;
 	out.stickThreshold = 0;
+	out.frameOnly = false;
+
+	// Independent Frame controls use the same IDs as the game controlmap.
+	struct FrameButton { const char* name; int hand; int id; };
+	static constexpr FrameButton frameButtons[] = {
+		{ "frame_dpad_left", 0, 5 }, { "frame_dpad_right", 0, 6 },
+		{ "frame_x", 1, 5 }, { "frame_y", 1, 6 },
+		{ "frame_l_bumper", 0, 3 }, { "frame_r_bumper", 1, 3 },
+		{ "frame_view", 0, 35 }, { "frame_menu", 1, 35 }
+	};
+	for (const auto& button : frameButtons) {
+		if (token == button.name) {
+			out.ctrl = button.hand;
+			out.mask = uint64_t{1} << button.id;
+			out.frameOnly = true;
+			return true;
+		}
+	}
 
 	// Face buttons
 	if (token == "a")            { out.ctrl = 1; out.mask = ButtonMaskFromId(k_EButton_A); return true; }
@@ -637,12 +657,20 @@ static void LoadCombos()
 
 static void ProcessCombos(BaseSystem* sys, const VRControllerState_t ctrlState[2], const bool ctrlValid[2])
 {
+	bool frameController[2] = {};
+	for (int hand = 0; hand < 2; ++hand) {
+		auto* device = BackendManager::Instance().GetDeviceByHand(
+		    hand == 0 ? ITrackedDevice::HAND_LEFT : ITrackedDevice::HAND_RIGHT);
+		const auto* profile = device ? device->GetInteractionProfile() : nullptr;
+		frameController[hand] = profile && profile->GetPath() == "/interaction_profiles/valve/frame_controller_valve";
+	}
 	for (auto& combo : s_combos) {
 		// Check if ALL required buttons are pressed
 		bool allPressed = true;
 		for (const auto& req : combo.buttons) {
 			int ci = req.ctrl;
 			if (!ctrlValid[ci]) { allPressed = false; break; }
+			if (req.frameOnly && !frameController[ci]) { allPressed = false; break; }
 
 			bool pressed = false;
 			if (req.mask != 0) {

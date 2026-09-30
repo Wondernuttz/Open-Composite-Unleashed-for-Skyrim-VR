@@ -9,7 +9,7 @@ The runtime, SKSE plugin and desktop tools are separate projects in this reposit
 | Configurator | `OpenCompositeSkyrimVR/OC Unleashed Configurator` | `OpenCompositeConfigurator.csproj` |
 | Keyboard Studio | `OpenCompositeSkyrimVR/OCU Keyboard Studio` | `OCUKeyboardStudio.csproj` |
 
-The outer `OpenCompositeInput- Skyrim SKSE/CMakeLists.txt` and its `src` directory are a legacy copy. Use the **nested** `OpenCompositeInput` project for the current plugin. The repository root is not itself a CMake project.
+Use the **nested** `OpenCompositeInput- Skyrim SKSE/OpenCompositeInput` project for the SKSE plugin. Its parent directory is only a container, not a CMake project. The obsolete outer project has been removed; its source remains available in Git history. The repository root is not itself a CMake project.
 
 ## Toolchain and dependency setup
 
@@ -91,5 +91,17 @@ The executables are `out/Configurator/OC Unleashed Configurator for Skyrim VR.ex
 Publishing a desktop tool produces that component's files, not a complete OCU mod ZIP. A full test drop also needs the runtime, SKSE plugin, configuration examples, bindings/assets and dependency/license files. Use the existing mod layout; do not replace users' saved INI files as part of a binary-only update.
 
 ## Validation scope
+
+Validate the assembled mod folder, final ZIP, and installed MO2 mod with
+`OpenCompositeSkyrimVR/scripts/VerifyUserPackage.py`:
+
+```powershell
+python OpenCompositeSkyrimVR/scripts/VerifyUserPackage.py "<package-folder-or-zip>"
+```
+
+The validator checks required runtime/plugin payloads, PE exports, controller
+definitions, duplicate paths, and developer files accidentally included in a
+package. Compare its reported component hashes with the intended build outputs.
+Keep this development script outside the user-facing mod package.
 
 These instructions were checked against the current project files, local configured build caches and output locations. They do **not** claim a clean-clone build with newly acquired SDK/CommonLib dependencies, native Linux compilation, or headset performance qualification. CMake regression targets are generally `EXCLUDE_FROM_ALL` and must be built and run explicitly; building `OCOVR` alone does not run them.

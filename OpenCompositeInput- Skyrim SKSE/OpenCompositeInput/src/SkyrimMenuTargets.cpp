@@ -8,6 +8,8 @@
 
 #include "../../../OpenCompositeSkyrimVR/OpenOVR/Compositor/SkyrimMenuTargets.h"
 
+#include "MenuSeparationPolicy.h"
+
 #include <cstddef>
 #include <cstring>
 
@@ -96,9 +98,14 @@ bool CommitTargets(const ocu_menu::Targets& candidate, ID3D11Device* device,
 }
 } // namespace
 
+extern "C" __declspec(dllexport) bool __cdecl OCU_CanSeparateMenu() noexcept
+{
+    return ocu_menu_policy::Allowed();
+}
+
 extern "C" __declspec(dllexport) bool __cdecl OCU_AcquireMenuTargets(ocu_menu::Targets* output) noexcept
 {
-    if (!output || !EmptyRequest(*output)) return false;
+    if (!ocu_menu_policy::Allowed() || !output || !EmptyRequest(*output)) return false;
     try {
         if (!REL::Module::IsVR() || REL::Module::get().version() != SKSE::RUNTIME_VR_1_4_15)
             return false;

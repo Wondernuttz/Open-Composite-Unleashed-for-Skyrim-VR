@@ -4127,6 +4127,7 @@ namespace OpenCompositeConfigurator
 
             string controlsPath = Path.Combine(GetInstalledModContentDir(), "interface", "controls", "pc");
             Directory.CreateDirectory(controlsPath);
+            if (_gameType == "skyrim") ControllerButtonDefinitions.Ensure(controlsPath);
             return Path.Combine(controlsPath, "controlmapvr.txt");
         }
 
@@ -4173,7 +4174,11 @@ namespace OpenCompositeConfigurator
                 ? GetInstalledRootDir()
                 : vortexGameRoot;
             if (createDirectories)
+            {
+                if (_gameType == "skyrim")
+                    ControllerButtonDefinitions.Ensure(Path.Combine(GetInstalledModContentDir(), "interface", "controls", "pc"));
                 Directory.CreateDirectory(targetRoot);
+            }
 
             return new[] { Path.Combine(targetRoot, "opencomposite.ini") };
         }
@@ -4902,7 +4907,7 @@ namespace OpenCompositeConfigurator
 
                 var lblCombo = new Label
                 {
-                    Text = $"{i + 1}. {combo.GetDisplaySummary(KeyScancodes)}",
+                    Text = $"{i + 1}. {combo.GetDisplaySummary(KeyScancodes, _controllerModelKey)}",
                     Location = new Point(6, y + 2),
                     Size = new Size(pw - 130, 20),
                     ForeColor = Color.White,

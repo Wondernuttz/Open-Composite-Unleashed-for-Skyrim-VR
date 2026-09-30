@@ -28,6 +28,7 @@
     <EmbeddedResource Include="Resources\DragonPug.png" />
     <EmbeddedResource Include="Resources\FO4Fox.png" />
     <EmbeddedResource Include="controlmapvr_template.txt" />
+    <EmbeddedResource Include="..\interface\controls\pc\oculuscontroller.txt" LogicalName="OpenCompositeConfigurator.oculuscontroller.txt" />
     <EmbeddedResource Include="controlmapvr_vrsafe.txt" />
     <EmbeddedResource Include="controlmapvr_vrik.txt" />
     <EmbeddedResource Include="controlmapvr_oculus_optimized.txt" />
@@ -42,7 +43,9 @@
 
   <ItemGroup>
     <None Include="..\doc\OCU-Setup-Readme.html" Link="Docs\OCU-Setup-Readme.html" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\interface\controls\pc\oculuscontroller.txt" Link="Interface\controls\pc\oculuscontroller.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <None Include="..\doc\Licenses\**\*.*" Link="Docs\Licenses\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="..\SDK\LASER-EXCEPTION.md" Link="Docs\Licenses\OCU-Laser-Exception.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <None Include="..\doc\images\**\*.*" Link="Docs\images\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 

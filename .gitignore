@@ -15,6 +15,9 @@ Release/
 *.exp
 libs/
 scripts/
+!/OpenCompositeSkyrimVR/scripts/
+/OpenCompositeSkyrimVR/scripts/*
+!/OpenCompositeSkyrimVR/scripts/VerifyUserPackage.py
 
 # Published executables
 *.exe

@@ -11,6 +11,7 @@
 #include <RE/C/ConfirmAndNameCallback.h>
 #include <RE/F/FxDelegateArgs.h>
 #include "RaceMenuKeyboardRecovery.h"
+#include "MenuSeparationPolicy.h"
 #include "RaceMenuNativeInput.h"
 #include <RE/G/GFxEvent.h>
 #include <RE/G/GFxValue.h>
@@ -1258,6 +1259,15 @@ namespace
 			SKSE::log::debug("Menu activity reconciled: active={} tracked={} liveUI={}",
 			    active, trackedMenuActive, ui != nullptr);
 		lastActive = active;
+
+		// A paused menu is not necessarily a flat UI panel. Books/notes and
+		// lockpicking have native 3D geometry, as do the map and constellations.
+		// Inspect the complete tracked set so a popup cannot hide an underlying
+		// physical menu. This never changes DAPA/foveation pause protection.
+		ocu_menu_policy::Publish(g_bridgeMenuStateObserved && ui &&
+		    trackedMenuActive && !startupMenuActive && !g_mapMenuOpen && !g_statsMenuOpen &&
+		    !g_activeTrackedMenus.contains("Book Menu") &&
+		    !g_activeTrackedMenus.contains("Lockpicking Menu"));
 
 		// A newly discovered/recreated window needs the current value even when
 		// no menu transition happened. Retry a failed property write next tick.

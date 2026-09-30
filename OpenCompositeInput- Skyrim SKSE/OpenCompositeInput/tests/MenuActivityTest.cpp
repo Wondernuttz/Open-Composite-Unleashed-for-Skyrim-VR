@@ -1,5 +1,6 @@
 // Executes the exact Main.cpp watcher, tracked-menu list and publication helper.
 // Fixtures replace engine services and unrelated laser/camera side effects.
+#include "../src/MenuSeparationPolicy.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -261,6 +262,35 @@ int main()
         g_gameHwnd = reinterpret_cast<HWND>(2);
         MenuEvent("MessageBoxMenu", false);
         CheckActive(false, "Popup closes normally after the window appears");
+
+        // Physical menu priority persists through nested popups and closes.
+        Check(!ocu_menu_policy::Allowed(), "Gameplay never admits menu separation");
+        MenuEvent("InventoryMenu", true);
+        Check(ocu_menu_policy::Allowed(), "Flat inventory panel remains eligible");
+        for (const char* physical : {"Book Menu", "Lockpicking Menu", "MapMenu", "StatsMenu"}) {
+            MenuEvent(physical, true);
+            Check(!ocu_menu_policy::Allowed(), "Physical menu must keep native rendering");
+            CheckActive(true, "Native rendering still retains menu pause protection");
+            MenuEvent("MessageBoxMenu", true);
+            Check(!ocu_menu_policy::Allowed(), "Popup cannot override underlying physical menu");
+            MenuEvent("MessageBoxMenu", false);
+            Check(!ocu_menu_policy::Allowed(), "Closing popup cannot reenable capture over physical menu");
+            MenuEvent(physical, false);
+            Check(ocu_menu_policy::Allowed(), "Closing physical menu restores underlying inventory eligibility");
+        }
+        MenuEvent("Book Menu", true);
+        MenuEvent("Lockpicking Menu", true);
+        MenuEvent("Book Menu", false);
+        Check(!ocu_menu_policy::Allowed(), "One physical close cannot override another physical menu");
+        MenuEvent("Lockpicking Menu", false);
+        Check(ocu_menu_policy::Allowed(), "Last physical close restores inventory");
+        RE::UI::current = nullptr;
+        RefreshMenuActivityFromGameState();
+        Check(!ocu_menu_policy::Allowed(), "Unavailable UI disables separation");
+        RE::UI::current = &ui;
+        MenuEvent("InventoryMenu", false);
+        Check(!ocu_menu_policy::Allowed(), "Last panel close restores native gameplay");
+        Check(ui.menuQueries == queriesBeforeEvents, "Separation policy never queries locked menus");
 
         // A failed SetPropW must not poison the cache and suppress retries.
         g_gameHwnd = reinterpret_cast<HWND>(3);

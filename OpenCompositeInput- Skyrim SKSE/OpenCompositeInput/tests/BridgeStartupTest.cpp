@@ -1,5 +1,6 @@
 // Executes the production initializer/reconciler with the actual bridge layout.
 // Only OS allocation, render-resource refresh, UI and logging are fixtures.
+#include "../src/MenuSeparationPolicy.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +21,7 @@ bool g_bridgeMenuStateObserved = false;
 HANDLE g_hBridgeMapFile = nullptr;
 HWND g_gameHwnd = nullptr;
 std::set<std::string> g_activeTrackedMenus;
+bool g_mapMenuOpen = false, g_statsMenuOpen = false;
 HANDLE CreateFileMappingW(HANDLE, void*, unsigned, unsigned, std::size_t, const wchar_t*);
 void* MapViewOfFile(HANDLE, unsigned, unsigned, unsigned, std::size_t);
 bool CloseHandle(HANDLE);

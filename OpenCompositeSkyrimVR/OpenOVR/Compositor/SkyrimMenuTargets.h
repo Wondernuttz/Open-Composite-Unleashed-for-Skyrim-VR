@@ -10,6 +10,10 @@ struct ID3D11Texture2D;
 namespace ocu_menu {
 inline constexpr std::uint32_t Version = 1;
 inline constexpr char AcquireExportName[] = "OCU_AcquireMenuTargets";
+// Additive capability: older providers keep native rendering when this query
+// is unavailable. Targets v1 and its ownership contract remain unchanged.
+inline constexpr char CanSeparateExportName[] = "OCU_CanSeparateMenu";
+using CanSeparateFn = bool(__cdecl*)() noexcept;
 
 // Same-process render-thread query. Pass an empty, initialized Targets object.
 // Success transfers one COM reference per non-null slot, including duplicates;
