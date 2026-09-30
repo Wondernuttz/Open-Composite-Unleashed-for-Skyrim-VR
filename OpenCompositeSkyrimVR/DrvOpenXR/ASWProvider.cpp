@@ -170,7 +170,7 @@ bool ASWProvider::Initialize(ID3D11Device* device, uint32_t eyeWidth, uint32_t e
 	InvalidateCachedFrame();
 	OOVR_LOGF("ASW: Initialized — %ux%u per eye, compute shader ready", eyeWidth, eyeHeight);
 	OOVR_LOG("DAPA: compute-state-restore-v1 / depth-read-hazard-v1");
-    OOVR_LOG("DAPA CHARACTER MOTION 5.0.1: original world shader / mask-only indirect character pass / 1.50ms complete-pair budget; three consecutive over-budget samples / automatic recovery");
+    OOVR_LOG("DAPA CHARACTER MOTION 5.0.3: original world shader / mask-only indirect character pass / 1.50ms complete-pair budget; three consecutive over-budget samples / automatic recovery");
 	return true;
 }
 
@@ -917,7 +917,7 @@ bool ASWProvider::WarpFrame(int eye, ID3D11DeviceContext* ctx,
     bool characterApplied=false;
     if(characterAllowed)characterApplied=m_nativePlayer.Apply(eye,ctx,m_warpDisplayTime,
         m_srvColor[eye],m_bodySrv[eye].Get(),m_srvDepth[eye],m_uavOutput[eye]);
-    if(eye==1)OOVR_LOG_LIMITEDF(5000,"DAPA CHARACTER MOTION 5.0.1: allowed=%d history=%d queued=%d budgetOff=%d extraSampledGpu=%.3fms capture=%.3fms correction=%.3fms overSamples=%u trip=%.3fms retryMs=%llu retries=%u; world shader unchanged; queued is not pixel coverage",
+    if(eye==1)OOVR_LOG_LIMITEDF(5000,"DAPA CHARACTER MOTION 5.0.3: allowed=%d history=%d queued=%d budgetOff=%d extraSampledGpu=%.3fms capture=%.3fms correction=%.3fms overSamples=%u trip=%.3fms retryMs=%llu retries=%u; world shader unchanged; queued is not pixel coverage",
         characterAllowed,m_nativePlayer.Ready(m_warpDisplayTime),characterApplied,m_nativePlayer.BudgetExceeded(),m_nativePlayer.CostMs(),m_nativePlayer.CaptureCostMs(),m_nativePlayer.CorrectionCostMs(),m_nativePlayer.OverBudgetSamples(),m_nativePlayer.TripCostMs(),static_cast<unsigned long long>(m_nativePlayer.RetryRemainingMs()),m_nativePlayer.RecoveryAttempts());
 
 	return true;

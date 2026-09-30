@@ -1,3 +1,26 @@
+OpenComposite Unleashed 5.0.3 for Skyrim VR
+
+1. DAPA player motion: Added native-motion-vector correction inside the existing player, hands, equipped-weapon and held-item masks. Camera motion is removed before prediction; the original world warp is preserved. Motion is prepared at render resolution, and output regions without usable motion are skipped.
+2. Automatic recovery: Extra player correction pauses after three consecutive complete stereo samples above 1.5 ms, then retries with fresh history. Repeated failures increase the retry delay from 2 seconds up to 30 seconds; sustained recovery restores the short delay. Original masked DAPA continues during cooldown.
+3. Steam Frame controls: Added controller artwork, calibrated binding circles, presets and extension-gated native bindings for the D-pad, ABXY, bumpers, triggers, grips, sticks and View/Menu buttons. Gaze uses the existing OpenXR eye-gaze path. Physical Steam Frame validation remains pending.
+4. Index grip holding: Added short touch-release confirmation and recovery for custom grip thresholds, with cleanup when focus, controller or interaction profile changes.
+5. Menu interaction: Improved MCM option targeting and laser/thumbstick handoff. Removed the unsafe Crafting-menu hit test and hardened Journal focus handling across menu transitions.
+6. Configurator: Included DPI/layout corrections, restored keyboard haptic controls, clearer disabled text and working setup-guide access.
+7. VR keyboard and cable tracking: Added console clipboard paste with Ctrl+V, corrected modifier handling, and an optional physical-turn counter with an unwind overlay and assignable shortcuts.
+8. Book, note and lockpicking menus: Keep native 3D menus out of the separate post-upscale UI capture path. Map, skills and startup/loading transitions retain native rendering, including when another popup opens over them. DAPA and foveation menu protection remain active.
+9. Steam Frame grip: Gameplay grab now uses runtime-thresholded analog squeeze rather than requiring the grip's physical end-stop click. Capacitive finger touch remains independent.
+10. Steam Frame hold actions: Registered the extra button IDs with Skyrim's controller definitions so held buttons accumulate duration for Journal/Wait, tween/sheathe and other hold-sensitive actions. Existing Touch button identities and Frame preset layouts are preserved.
+11. Steam Frame hotkeys: Add/Edit combo pickers now include right X/Y, D-pad Left/Right, both bumpers and View/Menu using the calibrated binding-circle positions. Added runtime handling for press, hold, long press and multi-tap shortcuts, with protection against matching unrelated controllers that reuse those button IDs.
+12. Steam Frame button registration: Saving bindings, presets, settings or hotkey combos now restores missing controller definitions and merges missing button entries without removing custom entries. This addresses missing held-time registration that can make extra buttons repeatedly activate inventory actions. In MO2, ensure OCU's Interface/controls/pc/oculuscontroller.txt wins file conflicts; restart Skyrim after saving.
+13. Quest/Touch and Frame repeated input: Corrected controller-definition field separators to the tabs required by Skyrim's native parser. The previous space-separated file could prevent standard A/trigger and extra Frame buttons from tracking held time, causing repeated inventory transfers and menu clicks. The Configurator repairs that older file when saving bindings, settings or combos. Restart Skyrim after updating.
+
+Player-motion correction remains experimental. It preserves the original mask outline; thin and rotating objects can still ghost. It pauses during locomotion, stick turns, menus, and invalid history. The GPU guard is sampled, and an FPS improvement is not guaranteed. AMD RDM remains experimental.
+
+Install the complete package, including root/openvr_api.dll, SKSE/Plugins/OpenCompositeInput.dll and Interface/controls/pc/oculuscontroller.txt. Preserve your existing settings when updating. No CSX/Open Shaders shader-cache deletion is required. DAPA, fixed VRS and verbose logging are off in the shipped configuration.
+
+
+Release history
+
 OpenComposite Unleashed 5.0.1 for Skyrim VR
 
 1. DAPA player motion: Added native-motion-vector correction inside the existing player, hands, equipped-weapon and held-item masks. Camera motion is removed before prediction; the original world warp is preserved. Motion is prepared at render resolution, and output regions without usable motion are skipped.
