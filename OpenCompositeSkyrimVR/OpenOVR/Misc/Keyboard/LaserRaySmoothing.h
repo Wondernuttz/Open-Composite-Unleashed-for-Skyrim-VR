@@ -10,7 +10,8 @@ namespace oovr_laser_smoothing {
 enum class Consumer {
 	Menu,
 	Keyboard,
-	KeyboardTarget
+	KeyboardTarget,
+	External
 };
 
 // Filters a calibrated ray in-place. Returns false for invalid/non-finite

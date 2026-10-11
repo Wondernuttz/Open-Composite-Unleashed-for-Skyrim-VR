@@ -266,6 +266,8 @@ set(OVR_PCH_EXCLUDED
 	OpenOVR/Misc/ini.c
 	OpenOVR/Misc/lodepng.cpp
 	OpenOVR/Misc/EffectFoveationState.cpp
+	OpenOVR/Misc/PointerState.cpp
+	OpenOVR/Misc/PointerTracking.cpp
 )
 
 add_library(OCCore STATIC
@@ -725,6 +727,12 @@ if (WIN32)
 		"${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/tests" "${XrDir}/include")
 	target_link_libraries(OCUFoveationGeometryTest PRIVATE d3d11)
 	set_target_properties(OCUFoveationGeometryTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    add_executable(OCUPointerStateTest EXCLUDE_FROM_ALL
+        tests/PointerStateTests.cpp OpenOVR/Misc/PointerState.cpp)
+    target_compile_definitions(OCUPointerStateTest PRIVATE NOMINMAX)
+    target_include_directories(OCUPointerStateTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(OCUPointerStateTest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 	add_executable(OCUEffectFoveationSelfTest EXCLUDE_FROM_ALL
 		tests/EffectFoveationTests.cpp OpenOVR/Misc/EffectFoveationState.cpp)

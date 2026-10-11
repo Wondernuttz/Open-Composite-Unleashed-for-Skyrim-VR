@@ -651,7 +651,8 @@ const std::vector<XrCompositionLayerBaseHeader*>& VRMenuLaser::Update(
 		rayValid[side] = false;
 
 		// Skip this hand if keyboard has it
-		if (keyboardHitSide[side]) {
+		if (keyboardHitSide[side] || (ocu_pointer::GetPointerState().ReadPresentation(
+		    ocu_pointer::PointerClockTicks()).snapshot.ownedHands & (1u << side))) {
 			oovr_laser_smoothing::Reset(
 			    oovr_laser_smoothing::Consumer::Menu, side, appSpace);
 			continue;
@@ -854,7 +855,8 @@ const std::vector<XrCompositionLayerBaseHeader*>& VRMenuLaser::UpdateWorld(
 		dotLayer[side].subImage.imageRect = laserAtlas->GetImageRect(
 		    clicked ? LaserAtlasRegion::DotClicked : LaserAtlasRegion::DotIdle);
 
-		if (keyboardHitSide[side]) {
+		if (keyboardHitSide[side] || (ocu_pointer::GetPointerState().ReadPresentation(
+		    ocu_pointer::PointerClockTicks()).snapshot.ownedHands & (1u << side))) {
 			oovr_laser_smoothing::Reset(
 			    oovr_laser_smoothing::Consumer::Menu, side, appSpace);
 			continue;
@@ -923,4 +925,32 @@ const std::vector<XrCompositionLayerBaseHeader*>& VRMenuLaser::UpdateWorld(
 	}
 
 	return activeLayers;
+}
+
+const std::vector<XrCompositionLayerBaseHeader*>& VRMenuLaser::UpdateExternal(
+    XrTime predictedTime, const ocu_pointer::Presentation& pointer)
+{
+    activeLayers.clear();
+    const auto& state = pointer.renderSnapshot;
+    const auto ownedHands = state.ownedHands & pointer.snapshot.ownedHands;
+    if (!ownedHands || pointer.lease.frameId != state.frameId ||
+        pointer.lease.sessionId != state.sessionId || state.sessionId != pointer.snapshot.sessionId ||
+        state.trackingOrigin != pointer.snapshot.trackingOrigin) return activeLayers;
+    const XrSpace space = xr_space_from_ref_space_type(GetUnsafeBaseSystem()->currentSpace);
+    XrSpaceLocation head{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(xrLocateSpace(xr_gbl->viewSpace, space, predictedTime, &head)) ||
+        !(head.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) return activeLayers;
+    for (int side = 0; side < 2; ++side) {
+        const auto& hand = state.hands[side];
+        if (!(ownedHands & (1u << side)) || !(hand.flags & ocu_pointer::RayValid) ||
+            !(pointer.lease.flags & (ocu_pointer::HasLeftHit << side))) continue;
+        beamLayer[side].space = space;
+        const XrVector3f origin{ hand.origin[0], hand.origin[1], hand.origin[2] };
+        const XrVector3f direction{ hand.direction[0], hand.direction[1], hand.direction[2] };
+        UpdateBeam(side, origin, direction, pointer.lease.hitDistance[side], head.pose.position);
+        beamLayer[side].subImage.imageRect = laserAtlas->GetImageRect(
+            (hand.flags & ocu_pointer::TriggerDown) ? LaserAtlasRegion::BeamClicked : LaserAtlasRegion::BeamIdle);
+        activeLayers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&beamLayer[side]));
+    }
+    return activeLayers;
 }

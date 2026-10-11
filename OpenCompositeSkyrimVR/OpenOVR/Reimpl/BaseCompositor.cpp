@@ -2,6 +2,7 @@
 #define BASE_IMPL
 
 #include "Misc/Config.h"
+#include "Misc/PointerState.h"
 
 #include "convert.h"
 #include "../../DrvOpenXR/ASWProvider.h"
@@ -79,6 +80,7 @@ void BaseCompositor::SetTrackingSpace(ETrackingUniverseOrigin eOrigin)
 		origin = XR_REFERENCE_SPACE_TYPE_LOCAL;
 	}
 
+	if (GetUnsafeBaseSystem()->currentSpace != origin) ocu_pointer::ResetPointerRuntime();
 	GetUnsafeBaseSystem()->currentSpace = origin;
 }
 

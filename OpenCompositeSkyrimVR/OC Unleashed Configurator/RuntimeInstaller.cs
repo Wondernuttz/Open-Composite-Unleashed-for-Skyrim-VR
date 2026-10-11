@@ -52,7 +52,8 @@ namespace OpenCompositeConfigurator
         private static bool IsCopyIfMissingOnly(string relPath)
         {
             string name = Path.GetFileName(relPath);
-            if (string.Equals(name, "opencomposite.ini", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(name, "opencomposite.ini", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(name, "menu_quad_settings.ini", StringComparison.OrdinalIgnoreCase))
                 return true;
             return relPath.StartsWith("Gestures" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
         }
@@ -442,10 +443,24 @@ namespace OpenCompositeConfigurator
             int applied = 0;
             foreach (var (src, dst) in plan)
             {
+                bool copyIfMissing = IsCopyIfMissingOnly(Path.GetRelativePath(gameDir, dst));
+                // Settings saved while the confirmation dialog is open remain authoritative.
+                if (copyIfMissing && File.Exists(dst))
+                    continue;
                 string? dir = Path.GetDirectoryName(dst);
                 if (!string.IsNullOrEmpty(dir))
                     Directory.CreateDirectory(dir);
-                File.Copy(src, dst, overwrite: true);
+                try
+                {
+                    File.Copy(src, dst, overwrite: !copyIfMissing);
+                }
+                catch (IOException error) when (copyIfMissing &&
+                    (error.HResult == unchecked((int)0x80070050)
+                    || error.HResult == unchecked((int)0x800700B7)))
+                {
+                    // Another writer created this user file after the existence check.
+                    continue;
+                }
                 applied++;
             }
             return applied;

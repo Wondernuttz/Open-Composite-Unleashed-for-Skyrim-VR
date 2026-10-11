@@ -7,6 +7,7 @@
 #include "../Misc/CameraLegCalibration.h"
 #include "Drivers/Backend.h"
 #include "Misc/Config.h"
+#include "Misc/PointerState.h"
 #include "convert.h"
 #include "generated/static_bases.gen.h"
 
@@ -679,6 +680,25 @@ HiddenAreaMesh_t BaseSystem::GetHiddenAreaMesh(EVREye eEye, EHiddenAreaMeshType 
 	return BackendManager::Instance().GetPrimaryHMD()->GetHiddenAreaMesh(eEye, type);
 }
 
+namespace {
+void MaskExternalPointerTrigger(vr::TrackedDeviceIndex_t device, vr::VRControllerState_t* state)
+{
+    if (device < 1 || device > 2) return;
+    auto& pointer = ocu_pointer::GetPointerState();
+    const auto now = ocu_pointer::PointerClockTicks();
+    if (!pointer.SuppressNative(device - 1, false, now, false)) return;
+    const auto triggerMask = vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
+    const auto input = GetBaseInput();
+    bool digital = false;
+    float analog = 0.0f;
+    const bool available = input && input->SamplePhysicalTrigger(device, digital, analog);
+    if (!pointer.SuppressNative(device - 1, digital || analog >= 0.3f, now, available)) return;
+    state->ulButtonPressed &= ~triggerMask;
+    state->ulButtonTouched &= ~triggerMask;
+    state->rAxis[1] = {};
+}
+}
+
 bool BaseSystem::GetControllerState(vr::TrackedDeviceIndex_t controllerDeviceIndex, vr::VRControllerState_t* controllerState, uint32_t controllerStateSize)
 {
 	if (sizeof(VRControllerState_t) != controllerStateSize)
@@ -705,6 +725,8 @@ bool BaseSystem::GetControllerState(vr::TrackedDeviceIndex_t controllerDeviceInd
 		inputSystem->LoadEmptyManifestIfRequired();
 
 	bool ok = inputSystem->GetLegacyControllerState(controllerDeviceIndex, controllerState);
+
+    if (ok) MaskExternalPointerTrigger(controllerDeviceIndex, controllerState);
 
 	// Mask controller input when a laser owns its synthetic click path. The
 	// keyboard owns several controls; the flat-menu bridge owns only trigger.
@@ -796,7 +818,10 @@ bool BaseSystem::GetUnmaskedControllerState(vr::TrackedDeviceIndex_t controllerD
 	if (frameNumber > 0)
 		inputSystem->LoadEmptyManifestIfRequired();
 
-	return inputSystem->GetLegacyControllerState(controllerDeviceIndex, controllerState);
+	const bool ok = inputSystem->GetLegacyControllerState(controllerDeviceIndex, controllerState);
+
+    if (ok) MaskExternalPointerTrigger(controllerDeviceIndex, controllerState);
+	return ok;
 }
 
 bool BaseSystem::GetControllerStateWithPose(ETrackingUniverseOrigin eOrigin, vr::TrackedDeviceIndex_t unControllerDeviceIndex,
@@ -957,6 +982,7 @@ void BaseSystem::PerformanceTestReportFidelityLevelChange(int nFidelityLevel)
 // Tracking origin stuff
 void BaseSystem::ResetSeatedZeroPose()
 {
+	ocu_pointer::ResetPointerRuntime();
 	if (BackendManager::Instance().IsGraphicsConfigured()) {
 		XrSpaceVelocity velocity{ XR_TYPE_SPACE_VELOCITY };
 		XrSpaceLocation location{ XR_TYPE_SPACE_LOCATION, &velocity, 0, {} };

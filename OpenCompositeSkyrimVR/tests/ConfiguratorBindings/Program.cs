@@ -26,6 +26,7 @@ static partial class Program
             if (args.Length > 0 && args[0] == "--foveation") return AuditFoveation();
             if (args.Length > 0 && args[0] == "--trackpads") return AuditTrackpads();
             if (args.Length > 0 && args[0] == "--controller-save") return AuditControllerSave();
+            if (args.Length > 0 && args[0] == "--runtime-settings") return AuditRuntimeSettings();
             // Fixtures stay beside this test executable; never show the form or install a runtime.
             var root = AppContext.BaseDirectory;
             Directory.CreateDirectory(Path.Combine(root, "root"));

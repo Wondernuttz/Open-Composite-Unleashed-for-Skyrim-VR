@@ -8,6 +8,7 @@
 #include "FoveationDebugOverlay.h"
 #include "CableTrackingOverlay.h"
 #include "../OpenOVR/Misc/EffectFoveationState.h"
+#include "../OpenOVR/Misc/PointerState.h"
 #include "generated/interfaces/vrtypes.h"
 
 #ifdef _WIN32
@@ -541,6 +542,7 @@ void XrBackend::WaitForTrackingData()
 {
 	// Make sure the OpenXR session is active before doing anything else, and if not then skip
 	if (!sessionActive) {
+		ocu_pointer::ResetPointerRuntime();
 		renderingFrame = false;
 		realFrameShouldRender = false;
 		return;
@@ -597,6 +599,7 @@ void XrBackend::WaitForTrackingData()
 	}
 
 	// Mark CPU frame start — game gets control back now
+	ocu_pointer::PublishPointerFrame();
 	QueryPerformanceCounter(&cpuFrameStart);
 }
 
@@ -2035,6 +2038,9 @@ void XrBackend::PumpEvents()
 			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
 			const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&ev);
+            if (changed->session == xr_session.get() &&
+                changed->referenceSpaceType == GetUnsafeBaseSystem()->currentSpace)
+                ocu_pointer::SchedulePointerReferenceChange(changed->changeTime);
 #if defined(SUPPORT_DX11)
 			if (cableTrackingOverlay && changed->session == xr_session.get() &&
 			    changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL)
@@ -2163,6 +2169,8 @@ void XrBackend::OnSessionCreated()
 
 void XrBackend::PrepareForSessionShutdown()
 {
+	ocu_pointer::ReleasePointerRenderer();
+	ocu_pointer::ResetPointerRuntime();
 	OcuLocomotionHeading::Instance().Reset();
 	OscLocomotion::Instance().Invalidate();
 #if defined(SUPPORT_DX11)

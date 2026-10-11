@@ -401,6 +401,9 @@ public: // INTERNAL FUNCTIONS
 	 */
 	bool GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDeviceIndex, vr::VRControllerState_t* controllerState);
 
+	/** Sample focused physical trigger actions without advancing legacy input smoothing. */
+	bool SamplePhysicalTrigger(vr::TrackedDeviceIndex_t device, bool& digital, float& analog);
+
 	void TriggerLegacyHapticPulse(vr::TrackedDeviceIndex_t controllerDeviceIndex, uint64_t durationNanos, float amplitude = -1.0f);
 
 	// aimPose defaults to false (grip), since OpenVR games are typically expecting a "raw"/natural controller pose, and

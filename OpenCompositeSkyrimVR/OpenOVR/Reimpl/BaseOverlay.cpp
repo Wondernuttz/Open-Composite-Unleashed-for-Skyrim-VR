@@ -6,6 +6,7 @@
 // TODO: extract all laser code into a separate file for proper separation
 // of concerns — it's currently interleaved in BaseOverlay::Submit().
 #include "../Misc/Keyboard/VRMenuLaser.h"
+#include "../Misc/PointerState.h"
 #include <memory>
 #include "BaseSystem.h"
 #include "Compositor/compositor.h"
@@ -365,6 +366,15 @@ static bool GetMenuProfile(const char* menuName, float& dist, float& w, float& h
 static std::unique_ptr<VRMenuLaser> menuLaser;
 // Independent from the calibrated menu renderer by design.
 static std::unique_ptr<VRMenuLaser> consoleLaser;
+static std::unique_ptr<VRMenuLaser> externalLaser;
+
+void ocu_pointer::ReleasePointerRenderer()
+{
+    externalLaser.reset();
+}
+
+#else
+void ocu_pointer::ReleasePointerRenderer() {}
 #endif // _WIN32
 
 // Reloadable keyboard shortcut settings (updated by file watcher)
@@ -834,6 +844,7 @@ public:
 
 BaseOverlay::~BaseOverlay()
 {
+	ocu_pointer::ReleasePointerRenderer();
 	for (const auto& kv : overlays) {
 		if (kv.second) {
 			delete kv.second;
@@ -2371,6 +2382,11 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 	}
 #endif
 
+    {
+        std::lock_guard<std::mutex> lock(pendingKeyboardMutex);
+        ocu_pointer::GetPointerState().SetBlockedHands(
+            (keyboard || pendingKeyboardRequest) ? 3u : 0u, ocu_pointer::PointerClockTicks());
+    }
 	if (keyboard) {
 		const auto& kbLayers = keyboard->Update();
 
@@ -2460,8 +2476,10 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 						s_pConsoleLaser->rayDirection[side][0] = direction.x;
 						s_pConsoleLaser->rayDirection[side][1] = direction.y;
 						s_pConsoleLaser->rayDirection[side][2] = direction.z;
-						if (consoleLaser->IsTriggerPressed(side))
+						if (consoleLaser->IsTriggerPressed(side)) {
+                            ocu_pointer::GetPointerState().CaptureNativeHand(side);
 							s_pConsoleLaser->triggerPressSequence[side]++;
+                        }
 					}
 					MemoryBarrier();
 					InterlockedIncrement(reinterpret_cast<volatile LONG*>(
@@ -2556,7 +2574,7 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 	static float s_mqMouseScaleX = 1.0f;  // UV scale multiplier for X
 	static float s_mqMouseScaleY = 1.0f;  // UV scale multiplier for Y
 	// Quad mode flags — controlled from Menu Quad Calibrator app
-	static bool  s_mqShowCalibQuad = true;  // Show the movable green calibration quad
+	static bool  s_mqShowCalibQuad = false; // Calibration grids require an explicit opt-in
 	static bool  s_mqShowProfileQuad = false; // Show pink profile quads (analysis mode)
 	static bool  s_mqShowSfCursor = false; // Tell SKSE to make Scaleform cursor visible
 	// (s_mqShowProfileQuad_prev and s_mqForceProfileReload removed —
@@ -3178,6 +3196,7 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 				int clickedHand = -1;
 				for (int side = 0; !suppressLaser && side < 2; side++) {
 					if (menuLaser->IsHit(side) && menuLaser->IsTriggerPressed(side)) {
+                        ocu_pointer::GetPointerState().CaptureNativeHand(side);
 						g_menuLaserSuppressUntilRelease[side].store(
 						    true, std::memory_order_release);
 						clickedHand = side;
@@ -3475,6 +3494,31 @@ int BaseOverlay::_BuildLayers(XrCompositionLayerBaseHeader* sceneLayer, XrCompos
 	}
 #endif // _WIN32 (menu laser system)
 #endif // Menu laser system v2
+
+#if defined(SUPPORT_DX) && defined(SUPPORT_DX11)
+    {
+        std::uint32_t captured = 0;
+        for (int side = 0; side < 2; ++side)
+            if (g_menuLaserSuppressUntilRelease[side].load(std::memory_order_acquire) ||
+                (consoleLaser && consoleLaser->IsTriggerDown(side) && g_consoleLaserConsumesTrigger[side]))
+                captured |= 1u << side;
+        ocu_pointer::GetPointerState().SetNativeCapturedHands(captured);
+        static std::uint64_t externalSession = 0;
+        const auto pointer = ocu_pointer::GetPointerState().ReadPresentation(ocu_pointer::PointerClockTicks());
+        if (externalSession != pointer.snapshot.sessionId) {
+            externalLaser.reset();
+            externalSession = pointer.snapshot.sessionId;
+        }
+        if (pointer.snapshot.ownedHands && BaseCompositor::dxcomp) {
+            if (!externalLaser) {
+                externalLaser = std::make_unique<VRMenuLaser>(BaseCompositor::dxcomp->GetDevice());
+                externalLaser->SetShowDebugQuad(false);
+            }
+            for (auto* layer : externalLaser->UpdateExternal(xr_gbl->nextPredictedFrameTime, pointer))
+                layerHeaders.push_back(layer);
+        }
+    }
+#endif
 
 	if (!oovr_global_configuration.EnableLayers()) {
 		goto done;
@@ -4564,8 +4608,10 @@ EVROverlayError BaseOverlay::ShowKeyboardWithDispatch(EGamepadTextInputMode eInp
 	{
 		std::lock_guard<std::mutex> lock(pendingKeyboardMutex);
 		alreadyPending = pendingKeyboardRequest != nullptr;
-		if (!alreadyPending)
+		if (!alreadyPending) {
+            ocu_pointer::GetPointerState().SetBlockedHands(3u, ocu_pointer::PointerClockTicks());
 			pendingKeyboardRequest = std::move(queuedRequest);
+        }
 	}
 
 	if (alreadyPending) {
@@ -4842,6 +4888,11 @@ void BaseOverlay::HideKeyboard()
 	// Delete the keyboard instance
 	keyboard.reset();
 	keyboardOwner = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(pendingKeyboardMutex);
+        ocu_pointer::GetPointerState().SetBlockedHands(
+            pendingKeyboardRequest ? 3u : 0u, ocu_pointer::PointerClockTicks());
+    }
 
 	{
 		ID3D11Device* postDestroyDev = BaseCompositor::dxcomp ? BaseCompositor::dxcomp->GetDevice() : nullptr;

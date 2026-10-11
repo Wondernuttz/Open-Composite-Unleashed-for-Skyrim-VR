@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
+#include "LaserPointerStyle.h"
 
 // Soft laser endpoint modeled after PrismaUI's warm circular cursor. The
 // texture is premultiplied because OCU's OpenXR quad layers intentionally do
@@ -64,7 +65,7 @@ inline void Fill(std::vector<uint32_t>& pixels, bool bgra,
 			Composite(r, g, b, a, innerGlow,
 			    0.60f * opacityScale * RadialFalloff(distance, 0.20f, 0.66f));
 			Composite(r, g, b, a, core,
-			    0.95f * opacityScale * RadialFalloff(distance, 0.23f, 0.34f));
+			    oovr_laser_style::DotCoreAlpha * opacityScale * RadialFalloff(distance, 0.23f, 0.34f));
 
 			uint8_t pr = static_cast<uint8_t>(std::round(std::clamp(r, 0.0f, 1.0f) * 255.0f));
 			uint8_t pg = static_cast<uint8_t>(std::round(std::clamp(g, 0.0f, 1.0f) * 255.0f));

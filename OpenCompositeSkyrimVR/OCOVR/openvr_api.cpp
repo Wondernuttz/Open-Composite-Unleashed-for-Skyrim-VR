@@ -10,6 +10,7 @@
 
 #include "Misc/Config.h"
 #include "Misc/EffectFoveationState.h"
+#include "Misc/PointerState.h"
 #include "Misc/debug_helper.h"
 #include "steamvr_abi.h"
 #include <functional>
@@ -492,6 +493,21 @@ extern "C" __declspec(dllexport) std::uint32_t OCU_GetEffectFoveationV1(
 {
 	return static_cast<std::uint32_t>(ocu_effect_foveation::GetState().Query(
 	    requestedVersion, outputBytes, output));
+}
+
+extern "C" __declspec(dllexport) std::uint32_t OCU_GetPointerStateV1(
+    std::uint32_t version, std::uint32_t bytes, ocu_pointer::Snapshot* output)
+{
+    return static_cast<std::uint32_t>(ocu_pointer::GetPointerState().Query(
+        version, bytes, output, ocu_pointer::PointerClockTicks()));
+}
+
+extern "C" __declspec(dllexport) std::uint32_t OCU_UpdatePointerLeaseV1(
+    std::uint32_t version, std::uint32_t bytes, const ocu_pointer::LeaseRequest* request,
+    std::uint32_t outputBytes, ocu_pointer::LeaseResponse* output)
+{
+    return static_cast<std::uint32_t>(ocu_pointer::GetPointerState().Update(
+        version, bytes, request, outputBytes, output, ocu_pointer::PointerClockTicks()));
 }
 
 extern "C" __declspec(dllexport) void OCU_CombatHaptic(int hand, int kind, unsigned int durationMicros)

@@ -11,6 +11,7 @@
 
 #include "BeamTexture.h"
 #include "LaserDotTexture.h"
+#include "LaserPointerStyle.h"
 #include "generated/static_bases.gen.h"
 
 namespace {
@@ -136,21 +137,17 @@ LaserTextureAtlas::LaserTextureAtlas(ID3D11Device* dev, XrSession activeSession)
 	std::vector<uint32_t> sprite;
 	const bool bgra = IsBgraFormat(format);
 
-	uint8_t idleR = 255, idleG = 240, idleB = 220;
-	uint8_t clickR = 55, clickG = 145, clickB = 255;
-	if (bgra) {
-		std::swap(idleR, idleB);
-		std::swap(clickR, clickB);
-	}
-	beamtex::Fill(sprite, idleR, idleG, idleB, 200);
-	Blit(atlas, sprite, kRegions[static_cast<int>(LaserAtlasRegion::BeamIdle)]);
-	beamtex::Fill(sprite, clickR, clickG, clickB, 220);
-	Blit(atlas, sprite, kRegions[static_cast<int>(LaserAtlasRegion::BeamClicked)]);
-	laserdot::Fill(sprite, bgra);
-	Blit(atlas, sprite, kRegions[static_cast<int>(LaserAtlasRegion::DotIdle)]);
-	laserdot::Fill(sprite, bgra,
-	    { 225, 245, 255 }, { 90, 175, 255 }, { 35, 105, 255 });
-	Blit(atlas, sprite, kRegions[static_cast<int>(LaserAtlasRegion::DotClicked)]);
+    for (int state = 0; state < 2; ++state) {
+        const auto& beam = oovr_laser_style::Beam[state];
+        beamtex::Fill(sprite, beam[bgra ? 2 : 0], beam[1], beam[bgra ? 0 : 2], beam[3]);
+        Blit(atlas, sprite, kRegions[static_cast<int>(LaserAtlasRegion::BeamIdle) + state]);
+        const auto& core = oovr_laser_style::DotCore[state];
+        const auto& inner = oovr_laser_style::DotInner[state];
+        const auto& outer = oovr_laser_style::DotOuter[state];
+        laserdot::Fill(sprite, bgra,
+            { core[0], core[1], core[2] }, { inner[0], inner[1], inner[2] }, { outer[0], outer[1], outer[2] });
+        Blit(atlas, sprite, kRegions[static_cast<int>(LaserAtlasRegion::DotIdle) + state]);
+    }
 
 	D3D11_TEXTURE2D_DESC textureDesc = {};
 	textureDesc.Width = kAtlasWidth;

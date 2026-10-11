@@ -3257,6 +3257,34 @@ VRInputValueHandle_t BaseInput::activeOriginFromSubaction(Action* action, const 
 	return handle;
 }
 
+bool BaseInput::SamplePhysicalTrigger(vr::TrackedDeviceIndex_t device, bool& digital, float& analog)
+{
+	digital = false;
+	analog = 0.0f;
+	if (device < 1 || device > 2) return false;
+	auto lock = xr_session.lock_shared();
+	const auto session = xr_session.get();
+	if (!HasFocusedActionSync(session)) return false;
+	const auto& actions = legacyControllers[device - 1];
+	XrActionStateGetInfo info{ XR_TYPE_ACTION_STATE_GET_INFO };
+	XrActionStateBoolean button{ XR_TYPE_ACTION_STATE_BOOLEAN };
+	XrActionStateFloat axis{ XR_TYPE_ACTION_STATE_FLOAT };
+	if (actions.triggerClick) {
+		info.action = actions.triggerClick;
+		if (XR_FAILED(xrGetActionStateBoolean(session, &info, &button))) return false;
+	}
+	if (actions.trigger) {
+		info.action = actions.trigger;
+		if (XR_FAILED(xrGetActionStateFloat(session, &info, &axis))) return false;
+	}
+	if (!button.isActive && !axis.isActive) return false;
+	if (axis.isActive && (!std::isfinite(axis.currentState) || axis.currentState < 0.0f || axis.currentState > 1.0f))
+		return false;
+	digital = button.isActive && button.currentState;
+	analog = axis.isActive ? axis.currentState : 0.0f;
+	return true;
+}
+
 bool BaseInput::GetLegacyControllerState(vr::TrackedDeviceIndex_t controllerDeviceIndex, vr::VRControllerState_t* state)
 {
 	*state = {};
