@@ -1,4 +1,5 @@
 #pragma once
+#include "../../DrvOpenXR/DapaComputeState.h"
 #include <d3d11.h>
 #include <wrl/client.h>
 
@@ -84,6 +85,8 @@ inline bool Dispatch(ID3D11DeviceContext* context, ID3D11ComputeShader* shader,
     ID3D11ShaderResourceView* source, ID3D11UnorderedAccessView* output, UINT width, UINT height)
 {
     if (!context || !shader || !source || !output || !width || !height) return false;
+    // Scene predication must not suppress the depth required for reprojection.
+    DapaPredicationState unpredicated(context);
     ScopedState saved(context, source);
     context->CSSetShader(shader, nullptr, 0);
     context->CSSetShaderResources(0, 1, &source);
