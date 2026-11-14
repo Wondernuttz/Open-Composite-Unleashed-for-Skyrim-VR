@@ -1,5 +1,6 @@
 #include "DrvOpenXR/DapaComputeState.h"
 #include "DrvOpenXR/DapaWarpShader.h"
+#include "D3D11PredicateFixture.h"
 #include <d3dcompiler.h>
 #include <d3d11sdklayers.h>
 #include <wrl/client.h>
@@ -417,16 +418,7 @@ AppendStructuredBuffer<float4> results : register(u0);
     void Predication() {
         Trace("suppressing predicate fixture");
         BindProducer();
-        ComPtr<ID3D11Predicate> predicate;
-        const D3D11_QUERY_DESC desc{D3D11_QUERY_OCCLUSION_PREDICATE,0};
-        HR(device->CreatePredicate(&desc,&predicate));
-        context->Begin(predicate.Get());context->End(predicate.Get());context->Flush();
-        BOOL visible=TRUE;HRESULT ready=S_FALSE;
-        for(unsigned i=0;i<10000&&ready==S_FALSE;++i) {
-            ready=context->GetData(predicate.Get(),&visible,sizeof(visible),D3D11_ASYNC_GETDATA_DONOTFLUSH);
-            if(ready==S_FALSE)Sleep(1);
-        }
-        Check(ready==S_OK&&visible==FALSE,"empty predicate did not resolve false");
+        auto predicate = ocu_test::EmptyOcclusionPredicate(device.Get(), context.Get());
         auto restored=[&](ID3D11Predicate* wanted,BOOL value) {
             ComPtr<ID3D11Predicate> actual;BOOL actualValue=FALSE;
             context->GetPredication(&actual,&actualValue);

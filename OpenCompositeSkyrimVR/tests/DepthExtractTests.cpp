@@ -1,4 +1,5 @@
 #include "OpenOVR/Compositor/DepthExtract.h"
+#include "D3D11PredicateFixture.h"
 #include <d3dcompiler.h>
 #include <d3d11sdklayers.h>
 #include <cmath>
@@ -78,20 +79,6 @@ static void CheckDebug(ID3D11InfoQueue* queue)
     queue->ClearStoredMessages();
 }
 
-static ComPtr<ID3D11Predicate> EmptyOcclusionPredicate(ID3D11Device* device, ID3D11DeviceContext* context)
-{
-    const D3D11_QUERY_DESC desc{D3D11_QUERY_OCCLUSION_PREDICATE, 0};
-    ComPtr<ID3D11Predicate> predicate; HR(device->CreatePredicate(&desc, &predicate));
-    context->Begin(predicate.Get()); context->End(predicate.Get()); context->Flush();
-    BOOL visible = TRUE; HRESULT ready = S_FALSE;
-    for (unsigned i = 0; i < 10000 && ready == S_FALSE; ++i) {
-        ready = context->GetData(predicate.Get(), &visible, sizeof(visible), D3D11_ASYNC_GETDATA_DONOTFLUSH);
-        if (ready == S_FALSE) Sleep(1);
-    }
-    Check(ready == S_OK && visible == FALSE, "Empty occlusion predicate did not resolve false");
-    return predicate;
-}
-
 // Negative control: the former dispatch sequence restored selected CS objects,
 // but never detached an overlapping writable depth output or saved instances.
 static void OldDispatch(ID3D11DeviceContext* context, ID3D11ComputeShader* shader,
@@ -161,7 +148,7 @@ RWTexture2D<float> destination : register(u0);
     const D3D11_SUBRESOURCE_DATA constantsData{classData, 0, 0};
     ComPtr<ID3D11Buffer> constants;
     HR(device->CreateBuffer(&constantsDesc, &constantsData, &constants));
-    auto predicate = EmptyOcclusionPredicate(device.Get(), context.Get());
+    auto predicate = ocu_test::EmptyOcclusionPredicate(device.Get(), context.Get());
     bool predicateSuppressesDispatch = false;
 
     // Prove the driver's linked producer works by itself before any production
@@ -287,6 +274,8 @@ RWTexture2D<float> destination : register(u0);
             ComPtr<ID3D11ShaderResourceView> afterSource; context->CSGetShaderResources(0, 1, &afterSource);
             ComPtr<ID3D11UnorderedAccessView> afterOutput; context->CSGetUnorderedAccessViews(0, 1, &afterOutput);
             Check(afterSource == gameInput && afterOutput == gameOutput, "Game CS resources changed");
+            // A previous producer dispatch must not satisfy this execution check.
+            context->ClearUnorderedAccessViewFloat(gameOutput.Get(), untouched);
             context->Dispatch(width, height, 1);
             CheckValues(device.Get(), context.Get(), gameTexture.Get(), 7, "Game compute draw no longer works after extraction");
             CheckDebug(debug.Get()); context->ClearState(); ++cases;
