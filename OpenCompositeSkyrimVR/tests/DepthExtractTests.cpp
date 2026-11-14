@@ -47,7 +47,11 @@ static std::vector<float> Read(ID3D11Device* device, ID3D11DeviceContext* contex
 }
 static void CheckValues(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* texture, float expected, const char* message)
 {
-    for (float value : Read(device, context, texture)) Check(std::abs(value - expected) <= 0.000001f, message);
+    for (float value : Read(device, context, texture)) {
+        if (std::abs(value - expected) > 0.000001f)
+            std::printf("Depth check mismatch: expected %.6f, got %.6f\n", expected, value);
+        Check(std::abs(value - expected) <= 0.000001f, message);
+    }
 }
 static UINT Counter(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11UnorderedAccessView* view)
 {
@@ -72,6 +76,20 @@ static void CheckDebug(ID3D11InfoQueue* queue)
         }
     }
     queue->ClearStoredMessages();
+}
+
+static ComPtr<ID3D11Predicate> EmptyOcclusionPredicate(ID3D11Device* device, ID3D11DeviceContext* context)
+{
+    const D3D11_QUERY_DESC desc{D3D11_QUERY_OCCLUSION_PREDICATE, 0};
+    ComPtr<ID3D11Predicate> predicate; HR(device->CreatePredicate(&desc, &predicate));
+    context->Begin(predicate.Get()); context->End(predicate.Get()); context->Flush();
+    BOOL visible = TRUE; HRESULT ready = S_FALSE;
+    for (unsigned i = 0; i < 10000 && ready == S_FALSE; ++i) {
+        ready = context->GetData(predicate.Get(), &visible, sizeof(visible), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (ready == S_FALSE) Sleep(1);
+    }
+    Check(ready == S_OK && visible == FALSE, "Empty occlusion predicate did not resolve false");
+    return predicate;
 }
 
 // Negative control: the former dispatch sequence restored selected CS objects,
@@ -143,6 +161,8 @@ RWTexture2D<float> destination : register(u0);
     const D3D11_SUBRESOURCE_DATA constantsData{classData, 0, 0};
     ComPtr<ID3D11Buffer> constants;
     HR(device->CreateBuffer(&constantsDesc, &constantsData, &constants));
+    auto predicate = EmptyOcclusionPredicate(device.Get(), context.Get());
+    bool predicateSuppressesDispatch = false;
 
     // Prove the driver's linked producer works by itself before any production
     // extraction/state capture runs. Flushed checkpoints localize driver faults.
@@ -159,6 +179,17 @@ RWTexture2D<float> destination : register(u0);
         context->Dispatch(1, 1, 1);
         Note(linkedProducer ? "reading dynamic producer before any extraction" : "reading ordinary producer before any extraction");
         CheckValues(device.Get(), context.Get(), baseline.Get(), 7, "Producer failed before any extraction");
+        const float untouched[4] = {-1, 0, 0, 0};
+        context->ClearUnorderedAccessViewFloat(baselineOutput.Get(), untouched);
+        context->SetPredication(predicate.Get(), FALSE);
+        context->Dispatch(1, 1, 1);
+        context->SetPredication(nullptr, FALSE);
+        const float predicatedValue = Read(device.Get(), context.Get(), baseline.Get()).front();
+        predicateSuppressesDispatch = std::abs(predicatedValue + 1.f) <= 0.000001f;
+        Check(predicateSuppressesDispatch || std::abs(predicatedValue - 7.f) <= 0.000001f, "Predicated producer control returned unexpected data");
+        Check(driver != D3D_DRIVER_TYPE_WARP || predicateSuppressesDispatch, "WARP negative control did not suppress Dispatch");
+        if (!predicateSuppressesDispatch)
+            Note("Hardware does not suppress the control Dispatch; testing depth and exact state restoration, with suppression regression covered by WARP.");
         CheckDebug(debug.Get()); context->ClearState();
         Note("standalone producer passed; beginning production depth cases");
     }
@@ -208,9 +239,15 @@ RWTexture2D<float> destination : register(u0);
         Check(debug->GetNumStoredMessagesAllowedByRetrievalFilter() > 0, "Expected old input/output hazard warning");
         debug->ClearStoredMessages(); context->ClearState();
 
-        // Exercise writable same-resource, matching read-only, unrelated, and
-        // absent DSVs, each with sparse RTV bindings and a live OM UAV counter.
-        for (int mode = 0; mode != 4; ++mode) for (UINT targetSlot : {0u, 2u}) {
+        // Cross DSV/RTV layouts with absent, allowing and suppressing predicates.
+        // Keep a live OM UAV counter and verify the producer resumes unchanged.
+        for (int mode = 0; mode != 4; ++mode) for (UINT targetSlot : {0u, 2u}) for (int predicateMode = 0; predicateMode != 4; ++predicateMode) {
+            ID3D11Predicate* boundPredicate = predicateMode < 2 ? nullptr : predicate.Get();
+            const BOOL predicateValue = predicateMode % 2 ? TRUE : FALSE;
+            const bool suppressesProducer = boundPredicate && predicateValue == FALSE && predicateSuppressesDispatch;
+            const float untouched[4] = {-1, 0, 0, 0};
+            context->ClearUnorderedAccessViewFloat(output.Get(), untouched);
+            context->ClearUnorderedAccessViewFloat(gameOutput.Get(), untouched);
             ID3D11DepthStencilView* boundDepth = mode == 0 ? writable.Get() : mode == 1 ? readOnly.Get() : mode == 2 ? other.Get() : nullptr;
             ID3D11RenderTargetView* targets[3]{}; targets[targetSlot] = target.Get();
             auto* sentinelView = sentinel.Get(); const UINT initialCounter = 3;
@@ -221,7 +258,15 @@ RWTexture2D<float> destination : register(u0);
             auto* gameSource = gameInput.Get(); context->CSSetShaderResources(0, 1, &gameSource);
             auto* gameDestination = gameOutput.Get(); context->CSSetUnorderedAccessViews(0, 1, &gameDestination, nullptr);
             CheckDebug(debug.Get());
+            context->SetPredication(boundPredicate, predicateValue);
             Check(ocu_depth_extract::Dispatch(context.Get(), extraction.Get(), source.Get(), output.Get(), width, height), "Production extraction rejected valid depth");
+            ComPtr<ID3D11Predicate> afterPredicate; BOOL afterPredicateValue = FALSE;
+            context->GetPredication(&afterPredicate, &afterPredicateValue);
+            Check(afterPredicate.Get() == boundPredicate && afterPredicateValue == predicateValue, "Game predicate pointer or value changed");
+            context->Dispatch(width, height, 1);
+            // Readback copies must run independently of the restored predicate.
+            context->SetPredication(nullptr, FALSE);
+            CheckValues(device.Get(), context.Get(), gameTexture.Get(), suppressesProducer ? -1.f : 7.f, "Restored predicate changed producer execution");
             CheckValues(device.Get(), context.Get(), outputTexture.Get(), .375f, "Extracted depth differs from actual bound scene depth");
             CheckValues(device.Get(), context.Get(), targetTexture.Get(), .625f, "Extraction changed game scene color");
             ComPtr<ID3D11DepthStencilView> afterDepth; ID3D11RenderTargetView* afterTargets[8]{};
@@ -249,8 +294,9 @@ RWTexture2D<float> destination : register(u0);
     }
     Check(!ocu_depth_extract::Dispatch(nullptr, extraction.Get(), nullptr, nullptr, 0, 0), "Invalid extraction must be rejected");
     context->ClearState(); context->Flush();
-    std::printf("PASS %s: %u depth/state cases; old writable-DSV zero-depth reproduced; production depth, color, OM UAV/counter and CS state preserved; class linkage=%s\n",
-        driver == D3D_DRIVER_TYPE_WARP ? "WARP" : "hardware", cases, linkedProducer ? "tested" : "explicit hardware-only skip");
+    std::printf("PASS %s: %u depth/state cases; old writable-DSV zero-depth reproduced; production depth, color, OM UAV/counter, CS state and predication preserved; class linkage=%s; Dispatch suppression=%s\n",
+        driver == D3D_DRIVER_TYPE_WARP ? "WARP" : "hardware", cases, linkedProducer ? "tested" : "explicit hardware-only skip",
+        predicateSuppressesDispatch ? "verified" : "not reproduced by this driver");
     std::fflush(stdout);
 }
 
